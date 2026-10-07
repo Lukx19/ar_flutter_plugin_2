@@ -13,7 +13,12 @@ import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.TotalCaptureResult
 import android.media.Image
+import com.uhg0.ar_flutter_plugin_2.BuildConfig
 import android.media.ImageReader
+import com.uhg0.ar_flutter_plugin_2.diagnostics.NativeFrameAttributionOwner
+import com.uhg0.ar_flutter_plugin_2.diagnostics.NativeFrameSpan
+import com.uhg0.ar_flutter_plugin_2.diagnostics.measureNativeFrame
+import com.uhg0.ar_flutter_plugin_2.diagnostics.StillCaptureMetadata
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Build
@@ -324,6 +329,7 @@ internal class SharedCameraManager(
         (SharedCameraCaptureResult, CaptureQualityPolicy?) -> Unit = { _, _ -> },
     private val onCaptureFinalizationFailed: (String, Throwable) -> Unit = { _, _ -> },
     private val resourceCounters: CaptureResourceCounters = CaptureResourceCounters(),
+    private val nativeFrameAttribution: NativeFrameAttributionOwner? = null,
 ) {
     // Additive V2 hook. V1 ImageCacheManager/correlation ownership is never
     // consulted by this route; a per-view #101 binding installs the Camera2 hook.
@@ -419,6 +425,11 @@ internal class SharedCameraManager(
     }
     private val pendingDirectStoreDispatches =
         mutableSetOf<DirectStoreDispatch>()
+    private val jpegDimensionLedger = JpegDimensionLedger()
+    private var attributionCameraEpoch = 0L
+    private var stillCaptureMetadata: StillCaptureMetadata? = null
+    private var matchStillPreviewFpsEffective = false
+    private var videoSnapshotJpegEffective = false
     private val captureObservationLock = Any()
     private val captureObservedTimestampsNs = linkedMapOf<Long, Long>()
     private val sharedCameraCaptureCallback =
@@ -429,6 +440,7 @@ internal class SharedCameraManager(
                 timestamp: Long,
                 frameNumber: Long,
             ) {
+                if (BuildConfig.NATIVE_FRAME_ATTRIBUTION) recordStillStarted(session, request, timestamp, frameNumber)
                 val directTag = request.tag as? DirectCaptureTagV2
                 if (directTag != null && pendingDirectCapture?.qualifier == directTag.qualifier) {
                     recordCaptureObservation(timestamp, System.nanoTime())
@@ -449,11 +461,37 @@ internal class SharedCameraManager(
                 recordCaptureObservation(timestamp, System.nanoTime())
             }
 
+            override fun onCaptureFailed(session: CameraCaptureSession, request: CaptureRequest, failure: android.hardware.camera2.CaptureFailure) {
+                if (BuildConfig.NATIVE_FRAME_ATTRIBUTION && session === captureSession) {
+                    val ledger=stillCaptureMetadata
+                    val token=if(ledger!=null) stillToken(request) else 0L
+                    if(token!=0L) try {ledger?.put(token,50,failure.reason.toLong());ledger?.put(token,4,android.os.SystemClock.elapsedRealtimeNanos());ledger?.event(token,52)}
+                    catch(_:Throwable){ledger?.probeError()} finally {ledger?.end(token)}
+                }
+                super.onCaptureFailed(session,request,failure)
+            }
+
             override fun onCaptureCompleted(
                 session: CameraCaptureSession,
                 request: CaptureRequest,
                 result: TotalCaptureResult,
             ) {
+                if (BuildConfig.NATIVE_FRAME_ATTRIBUTION) recordStillCompleted(session, request, result)
+                val attribution = nativeFrameAttribution
+                if (attribution != null && attribution.active && session === captureSession) {
+                    try {
+                        val intent = request.get(CaptureRequest.CONTROL_CAPTURE_INTENT)
+                        if (request.tag == null && intent == CaptureRequest.CONTROL_CAPTURE_INTENT_VIDEO_RECORD) {
+                            val arrivalNs = attribution.arrivalElapsedNs()
+                            attribution.repeatingResult(attributionCameraEpoch,
+                                result.get(CaptureResult.SENSOR_TIMESTAMP), result.frameNumber, arrivalNs,
+                                result.get(CaptureResult.SENSOR_EXPOSURE_TIME),
+                                result.get(CaptureResult.SENSOR_FRAME_DURATION))
+                        } else if (isOwnedStillRequest(request)) {
+                            attribution.stillResult(attributionCameraEpoch, result.frameNumber)
+                        }
+                    } catch (_: Throwable) { attribution.recordCameraProbeFailure() }
+                }
                 latestPreviewExposureState =
                     buildObservedExposureState(result, runtimeCameraController)
                 if (pendingManualCapture != null) {
@@ -533,9 +571,14 @@ internal class SharedCameraManager(
     private var previewImageReader: ImageReader? = null
     private var rawImageReader: ImageReader? = null
     private var activeCameraCharacteristics: CameraCharacteristics? = null
-    private var backgroundThread: HandlerThread? = null
+    private val callbackThreads = CameraCallbackThreads<HandlerThread>({ it.quitSafely(); Unit }, SystemClock::elapsedRealtime)
+    private var backgroundThread: HandlerThread?
+        get() = callbackThreads.camera
+        set(value) { callbackThreads.camera = value }
     private var backgroundHandler: Handler? = null
-    private var captureCallbackThread: HandlerThread? = null
+    private var captureCallbackThread: HandlerThread?
+        get() = callbackThreads.capture
+        set(value) { callbackThreads.capture = value }
     private var captureCallbackHandler: Handler? = null
 
     /** Reusable per-finalizer encoding storage; no encoded output is retained here. */
@@ -659,8 +702,17 @@ internal class SharedCameraManager(
     private var cameraDeviceClosed = false
     @Volatile
     private var cameraCloseLatch = CountDownLatch(1)
+    private val cameraDeviceCloseBarrier = CameraDeviceCloseBarrier<CameraDevice>()
     private var processShutdownGeneration: Long? = null
     private var sessionCallbackGeneration = 0L
+    // Fixed diagnostic manager metadata: 36 portable scalar bytes, no payloads.
+    // 0=unobserved, 1=entered, 2=returned/forwarded, 3=rejected, 4=threw.
+    @Volatile private var diagnosticDeviceCloseGeneration = -1L
+    @Volatile private var diagnosticSessionCloseGeneration = -1L
+    @Volatile private var diagnosticDeviceCloseOutcome = 0
+    @Volatile private var diagnosticSessionCloseOutcome = 0
+    @Volatile private var diagnosticSessionWrappedCloseGeneration = -1L
+    @Volatile private var diagnosticSessionWrappedCloseOutcome = 0
 
     private var isInitialized = false
     private val requestGeneration = CaptureRequestGeneration()
@@ -744,6 +796,11 @@ internal class SharedCameraManager(
 
         try {
             imageCacheManager = cacheManager
+            if (BuildConfig.NATIVE_FRAME_ATTRIBUTION) {
+                stillCaptureMetadata = StillCaptureMetadata.create(true, cacheManager::reserveStillCaptureMetadata) {
+                    cacheManager.releaseStillCaptureMetadata(StillCaptureMetadata.PORTABLE_BYTES)
+                }
+            }
             awaitSharedCameraRestartWindow()
             startBackgroundThread()
             setupCameraBasedOnConfig()
@@ -811,6 +868,7 @@ internal class SharedCameraManager(
         sharedCamera.setAppSurfaces(cameraId, listOf(scenePreviewSurface))
 
         val openCameraStartedNs = SystemClock.elapsedRealtimeNanos()
+        val cameraOpenGeneration = sessionCallbackGeneration
         val deviceStateCallback =
             object : CameraDevice.StateCallback() {
                 override fun onOpened(camera: CameraDevice) {
@@ -827,32 +885,68 @@ internal class SharedCameraManager(
                 }
 
                 override fun onDisconnected(camera: CameraDevice) {
+                    val ownsClosure = cameraDeviceCloseBarrier.bindClose(cameraOpenGeneration, camera)
                     camera.close()
+                    if (!ownsClosure) {
+                        closeDiagnostic("device-disconnected-close-rejected", cameraOpenGeneration)
+                        return
+                    }
                     cameraDevice = null
                     startupBarrier.fail("Shared camera disconnected during startup")
                 }
 
                 override fun onError(camera: CameraDevice, error: Int) {
+                    val ownsClosure = cameraDeviceCloseBarrier.bindClose(cameraOpenGeneration, camera)
                     camera.close()
+                    if (!ownsClosure) {
+                        closeDiagnostic("device-error-close-rejected", cameraOpenGeneration)
+                        return
+                    }
                     cameraDevice = null
                     startupBarrier.fail("Shared camera failed to open (error=$error)")
                     Log.e("SharedCameraManager", "Camera error: $error")
                 }
 
                 override fun onClosed(camera: CameraDevice) {
+                    if (!cameraDeviceCloseBarrier.onClosed(cameraOpenGeneration, camera)) {
+                        closeDiagnostic("device-application-close-rejected", cameraOpenGeneration)
+                        return
+                    }
                     cameraDeviceClosed = true
+                    closeDiagnostic("device-application-closed", cameraOpenGeneration)
                     signalCameraCloseBarrierIfComplete()
                     scheduleBackgroundThreadShutdownWhenClosed()
                 }
             }
         val wrappedDeviceStateCallback =
             sharedCamera.createARDeviceStateCallback(deviceStateCallback, backgroundHandler)
+        val observedDeviceStateCallback = if (BuildConfig.NATIVE_FRAME_ATTRIBUTION) {
+            object : CameraDevice.StateCallback() {
+                override fun onOpened(camera: CameraDevice) = wrappedDeviceStateCallback.onOpened(camera)
+                override fun onDisconnected(camera: CameraDevice) = wrappedDeviceStateCallback.onDisconnected(camera)
+                override fun onError(camera: CameraDevice, error: Int) = wrappedDeviceStateCallback.onError(camera, error)
+                override fun onClosed(camera: CameraDevice) {
+                    diagnosticDeviceCloseGeneration = cameraOpenGeneration
+                    diagnosticDeviceCloseOutcome = 1
+                    closeDiagnostic("device-wrapped-enter", cameraOpenGeneration)
+                    try {
+                        wrappedDeviceStateCallback.onClosed(camera)
+                        diagnosticDeviceCloseOutcome = 2
+                        closeDiagnostic("device-wrapped-return", cameraOpenGeneration)
+                    } catch (error: Throwable) {
+                        diagnosticDeviceCloseOutcome = 4
+                        closeDiagnostic("device-wrapped-threw:${error.javaClass.simpleName}", cameraOpenGeneration)
+                        throw error
+                    }
+                }
+            }
+        } else wrappedDeviceStateCallback
 
         startupProbe("open-enter", openCameraStartedNs)
         try {
             cameraManager.openCamera(
                 cameraId,
-                wrappedDeviceStateCallback,
+                observedDeviceStateCallback,
                 backgroundHandler,
             )
         } finally {
@@ -883,7 +977,9 @@ internal class SharedCameraManager(
         return try {
             builder.setTag(DirectCaptureTagV2(qualifier))
             captureLatencyLog("camera_request_submit", qualifier.identity.attemptId)
-            activeSession.capture(builder.build(), sharedCameraCaptureCallback, captureCallbackHandler)
+            val request = builder.build()
+            if (BuildConfig.NATIVE_FRAME_ATTRIBUTION) recordStillSubmission(request)
+            activeSession.capture(request, sharedCameraCaptureCallback, captureCallbackHandler)
             captureLatencyLog("camera_request_submitted", qualifier.identity.attemptId)
             true
         } catch (error: Throwable) {
@@ -896,6 +992,93 @@ internal class SharedCameraManager(
     private fun cancelDirectExposureV2(qualifier: CaptureAttemptQualifierV2) {
         pendingDirectCaptureOwner.cancel(qualifier) ?: return
         directRawJpegCaptureCorrelator.clear()
+    }
+
+    private fun isOwnedStillRequest(request: CaptureRequest): Boolean = when (val tag = request.tag) {
+        is ManualCaptureTag -> stillCaptureMetadata?.owns(
+            sessionCallbackGeneration, StillCaptureMetadata.MANUAL, tag.generation, tag.bracketIndex,
+        ) == true || requestGeneration.isCurrent(tag.generation)
+        is DirectCaptureTagV2 -> stillCaptureMetadata?.owns(
+            sessionCallbackGeneration, StillCaptureMetadata.DIRECT, tag.qualifier.exposureGeneration, 0,
+        ) == true || pendingDirectCapture?.qualifier == tag.qualifier
+        else -> false
+    }
+
+    private fun stillToken(request: CaptureRequest, submitting: Boolean = false): Long {
+        val ledger=stillCaptureMetadata ?: return 0
+        return try {
+        val tag=request.tag
+        val kind:Int;val generation:Long;val ordinal:Int
+        when(tag) {
+            is ManualCaptureTag -> {kind=StillCaptureMetadata.MANUAL;generation=tag.generation;ordinal=tag.bracketIndex}
+            is DirectCaptureTagV2 -> {kind=StillCaptureMetadata.DIRECT;generation=tag.qualifier.exposureGeneration;ordinal=0}
+            else -> return 0
+        }
+        if(submitting) ledger.submitted(sessionCallbackGeneration,kind,generation,ordinal,android.os.SystemClock.elapsedRealtimeNanos())
+        else ledger.begin(sessionCallbackGeneration,kind,generation,ordinal)
+        } catch (_: Throwable) { ledger.probeError(); 0L }
+    }
+    private fun recordStillSubmission(request: CaptureRequest) {
+        val ledger=stillCaptureMetadata ?: return
+        val token=stillToken(request,true);if(token==0L)return
+        try {
+            ledger.put(token,16,request.get(CaptureRequest.CONTROL_CAPTURE_INTENT)?.toLong())
+            request.get(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE)?.let { ledger.put(token,18,it.lower.toLong());ledger.put(token,19,it.upper.toLong()) }
+            ledger.put(token,22,request.get(CaptureRequest.CONTROL_AE_MODE)?.toLong())
+            ledger.put(token,24,request.get(CaptureRequest.CONTROL_AF_MODE)?.toLong())
+            ledger.put(token,26,request.get(CaptureRequest.CONTROL_AWB_MODE)?.toLong())
+            ledger.put(token,30,request.get(CaptureRequest.EDGE_MODE)?.toLong())
+            ledger.put(token,32,request.get(CaptureRequest.NOISE_REDUCTION_MODE)?.toLong())
+            ledger.put(token,34,request.get(CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE)?.toLong())
+            ledger.put(token,36,request.get(CaptureRequest.TONEMAP_MODE)?.toLong())
+            ledger.put(token,38,request.get(CaptureRequest.SHADING_MODE)?.toLong())
+            ledger.put(token,28,request.get(CaptureRequest.CONTROL_ENABLE_ZSL)?.let {if(it)1L else 0L})
+            ledger.put(token,40,request.get(CaptureRequest.JPEG_QUALITY)?.toInt()?.and(255)?.toLong())
+        } catch (_: Throwable) { ledger.probeError() } finally {ledger.end(token)}
+    }
+    private fun recordStillStarted(session:CameraCaptureSession,request:CaptureRequest,sensor:Long,frame:Long) {
+        val ledger=stillCaptureMetadata ?: return
+        if(session !== captureSession) return
+        val token=stillToken(request);if(token==0L)return
+        try {ledger.put(token,1,sensor);ledger.put(token,2,frame);ledger.put(token,3,android.os.SystemClock.elapsedRealtimeNanos());ledger.event(token,51)}
+        catch(_:Throwable){ledger.probeError()} finally{ledger.end(token)}
+    }
+    private fun recordStillCompleted(session:CameraCaptureSession,request:CaptureRequest,result:TotalCaptureResult) {
+        val ledger=stillCaptureMetadata ?: return
+        if(session !== captureSession) return
+        val token=stillToken(request);if(token==0L)return
+        try {
+            ledger.put(token,4,android.os.SystemClock.elapsedRealtimeNanos());ledger.put(token,6,result.frameNumber);ledger.event(token,52)
+            ledger.put(token,5,result.get(CaptureResult.SENSOR_TIMESTAMP))
+            ledger.put(token,7,result.get(CaptureResult.SENSOR_EXPOSURE_TIME))
+            ledger.put(token,8,result.get(CaptureResult.SENSOR_FRAME_DURATION))
+            ledger.put(token,9,result.get(CaptureResult.SENSOR_ROLLING_SHUTTER_SKEW))
+            ledger.put(token,17,result.get(CaptureResult.CONTROL_CAPTURE_INTENT)?.toLong())
+            ledger.put(token,23,result.get(CaptureResult.CONTROL_AE_MODE)?.toLong())
+            ledger.put(token,25,result.get(CaptureResult.CONTROL_AF_MODE)?.toLong())
+            ledger.put(token,27,result.get(CaptureResult.CONTROL_AWB_MODE)?.toLong())
+            ledger.put(token,31,result.get(CaptureResult.EDGE_MODE)?.toLong())
+            ledger.put(token,33,result.get(CaptureResult.NOISE_REDUCTION_MODE)?.toLong())
+            ledger.put(token,35,result.get(CaptureResult.COLOR_CORRECTION_ABERRATION_MODE)?.toLong())
+            ledger.put(token,37,result.get(CaptureResult.TONEMAP_MODE)?.toLong())
+            ledger.put(token,39,result.get(CaptureResult.SHADING_MODE)?.toLong())
+            ledger.put(token,42,result.get(CaptureResult.SENSOR_SENSITIVITY)?.toLong())
+            ledger.put(token,43,result.get(CaptureResult.CONTROL_AE_STATE)?.toLong())
+            ledger.put(token,44,result.get(CaptureResult.CONTROL_AF_STATE)?.toLong())
+            ledger.put(token,45,result.get(CaptureResult.CONTROL_AWB_STATE)?.toLong())
+            result.get(CaptureResult.CONTROL_AE_TARGET_FPS_RANGE)?.let {ledger.put(token,20,it.lower.toLong());ledger.put(token,21,it.upper.toLong())}
+            result.get(CaptureResult.CONTROL_ENABLE_ZSL)?.let {ledger.put(token,29,if(it)1 else 0)}
+            ledger.put(token,41,result.get(CaptureResult.JPEG_QUALITY)?.toInt()?.and(255)?.toLong())
+            result.get(CaptureResult.SCALER_CROP_REGION)?.let {ledger.put(token,46,it.left.toLong());ledger.put(token,47,it.top.toLong());ledger.put(token,48,it.right.toLong());ledger.put(token,49,it.bottom.toLong())}
+        } catch(_:Throwable){ledger.probeError()} finally{ledger.end(token)}
+    }
+    private fun recordStillImage(image:Image) {
+        val ledger=stillCaptureMetadata ?: return
+        try {
+            if(image.format != ImageFormat.JPEG) return
+            val token=ledger.image(sessionCallbackGeneration,image.timestamp,android.os.SystemClock.elapsedRealtimeNanos(),image.width,image.height,image.format)
+            ledger.end(token)
+        } catch(_:Throwable){ledger.probeError()}
     }
 
     private fun captureLatencyLog(stage: String, attemptId: String, exposureTimestampNs: Long? = null) {
@@ -1065,6 +1248,9 @@ internal class SharedCameraManager(
             capabilities =
                 SharedCaptureCapabilities(
                     supportedOutputSizes = supportedSizes.map { it.width to it.height },
+                    highResolutionOutputSizes = if (config.format == ImageFormat.JPEG && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
+                        configMap.getHighResolutionOutputSizes(ImageFormat.JPEG)?.map { it.width to it.height } ?: emptyList()
+                    else emptyList(),
                     timestampSource =
                         characteristics.get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE),
                     isoRange =
@@ -1147,6 +1333,7 @@ internal class SharedCameraManager(
                             rawImageReader?.surface,
                         ),
                 )
+            val sessionOpenGeneration = sessionCallbackGeneration
             val sessionStateCallback =
                 object : CameraCaptureSession.StateCallback() {
                     override fun onConfigured(session: CameraCaptureSession) {
@@ -1154,6 +1341,13 @@ internal class SharedCameraManager(
                         if (!configureCameraSettings()) {
                             return
                         }
+                        attributionCameraEpoch = nativeFrameAttribution?.openCameraEpoch(
+                            activeCameraCharacteristics?.get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE) ==
+                                CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME) ?: 0L
+                        val ledger = stillCaptureMetadata
+                        if (ledger != null) try {
+                            ledger.openSession(sessionCallbackGeneration, activeCameraCharacteristics?.get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE))
+                        } catch (_: Throwable) { ledger.probeError() }
                         startRepeatingRequest()
                     }
 
@@ -1190,15 +1384,40 @@ internal class SharedCameraManager(
 
                     override fun onClosed(session: CameraCaptureSession) {
                         captureSessionClosed = true
+                        closeDiagnostic("session-application-closed", sessionOpenGeneration)
                         signalCameraCloseBarrierIfComplete()
                         scheduleBackgroundThreadShutdownWhenClosed()
                     }
                 }
             val wrappedSessionStateCallback =
                 sharedCamera.createARSessionStateCallback(sessionStateCallback, backgroundHandler)
+            val observedSessionStateCallback = if (BuildConfig.NATIVE_FRAME_ATTRIBUTION) {
+                object : CameraCaptureSession.StateCallback() {
+                    override fun onConfigured(session: CameraCaptureSession) = wrappedSessionStateCallback.onConfigured(session)
+                    override fun onConfigureFailed(session: CameraCaptureSession) = wrappedSessionStateCallback.onConfigureFailed(session)
+                    override fun onReady(session: CameraCaptureSession) = wrappedSessionStateCallback.onReady(session)
+                    override fun onActive(session: CameraCaptureSession) = wrappedSessionStateCallback.onActive(session)
+                    override fun onCaptureQueueEmpty(session: CameraCaptureSession) = wrappedSessionStateCallback.onCaptureQueueEmpty(session)
+                    override fun onSurfacePrepared(session: CameraCaptureSession, surface: Surface) = wrappedSessionStateCallback.onSurfacePrepared(session, surface)
+                    override fun onClosed(session: CameraCaptureSession) {
+                        diagnosticSessionWrappedCloseGeneration = sessionOpenGeneration
+                        diagnosticSessionWrappedCloseOutcome = 1
+                        closeDiagnostic("session-wrapped-enter", sessionOpenGeneration)
+                        try {
+                            wrappedSessionStateCallback.onClosed(session)
+                            diagnosticSessionWrappedCloseOutcome = 2
+                            closeDiagnostic("session-wrapped-return", sessionOpenGeneration)
+                        } catch (error: Throwable) {
+                            diagnosticSessionWrappedCloseOutcome = 4
+                            closeDiagnostic("session-wrapped-threw:${error.javaClass.simpleName}", sessionOpenGeneration)
+                            throw error
+                        }
+                    }
+                }
+            } else wrappedSessionStateCallback
             val guardedSessionStateCallback =
                 guardArCoreStartupStateCallback(
-                    wrappedSessionStateCallback,
+                    observedSessionStateCallback,
                     sessionCallbackGeneration,
                 )
             cameraDevice.createCaptureSession(
@@ -1256,14 +1475,12 @@ internal class SharedCameraManager(
                 }
             previewCaptureRequestBuilder = repeatingBuilder
 
-            val requestBuilder =
+            var requestBuilder =
                 cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
                     arCoreSurfaces.forEach(::addTarget)
                     addTarget(previewImageReader.surface)
                     rawImageReader?.surface?.let(::addTarget)
                 }
-            manualCaptureRequestBuilder = requestBuilder
-
             for (builder in listOf(repeatingBuilder, requestBuilder)) {
                 if (config.autoExposure) {
                     builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
@@ -1287,6 +1504,70 @@ internal class SharedCameraManager(
                     builder.set(CaptureRequest.JPEG_ORIENTATION, 0)
                     builder.set(CaptureRequest.JPEG_QUALITY, config.jpegQuality.toByte())
                 }
+            }
+
+            check(!(BuildConfig.MATCH_STILL_PREVIEW_FPS && BuildConfig.VIDEO_SNAPSHOT_JPEG)) {
+                "Still FPS match and video snapshot JPEG experiments are mutually exclusive"
+            }
+            videoSnapshotJpegEffective = false
+            if (BuildConfig.VIDEO_SNAPSHOT_JPEG) {
+                val characteristics = activeCameraCharacteristics
+                    ?: error("Video snapshot experiment requires active camera characteristics")
+                check(cameraDevice.id == "0" && !config.processed && !config.rawJpeg &&
+                    config.format == ImageFormat.JPEG && rawImageReader == null) {
+                    "Video snapshot experiment supports ordinary primary camera0 JPEG only"
+                }
+                val capabilities = characteristics.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
+                    ?: error("Video snapshot experiment requires capability qualification")
+                check(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_LOGICAL_MULTI_CAMERA !in capabilities &&
+                    characteristics.physicalCameraIds.isEmpty()) {
+                    "Video snapshot experiment does not qualify logical/physical camera overrides"
+                }
+                // Both requests use the no-physical-ID, non-reprocess constructor. Android's
+                // public request API has no getTargets; these exact source-owned surfaces
+                // are the complete additions to the initially untargeted builders.
+                val ownedTargets = arCoreSurfaces + previewImageReader.surface
+                var copiedCandidate: CaptureRequest.Builder? = null
+                val adapter = object : VideoSnapshotRequestAdapter<CaptureRequest.Builder, CaptureRequest.Key<*>> {
+                    override val captureIntentKey = CaptureRequest.CONTROL_CAPTURE_INTENT
+                    override val stillCaptureIntent: Any = CaptureRequest.CONTROL_CAPTURE_INTENT_STILL_CAPTURE
+                    override val videoSnapshotIntent: Any = CaptureRequest.CONTROL_CAPTURE_INTENT_VIDEO_SNAPSHOT
+                    override fun controls(request: CaptureRequest.Builder): Map<CaptureRequest.Key<*>, Any?> {
+                        val snapshot = request.build()
+                        return snapshot.keys.filter { it.name.startsWith("android.") }
+                            .associateWith { snapshot.get(it) }
+                    }
+                    override fun createVideoSnapshot(): CaptureRequest.Builder =
+                        cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_VIDEO_SNAPSHOT)
+                    @Suppress("UNCHECKED_CAST")
+                    override fun setControl(request: CaptureRequest.Builder, key: CaptureRequest.Key<*>, value: Any) {
+                        request.set(key as CaptureRequest.Key<Any>, value)
+                    }
+                    override fun copyTargetsAndTag(baseline: CaptureRequest.Builder, candidate: CaptureRequest.Builder) {
+                        ownedTargets.forEach(candidate::addTarget)
+                        candidate.setTag(baseline.build().tag)
+                        copiedCandidate = candidate
+                    }
+                    override fun targetsAndTagMatch(baseline: CaptureRequest.Builder, candidate: CaptureRequest.Builder): Boolean =
+                        copiedCandidate === candidate && baseline.build().tag === candidate.build().tag
+                    override fun isOrdinaryPrimaryRequest(request: CaptureRequest.Builder): Boolean =
+                        !request.build().isReprocess
+                }
+                requestBuilder = VideoSnapshotRequestPolicy.transform(true, requestBuilder, adapter)
+                videoSnapshotJpegEffective = true
+            }
+            manualCaptureRequestBuilder = requestBuilder
+
+            matchStillPreviewFpsEffective = false
+            if (BuildConfig.MATCH_STILL_PREVIEW_FPS) {
+                matchStillPreviewFpsEffective = StillPreviewFpsPolicy.apply(
+                    enabled = true,
+                    repeatingRange = { repeatingBuilder.get(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE) },
+                    advertisedRanges = {
+                        activeCameraCharacteristics?.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)?.asList()
+                    },
+                    setStillRange = { requestBuilder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it) },
+                )
             }
 
             runtimeCameraController =
@@ -1456,6 +1737,8 @@ internal class SharedCameraManager(
         resourceCounters.onImageAcquired()
         var imageTransferred = false
         try {
+            if (image.format == ImageFormat.JPEG) jpegDimensionLedger.record(image.width, image.height, reader.width, reader.height)
+            if (BuildConfig.NATIVE_FRAME_ATTRIBUTION) recordStillImage(image)
             val direct = pendingDirectCapture
             if (pendingManualCapture == null && direct == null) {
                 return
@@ -1533,7 +1816,9 @@ internal class SharedCameraManager(
                 }
                 return
             }
-            val jpegBytes = readImageBytes(image)
+            val jpegBytes = nativeFrameAttribution.measureNativeFrame(NativeFrameSpan.JPEG_COPY) {
+                readImageBytes(image)
+            }
             Log.i(
                 "SharedCameraManager",
                 "Encoded ${jpegBytes.size} bytes in ${System.currentTimeMillis() - encodeStartedAtMs}ms",
@@ -1669,6 +1954,7 @@ internal class SharedCameraManager(
                     rawWidth = rawImage.width,
                     rawHeight = rawImage.height,
                     primaryAssetName = "jpeg",
+                    requiresPose = manual.requiresPose,
                 )
             manual.latch.countDown()
         } catch (error: Throwable) {
@@ -1969,8 +2255,36 @@ internal class SharedCameraManager(
     }
 
     private fun closeTrackedImage(image: Image) {
-        image.close()
-        resourceCounters.onImageClosed()
+        if (BuildConfig.NATIVE_FRAME_ATTRIBUTION && stillCaptureMetadata != null) {
+            closeStillTrackedImage(image)
+            return
+        }
+        closeTrackedImageCore(image)
+    }
+    private fun closeTrackedImageCore(image: Image) {
+        nativeFrameAttribution.measureNativeFrame(NativeFrameSpan.IMAGE_CLOSE) {
+            image.close()
+            resourceCounters.onImageClosed()
+        }
+    }
+    private fun closeStillTrackedImage(image: Image) {
+        val ledger = stillCaptureMetadata
+        var token = 0L
+        try { if (image.format == ImageFormat.JPEG) token = ledger?.imageCloseBegin(sessionCallbackGeneration, image.timestamp) ?: 0L }
+        catch (_: Throwable) { ledger?.probeError() }
+        try { closeTrackedImageCore(image) }
+        catch (failure: Throwable) {
+            try { ledger?.put(token,55,1) } catch (_: Throwable) { ledger?.probeError() }
+            throw failure
+        } finally {
+            if (token != 0L) {
+                try {
+                    ledger?.put(token,12,android.os.SystemClock.elapsedRealtimeNanos())
+                    ledger?.event(token,54)
+                } catch (_: Throwable) { ledger?.probeError() }
+                finally { ledger?.end(token) }
+            }
+        }
     }
 
     private fun exposureBracketSpecs(): List<ExposureBracketSpec> {
@@ -2149,6 +2463,10 @@ internal class SharedCameraManager(
     ) {
         SharedCameraCallbackGuard.run(
             onFailure = { error ->
+                if (terminal && BuildConfig.NATIVE_FRAME_ATTRIBUTION) {
+                    diagnosticSessionCloseOutcome = 4
+                    closeDiagnostic("session-gate-threw:${error.javaClass.simpleName}", generation)
+                }
                 if (cleanupRequested) {
                     Log.w("SharedCameraManager", "Ignored ARCore callback failure during $stage teardown", error)
                 } else {
@@ -2161,7 +2479,16 @@ internal class SharedCameraManager(
             },
         ) {
             if (terminal) {
-                sessionCallbackFence.runTerminal(generation, callback)
+                if (BuildConfig.NATIVE_FRAME_ATTRIBUTION) {
+                    diagnosticSessionCloseGeneration = generation
+                    diagnosticSessionCloseOutcome = 1
+                    closeDiagnostic("session-gate-enter", generation)
+                }
+                val forwarded = sessionCallbackFence.runTerminal(generation, callback)
+                if (BuildConfig.NATIVE_FRAME_ATTRIBUTION) {
+                    diagnosticSessionCloseOutcome = if (forwarded) 2 else 3
+                    closeDiagnostic(if (forwarded) "session-gate-forwarded" else "session-gate-rejected", generation)
+                }
             } else {
                 sessionCallbackFence.runActive(generation, callback)
             }
@@ -2200,7 +2527,7 @@ internal class SharedCameraManager(
             if (exposureBracket.isEmpty()) {
                 builder.setTag(ManualCaptureTag(generation))
                 activeSession.capture(
-                    builder.build(),
+                    builder.build().also { if (BuildConfig.NATIVE_FRAME_ATTRIBUTION) recordStillSubmission(it) },
                     sharedCameraCaptureCallback,
                     captureCallbackHandler,
                 )
@@ -2213,7 +2540,7 @@ internal class SharedCameraManager(
                         CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION,
                         member.compensationSteps,
                     )
-                    builder.build()
+                    builder.build().also { if (BuildConfig.NATIVE_FRAME_ATTRIBUTION) recordStillSubmission(it) }
                 }
                 builder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, originalCompensation)
                 activeSession.captureBurst(
@@ -2350,6 +2677,39 @@ internal class SharedCameraManager(
     fun getCaptureCapacity(): Map<String, Any?> =
         imageCacheManager?.getCaptureCapacity()
             ?: throw IllegalStateException("ImageCacheManager is not initialized")
+
+    internal fun stillCaptureMetadataReceipt(): Map<String, Any?> =
+        stillCaptureMetadata?.receipt() ?: mapOf("declared" to BuildConfig.NATIVE_FRAME_ATTRIBUTION,
+            "effective" to false, "scope" to "still ledger unavailable: disabled, unfunded or closed")
+    internal fun resetStillCaptureMetadata() { stillCaptureMetadata?.resetMeasurements() }
+
+    /** Current native reader configuration and actual received-JPEG dimensions. */
+    internal fun captureConfigurationReceipt(): Map<String, Any?> = mapOf(
+        "cameraId" to cameraDevice?.id,
+        "sessionCallbackGeneration" to sessionCallbackGeneration,
+        "requestedWidth" to config.resolution.width,
+        "requestedHeight" to config.resolution.height,
+        "effectiveWidth" to capabilityReport?.effectiveWidth,
+        "effectiveHeight" to capabilityReport?.effectiveHeight,
+        "resolutionSelectionReason" to capabilityReport?.resolutionSelectionReason,
+        "readerWidth" to previewImageReader?.width,
+        "readerHeight" to previewImageReader?.height,
+        "readerFormat" to previewImageReader?.imageFormat,
+        "jpegQuality" to config.jpegQuality,
+        "videoSnapshotJpegDeclared" to BuildConfig.VIDEO_SNAPSHOT_JPEG,
+        "videoSnapshotJpegEffective" to (isInitialized && videoSnapshotJpegEffective),
+        "stillTemplateScope" to if (BuildConfig.VIDEO_SNAPSHOT_JPEG) "ordinary primary camera0 JPEG; no physical-ID or reprocess overrides" else "baseline STILL_CAPTURE",
+        "actualStillRequestCaptureIntent" to manualCaptureRequestBuilder?.get(CaptureRequest.CONTROL_CAPTURE_INTENT),
+        "matchStillPreviewFpsDeclared" to BuildConfig.MATCH_STILL_PREVIEW_FPS,
+        "matchStillPreviewFpsEffective" to (isInitialized && matchStillPreviewFpsEffective),
+        "actualRepeatingRequestFpsLower" to previewCaptureRequestBuilder?.get(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE)?.lower,
+        "actualRepeatingRequestFpsUpper" to previewCaptureRequestBuilder?.get(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE)?.upper,
+        "actualStillRequestFpsLower" to manualCaptureRequestBuilder?.get(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE)?.lower,
+        "actualStillRequestFpsUpper" to manualCaptureRequestBuilder?.get(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE)?.upper,
+        "configuredFpsLower" to session?.cameraConfig?.fpsRange?.lower,
+        "configuredFpsUpper" to session?.cameraConfig?.fpsRange?.upper,
+        "receivedJpegDimensions" to jpegDimensionLedger.receipt(),
+    )
 
     /** Scalar scratch ownership evidence used by the capture performance receipt. */
     internal fun captureScratchReceipt(): Map<String, Long> {
@@ -2542,7 +2902,8 @@ internal class SharedCameraManager(
             processShutdownGeneration = processRestartGate.markShutdownStarted()
         }
         cleanupRequested = true
-        sessionCallbackFence.beginShutdown(sessionCallbackGeneration)
+        val callbackShutdownStarted = sessionCallbackFence.beginShutdown(sessionCallbackGeneration)
+        if (BuildConfig.NATIVE_FRAME_ATTRIBUTION) closeDiagnostic("cleanup-begin:gateStarted=$callbackShutdownStarted")
         pendingManualCapture?.let { pending ->
             pending.error = CaptureSessionException(
                 code = "CAPTURE_DISPOSED",
@@ -2563,13 +2924,18 @@ internal class SharedCameraManager(
         captureSession = null
 
         val closingCameraDevice = cameraDevice
-        cameraDeviceClosed = closingCameraDevice == null
+        cameraDeviceClosed = cameraDeviceCloseBarrier.beginClose(sessionCallbackGeneration, closingCameraDevice)
         closingCameraDevice?.close()
         cameraDevice = null
         signalCameraCloseBarrierIfComplete()
 
         activeCameraCharacteristics = null
         previewCaptureRequestBuilder = null
+        stillCaptureMetadata?.close()
+        stillCaptureMetadata = null
+        nativeFrameAttribution?.invalidateCameraEpoch(attributionCameraEpoch)
+        matchStillPreviewFpsEffective = false
+        videoSnapshotJpegEffective = false
         manualCaptureRequestBuilder = null
 
         if (finalizationWorkersDelegate.isInitialized()) finalizationWorkers.close()
@@ -2595,34 +2961,57 @@ internal class SharedCameraManager(
     }
 
     /**
-     * Waits until Camera2 has delivered both wrapped close callbacks. ARCore's
-     * SharedCamera callbacks still dereference the ARCore Session, so the host
-     * must not destroy that Session before this barrier opens.
+     * Requires closure of the matching CameraDevice, then drains both owned
+     * callback threads and Images before the host may destroy the ARCore Session.
+     * A separate session onClosed is observational, not hardware-close authority.
      */
     fun finishCameraShutdown(timeoutMs: Long) {
-        try {
-            val callbacksCompleted = cameraCloseLatch.await(timeoutMs, TimeUnit.MILLISECONDS)
-            // Match ARCore's SharedCamera sample: readers remain valid until the
-            // wrapped camera close callback has completed, then their callback
-            // handlers are drained before the ARCore Session is destroyed.
-            closeImageReaders()
-            stopBackgroundThreadsAfterDrain()
-            if (!callbacksCompleted) {
-                Log.i(
-                    "SharedCameraManager",
-                    "Camera2 close callbacks were not forwarded; callback handlers drained before ARCore disposal",
-                )
-            }
-        } finally {
-            sessionCallbackFence.finishShutdown(sessionCallbackGeneration)
-            processShutdownGeneration?.let { generation ->
-                processRestartGate.markShutdownCompleted(
-                    generation = generation,
-                    nowMs = SystemClock.elapsedRealtime(),
-                )
-            }
-            processShutdownGeneration = null
-        }
+        val deadlineMs = SystemClock.elapsedRealtime() + timeoutMs
+        CameraShutdownDrain.finish(
+            quiesceCallbacks = {
+                check(cameraCloseLatch.await(timeoutMs, TimeUnit.MILLISECONDS)) {
+                    closeDiagnostic("close-callback-deadline")
+                    "Camera close callbacks did not drain; AR session retained"
+                }
+                stopBackgroundThreadsAfterDrain(deadlineMs)
+            },
+            releaseCorrelatorOwners = ::clearPendingRawJpegComponents,
+            awaitImagesClosed = {
+                while (resourceCounters.outstandingImages() != 0L) {
+                    check(SystemClock.elapsedRealtime() < deadlineMs) { "Camera Images still owned; AR session retained" }
+                    Thread.sleep(5)
+                }
+            },
+            closeReaders = ::closeImageReaders,
+            completeShutdown = {
+                cameraDeviceCloseBarrier.finish(sessionCallbackGeneration)
+                sessionCallbackFence.finishShutdown(sessionCallbackGeneration)
+                processShutdownGeneration?.let { generation ->
+                    processRestartGate.markShutdownCompleted(generation, SystemClock.elapsedRealtime())
+                }
+                processShutdownGeneration = null
+            },
+        )
+    }
+
+    /** Cold callback/shutdown observations; no new admission or close authority. */
+    private fun closeDiagnostic(stage: String, callbackGeneration: Long = sessionCallbackGeneration) {
+        if (!BuildConfig.NATIVE_FRAME_ATTRIBUTION) return
+        val cameraThread = backgroundThread
+        val imageThread = captureCallbackThread
+        Log.i("SharedCameraManager", "[CAMERA-CLOSE-DIAGNOSTIC] stage=$stage " +
+            "managerIdentity=${System.identityHashCode(this)} arSessionIdentity=${System.identityHashCode(session)} " +
+            "callbackGeneration=$callbackGeneration currentOpenGeneration=$sessionCallbackGeneration " +
+            "shutdownGeneration=$processShutdownGeneration cameraEpoch=$attributionCameraEpoch " +
+            "cleanupRequested=$cleanupRequested captureSessionClosed=$captureSessionClosed cameraDeviceClosed=$cameraDeviceClosed " +
+            "deviceObservedGeneration=$diagnosticDeviceCloseGeneration deviceWrappedOutcome=$diagnosticDeviceCloseOutcome " +
+            "sessionObservedGeneration=$diagnosticSessionCloseGeneration sessionGateOutcome=$diagnosticSessionCloseOutcome " +
+            "sessionWrappedGeneration=$diagnosticSessionWrappedCloseGeneration sessionWrappedOutcome=$diagnosticSessionWrappedCloseOutcome " +
+            "cameraHandlerPresent=${backgroundHandler != null} cameraThreadPresent=${cameraThread != null} " +
+            "cameraThreadAlive=${cameraThread?.isAlive} cameraThreadState=${cameraThread?.state} " +
+            "imageHandlerPresent=${captureCallbackHandler != null} imageThreadPresent=${imageThread != null} " +
+            "imageThreadAlive=${imageThread?.isAlive} imageThreadState=${imageThread?.state} " +
+            "callbackThread=${Thread.currentThread().name} scope=nonAtomicColdObservation")
     }
 
     private fun closeImageReaders() {
@@ -3277,6 +3666,16 @@ internal class SharedCameraManager(
 
     private fun startBackgroundThread() {
         sessionCallbackGeneration = sessionCallbackFence.open()
+        cameraDeviceCloseBarrier.open(sessionCallbackGeneration)
+        if (BuildConfig.NATIVE_FRAME_ATTRIBUTION) {
+            diagnosticDeviceCloseGeneration = -1L
+            diagnosticSessionCloseGeneration = -1L
+            diagnosticDeviceCloseOutcome = 0
+            diagnosticSessionCloseOutcome = 0
+            diagnosticSessionWrappedCloseGeneration = -1L
+            diagnosticSessionWrappedCloseOutcome = 0
+            closeDiagnostic("open-generation")
+        }
         cleanupRequested = false
         captureSessionClosed = false
         cameraDeviceClosed = false
@@ -3288,9 +3687,9 @@ internal class SharedCameraManager(
     }
 
     private fun scheduleBackgroundThreadShutdownWhenClosed() {
-        if (!cleanupRequested || !captureSessionClosed || !cameraDeviceClosed) return
+        if (!cleanupRequested || !cameraDeviceCloseBarrier.isClosed(sessionCallbackGeneration)) return
         // Samsung may enqueue terminal capture callbacks from its executor
-        // immediately after both framework onClosed callbacks. Keep the
+        // immediately after the framework device onClosed callback. Keep the
         // handler alive for a bounded drain window before stopping its looper.
         backgroundHandler?.postDelayed(
             ::quitBackgroundThreadFromCameraCallback,
@@ -3299,43 +3698,19 @@ internal class SharedCameraManager(
     }
 
     private fun signalCameraCloseBarrierIfComplete() {
-        if (captureSessionClosed && cameraDeviceClosed) {
+        if (cleanupRequested && cameraDeviceCloseBarrier.isClosed(sessionCallbackGeneration)) {
             cameraCloseLatch.countDown()
         }
     }
 
     private fun quitBackgroundThreadFromCameraCallback() {
-        backgroundThread?.quitSafely()
-        backgroundThread = null
+        callbackThreads.requestQuit()
+    }
+
+    private fun stopBackgroundThreadsAfterDrain(deadlineMs: Long) {
+        callbackThreads.drainUntil(deadlineMs)
         backgroundHandler = null
-        captureCallbackThread?.quitSafely()
-        captureCallbackThread = null
         captureCallbackHandler = null
     }
 
-    private fun stopBackgroundThread() {
-        backgroundThread?.quitSafely()
-        try {
-            backgroundThread?.join()
-            backgroundThread = null
-            backgroundHandler = null
-        } catch (e: InterruptedException) {
-            Log.e("SharedCameraManager", "Error stopping background thread", e)
-        }
-    }
-
-    private fun stopBackgroundThreadsAfterDrain() {
-        val cameraThread = backgroundThread
-        val captureThread = captureCallbackThread
-        cameraThread?.quitSafely()
-        captureThread?.quitSafely()
-        runCatching { cameraThread?.join() }
-            .onFailure { Log.e("SharedCameraManager", "Error joining camera thread", it) }
-        runCatching { captureThread?.join() }
-            .onFailure { Log.e("SharedCameraManager", "Error joining capture callback thread", it) }
-        backgroundThread = null
-        backgroundHandler = null
-        captureCallbackThread = null
-        captureCallbackHandler = null
-    }
 }

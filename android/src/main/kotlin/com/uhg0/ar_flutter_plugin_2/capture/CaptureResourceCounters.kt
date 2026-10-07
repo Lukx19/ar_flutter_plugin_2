@@ -15,6 +15,8 @@ internal class CaptureResourceCounters {
         imagesClosed.incrementAndGet()
     }
 
+    fun outstandingImages(): Long = (imagesAcquired.get() - imagesClosed.get()).coerceAtLeast(0)
+
     fun snapshot(): Map<String, Long> {
         val acquired = imagesAcquired.get()
         val closed = imagesClosed.get()

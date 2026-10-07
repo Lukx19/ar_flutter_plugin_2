@@ -9,6 +9,7 @@ import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
 import io.flutter.plugin.common.MethodChannel
 import com.uhg0.ar_flutter_plugin_2.capabilities.MethodChannelARCameraCapabilities
 import com.uhg0.ar_flutter_plugin_2.capture.NativeCapturePreviewOwnerV2
+import com.uhg0.ar_flutter_plugin_2.capture.CapturePreviewWorkQueue
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommittedBaselineAuthority
 
 class ArFlutterPlugin: FlutterPlugin, ActivityAware {
@@ -17,24 +18,32 @@ class ArFlutterPlugin: FlutterPlugin, ActivityAware {
     private var flutterPluginBinding: FlutterPlugin.FlutterPluginBinding? = null
     private var cameraCapabilities: MethodChannelARCameraCapabilities? = null
     private var nativeCapturePreviewChannel: MethodChannel? = null
+    private var nativeCapturePreviewWorker: CapturePreviewWorkQueue? = null
     private val CommittedBaselineAuthority = CommittedBaselineAuthority()
 
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         flutterPluginBinding = binding
         val previewOwner = NativeCapturePreviewOwnerV2(binding.applicationContext.filesDir)
+        val previewWorker = CapturePreviewWorkQueue {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
+        }.also { nativeCapturePreviewWorker = it }
         nativeCapturePreviewChannel = MethodChannel(
             binding.binaryMessenger,
             "ar_flutter_plugin_2/native_capture_preview",
         ).apply {
             setMethodCallHandler { call, result ->
+                if (call.method == "cancelNativeCapturePreview") {
+                    call.argument<String>("requestId")?.let(previewWorker::cancel)
+                    result.success(null)
+                    return@setMethodCallHandler
+                }
                 if (call.method !in setOf("materializeNativeCapturePreview", "beginNativeCapturePreviewDeletion",
                         "commitNativeCapturePreviewDeletion", "rollbackNativeCapturePreviewDeletion",
                         "reconcileNativeCapturePreviews")) {
                     result.notImplemented()
                     return@setMethodCallHandler
                 }
-                Thread({
-                    runCatching {
+                previewWorker.submit(call.argument<String>("requestId"), { cancelled ->
                         when (call.method) {
                             "reconcileNativeCapturePreviews" -> {
                                 previewOwner.reconcile(requireNotNull(call.argument<List<String>>("references")))
@@ -43,6 +52,8 @@ class ArFlutterPlugin: FlutterPlugin, ActivityAware {
                             "materializeNativeCapturePreview" -> previewOwner.materialize(
                                 requireNotNull(call.argument<String>("manifestId")),
                                 requireNotNull(call.argument<String>("captureId")),
+                                cancelled,
+                                if (call.argument<Boolean>("detailed") == true) 1024 else 512,
                             )
                             "beginNativeCapturePreviewDeletion" -> previewOwner.beginDeletion(
                                 requireNotNull(call.argument<List<String>>("references")),
@@ -56,9 +67,10 @@ class ArFlutterPlugin: FlutterPlugin, ActivityAware {
                                 null
                             }
                         }
-                    }.onSuccess(result::success)
+                }, { outcome ->
+                    outcome.onSuccess(result::success)
                         .onFailure { error -> result.error("NATIVE_CAPTURE_PREVIEW_FAILED", error.message, null) }
-                }, "capture3d-v2-preview-reader").apply { isDaemon = true }.start()
+                })
             }
         }
     }
@@ -66,6 +78,8 @@ class ArFlutterPlugin: FlutterPlugin, ActivityAware {
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         nativeCapturePreviewChannel?.setMethodCallHandler(null)
         nativeCapturePreviewChannel = null
+        nativeCapturePreviewWorker?.close()
+        nativeCapturePreviewWorker = null
         flutterPluginBinding = null
     }
 

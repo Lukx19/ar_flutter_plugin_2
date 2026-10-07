@@ -3,6 +3,9 @@ package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import com.uhg0.ar_flutter_plugin_2.sceneview.NativeCoverageRendererOwner
+import com.uhg0.ar_flutter_plugin_2.sceneview.RendererAttributeCodec
+import com.uhg0.ar_flutter_plugin_2.BuildConfig
 import com.uhg0.ar_flutter_plugin_2.util.toLowercaseHex
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommittedBaselineAuthority
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommittedBaselineScopeV1
@@ -36,6 +39,7 @@ import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.RendererStyleCommandV1
 import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
+import java.util.concurrent.atomic.AtomicReference
 import java.nio.ByteBuffer
 import java.math.BigDecimal
 import java.util.ArrayDeque
@@ -117,10 +121,66 @@ class VisibilityGridV2Binding internal constructor(
     internal val beforeAbandonCleanup: (() -> Unit)? = null,
     private val onRendererStyleCut: ((QualifiedRendererStyleCut) -> RendererStyleCutResult)? = null,
     private val coverageRendererOwner: CoverageRendererOwner? = null,
+    private val canonicalReadyHints: CanonicalReadyHintOwner? = null,
 ) {
     private val main = Handler(Looper.getMainLooper())
     private val disposed = AtomicBoolean(false)
     private val controlHandlerInstalled = AtomicBoolean(true)
+    @Volatile private var acceptedRendererStyleHeader: ByteArray? = null
+    private var rendererAttributeBudget: ((Long) -> Boolean)? = null
+    internal fun configureRendererAttributeBudget(admit: (Long) -> Boolean) {
+        rendererAttributeBudget = admit
+        (coverageRendererOwner as? NativeCoverageRendererOwner)?.configureRendererAttributes(
+            currentBindingGeneration, {
+                if (disposed.get() || replacementBinding != null ||
+                    !streamChannel.rendererStyleAcknowledgementComplete) null else acceptedRendererStyleHeader
+            }, admit)
+    }
+
+    private fun handleRendererAttributeCall(call: MethodCall, result: MethodChannel.Result): Boolean {
+        if (call.method != "rendererAttributesCapabilities" && call.method != "rendererAttributesV1") return false
+        val raw = call.arguments as? ByteArray
+        if (raw == null || raw.size > RendererAttributeCodec.PAGE_BYTES + 32) {
+            result.success(mapOf("outcome" to "malformed")); return true
+        }
+        val admission = admitControl(raw)
+        val owner = coverageRendererOwner as? NativeCoverageRendererOwner
+        if (admission == null || admission.payload.size > RendererAttributeCodec.PAGE_BYTES) {
+            result.success(mapOf("outcome" to "malformed")); return true
+        }
+        if (owner == null || rendererAttributeBudget == null) {
+            result.success(mapOf("supported" to false, "outcome" to "unsupported")); return true
+        }
+        if (call.method == "rendererAttributesCapabilities") {
+            result.success(mapOf("supported" to true, "version" to 1, "maximumPatches" to 4096,
+                "maximumBalls" to 256, "maximumPageBytes" to RendererAttributeCodec.PAGE_BYTES)); return true
+        }
+        if (!streamChannel.rendererStyleAcknowledgementComplete) {
+            result.success(mapOf("outcome" to "staleCut")); return true
+        }
+        val invocation = owner.beginAttributeInvocation() ?: run { result.success(mapOf("outcome" to "busy")); return true }
+        val pending = PendingControlResult(result) { pendingControlResults.remove(it); owner.endAttributeInvocation(invocation) }
+        pendingControlResults.add(pending)
+        try {
+            executor.execute {
+                val response = runCatching {
+                    checkCurrentBinding(admission.generation, admission.qualifier)
+                    owner.exchangeRendererAttributes(admission.payload)
+                }
+                post {
+                    try {
+                        if (pending.tryClaim()) response.fold(
+                            onSuccess = { pending.result.success(if (it is ByteArray) qualify(it) else it) },
+                            onFailure = { pending.result.success(mapOf("outcome" to "staleCut")) })
+                    } finally { owner.endAttributeInvocation(invocation) }
+                }
+            }
+        } catch (_: RejectedExecutionException) {
+            if (pending.tryClaim()) result.success(mapOf("outcome" to "cancelled"))
+            owner.endAttributeInvocation(invocation)
+        }
+        return true
+    }
     @Volatile private var lifecycle = newLifecycle()
     private val controlChannel = MethodChannel(
         messenger,
@@ -167,11 +227,25 @@ class VisibilityGridV2Binding internal constructor(
     @Volatile private var activeGroupFrame: VisibilityGroupFrame? = null
     private val executorTrace = ArrayDeque<String>()
     private val publicationFence = Any()
+    private data class ObservationOwnershipPublication(
+        val epoch: Long,
+        val ownership: VisibilityObservationOwnership?,
+    )
+    private val observationOwnershipPublication =
+        AtomicReference(ObservationOwnershipPublication(0L, null))
+    @Volatile private var preparedObservationEpoch = -1L
+    @Volatile private var observationOwnershipReadsClosed = false
     private val pendingControlResults = ConcurrentHashMap.newKeySet<PendingControlResult>()
     private val pendingCleanupResults = ConcurrentHashMap.newKeySet<PendingCleanupResult>()
     @Volatile private var recoveryGroupCut: RecoveryGroupCut? = null
     @Volatile private var replacementBinding: VisibilityGridV2Binding? = null
     @Volatile private var observationRuntime: AndroidVisibilityGridRuntime? = null
+    private val canonicalReadyTimingLedger =
+        if (BuildConfig.COVERAGE_PUBLICATION_DIAGNOSTICS) {
+            CanonicalReadyTimingLedger(enabled = true)
+        } else {
+            null
+        }
 
     private fun newLifecycle() = ControlLifecycle(
         CommittedBaselineAuthority = CommittedBaselineAuthority,
@@ -197,7 +271,10 @@ class VisibilityGridV2Binding internal constructor(
         onExecutorOperation = ::recordExecutorOperation,
         bindingQualifier = bindingQualifier(),
         beforeWorkerProcessing = debugRecoverySeam::beforeExchange,
-        beforeRequestProcessing = debugRecoverySeam::beforeRequest,
+        beforeRequestProcessing = { request ->
+            canonicalReadyTimingLedger?.recordFirstCurrentExchange(request)
+            debugRecoverySeam.beforeRequest(request)
+        },
         onCommitPublished = { request, baseline ->
             activeReceiptQuery(request, baseline)?.let { query ->
                 CommittedBaselineAuthority.publishCommit(query, baseline)
@@ -211,7 +288,14 @@ class VisibilityGridV2Binding internal constructor(
             }
         },
         onAbandonedContinuation = debugRecoverySeam::oldContinuationFenced,
-        onStructuralTransactionAcknowledged = ::onStructuralTransactionAcknowledged,
+        onStructuralTransactionAcknowledged = { baseline ->
+            canonicalReadyTimingLedger?.recordStructuralAcknowledgement(
+                transactionId = baseline.transactionId,
+                geometryRevision = baseline.geometryRevision,
+                lineageRevision = baseline.lineageRevision,
+            )
+            onStructuralTransactionAcknowledged(baseline)
+        },
         debugTransportProbe = issue98Probe,
         admitRendererStylePage = ::admitRendererStylePage,
         onRendererStyleCut = ::applyRendererStyleCutCommand,
@@ -310,18 +394,31 @@ class VisibilityGridV2Binding internal constructor(
             15L * 40L + // stream callbacks/method references owned by this binding
             7L * 32L + // bounded deques/maps/sets and their empty envelopes
             16L + // executor capability (thread infrastructure is platform-managed, not retained payload)
-            identityPayload + tracePayload + transportPayload
+            800L + // assigned portable atomic publication, immutable DTO/UUID strings; VM padding unmeasured
+            identityPayload + tracePayload + transportPayload + (canonicalReadyHints?.portableOwnedBytes() ?: 0L)
     }
 
     /** Returns the exact active V2 lifecycle cut or null before a qualified START. */
     internal fun currentObservationOwnership(): VisibilityObservationOwnership? {
+        if (observationOwnershipReadsClosed) return null
         replacementBinding?.let { return it.currentObservationOwnership() }
-        return synchronized(publicationFence) {
-            val frame = activeGroupFrame ?: return@synchronized null
-            val baseline = acknowledgedEmptyBaseline
-            if (disposed.get() || !initialTransactionQueued || baseline == null) return@synchronized null
-            observationOwnership(frame)
+        if (disposed.get()) return null
+        return observationOwnershipPublication.get().ownership?.takeUnless { disposed.get() }
+    }
+
+    private fun invalidateObservationOwnership() {
+        observationOwnershipPublication.updateAndGet {
+            ObservationOwnershipPublication(Math.addExact(it.epoch, 1L), null)
         }
+    }
+
+    private fun publishObservationOwnership() {
+        val previous = observationOwnershipPublication.get()
+        val frame = activeGroupFrame ?: return
+        if (disposed.get() || observationOwnershipReadsClosed || !initialTransactionQueued || acknowledgedEmptyBaseline == null ||
+            preparedObservationEpoch != previous.epoch) return
+        val published = ObservationOwnershipPublication(previous.epoch, observationOwnership(frame))
+        observationOwnershipPublication.compareAndSet(previous, published)
     }
 
     /** Builds the ownership prepared by START; publication readiness is checked by the caller. */
@@ -423,7 +520,9 @@ class VisibilityGridV2Binding internal constructor(
             check(pending.matches(candidate) &&
                 streamChannel.hasExactQueuedCurrentDelta(receipt)
             ) { "canonical surface current delta replay is not byte-exact" }
-            return CurrentDeltaQueueResult.ALREADY_QUEUED
+            return withCanonicalReadyQueueCommit(selector, acknowledged, CurrentDeltaQueueResult.ALREADY_QUEUED) {
+                CurrentDeltaQueueResult.ALREADY_QUEUED
+            }
         }
         check(selector.transactionId == nextPortableOrdinal(acknowledged.transactionId)) {
             "canonical surface current delta is not the next transaction"
@@ -440,19 +539,114 @@ class VisibilityGridV2Binding internal constructor(
         // A prior call may have thrown after the stream atomically installed
         // the exact frames but before this binding recorded its scalar cut.
         if (streamChannel.hasExactQueuedCurrentDelta(receipt)) {
+            canonicalReadyTimingLedger?.recordUnattributedRecovery()
             pendingPublicationCut = candidate
+            canonicalReadyHints?.stage(canonicalReadyEnvelope(selector))
             return CurrentDeltaQueueResult.RECOVERED_EXACT_QUEUE
         }
         check(streamChannel.canQueueStructuralTransaction()) {
             "V2 stream requires binding rollover"
         }
-        streamChannel.queueCurrentDelta(
-            CurrentDeltaSourceV1 { requested -> receipt.takeIf { requested == selector } },
-            selector,
-            negotiatedOrdinaryResponseProfile(),
+        return withCanonicalReadyQueueCommit(selector, acknowledged, CurrentDeltaQueueResult.QUEUED) {
+            streamChannel.queueCurrentDelta(
+                CurrentDeltaSourceV1 { requested -> receipt.takeIf { requested == selector } },
+                selector,
+                negotiatedOrdinaryResponseProfile(),
+            )
+            pendingPublicationCut = candidate
+            CurrentDeltaQueueResult.QUEUED
+        }
+    }
+
+    private inline fun <T> withCanonicalReadyQueueCommit(
+        selector: CurrentDeltaSelectorV1,
+        previous: AcknowledgedCut,
+        disposition: CurrentDeltaQueueResult,
+        noinline block: () -> T,
+    ): T {
+        val ledger = canonicalReadyTimingLedger
+        val result = if (ledger == null) block() else ledger.withQueueCommit(
+            identity = CanonicalReadyTimingIdentity(
+                bindingGeneration = currentBindingGeneration,
+                sessionGeneration = activeSessionGeneration,
+                groupGeneration = activeGroupGeneration,
+                streamToken = lifecycle.streamToken(),
+                transactionId = selector.transactionId,
+                geometryRevision = selector.targetGeometryRevision,
+                lineageRevision = selector.targetLineageRevision,
+                previousTransactionId = previous.transactionId,
+                previousGeometryRevision = previous.targetGeometryRevision,
+                previousLineageRevision = previous.targetLineageRevision,
+            ),
+            disposition = disposition,
+            block = block,
         )
-        pendingPublicationCut = candidate
-        return CurrentDeltaQueueResult.QUEUED
+        canonicalReadyHints?.stage(canonicalReadyEnvelope(selector))
+        return result
+    }
+
+    /** Caller must have released producer/integration/renderer critical sections. */
+    internal fun canonicalReadyPublicationStamp(): Long = canonicalReadyHints?.publicationStamp() ?: 0L
+    internal fun canonicalReadyWakeEnabled(): Boolean = canonicalReadyHints != null
+    internal fun publishCanonicalReadyHint(stamp: Long) {
+        canonicalReadyHints?.publish(stamp)
+    }
+
+    private fun canonicalReadyEnvelope(selector: CurrentDeltaSelectorV1) = CanonicalReadyHintV1.create(
+        identities = listOf(
+            requireNotNull(activeSessionId).bytes, requireNotNull(activeCaptureGroupId).bytes,
+            arSessionIdentity, viewInstanceId, nativeStreamToken, workerBindingToken,
+        ),
+        ordinals = longArrayOf(
+            viewId.toLong(), viewGeneration, currentBindingGeneration, activeSessionGeneration,
+            activeGroupGeneration, activeCoverageEpoch, lifecycleSequence, operationGeneration,
+            lifecycle.streamToken(), selector.transactionId, selector.targetGeometryRevision,
+            selector.targetLineageRevision,
+        ),
+    )
+
+    /** Optional root-isolate subscription; old/iOS peers simply keep polling. */
+    internal fun handleCanonicalReadyCall(call: MethodCall, result: MethodChannel.Result): Boolean {
+        if (call.method != "registerCanonicalReady" && call.method != "unregisterCanonicalReady") return false
+        replacementBinding?.let { return it.handleCanonicalReadyCall(call, result) }
+        val owner = canonicalReadyHints
+        if (owner == null) { result.success(false); return true }
+        val expected = CanonicalReadyHintV1.decode(call.arguments as? ByteArray)
+        val accepted = synchronized(this) {
+            if (disposed.get() || expected == null || acknowledgedPublicationCut == null) false
+            else {
+                val baseline = acknowledgedPublicationCut!!
+                val actual = canonicalReadyEnvelope(CurrentDeltaSelectorV1(
+                    baseline.transactionId, baseline.targetGeometryRevision, baseline.targetLineageRevision,
+                ))
+                if (!expected.sameOwner(actual)) false
+                else {
+                    if (call.method == "registerCanonicalReady") {
+                        pendingPublicationCut?.selector?.let { owner.restorePublished(canonicalReadyEnvelope(it)) }
+                        owner.register()
+                    } else owner.unregister()
+                    true
+                }
+            }
+        }
+        result.success(accepted)
+        return true
+    }
+
+    internal fun canonicalReadyTimingSnapshot(): Map<String, Any> =
+        replacementBinding?.canonicalReadyTimingSnapshot()
+            ?: canonicalReadyTimingLedger?.snapshotWireMap()
+            ?: emptyMap()
+
+    internal fun canonicalReadyWakeSnapshot(): Map<String, Any> =
+        canonicalReadyHints?.snapshot() ?: mapOf("enabled" to false)
+
+    /** Fences pending timing samples across the runtime pause cut. */
+    @Synchronized
+    internal fun resetCanonicalReadyTiming(reason: String = "paused") {
+        canonicalReadyTimingLedger?.reset(reason)
+        canonicalReadyHints?.unregister()
+        (coverageRendererOwner as? NativeCoverageRendererOwner)?.invalidateRendererAttributes(currentBindingGeneration)
     }
 
     /**
@@ -510,12 +704,14 @@ class VisibilityGridV2Binding internal constructor(
                 lineageRevision = baseline.lineageRevision,
             )
             acknowledgedPublicationCut = AcknowledgedCut.from(selector)
+            publishObservationOwnership()
             return
         }
         val pending = pendingPublicationCut ?: return
         if (pending.selector != selector) return
         pendingPublicationCut = null
         pendingRendererPublication = selector
+        canonicalReadyHints?.acknowledged(selector.transactionId)
         acknowledgedPublicationCut = AcknowledgedCut.from(selector)
         acknowledgementListener?.invoke(selector)
     }
@@ -623,6 +819,17 @@ class VisibilityGridV2Binding internal constructor(
         publishCommittedBaselineAdvance(previousBaseline, nextBaseline)
         logRendererStylePhase(command, "baselineAdvanced", startedNs)
         lifecycle.setCommittedBaselineLocally(nextBaseline)
+        acceptedRendererStyleHeader = ByteArray(116).also { bytes ->
+            val header = ByteBuffer.wrap(bytes).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            header.put(command.captureGroupId)
+            for (ordinal in longArrayOf(command.bindingGeneration, command.groupGeneration,
+                command.transactionId, command.geometryRevision, command.lineageRevision,
+                command.semanticRevision, command.coverageRevision, command.styleRevision,
+                command.residencyRevision, command.targetRevision)) header.putLong(ordinal)
+            header.put(if (command.reset) 1 else 0).put(0).putShort(0)
+            header.putLong(command.targetSurfaceId ?: -1L).putInt(command.targetDirectionIndex ?: -1)
+                .putInt(command.surfaceIds.size)
+        }
         return RendererStyleCommandApplyResultV1(command.styleRevision)
     }
 
@@ -691,7 +898,7 @@ class VisibilityGridV2Binding internal constructor(
             "recoveryPending" to status.recoveryPending,
             "resourceFailureCount" to status.resourceFailureCount,
             "lowMemoryPressure" to status.lowMemoryPressure,
-        )
+        ) + ((owner as? NativeCoverageRendererOwner)?.rendererGeometryStatus() ?: emptyMap())
     }
 
     private fun rendererExpectedRevisionStale(arguments: Map<*, *>): Boolean {
@@ -761,7 +968,7 @@ class VisibilityGridV2Binding internal constructor(
                     "rowCount" to receipt.rowCount,
                     "selectedRowCount" to receipt.selectedRowCount,
                     "rendererGeneration" to receipt.rendererGeneration,
-                ),
+                ) + ((owner as? NativeCoverageRendererOwner)?.rendererGeometryStatus() ?: emptyMap()),
             )
             return true
         }
@@ -820,6 +1027,7 @@ class VisibilityGridV2Binding internal constructor(
     }
 
     private fun onControlCall(call: MethodCall, result: MethodChannel.Result) {
+        if (handleRendererAttributeCall(call, result)) return
         if (onRendererControlCall(call, result)) return
         if (call.method == "configureDebugV2ExchangeStall") {
             if (!isDebuggable) {
@@ -1130,6 +1338,7 @@ class VisibilityGridV2Binding internal constructor(
         }
         val pending = PendingControlResult(result) { pendingControlResults.remove(it) }
         pendingControlResults.add(pending)
+        val observationEpoch = observationOwnershipPublication.get().epoch
         try {
             executor.execute {
                 val outcome = runCatching {
@@ -1153,6 +1362,9 @@ class VisibilityGridV2Binding internal constructor(
                         val wasIdle = lifecycle.state() == ControlLifecycle.State.IDLE
                         val response = lifecycle.handle(request, admission.payload)
                         val decoded = ControlCodec.decodeResponse(response)
+                        if (operation == ControlOperation.STOP && decoded.outcome == 0) {
+                            invalidateObservationOwnership()
+                        }
                         if (
                             wasIdle && operation == ControlOperation.START &&
                             decoded.outcome == 0
@@ -1171,6 +1383,7 @@ class VisibilityGridV2Binding internal constructor(
                             ) {
                                 val configuration = lifecycle.successfulStartConfiguration()
                                     ?: error("Accepted START has no decoded configuration")
+                                preparedObservationEpoch = observationEpoch
                                 activeGroupFrame = VisibilityGroupFrame.copyOf(
                                     groupFromWorldGl = configuration.groupFromWorldGl.toDoubleArray(),
                                     worldFromGroupGl = configuration.worldFromGroupGl.toDoubleArray(),
@@ -1178,6 +1391,7 @@ class VisibilityGridV2Binding internal constructor(
                                     modelCapacity = configuration.negotiatedModelCapacity,
                                 )
                                 operationGeneration++
+                                canonicalReadyHints?.reset()
                                 lifecycleSequence = allocateLifecycleSequence()
                                 activeControlRequestId = request.controlRequestId
                                 activeSessionId = request.sessionId
@@ -1188,6 +1402,7 @@ class VisibilityGridV2Binding internal constructor(
                                 retainedRendererRebind = queueInitialTransaction(lifecycle.committedBaseline())
                             }
                             if (operation == ControlOperation.STOP && decoded.outcome == 0) {
+                                canonicalReadyHints?.reset()
                                 activeGroupFrame = null
                             }
                             if (retainedRendererRebind == null) acceptedControls++
@@ -1408,6 +1623,7 @@ class VisibilityGridV2Binding internal constructor(
             acknowledgedEmptyBaseline = pending.freshBaseline
             acknowledgedPublicationCut = pending.acknowledgedCut
             initialTransactionQueued = true
+            publishObservationOwnership()
             acceptedControls++
         }
     }
@@ -1428,6 +1644,9 @@ class VisibilityGridV2Binding internal constructor(
     private fun replaceBinding(
         currentCleanup: PendingCleanupResult? = null,
     ): Map<String, Any?> {
+        invalidateObservationOwnership()
+        canonicalReadyTimingLedger?.reset("replaced")
+        canonicalReadyHints?.reset()
         val resourcesBefore = lifecycleResources(excludedCleanup = currentCleanup)
         val closedBefore = closedResources
         recordExecutorOperation("control:dispose_binding")
@@ -1496,6 +1715,8 @@ class VisibilityGridV2Binding internal constructor(
     }
 
     fun dispose() {
+        observationOwnershipReadsClosed = true
+        invalidateObservationOwnership()
         if (disposed.compareAndSet(false, true)) closeBindingResources()
         replacementBinding?.dispose()
     }
@@ -1509,6 +1730,7 @@ class VisibilityGridV2Binding internal constructor(
     private fun abandonAndReplace(
         currentCleanup: PendingCleanupResult? = null,
     ): Map<String, Any?> {
+        invalidateObservationOwnership()
         val resourcesBefore = lifecycleResources(excludedCleanup = currentCleanup)
         val closedBefore = closedResources
         synchronized(publicationFence) {
@@ -1544,7 +1766,9 @@ class VisibilityGridV2Binding internal constructor(
             initialCommittedBaselineSeed = lifecycle.committedBaseline(),
             onRendererStyleCut = onRendererStyleCut,
             coverageRendererOwner = coverageRendererOwner,
+            canonicalReadyHints = canonicalReadyHints,
         ).also { replacement ->
+            rendererAttributeBudget?.let { replacement.configureRendererAttributeBudget(it) }
             observationRuntime?.let(replacement::attachObservationRuntime)
             acknowledgementListener?.let(replacement::attachPublicationAcknowledgementListener)
             retainedRendererRebindListener?.let(replacement::attachRetainedRendererRebindListener)
@@ -1599,6 +1823,9 @@ class VisibilityGridV2Binding internal constructor(
     }
 
     private fun closeBindingResources(abandonStream: Boolean = false) {
+        invalidateObservationOwnership()
+        canonicalReadyHints?.reset()
+        canonicalReadyTimingLedger?.reset(if (abandonStream) "replaced" else "closed")
         synchronized(publicationFence) { activeGroupFrame = null }
         terminatePendingControlResults()
         controlChannel.setMethodCallHandler(null)
@@ -1716,6 +1943,8 @@ class VisibilityGridV2Binding internal constructor(
         "viewGeneration" to viewGeneration,
         "lifecycleSequence" to lifecycleSequence,
         "operationGeneration" to operationGeneration,
+        "canonicalReadyWakeSupported" to (canonicalReadyHints != null),
+        "canonicalReadyWake" to (canonicalReadyHints?.snapshot() ?: mapOf("enabled" to false)),
         "executorTrace" to executorTrace,
         "sourceHealth" to observationRuntime?.snapshotWireMap(),
     )

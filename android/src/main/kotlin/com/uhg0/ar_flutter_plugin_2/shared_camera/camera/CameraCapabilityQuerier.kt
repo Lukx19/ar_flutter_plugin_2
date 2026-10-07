@@ -125,6 +125,12 @@ class CameraCapabilityQuerier(private val context: Context) {
             "validatedSharedResolutions" to validatedResolutions.map {
                 mapOf("width" to it.width, "height" to it.height)
             },
+            "advertisedJpegRegularResolutions" to advertisedJpegResolutions(false).map {
+                mapOf("width" to it.width, "height" to it.height)
+            },
+            "advertisedJpegHighResolutionResolutions" to advertisedJpegResolutions(true).map {
+                mapOf("width" to it.width, "height" to it.height)
+            },
             "validatedRawJpegResolutions" to validatedRawJpegResolutions.map {
                 mapOf("width" to it.width, "height" to it.height)
             },
@@ -494,9 +500,12 @@ class CameraCapabilityQuerier(private val context: Context) {
             val configMap =
                 characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
                     ?: return emptyList()
+            val regular = configMap.getOutputSizes(format) ?: emptyArray()
+            val highResolution = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && format == android.graphics.ImageFormat.JPEG) {
+                configMap.getHighResolutionOutputSizes(format) ?: emptyArray()
+            } else emptyArray()
             val resolutions =
-                (configMap.getOutputSizes(format)
-                    ?: emptyArray())
+                (regular + highResolution)
                     .map { size -> CameraResolution(size.width, size.height) }
                     .distinct()
                     .sortedByDescending { it.width.toLong() * it.height.toLong() }
@@ -506,6 +515,18 @@ class CameraCapabilityQuerier(private val context: Context) {
         } catch (e: Exception) {
             emptyList()
         }
+    }
+
+    /** Sizes validated with CameraDevice.isSessionConfigurationSupported. */
+    private fun advertisedJpegResolutions(highResolution: Boolean): List<CameraResolution> {
+        val characteristics = getCameraCharacteristics(getDefaultCameraId())
+        val streams = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            ?: return emptyList()
+        val sizes = if (highResolution && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            streams.getHighResolutionOutputSizes(android.graphics.ImageFormat.JPEG)
+        } else if (!highResolution) streams.getOutputSizes(android.graphics.ImageFormat.JPEG) else null
+        return sizes.orEmpty().map { CameraResolution(it.width, it.height) }.distinct()
+            .sortedByDescending { it.width.toLong() * it.height.toLong() }
     }
 
     /** Sizes validated with CameraDevice.isSessionConfigurationSupported. */

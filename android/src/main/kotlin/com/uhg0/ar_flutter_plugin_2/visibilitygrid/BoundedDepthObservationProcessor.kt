@@ -76,14 +76,17 @@ internal class BoundedDepthObservationProcessor<T : AutoCloseable, R>(
         }
     }
 
-    override fun close() {
+    fun closeAndAwait(timeoutMillis: Long): Boolean {
         synchronized(lock) { closed = true }
         executor.shutdown()
-        try {
-            if (!executor.awaitTermination(1, TimeUnit.SECONDS)) executor.shutdownNow()
+        return try {
+            executor.awaitTermination(timeoutMillis, TimeUnit.MILLISECONDS)
         } catch (_: InterruptedException) {
-            executor.shutdownNow()
             Thread.currentThread().interrupt()
+            false
         }
+    }
+    override fun close() {
+        check(closeAndAwait(1_000)) { "Depth processor still owns an admitted Image" }
     }
 }

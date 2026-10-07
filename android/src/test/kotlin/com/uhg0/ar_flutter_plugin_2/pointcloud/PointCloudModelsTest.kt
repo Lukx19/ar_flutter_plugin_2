@@ -10,6 +10,22 @@ import org.junit.Assert.fail
 import org.junit.Test
 
 class PointCloudModelsTest {
+    @Test fun `age mode uses sequential freshness colors independently of coverage readiness`() {
+        val expected = intArrayOf(0xff440154.toInt(), 0xff31688e.toInt(), 0xff35b779.toInt(), 0xfffde725.toInt())
+        for (cut in listOf(CoverageRendererCut.EXACT_CURRENT, CoverageRendererCut.COVERAGE_PENDING,
+            CoverageRendererCut.INDETERMINATE_HISTORY, CoverageRendererCut.STALE_DISPLAY)) {
+            CoverageRendererAge.values().forEachIndexed { index, age ->
+                val row = CoverageRendererStyleRowV1(palette = CoverageRendererPalette.AGE, cut = cut, age = age)
+                assertEquals(expected[index], row.packedColor())
+                assertEquals(expected[index], CoverageRendererStyleRowV1.validatedPackedColor(row.encode()))
+            }
+        }
+        val unavailable = CoverageRendererStyleRowV1(palette = CoverageRendererPalette.AGE,
+            cut = CoverageRendererCut.UNAVAILABLE)
+        assertEquals(0, unavailable.packedColor())
+        assertEquals(0, CoverageRendererStyleRowV1.validatedPackedColor(unavailable.encode()))
+    }
+
     @Test
     fun `palette rewrite centralizes top-level and populated span buffers`() {
         val first = CoverageRendererStyleRowV1(

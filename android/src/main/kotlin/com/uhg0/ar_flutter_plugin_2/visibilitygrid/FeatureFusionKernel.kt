@@ -488,27 +488,32 @@ internal class FeatureFusionKernel(
             packedNormalizedCount = packed.count
             packedDirectionCacheKeys.fill(Long.MIN_VALUE)
             val pose = observation.frame.pose.worldFromCameraGl
-            val cameraX = FeatureNormalEvidence.intMillimeters(pose[12])
+            val group = observation.ownership.groupFrame
+            val matrix = group.groupFromWorldGl
+            val cameraX = FeatureNormalEvidence.intMillimeters(FeatureNormalEvidence.groupComponent(matrix, pose[12], pose[13], pose[14], 0))
                 ?: return@allocate Normalization.Refused(FeatureFusionRefusal.INVALID_NORMAL_EVIDENCE)
-            val cameraY = FeatureNormalEvidence.intMillimeters(pose[13])
+            val cameraY = FeatureNormalEvidence.intMillimeters(FeatureNormalEvidence.groupComponent(matrix, pose[12], pose[13], pose[14], 1))
                 ?: return@allocate Normalization.Refused(FeatureFusionRefusal.INVALID_NORMAL_EVIDENCE)
-            val cameraZ = FeatureNormalEvidence.intMillimeters(pose[14])
+            val cameraZ = FeatureNormalEvidence.intMillimeters(FeatureNormalEvidence.groupComponent(matrix, pose[12], pose[13], pose[14], 2))
                 ?: return@allocate Normalization.Refused(FeatureFusionRefusal.INVALID_NORMAL_EVIDENCE)
             for (index in 0 until packed.count) {
                 val sampleXWorld = packed.xWorldAt(index)
                 val sampleYWorld = packed.yWorldAt(index)
                 val sampleZWorld = packed.zWorldAt(index)
-                val x = quantize(sampleXWorld)
-                    ?: return@allocate Normalization.Refused(quantizationRefusal(sampleXWorld))
-                val y = quantize(sampleYWorld)
-                    ?: return@allocate Normalization.Refused(quantizationRefusal(sampleYWorld))
-                val z = quantize(sampleZWorld)
-                    ?: return@allocate Normalization.Refused(quantizationRefusal(sampleZWorld))
-                val sampleX = FeatureNormalEvidence.intMillimeters(sampleXWorld)
+                val sampleXGroup = FeatureNormalEvidence.groupComponent(matrix, sampleXWorld, sampleYWorld, sampleZWorld, 0)
+                val sampleYGroup = FeatureNormalEvidence.groupComponent(matrix, sampleXWorld, sampleYWorld, sampleZWorld, 1)
+                val sampleZGroup = FeatureNormalEvidence.groupComponent(matrix, sampleXWorld, sampleYWorld, sampleZWorld, 2)
+                val x = quantize(sampleXGroup)
+                    ?: return@allocate Normalization.Refused(quantizationRefusal(sampleXGroup))
+                val y = quantize(sampleYGroup)
+                    ?: return@allocate Normalization.Refused(quantizationRefusal(sampleYGroup))
+                val z = quantize(sampleZGroup)
+                    ?: return@allocate Normalization.Refused(quantizationRefusal(sampleZGroup))
+                val sampleX = FeatureNormalEvidence.intMillimeters(sampleXGroup)
                     ?: return@allocate Normalization.Refused(FeatureFusionRefusal.INVALID_NORMAL_EVIDENCE)
-                val sampleY = FeatureNormalEvidence.intMillimeters(sampleYWorld)
+                val sampleY = FeatureNormalEvidence.intMillimeters(sampleYGroup)
                     ?: return@allocate Normalization.Refused(FeatureFusionRefusal.INVALID_NORMAL_EVIDENCE)
-                val sampleZ = FeatureNormalEvidence.intMillimeters(sampleZWorld)
+                val sampleZ = FeatureNormalEvidence.intMillimeters(sampleZGroup)
                     ?: return@allocate Normalization.Refused(FeatureFusionRefusal.INVALID_NORMAL_EVIDENCE)
                 val confidence = FeatureNormalEvidence.q15(packed.confidenceAt(index))
                     ?: return@allocate Normalization.Refused(FeatureFusionRefusal.INVALID_NORMAL_EVIDENCE)
@@ -1215,6 +1220,7 @@ internal class FeatureFusionBatch(val sequence: Long, val timestampNs: Long, obs
     val observations: List<FeatureFusionEvidence> = observations.toList()
 }
 
+/** Coordinates and normal evidence are group-local; world payload conversion precedes this seam. */
 internal data class FeatureFusionEvidence(
     val xMeters: Double, val yMeters: Double, val zMeters: Double, val signedWeight: Int, val supportId: Int,
     val normalEvidence: FeatureNormalEvidence? = null,

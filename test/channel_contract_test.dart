@@ -196,7 +196,11 @@ void main() {
       id: 42,
     );
     final states = <ARSessionState>[];
-    final subscription = manager.stateStream.listen(states.add);
+    final streamDone = Completer<void>();
+    final subscription = manager.stateStream.listen(
+      states.add,
+      onDone: streamDone.complete,
+    );
 
     await manager.initialize();
     expect(manager.sessionState, ARSessionState.initialized);
@@ -207,6 +211,8 @@ void main() {
     expect(manager.sessionState, ARSessionState.paused);
     await manager.dispose();
     await manager.dispose();
+    await streamDone.future;
+    expect(manager.sessionState, ARSessionState.disposed);
     await subscription.cancel();
 
     expect(
@@ -236,6 +242,7 @@ void main() {
         ARSessionState.running,
         ARSessionState.pausing,
         ARSessionState.paused,
+        ARSessionState.closing,
         ARSessionState.disposed,
       ],
     );

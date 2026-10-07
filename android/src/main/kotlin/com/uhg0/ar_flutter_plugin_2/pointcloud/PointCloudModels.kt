@@ -145,13 +145,16 @@ data class CoverageRendererStyleRowV1(
 
     /** Deterministic ARGB projection used by the current point/cube material. */
     fun packedColor(): Int {
-        when (cut) {
-            CoverageRendererCut.COVERAGE_PENDING -> return 0xffffa000.toInt()
-            CoverageRendererCut.INDETERMINATE_HISTORY -> return 0xff616161.toInt()
-            CoverageRendererCut.UNAVAILABLE -> return 0x00000000
-            CoverageRendererCut.STALE_DISPLAY -> return 0xff8d6e63.toInt()
-            CoverageRendererCut.LOWER_BOUND -> return 0xff5c6bc0.toInt()
-            CoverageRendererCut.EXACT_CURRENT -> Unit
+        if (cut == CoverageRendererCut.UNAVAILABLE) return 0x00000000
+        if (palette == CoverageRendererPalette.COVERAGE) {
+            when (cut) {
+                CoverageRendererCut.COVERAGE_PENDING -> return 0xffffa000.toInt()
+                CoverageRendererCut.INDETERMINATE_HISTORY -> return 0xff616161.toInt()
+                CoverageRendererCut.UNAVAILABLE -> return 0x00000000
+                CoverageRendererCut.STALE_DISPLAY -> return 0xff8d6e63.toInt()
+                CoverageRendererCut.LOWER_BOUND -> return 0xff5c6bc0.toInt()
+                CoverageRendererCut.EXACT_CURRENT -> Unit
+            }
         }
         return when (palette) {
             CoverageRendererPalette.UNIFORM -> 0xffffffff.toInt()
@@ -172,10 +175,10 @@ data class CoverageRendererStyleRowV1(
                 else -> 0xff6a1b9a.toInt()
             }
             CoverageRendererPalette.AGE -> when (age) {
-                CoverageRendererAge.FRESH -> 0xff26c6da.toInt()
-                CoverageRendererAge.RECENT -> 0xff66bb6a.toInt()
-                CoverageRendererAge.AGING -> 0xffffca28.toInt()
-                CoverageRendererAge.OLD -> 0xff8d6e63.toInt()
+                CoverageRendererAge.FRESH -> 0xff440154.toInt()
+                CoverageRendererAge.RECENT -> 0xff31688e.toInt()
+                CoverageRendererAge.AGING -> 0xff35b779.toInt()
+                CoverageRendererAge.OLD -> 0xfffde725.toInt()
             }
             CoverageRendererPalette.SOURCE_HEALTH -> when (sourceHealth) {
                 CoverageRendererSourceHealth.HEALTHY -> 0xff00c853.toInt()
@@ -239,7 +242,8 @@ data class CoverageRendererStyleRowV1(
             val flags = bytes[offset + 1].u8()
             val paletteCut = bytes[offset + 2].u8()
             val glyphAgeHealth = bytes[offset + 3].u8()
-            when ((paletteCut ushr 4) and 7) {
+            if (((paletteCut ushr 4) and 7) == CoverageRendererCut.UNAVAILABLE.code) return 0x00000000
+            if ((paletteCut and 15) == CoverageRendererPalette.COVERAGE.code) when ((paletteCut ushr 4) and 7) {
                 1 -> return 0xff8d6e63.toInt()
                 2 -> return 0xff5c6bc0.toInt()
                 3 -> return 0xffffa000.toInt()
@@ -259,8 +263,8 @@ data class CoverageRendererStyleRowV1(
                     0 -> 0xff78909c.toInt(); 1 -> 0xff3949ab.toInt(); else -> 0xff6a1b9a.toInt()
                 }
                 5 -> when ((glyphAgeHealth ushr 2) and 3) {
-                    0 -> 0xff26c6da.toInt(); 1 -> 0xff66bb6a.toInt()
-                    2 -> 0xffffca28.toInt(); else -> 0xff8d6e63.toInt()
+                    0 -> 0xff440154.toInt(); 1 -> 0xff31688e.toInt()
+                    2 -> 0xff35b779.toInt(); else -> 0xfffde725.toInt()
                 }
                 6 -> when ((glyphAgeHealth ushr 4) and 7) {
                     0 -> 0xff00c853.toInt(); 1 -> 0xff039be5.toInt(); 2 -> 0xffffa000.toInt()

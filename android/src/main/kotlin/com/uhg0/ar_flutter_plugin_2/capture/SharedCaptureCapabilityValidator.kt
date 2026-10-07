@@ -5,6 +5,7 @@ internal data class SharedCaptureCapabilities(
     val timestampSource: Int?,
     val isoRange: IntRange? = null,
     val exposureTimeRangeNs: LongRange? = null,
+    val highResolutionOutputSizes: List<Pair<Int, Int>> = emptyList(),
 )
 
 internal data class SharedCaptureCapabilityReport(
@@ -31,14 +32,16 @@ internal object SharedCaptureCapabilityValidator {
         defaultIso: Int? = null,
         defaultExposureTimeMicros: Long? = null,
     ): SharedCaptureCapabilityReport {
-        if (capabilities.supportedOutputSizes.isEmpty()) {
+        val supportedOutputSizes =
+            (capabilities.supportedOutputSizes + capabilities.highResolutionOutputSizes).distinct()
+        if (supportedOutputSizes.isEmpty()) {
             throw IllegalStateException(
                 "No supported output sizes are available for the configured format",
             )
         }
         val resolutionSelection =
             selectEffectiveResolution(
-                supportedOutputSizes = capabilities.supportedOutputSizes,
+                supportedOutputSizes = supportedOutputSizes,
                 requestedWidth = requestedWidth,
                 requestedHeight = requestedHeight,
             )
@@ -78,7 +81,7 @@ internal object SharedCaptureCapabilityValidator {
             timestampSourceRealtimeVerified = timestampSourceRealtimeVerified,
             timestampCorrelationProbeRequired = !timestampSourceRealtimeVerified,
             supportedOutputSizes =
-                capabilities.supportedOutputSizes.sortedByDescending { (width, height) ->
+                supportedOutputSizes.sortedByDescending { (width, height) ->
                     width.toLong() * height.toLong()
                 },
         )

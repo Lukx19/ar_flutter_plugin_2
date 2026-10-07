@@ -2,7 +2,6 @@ package com.uhg0.ar_flutter_plugin_2.capture
 
 import java.io.File
 import java.io.FileInputStream
-import java.io.FileOutputStream
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 
@@ -15,6 +14,8 @@ import java.nio.file.StandardCopyOption
  */
 internal class NativeCapturePreviewReaderV2(
     private val storeRoot: File,
+    private val writePreview: (File, File, () -> Boolean, Int) -> Boolean = CaptureThumbnail::write,
+    private val validPreview: (File, Int) -> Boolean = CaptureThumbnail::valid,
 ) {
     private val copyWorkspace = CaptureCopyWorkspace()
     private val rootMetadata = CaptureRootMetadataReaderV2()
@@ -24,39 +25,34 @@ internal class NativeCapturePreviewReaderV2(
         manifestId: String,
         captureId: String,
         target: File,
+        cancelled: () -> Boolean = { false },
+        edge: Int = 512,
     ): Boolean {
+        require(edge == 512 || edge == 1024)
         if (!HASH.matches(manifestId) || !HASH.matches(captureId)) return false
-        val sessions = File(storeRoot, "sessions")
-            .listFiles()
-            ?.filter { it.isDirectory }
-            .orEmpty()
-        for (session in sessions) {
-            if (manifestId !in retainedRootHashes(session)) continue
-            val descriptor = readRootMetadata(session, manifestId)?.components
+        val sessions = File(storeRoot.canonicalFile, "sessions")
+        if (!sessions.isDirectory) return false
+        Files.newDirectoryStream(sessions.toPath()).use { entries ->
+        for (entry in entries) {
+            if (cancelled()) return false
+            val session = entry.toFile()
+            if (!session.isDirectory || session.canonicalFile != session.absoluteFile || File(session, "tombstone").exists()) continue
+            val descriptor = committedRoot(session, manifestId, cancelled)?.components
                 ?.firstOrNull { it.kind == "JPEG" }?.let { Descriptor(it.length, it.hash) }
                 ?: continue
             val source = File(
                 session,
                 "assets/$captureId/jpeg.${descriptor.hash}.blob",
             )
-            if (!source.isFile || source.length() != descriptor.length) continue
+            if (!source.isFile || source.canonicalFile != source.absoluteFile || source.length() != descriptor.length) continue
             val parent = target.parentFile ?: continue
             parent.mkdirs()
-            if (isValidPreview(target, descriptor)) return true
+            if (validPreview(target, edge)) return true
             val partial = File(parent, "${target.name}.part")
             try {
-                val receipt = FileInputStream(source).use { input ->
-                    FileOutputStream(partial).use { output ->
-                        val copied = copyWorkspace.copy(
-                            read = { buffer, offset, count -> input.read(buffer, offset, count) },
-                            write = { buffer, offset, count -> output.write(buffer, offset, count) },
-                        )
-                        output.fd.sync()
-                        copied
-                    }
-                }
-                check(receipt.length == descriptor.length)
-                check(receipt.digest.hex() == descriptor.hash)
+                check(target.canonicalFile == target.absoluteFile && partial.canonicalFile == partial.absoluteFile)
+                if (cancelled() || sha256(source, cancelled).hex() != descriptor.hash) return false
+                if (!writePreview(source, partial, cancelled, edge) || cancelled()) return false
                 Files.move(
                     partial.toPath(),
                     target.toPath(),
@@ -64,27 +60,27 @@ internal class NativeCapturePreviewReaderV2(
                     StandardCopyOption.REPLACE_EXISTING,
                 )
                 return true
-            } catch (_: Throwable) {
-                partial.delete()
-                return false
-            }
+            } catch (_: Throwable) { return false }
+            finally { partial.delete() }
+        }
         }
         return false
     }
 
-    private fun isValidPreview(target: File, descriptor: Descriptor): Boolean =
-        target.isFile && target.length() == descriptor.length &&
-            runCatching { sha256(target).hex() == descriptor.hash }.getOrDefault(false)
-
-    private fun retainedRootHashes(session: File): Set<String> {
-        val selected = selectedRoot(session) ?: return emptySet()
-        return buildSet {
-            var hash: String? = selected.hash
-            repeat(MAX_RETAINED_ROOTS) {
-                hash?.let(::add)
-                hash = hash?.let { rootPrevious(session, it) }
-            }
+    /** Walk immutable ancestors with one open descriptor and scalar state, not a root-sized set. */
+    private fun committedRoot(session: File, wanted: String, cancelled: () -> Boolean): CaptureRootMetadataV2? {
+        val selected = selectedRoot(session) ?: return null
+        var hash = selected.hash
+        var revision = selected.revision
+        while (revision > 0 && !cancelled()) {
+            val root = readRootMetadata(session, hash) ?: return null
+            if (root.schema != "5" || root.revision != revision || !CaptureRootMetadataReaderV2.isHash(root.request)) return null
+            if (revision == 1L && (root.previous != "-" || root.secondPrevious != "-")) return null
+            if (hash == wanted) return root
+            hash = root.previous?.takeIf(HASH::matches) ?: return null
+            revision--
         }
+        return null
     }
 
     private fun selectedRoot(session: File): RootPointer? {
@@ -127,9 +123,12 @@ internal class NativeCapturePreviewReaderV2(
     private fun rootPrevious(session: File, hash: String): String? =
         readRootMetadata(session, hash)?.previous?.takeUnless { it == "-" }
 
-    private fun sha256(file: File): ByteArray {
+    private fun sha256(file: File, cancelled: () -> Boolean): ByteArray {
         return FileInputStream(file).use { input ->
-            copyWorkspace.digest { buffer, offset, count -> input.read(buffer, offset, count) }.digest
+            copyWorkspace.digest { buffer, offset, count ->
+                check(!cancelled()) { "Obsolete preview load" }
+                input.read(buffer, offset, count)
+            }.digest
         }
     }
 
@@ -140,7 +139,6 @@ internal class NativeCapturePreviewReaderV2(
 
     private companion object {
         const val MAX_ROOT_DEPTH = 2
-        const val MAX_RETAINED_ROOTS = 3
         val HASH = Regex("[0-9a-f]{64}")
     }
 }

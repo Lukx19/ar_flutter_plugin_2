@@ -37,6 +37,7 @@ internal const val VISIBILITY_GRID_INTEGRATION_SCALAR_OWNER_BYTES = 344L
 // AtomicReference: 16 bytes. Immutable health: header + eleven Longs + Int + reference.
 internal const val VISIBILITY_GRID_ADMISSION_HEALTH_OWNER_BYTES = 128L
 private const val UNAVAILABLE_ALLOCATION_BYTES = -1L
+private const val NATIVE_OWNER_LIMIT_BYTES = 64L * 1024L * 1024L
 
 private data class PendingDepthCommit(
     val offerLedger: DepthOfferTimingLedger?,
@@ -291,6 +292,7 @@ internal class VisibilityGridIntegration(
     private var canonicalSurfaceHighWater = 0L
     private var associationHighWater = 0L
     private var canonicalOwnedBytesHighWater = 0L
+    private var rendererAttributeReservationBytes = 0L
     private val retainedDelta = ExactCurrentDeltaSource()
     @Volatile private var committed = 0L
     @Volatile private var rejected = 0L
@@ -402,6 +404,8 @@ internal class VisibilityGridIntegration(
         val fused = if (observation.packedSamples != null) {
             requireNotNull(kernel).preparePacked(observation, featureSequence)
         } else {
+            val groupFrame = observation.ownership.groupFrame
+            val matrix = groupFrame.groupFromWorldGl
             val normalEvidence = (FeatureNormalEvidence.from(observation) as? FeatureNormalEvidence.Conversion.Accepted)
                 ?: run {
                     rejected++
@@ -413,7 +417,12 @@ internal class VisibilityGridIntegration(
                     sequence = featureSequence,
                     timestampNs = observation.frame.sourceTimestampNs,
                     observations = observation.samples.zip(normalEvidence.evidence).map { (sample, normal) ->
-                        FeatureFusionEvidence(sample.xWorld, sample.yWorld, sample.zWorld, 2, sample.id, normal)
+                        FeatureFusionEvidence(
+                            FeatureNormalEvidence.groupComponent(matrix, sample.xWorld, sample.yWorld, sample.zWorld, 0),
+                            FeatureNormalEvidence.groupComponent(matrix, sample.xWorld, sample.yWorld, sample.zWorld, 1),
+                            FeatureNormalEvidence.groupComponent(matrix, sample.xWorld, sample.yWorld, sample.zWorld, 2),
+                            2, sample.id, normal,
+                        )
                     },
                 ),
             )
@@ -521,6 +530,9 @@ internal class VisibilityGridIntegration(
         }
         afterLifecycleFence()
         drain()
+        // A paused wall interval must not be attributed to a queued native
+        // exchange when the sensor/runtime resumes.
+        binding.resetCanonicalReadyTiming()
         synchronized(lock) {
             discardPendingDepthCommit()
             releaseDeferredDepth(fenced = true)
@@ -542,6 +554,7 @@ internal class VisibilityGridIntegration(
         }
         afterLifecycleFence()
         drain()
+        binding.resetCanonicalReadyTiming("rollover")
         val alreadyRebound = synchronized(lock) {
             if (closed || this.ownership() != ownership) return
             if (cut == ownership) return@synchronized true
@@ -695,6 +708,12 @@ internal class VisibilityGridIntegration(
         )
     }
 
+    /** Returns the bounded queued-to-first-exchange diagnostic receipt. */
+    internal fun canonicalReadyTimingSnapshot(): Map<String, Any> =
+        binding.canonicalReadyTimingSnapshot()
+
+    internal fun canonicalReadyWakeSnapshot(): Map<String, Any> = binding.canonicalReadyWakeSnapshot()
+
     /** Fixed native-owner scalars for the debug pressure receipt. */
     internal fun pressureSnapshot(): CanonicalVisibilityPressureSnapshot = synchronized(lock) {
         // A debug snapshot must not make the platform thread wait behind the
@@ -717,6 +736,55 @@ internal class VisibilityGridIntegration(
 
     internal fun pendingDepthRetentionReceipt(): PendingDepthRetentionReceipt? = synchronized(lock) {
         pendingDepthCommit?.let(::retentionReceipt)
+    }
+
+    /** Optional display work reserves the complete supported future profile.
+     * Canonical/depth admission never waits for or refuses because of a display
+     * table. An underfunded profile refuses only the optional sidecar. */
+    internal fun reserveRendererAttributeBytes(required: Long): Boolean = synchronized(lock) {
+        if (closed || required < 0 || kernel == null || depthKernel == null || resources == null) return@synchronized false
+        val reserved = maxOf(required, rendererAttributeReservationBytes)
+        val ceiling = rendererAttributeCanonicalCeilingBytes()
+        if (ceiling > NATIVE_OWNER_LIMIT_BYTES - reserved) return@synchronized false
+        rendererAttributeReservationBytes = reserved
+        recordCanonicalPressureHighWater()
+        true
+    }
+
+    private fun rendererAttributeCanonicalCeilingComponents(): Map<String, Long> {
+        val maximumPending = PendingDepthRetentionReceipt.maximumModeled()
+        val featureBytes = kernel?.resourceReceipt()?.assignedTupleShareBytes?.toLong() ?: 0
+        val canonical = resources?.completeCurrentLeaseReceipt()
+        // Durable receipts reserve a kernel partition; it is not a second
+        // physical kernel. Charge the concrete kernel above once, retaining
+        // any larger declared partition if the concrete owner is smaller.
+        val kernelAlreadyCharged = minOf(featureBytes, canonical?.baseRetained?.kernelBytes ?: 0)
+        val depthPlanning = minOf(maximumPending.mutationPlanBytes, MutableCanonicalOverlay.maximumDepthPlanningBytes)
+        return mapOf(
+            "rendererAttributeFeatureTupleShareBytes" to featureBytes,
+            "rendererAttributeDepthFixedPrimitiveBytes" to (depthKernel?.resourceReceipt()?.fixedPrimitiveBytes?.toLong() ?: 0),
+            "rendererAttributeCanonicalProfileCeilingBytes" to maxOf((canonical?.retainedTotalBytes ?: 0) - kernelAlreadyCharged,
+                CanonicalActivationResources.MAXIMUM_PROFILE_RETAINED_BYTES),
+            "rendererAttributeCanonicalScalarBytes" to (resources?.retainedScalarMemoryReceipt()?.portableBytes ?: 0),
+            "rendererAttributeOtherPortableOwnerBytes" to (portableOwnerMemoryReceipt().portableBytes - rendererAttributeReservationBytes),
+            // Prepared depth primitive arrays are already counted by the fixed
+            // kernel receipt. Mutation/geometry/remap owners are separate.
+            "rendererAttributePendingDepthOutsideKernelCeilingBytes" to (maximumPending.totalBytes - maximumPending.depthPreparedBytes -
+                maximumPending.mutationPlanBytes + depthPlanning),
+            "rendererAttributeCanonicalPhaseCeilingBytes" to CanonicalActivationResources.SHARED_PHASE_BYTES,
+        )
+    }
+    private fun rendererAttributeCanonicalCeilingBytes(): Long = rendererAttributeCanonicalCeilingComponents().values.fold(0L, Math::addExact)
+
+    internal fun rendererAttributeReservationReceipt(): Map<String, Any> = synchronized(lock) {
+        val pending = PendingDepthRetentionReceipt.maximumModeled()
+        val depthPlanning = minOf(pending.mutationPlanBytes, MutableCanonicalOverlay.maximumDepthPlanningBytes)
+        mapOf("rendererAttributeReservedBytes" to rendererAttributeReservationBytes,
+            "rendererAttributeCanonicalCeilingBytes" to rendererAttributeCanonicalCeilingBytes(),
+            "rendererAttributeNativeLimitBytes" to NATIVE_OWNER_LIMIT_BYTES,
+            "rendererAttributePendingDepthCeilingBytes" to (pending.totalBytes - pending.mutationPlanBytes + depthPlanning),
+            "rendererAttributeDepthPlanningCeilingBytes" to depthPlanning,
+            "rendererAttributeActualHeapMeasured" to false) + rendererAttributeCanonicalCeilingComponents()
     }
 
     internal fun depthPublicationDeferralSnapshot(): DepthPublicationDeferralSnapshot = synchronized(lock) {
@@ -847,6 +915,7 @@ internal class VisibilityGridIntegration(
             bindingOwnerBytes = binding.portableOwnerBytes(),
             coordinatorOwnerBytes = resources?.portableCoordinatorOwnerBytes() ?: 0,
             rendererOwnerBytes = renderer.portableOwnerBytes(),
+            rendererAttributeReservationBytes = rendererAttributeReservationBytes,
         )
     }
 
@@ -890,6 +959,8 @@ internal class VisibilityGridIntegration(
             resources?.completeCurrentLeaseReceipt()?.retainedTotalBytes ?: 0,
             resources?.retainedScalarMemoryReceipt()?.portableBytes ?: 0,
             portableOwnerMemoryReceipt().portableBytes,
+            pendingDepthCommit?.let { retentionReceipt(it)?.let { receipt ->
+                receipt.totalBytes - receipt.depthPreparedBytes } } ?: 0,
         ).fold(0L, Math::addExact)
         canonicalOwnedBytesHighWater = maxOf(
             canonicalOwnedBytesHighWater,
@@ -903,6 +974,8 @@ internal class VisibilityGridIntegration(
             synchronized(lock) { publishAdmissionHealth(fencedDelta = 1L) }
             return
         }
+        // Disabled control borrows no additional mutable stamp owner.
+        val readyStamp = if (binding.canonicalReadyWakeEnabled()) LongArray(1) else null
         val future = executor.submit {
             synchronized(lock) { active++ }
             try {
@@ -915,6 +988,7 @@ internal class VisibilityGridIntegration(
                     work()
                 }
             } finally {
+                readyStamp?.set(0, binding.canonicalReadyPublicationStamp())
                 synchronized(lock) { active-- }
             }
         }
@@ -930,6 +1004,8 @@ internal class VisibilityGridIntegration(
                 is Error -> throw cause
                 else -> throw IllegalStateException("visibility admission failed", cause)
             }
+        } finally {
+            readyStamp?.let { binding.publishCanonicalReadyHint(it[0]) }
         }
     }
 
@@ -1828,7 +1904,7 @@ internal class VisibilityGridIntegration(
         if (closed) return
         runCatching {
             executor.submit {
-                synchronized(lock) {
+                try { synchronized(lock) {
                     if (pending != selector || closed) return@synchronized
                     pendingBindingAcknowledged = true
                     if (!pendingQueued) {
@@ -1844,7 +1920,7 @@ internal class VisibilityGridIntegration(
                         }
                     }
                     finishPendingAcknowledgement(selector)
-                }
+                } } finally { binding.publishCanonicalReadyHint(binding.canonicalReadyPublicationStamp()) }
             }
         }
     }
@@ -2166,6 +2242,7 @@ internal data class RuntimeOwnerMemoryReceipt(
     val bindingOwnerBytes: Long,
     val coordinatorOwnerBytes: Long,
     val rendererOwnerBytes: Long,
+    val rendererAttributeReservationBytes: Long = 0,
 ) {
     val portableBytes: Long get() = listOf(
         integrationObjectBytes,
@@ -2179,6 +2256,7 @@ internal data class RuntimeOwnerMemoryReceipt(
         bindingOwnerBytes,
         coordinatorOwnerBytes,
         rendererOwnerBytes,
+        rendererAttributeReservationBytes,
     ).fold(0L, Math::addExact)
 }
 

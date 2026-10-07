@@ -29,6 +29,8 @@ enum class CoveragePresentationMode(val wireName: String) {
     WARM_PROXIES("warmProxies"),
     OVERVIEW("overview"),
     SUPPRESSED_DEBUG("suppressedDebug"),
+    PLANAR_PATCHES("planarPatches"),
+    DIRECTIONAL_BALLS("directionalBalls"),
     ;
 
     val presentationCapacity: Int
@@ -39,6 +41,7 @@ enum class CoveragePresentationMode(val wireName: String) {
             WARM_PROXIES -> CoverageRendererLimits.WARM_PROXY_CAPACITY
             OVERVIEW -> CoverageRendererLimits.COLD_OVERVIEW_CAPACITY
             SUPPRESSED_DEBUG -> CoverageRendererLimits.DEBUG_ROW_CAPACITY
+            PLANAR_PATCHES, DIRECTIONAL_BALLS -> CoverageRendererLimits.CENTROID_CAPACITY
         }
 
     companion object {
@@ -55,6 +58,8 @@ internal fun CoveragePresentationMode.toVoxelRenderMode(): VoxelRenderMode = whe
     CoveragePresentationMode.WARM_PROXIES,
     CoveragePresentationMode.OVERVIEW,
     CoveragePresentationMode.SUPPRESSED_DEBUG,
+    CoveragePresentationMode.PLANAR_PATCHES,
+    CoveragePresentationMode.DIRECTIONAL_BALLS,
     -> VoxelRenderMode.CENTROIDS
 }
 
@@ -449,6 +454,145 @@ internal class NativeCoverageRendererOwner(
     private var selectorEpoch: SelectorEpoch? = null
     private var resourceEpoch = 0L
     private var resourceToken: CoverageResourceToken? = null
+    private var attributeAuthority: (() -> ByteArray?)? = null
+    private var attributeBudget: (Long) -> Boolean = { false }
+    private var attributeBinding = 0L
+    private val attributeInvocation = java.util.concurrent.atomic.AtomicLong()
+    private val attributeInvocationSequence = java.util.concurrent.atomic.AtomicLong()
+    private var completedShapeResource = 0L
+    private var completedShapeSelection = 0L
+    private var completedShapeVertices = 0
+    private var completedShapeIndices = 0
+    private val shapeResourceTokens = linkedSetOf<CoverageResourceToken>()
+    private val shapeUploadMeasurement = CoverageShapeUploadMeasurement()
+    private val shapeDrawingToken = java.util.concurrent.atomic.AtomicLong()
+    @Volatile private var currentShapeTokenEpoch = 0L
+    private val shapeBodies = PreparedCoverageShapeOwner()
+    private val attributeOwner = RendererAttributeOwner(::rendererAttributeBasis,
+        { attributeBudget(it) }, ::attachRendererAttributes)
+
+    internal fun configureRendererAttributes(binding: Long, authority: () -> ByteArray?,
+        budget: (Long) -> Boolean) {
+        val changed = synchronized(this) {
+            val changed = attributeBinding != binding
+            attributeBinding = binding; attributeAuthority = authority; attributeBudget = budget
+            changed
+        }
+        if (changed) { attributeOwner.invalidate(); shapeBodies.invalidate() }
+    }
+    internal fun beginAttributeInvocation(): Long? {
+        val token = attributeInvocationSequence.incrementAndGet()
+        return if (attributeInvocation.compareAndSet(0, token)) token else null
+    }
+    internal fun endAttributeInvocation(token: Long) { attributeInvocation.compareAndSet(token, 0) }
+    internal fun exchangeRendererAttributes(bytes: ByteArray): Any = attributeOwner.exchange(bytes)
+    internal fun rendererAttributePortableBytes(): Long = attributeOwner.portableBytes()
+    internal fun rendererAttributeSnapshot(): Map<String, Any> = attributeOwner.snapshot()
+    internal fun invalidateRendererAttributes(binding: Long) {
+        if (attributeBinding == binding) { attributeOwner.invalidate(); shapeBodies.invalidate() }
+    }
+    @Synchronized internal fun recordShapeResourceCreated(token: CoverageResourceToken) {
+        shapeResourceTokens += token
+    }
+    @Synchronized internal fun recordCompletedShapeUpload(token: CoverageResourceToken, mesh: PreparedCoverageShapeReference,
+        reuse: Boolean = false) {
+        if (!acceptsResourceToken(token) || latestPresentationDescriptor?.shapes !== mesh) return
+        completedShapeResource = token.epoch
+        completedShapeSelection = mesh.header.selectionGeneration
+        completedShapeVertices = mesh.vertexCount
+        completedShapeIndices = mesh.indexCount
+        shapeUploadMeasurement.completed(System.nanoTime(), token.epoch, mesh.header.selectionGeneration,
+            mesh.header.shape, mesh.shapeCount, reuse)
+    }
+    internal fun beginShapeMeasurementWindow() { shapeUploadMeasurement.begin(System.nanoTime()) }
+    internal fun endShapeMeasurementWindow() { shapeUploadMeasurement.freeze(System::nanoTime) }
+    internal fun shapeMeasurementSnapshot(): Map<String, Any> = shapeUploadMeasurement.snapshot()
+    internal fun recordShapeDrawState(token: CoverageResourceToken, visible: Boolean) {
+        if (visible && currentShapeTokenEpoch == token.epoch) shapeDrawingToken.set(token.epoch)
+        else shapeDrawingToken.compareAndSet(token.epoch, 0)
+    }
+    internal fun recordShapeMeasurementFrame(now: Long) {
+        val token = shapeDrawingToken.get()
+        shapeUploadMeasurement.frame(now, token != 0L && token == currentShapeTokenEpoch)
+    }
+    @Synchronized internal fun recordShapeResourceUnmounted(token: CoverageResourceToken) {
+        shapeResourceTokens.remove(token)
+        shapeDrawingToken.compareAndSet(token.epoch, 0)
+        if (completedShapeResource != token.epoch) return
+        completedShapeResource = 0; completedShapeSelection = 0
+        completedShapeVertices = 0; completedShapeIndices = 0
+    }
+
+    @Synchronized private fun rendererAttributeBasis(): RendererAttributeBasis? {
+        if (disposed || lifecyclePaused || unavailable || !controls.visible) return null
+        val descriptor = latestPresentationDescriptor ?: return null
+        val shape = when (controls.mode) {
+            CoveragePresentationMode.PLANAR_PATCHES -> RendererAttributeCodec.PATCHES
+            CoveragePresentationMode.DIRECTIONAL_BALLS -> RendererAttributeCodec.BALLS
+            else -> return null
+        }
+        val header = attributeAuthority?.invoke() ?: return null
+        return RendererAttributeBasis(header, descriptor.qualifier.rendererGeneration, shape,
+            if (controls.palette == CoveragePalette.DIRECTION) RendererAttributeCodec.DIRECTION_IDENTITY else RendererAttributeCodec.OBSERVATIONS,
+            descriptor.count, paletteRevision, descriptor::surfaceIdAt)
+    }
+
+    private fun attachRendererAttributes(table: RendererAttributeTable): Boolean {
+        val descriptor = synchronized(this) { latestPresentationDescriptor } ?: return false
+        if (!shapeBodies.begin()) return false
+        val mesh = try { PreparedCoverageShapes.build(descriptor, table) }
+            catch (_: RuntimeException) { null }
+        if (mesh == null) { shapeBodies.cancel(); return false }
+        val reference = shapeBodies.publish(mesh)
+        return synchronized(this) {
+            if (disposed || lifecyclePaused || latestPresentationDescriptor !== descriptor ||
+                attributeAuthority?.invoke()?.let { table.header.styleMatches(it) } != true) {
+                shapeBodies.invalidate(); return@synchronized false
+            }
+            latestPresentationDescriptor = descriptor.withAttributes(reference.header, reference)
+            notifyPresentationChanged()
+            true
+        }
+    }
+
+    internal fun rendererGeometryStatus(): Map<String, Any> {
+        val attributeOutcome = attributeOwner.currentOutcome()
+        return synchronized(this) {
+        val descriptor = latestPresentationDescriptor
+        val geometryMode = controls.mode == CoveragePresentationMode.PLANAR_PATCHES ||
+            controls.mode == CoveragePresentationMode.DIRECTIONAL_BALLS
+        val mesh = descriptor?.shapes
+        val available = geometryMode && mesh != null && mesh.available && mesh.shapeCount > 0 && descriptor.enabled
+        val mounted = resourceMounted && resourceToken in shapeResourceTokens
+        val uploaded = available && mounted && resourceToken?.epoch == completedShapeResource &&
+            descriptor?.attributes?.selectionGeneration == completedShapeSelection
+        val fallback = geometryMode && !uploaded
+        val pointRows = (mesh?.pointCount ?: 0) + if (mesh != null) (descriptor.count - mesh.header.total).coerceAtLeast(0) else 0
+        val outcome = if (uploaded) { if (pointRows > 0) "partial" else "accepted" }
+            else if (available) "receiving"
+            else if (!geometryMode) "unavailable" else if (mesh != null && !mesh.available) "staleCut" else attributeOutcome
+        mapOf("rendererGeometrySupported" to (attributeAuthority != null),
+            "requestedMode" to controls.mode.wireName,
+            "effectiveMode" to (if (fallback) CoveragePresentationMode.RAW_FEATURES else controls.mode).wireName,
+            "basisAvailable" to available, "basisOutcome" to outcome,
+            "shapeCount" to (mesh?.shapeCount ?: 0), "shapePointFallbackCount" to pointRows,
+            "selectedAttributeRows" to (mesh?.header?.total ?: 0),
+            "requestedAttributeRows" to attributeOwner.requestedRows,
+            "fundedAttributeRows" to (mesh?.header?.total ?: attributeOwner.fundedRows),
+            "rendererAttributeModeledCpuBytes" to attributeOwner.fundedModeledBytes,
+            "shapeVertexCount" to (mesh?.vertexCount ?: 0), "shapeIndexCount" to (mesh?.indexCount ?: 0),
+            "currentShapeResourceGeneration" to (resourceToken?.epoch ?: 0),
+            "currentShapeSelectionGeneration" to (descriptor?.attributes?.selectionGeneration ?: 0),
+            "completedShapeUploadGeneration" to completedShapeResource,
+            "completedShapeSelectionGeneration" to completedShapeSelection,
+            "completedShapeVertexCount" to completedShapeVertices,
+            "completedShapeIndexCount" to completedShapeIndices,
+            "currentShapeResourceMounted" to (geometryMode && mounted && !disposed),
+            "rendererObservationColorsMeaningful" to (uploaded && controls.mode == CoveragePresentationMode.DIRECTIONAL_BALLS &&
+                controls.palette != CoveragePalette.UNIFORM && descriptor?.attributes?.color == RendererAttributeCodec.OBSERVATIONS),
+            "approximateCellCenterPatches" to (controls.mode == CoveragePresentationMode.PLANAR_PATCHES))
+        }
+    }
 
     @Synchronized
     fun attachCommittedRowsBorrower(value: CoverageCommittedRowsBorrower) {
@@ -669,13 +813,13 @@ internal class NativeCoverageRendererOwner(
             )
         }
         val replayed = priorQualifier == qualifier
+        val previous = latestPresentationDescriptor
         val presentation = descriptor.withControls(
             mode = controls.mode,
             enabled = controls.visible,
             palette = controls.palette,
             paletteEpoch = paletteRevision,
-        )
-        val previous = latestPresentationDescriptor
+        ).withReplayAttributesFrom(previous)
         val steady = previous != null &&
             previous.qualifier.bindingGeneration == presentation.qualifier.bindingGeneration &&
             previous.qualifier.groupGeneration == presentation.qualifier.groupGeneration &&
@@ -775,7 +919,7 @@ internal class NativeCoverageRendererOwner(
             paletteRevision++
         }
         this.controls = controls
-        if (modeChanged) resourceToken = null
+        if (modeChanged) { resourceToken = null; currentShapeTokenEpoch = 0 }
         controlsConfigured = true
         recomputePresentationPlan(
             explicitResync = modeChanged,
@@ -784,7 +928,7 @@ internal class NativeCoverageRendererOwner(
         notifyPresentationChanged()
         val snapshot = latest
         return RendererControlReceipt(
-            accepted = !unavailable && resourceMounted,
+            accepted = true,
             rendererUnavailable = unavailable,
             visible = controls.visible,
             mode = controls.mode,
@@ -896,14 +1040,17 @@ internal class NativeCoverageRendererOwner(
         )
     }
 
-    @Synchronized
     override fun pause() {
-        if (disposed) return
-        resetPresentationSelector()
-        lifecyclePaused = true
-        unavailable = true
-        recoveryPending = true
-        recoveryRequestOutstanding = false
+        synchronized(this) {
+            if (disposed) return
+            resetPresentationSelector()
+            lifecyclePaused = true
+            unavailable = true
+            recoveryPending = true
+            recoveryRequestOutstanding = false
+            shapeDrawingToken.set(0)
+        }
+        shapeBodies.invalidate(); attributeOwner.invalidate()
     }
 
     @Synchronized
@@ -954,18 +1101,21 @@ internal class NativeCoverageRendererOwner(
         )
     }
 
-    @Synchronized
     override fun dispose() {
-        disposed = true
-        lifecyclePaused = true
-        unavailable = true
-        recoveryPending = false
-        recoveryRequestOutstanding = false
-        latest = null
-        presentationPlan = null
-        latestPresentationDescriptor = null
-        resetPresentationSelector()
-        resourceMounted = false
+        synchronized(this) {
+            disposed = true
+            lifecyclePaused = true
+            unavailable = true
+            recoveryPending = false
+            recoveryRequestOutstanding = false
+            latest = null
+            presentationPlan = null
+            latestPresentationDescriptor = null
+            resetPresentationSelector()
+            resourceMounted = false
+            shapeDrawingToken.set(0)
+        }
+        shapeBodies.invalidate(); attributeOwner.invalidate()
     }
 
     /** Called only after the concrete SceneView resource has mounted. */
@@ -1099,6 +1249,7 @@ internal class NativeCoverageRendererOwner(
             controls.mode != token.mode
         ) return false
         resourceToken = token
+        currentShapeTokenEpoch = token.epoch
         resourceMounted = true
         unavailable = lifecyclePaused
         recoveryPending = lifecyclePaused
@@ -1178,6 +1329,7 @@ internal class NativeCoverageRendererOwner(
         latestPresentationDescriptor = null
         resetPresentationSelector()
         resourceToken = null
+        currentShapeTokenEpoch = 0
         lowMemoryPressure = false
     }
 
@@ -1433,6 +1585,7 @@ internal class NativeCoverageRendererOwner(
             mode = mode,
         )
         resourceToken = token
+        currentShapeTokenEpoch = token.epoch
         return token
     }
 

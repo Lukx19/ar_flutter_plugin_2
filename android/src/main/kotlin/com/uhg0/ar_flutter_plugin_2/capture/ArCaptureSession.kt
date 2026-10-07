@@ -1,5 +1,7 @@
 package com.uhg0.ar_flutter_plugin_2.capture
 
+import com.uhg0.ar_flutter_plugin_2.diagnostics.NativeFrameAttributionOwner
+import com.uhg0.ar_flutter_plugin_2.BuildConfig
 import android.graphics.ImageFormat
 import android.graphics.Bitmap
 import android.graphics.Rect
@@ -43,6 +45,7 @@ internal class ArCaptureSession(
     private val sceneHost: SceneViewCaptureHost,
     private val capabilityQuerier: CameraCapabilityQuerier,
     private val captureChannel: MethodChannel,
+    private val lifecycleDrain: CaptureLifecycleDrain,
     private val onCapacityChanged: (Map<String, Any?>) -> Unit = {},
     private val onObservedControlStateChanged: (ArCaptureSession) -> Unit = {},
     private val onCaptureAccepted: (Map<String, Any?>) -> Unit = {},
@@ -252,6 +255,15 @@ internal class ArCaptureSession(
                     onCapacityChanged = onCapacityChanged,
                 )
             sharedImageCacheManager = imageCacheManager
+            if (BuildConfig.NATIVE_FRAME_ATTRIBUTION) {
+                val attribution = NativeFrameAttributionOwner.create(
+                    enabled = true,
+                    reserve = imageCacheManager::reserveDiagnosticMetadata,
+                    release = { imageCacheManager.releaseDiagnosticMetadata(
+                        NativeFrameAttributionOwner.MODELED_OWNER_BYTES) },
+                )
+                if (!sceneHost.bindNativeFrameAttribution(attribution)) attribution?.close()
+            }
             val scenePreviewSurface = createSharedCameraPreviewSurface()
             val createManager = {
                 SharedCameraManager(
@@ -322,6 +334,7 @@ internal class ArCaptureSession(
                         )
                     },
                     resourceCounters = resourceCounters,
+                    nativeFrameAttribution = sceneHost.nativeFrameAttribution,
                 )
             }
             var startupError: Exception? = null
@@ -351,6 +364,7 @@ internal class ArCaptureSession(
                 }
             }
             if (sharedCameraManager == null) {
+                sceneHost.bindNativeFrameAttribution(null)
                 sharedImageCacheManager = null
                 val error = checkNotNull(startupError)
                 throw CaptureSessionException(
@@ -544,7 +558,11 @@ internal class ArCaptureSession(
         resetDiagnosticTiming: Boolean = false,
         includeDiagnosticTiming: Boolean = false,
     ): Map<String, Any?> {
-        if (resetDiagnosticTiming) processTelemetryTiming?.reset(processTelemetry.isRefreshPending())
+        if (resetDiagnosticTiming) {
+            processTelemetryTiming?.reset(processTelemetry.isRefreshPending())
+            sceneHost.nativeFrameAttribution?.resetMeasurements()
+            sharedCameraManager?.resetStillCaptureMetadata()
+        }
         val runtime = Runtime.getRuntime()
         val batteryManager =
             sceneHost.context.getSystemService(BatteryManager::class.java)
@@ -573,6 +591,15 @@ internal class ArCaptureSession(
             }
         return resourceCounters.snapshot() +
             (sharedCameraManager?.captureScratchReceipt() ?: emptyMap()) +
+            mapOf(
+                "nativeFrameAttribution" to (sceneHost.nativeFrameAttribution?.receipt()
+                    ?.plus("declared" to BuildConfig.NATIVE_FRAME_ATTRIBUTION)
+                    ?: mapOf("declared" to BuildConfig.NATIVE_FRAME_ATTRIBUTION,
+                        "effective" to false, "scope" to "inactive: funded capture diagnostic owner not installed")),
+                "captureConfiguration" to sharedCameraManager?.captureConfigurationReceipt(),
+                "stillCaptureMetadata" to sharedCameraManager?.stillCaptureMetadataReceipt(),
+                "diagnosticOwnership" to sharedImageCacheManager?.diagnosticOwnershipReceipt(),
+            ) +
             processTelemetry.snapshot().toMap() +
             (if (includeDiagnosticTiming && processTelemetryTiming != null)
                 mapOf("processTelemetryTiming" to processTelemetryTiming.snapshot()) else emptyMap()) +
@@ -811,11 +838,16 @@ internal class ArCaptureSession(
         return poseDataExtractor.latestPacked(++poseSequence)
     }
 
-    fun prepareNativeCaptureForPause(onCompleted: (Result<Unit>) -> Unit): Boolean =
-        nativeCaptureSerialOwnerV2.submit(
-            operation = { nativeCaptureBindingV2.onPause() },
-            completion = onCompleted,
-        )
+    fun prepareNativeCaptureForPause(
+        backgroundDrain: () -> Unit = {},
+        onCompleted: (Result<Unit>) -> Unit,
+    ): Boolean = nativeCaptureSerialOwnerV2.submit(
+        operation = {
+            nativeCaptureBindingV2.onPause()
+            backgroundDrain()
+        },
+        completion = onCompleted,
+    )
 
     /** Scalar-only V2 admission. Component descriptors and bytes are native post-output authority. */
     fun admitNativeCaptureV2(
@@ -1047,11 +1079,21 @@ internal class ArCaptureSession(
             operation = { nativeCaptureBindingV2.close() },
             timeoutOperation = { nativeCaptureBindingV2.forceCloseForDeadline() },
         ) { durableResult ->
-            val cleanupResult = runCatching { disposeMainResources() }
-            val completed = durableResult.exceptionOrNull()?.let(Result.Companion::failure) ?: cleanupResult
-            disposeResult = completed
-            disposeCallbacks.toList().forEach { it(completed) }
-            disposeCallbacks.clear()
+            if (durableResult.isFailure) {
+                finishDispose(durableResult)
+            } else {
+                val manager = sharedCameraManager
+                val started = lifecycleDrain.shutdown(
+                    timeoutMillis = 3_000,
+                    barrier = {
+                        manager?.cleanup()
+                        manager?.finishCameraShutdown(2_000L)
+                    },
+                    releaseMainResources = ::disposeMainResources,
+                    completion = ::finishDispose,
+                )
+                if (!started) finishDispose(Result.failure(IllegalStateException("Camera shutdown drain is already owned")))
+            }
         }
         if (!accepted) {
             val failed = Result.failure<Unit>(IllegalStateException("Native capture durable owner is already closing"))
@@ -1062,14 +1104,18 @@ internal class ArCaptureSession(
         return accepted
     }
 
+    private fun finishDispose(result: Result<Unit>) {
+        disposeResult = result
+        disposeCallbacks.toList().forEach { it(result) }
+        disposeCallbacks.clear()
+    }
+
     private fun disposeMainResources() {
         poseDataExtractor.clearDebugFixture()
         syntheticCaptureCompletion.clear()
         byteCache.dispose()
         sharedCameraManager?.let { manager ->
             nativeCaptureBindingV2.detachSharedCamera(manager)
-            manager.cleanup()
-            manager.finishCameraShutdown(1_000L)
         }
         sharedCameraManager = null
         sharedCameraFilamentStream?.let { stream ->
@@ -1080,6 +1126,7 @@ internal class ArCaptureSession(
         sharedCameraPreviewSurface = null
         sharedCameraPreviewSurfaceTexture?.release()
         sharedCameraPreviewSurfaceTexture = null
+        sceneHost.bindNativeFrameAttribution(null)
         sharedImageCacheManager = null
         config = null
         highResCaptureEnabled = false

@@ -61,8 +61,19 @@ createManagers(
 }
 
 /// Android-specific implementation of [PlatformARView]
-/// Uses Hybrid Composition to increase peformance on Android 9 and below (https://flutter.dev/docs/development/platform-integration/platform-views)
+/// Uses the surface-controller route unless hybrid composition is explicitly requested.
+/// Native SceneView rendering is independent of this outer composition choice.
 class AndroidARView implements PlatformARView {
+  AndroidARView({
+    this.useHybridComposition = const bool.fromEnvironment(
+      'CAPTURE3D_AR_HYBRID_COMPOSITION',
+      defaultValue: false,
+    ),
+  });
+
+  /// Experimental outer Android composition route; defaults to the existing route.
+  final bool useHybridComposition;
+
   late BuildContext? _context;
   late ARViewCreatedCallback? _arViewCreatedCallback;
   late PlaneDetectionConfig? _planeDetectionConfig;
@@ -98,8 +109,12 @@ class AndroidARView implements PlatformARView {
     };
 
     return PlatformViewLink(
-      key: ValueKey<(bool, String?)>(
-        (captureConfig?.enableHighResCapture ?? false, rearCameraId),
+      key: ValueKey<(bool, String?, bool)>(
+        (
+          captureConfig?.enableHighResCapture ?? false,
+          rearCameraId,
+          useHybridComposition,
+        ),
       ),
       viewType: viewType,
       surfaceFactory: (context, controller) => AndroidViewSurface(
@@ -108,7 +123,9 @@ class AndroidARView implements PlatformARView {
         gestureRecognizers: const {},
       ),
       onCreatePlatformView: (params) {
-        final controller = PlatformViewsService.initSurfaceAndroidView(
+        final AndroidViewController controller = (useHybridComposition
+            ? PlatformViewsService.initExpensiveAndroidView
+            : PlatformViewsService.initSurfaceAndroidView)(
           id: params.id,
           viewType: viewType,
           layoutDirection: TextDirection.ltr,

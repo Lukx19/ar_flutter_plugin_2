@@ -308,6 +308,80 @@ class HighResCapturePipelineTest {
         assertEquals(listOf("reservation-1"), cache.committedReservations)
     }
 
+    @Test
+    fun `pose free RAW JPEG probe stages encoded outputs without photo pose and retains blur rejection`() {
+        for (blurPassed in listOf(true, false)) {
+            val cache = FakeCache()
+            val poseResolver = FakePoseResolver(resolvedPose = null)
+            var rawClosed = 0
+            var rawEncoded = 0
+            val rawResult = sampleSharedResult().copy(
+                requiresPose = false,
+                rawDngEncoder = {
+                    rawEncoded++
+                    rawClosed++
+                    byteArrayOf(8, 9)
+                },
+                closeRawImage = { rawClosed++ },
+            )
+            val pipeline = HighResCapturePipeline(
+                cache = cache,
+                poseResolver = poseResolver,
+                qualityAnalyzer = { _, _ -> qualityMap(blurPassed, 110.0) },
+            )
+            val result = pipeline.processCapture(
+                rawResult,
+                CaptureQualityPolicy(true, 110.0, false),
+            )
+            assertNull(result["capture"])
+            assertTrue(poseResolver.resolvedTimings.isEmpty())
+            assertEquals(1, rawClosed)
+            if (blurPassed) {
+                assertEquals("staged", result["status"])
+                assertEquals("image-1", result["imageId"])
+                assertEquals(1, rawEncoded)
+                assertEquals(setOf("jpeg", "dng"), cache.committedAssetNames)
+                assertEquals(listOf("reservation-1"), cache.committedReservations)
+                assertTrue(cache.releasedReservations.isEmpty())
+            } else {
+                assertEquals("rejectedBlur", result["status"])
+                assertNull(result["imageId"])
+                assertEquals(0, rawEncoded)
+                assertTrue(cache.committedReservations.isEmpty())
+                assertEquals(listOf("reservation-1"), cache.releasedReservations)
+            }
+        }
+    }
+
+    @Test
+    fun `guided RAW JPEG keeps default pose requirement and releases raw image before failed staging`() {
+        val cache = FakeCache()
+        val poseResolver = FakePoseResolver(resolvedPose = null)
+        var rawClosed = 0
+        var rawEncoded = 0
+        val rawResult = sampleSharedResult().copy(
+            rawDngEncoder = { rawEncoded++; byteArrayOf(8, 9) },
+            closeRawImage = { rawClosed++ },
+        )
+        assertTrue(rawResult.requiresPose)
+        val pipeline = HighResCapturePipeline(
+            cache = cache,
+            poseResolver = poseResolver,
+            qualityAnalyzer = { _, _ -> qualityMap(true, 110.0) },
+        )
+        val error = try {
+            pipeline.processCapture(rawResult, CaptureQualityPolicy(true, 110.0, false))
+            null
+        } catch (failure: CaptureSessionException) { failure }
+        requireNotNull(error)
+        assertEquals("POSE_SYNC_FAILED", error.code)
+        assertEquals(1, poseResolver.resolvedTimings.size)
+        assertEquals(0, rawEncoded)
+        assertEquals(1, rawClosed)
+        assertTrue(cache.committedReservations.isEmpty())
+        assertEquals(listOf("reservation-1"), cache.releasedReservations)
+    }
+
     private fun sampleSharedResult() =
         SharedCameraCaptureResult(
             reservationToken = "reservation-1",
@@ -346,6 +420,17 @@ class HighResCapturePipelineTest {
     private class FakeCache : HighResCaptureCache {
         val releasedReservations = mutableListOf<String>()
         val committedReservations = mutableListOf<String>()
+        var committedAssetNames: Set<String> = emptySet()
+
+        override fun commitReservedAssets(
+            reservationToken: String,
+            imageId: String,
+            assets: Map<String, CachedImageAsset>,
+        ): Boolean {
+            committedAssetNames = assets.keys.toSet()
+            return super<HighResCaptureCache>.commitReservedAssets(reservationToken, imageId, assets)
+        }
+
 
         override fun releaseReservation(reservationToken: String): Boolean {
             releasedReservations += reservationToken

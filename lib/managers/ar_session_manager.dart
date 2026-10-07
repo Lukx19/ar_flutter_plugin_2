@@ -8,6 +8,7 @@ import 'package:ar_flutter_plugin_2/datatypes/image_format.dart';
 import 'package:ar_flutter_plugin_2/models/ar_anchor.dart';
 import 'package:ar_flutter_plugin_2/models/ar_hittest_result.dart';
 import 'package:ar_flutter_plugin_2/models/ar_capture_config.dart';
+import 'package:ar_flutter_plugin_2/models/canonical_ready_hint.dart';
 import 'package:ar_flutter_plugin_2/capabilities/ar_camera_capabilities.dart';
 import 'package:ar_flutter_plugin_2/utils/json_converters.dart';
 import 'package:flutter/material.dart';
@@ -20,6 +21,10 @@ typedef ARHitResultHandler = void Function(List<ARHitTestResult> hits);
 typedef ARPlaneResultHandler = void Function(int planeCount);
 typedef ErrorHandler = void Function(String error);
 
+/// Completes after worker advisory admission only, never after native polling.
+typedef CanonicalReadyHintHandler = Future<bool> Function(
+    CanonicalReadyHintV1 hint);
+
 /// AR Session states for lifecycle management
 enum ARSessionState {
   notInitialized,
@@ -30,6 +35,8 @@ enum ARSessionState {
   pausing,
   paused,
   error,
+  closing,
+  retained,
   disposed,
 }
 
@@ -88,6 +95,8 @@ class ARSessionManager {
 
   /// Current session state
   ARSessionState _sessionState = ARSessionState.notInitialized;
+  bool _closeStarted = false;
+  Future<void>? _disposeAttempt;
 
   /// Session state change stream controller
   final StreamController<ARSessionState> _stateController =
@@ -107,6 +116,79 @@ class ARSessionManager {
 
   /// Callback that is triggered once error is triggered
   ErrorHandler? onError;
+  CanonicalReadyHintHandler? _canonicalReadyHandler;
+  bool _canonicalReadyDeliveryPending = false;
+  bool _canonicalReadyRegistrationPending = false;
+  static bool _canonicalReadyRegistrationReserved = false;
+
+  /// Synchronous local fence; no Future, codec buffer or platform invocation.
+  void clearCanonicalReadyHandler(CanonicalReadyHintHandler handler) {
+    if (identical(_canonicalReadyHandler, handler))
+      _canonicalReadyHandler = null;
+  }
+
+  Future<bool> _invokeCanonicalReadyRegistration(
+      String method, Uint8List bytes) async {
+    if (_closeStarted ||
+        _canonicalReadyRegistrationPending ||
+        _canonicalReadyRegistrationReserved) return false;
+    _canonicalReadyRegistrationPending = true;
+    _canonicalReadyRegistrationReserved = true;
+    final invocation = _invokeOpenSession<bool>(method, bytes);
+    // A lost reply keeps one reservation occupied; fallback cannot queue RPCs.
+    unawaited(invocation.then<void>((_) {
+      _canonicalReadyRegistrationPending = false;
+      _canonicalReadyRegistrationReserved = false;
+    }, onError: (Object _, StackTrace __) {
+      _canonicalReadyRegistrationPending = false;
+      _canonicalReadyRegistrationReserved = false;
+    }));
+    try {
+      return await invocation.timeout(const Duration(seconds: 2)) ?? false;
+    } on MissingPluginException {
+      return false;
+    } on PlatformException {
+      return false;
+    } on TimeoutException {
+      return false;
+    }
+  }
+
+  /// Optional Android ready capability on this existing root handler. Missing
+  /// or older/iOS peers retain ordinary polling. No second manager is created.
+  Future<bool> registerCanonicalReady(
+      CanonicalReadyHintV1 owner, CanonicalReadyHintHandler handler) async {
+    if (owner.viewId != channelId || _closeStarted) return false;
+    _canonicalReadyHandler = handler;
+    try {
+      final supported = await _invokeCanonicalReadyRegistration(
+          'registerCanonicalReady', owner.bytes);
+      if (!supported && identical(_canonicalReadyHandler, handler))
+        _canonicalReadyHandler = null;
+      return supported;
+    } on MissingPluginException {
+      if (identical(_canonicalReadyHandler, handler))
+        _canonicalReadyHandler = null;
+      return false;
+    } on PlatformException {
+      if (identical(_canonicalReadyHandler, handler))
+        _canonicalReadyHandler = null;
+      return false;
+    }
+  }
+
+  /// Locally fences old delivery before the optional native unregister reply.
+  Future<void> unregisterCanonicalReady(
+      CanonicalReadyHintV1? owner, CanonicalReadyHintHandler handler) async {
+    clearCanonicalReadyHandler(handler);
+    if (owner == null) return;
+    try {
+      await _invokeCanonicalReadyRegistration(
+          'unregisterCanonicalReady', owner.bytes);
+    } on MissingPluginException {
+      /* Older peers have no advisory subscription. */
+    } on PlatformException {/* Replaced/disposed peers are already fenced. */}
+  }
 
   // Legacy constructor for backward compatibility
   ARSessionManager(int id, this.buildContext, this.planeDetectionConfig,
@@ -196,6 +278,7 @@ class ARSessionManager {
 
   /// Initialize AR session with integrated capture
   Future<void> initialize() async {
+    _requireOpenSession();
     if (_sessionState != ARSessionState.notInitialized) {
       if (debug) {
         print('Session already initialized or in process');
@@ -216,6 +299,7 @@ class ARSessionManager {
         await _validateARConfiguration(_arConfig!);
       }
 
+      _requireOpenSession();
       // Initialize capture manager if enabled
       if (_arConfig?.enableCapture == true &&
           _arConfig?.captureConfig != null) {
@@ -263,7 +347,7 @@ class ARSessionManager {
       }
 
       // Resume platform AR session
-      await _channel.invokeMethod('resumeSession');
+      await _invokeOpenSession('resumeSession');
 
       // Resume capture if available
       if (_captureManager != null) {
@@ -302,7 +386,7 @@ class ARSessionManager {
       }
 
       // Pause platform AR session
-      await _channel.invokeMethod('pauseSession');
+      await _invokeOpenSession('pauseSession');
 
       _setState(ARSessionState.paused);
 
@@ -316,56 +400,57 @@ class ARSessionManager {
     }
   }
 
-  /// Enhanced dispose with integrated cleanup
-  @override
-  Future<void> dispose() async {
-    if (_sessionState == ARSessionState.disposed) {
-      if (debug) {
-        print('Session already disposed');
-      }
-      return;
+  void _requireOpenSession() {
+    if (_closeStarted) {
+      throw ARSessionException(
+          'AR session is closing or retains native resources');
     }
+  }
 
-    if (debug) {
-      print('Disposing AR session...');
-    }
-    _setState(ARSessionState.disposed);
-    Object? firstError;
+  Future<T?> _invokeOpenSession<T>(String method, [Object? arguments]) {
+    _requireOpenSession();
+    return _channel.invokeMethod<T>(method, arguments);
+  }
 
-    final captureManager = _captureManager;
-    _captureManager = null;
-    if (captureManager != null) {
+  /// Shares one capture-then-view close. Failure preserves remaining owners.
+  /// Throws the native [PlatformException] from capture or session release.
+  Future<void> dispose() {
+    final pending = _disposeAttempt;
+    if (pending != null) return pending;
+    if (_sessionState == ARSessionState.disposed) return Future<void>.value();
+    final completion = Completer<void>();
+    _disposeAttempt = completion.future;
+    _closeStarted = true;
+    _setState(ARSessionState.closing);
+    unawaited(() async {
       try {
-        await captureManager.dispose();
-      } catch (error) {
-        firstError ??= error;
+        await _captureManager?.dispose();
+        await _channel.invokeMethod<void>('dispose');
+        _captureManager = null;
+        _canonicalReadyHandler = null;
+        _channel.setMethodCallHandler(null);
+        _setState(ARSessionState.disposed);
+        unawaited(_stateController.close());
+        completion.complete();
+      } on Object catch (error, stack) {
+        _lastError = error.toString();
+        _setState(ARSessionState.retained);
+        completion.completeError(error, stack);
+      } finally {
+        _disposeAttempt = null;
       }
-    }
-    try {
-      await _channel.invokeMethod<void>('dispose');
-    } catch (error) {
-      firstError ??= error;
-    } finally {
-      _channel.setMethodCallHandler(null);
-    }
-    try {
-      await _stateController.close();
-    } catch (error) {
-      firstError ??= error;
-    }
-
-    if (firstError != null) {
-      _lastError = firstError.toString();
-      if (debug) {
-        print('Error during disposal: $firstError');
-      }
-    } else if (debug) {
-      print('AR session disposed successfully');
-    }
+    }());
+    return completion.future;
   }
 
   /// Set session state and notify listeners
   void _setState(ARSessionState newState) {
+    if (_closeStarted &&
+        newState != ARSessionState.closing &&
+        newState != ARSessionState.retained &&
+        newState != ARSessionState.disposed) {
+      return;
+    }
     if (_sessionState != newState) {
       _sessionState = newState;
       _stateController.add(newState);
@@ -401,7 +486,7 @@ class ARSessionManager {
           debug: debug,
         );
 
-    await _channel.invokeMethod('init', {
+    await _invokeOpenSession('init', {
       'showAnimatedGuide': config.showAnimatedGuide,
       'showFeaturePoints': config.showFeaturePoints,
       'planeDetectionConfig':
@@ -590,7 +675,7 @@ class ARSessionManager {
   Future<Matrix4?> getCameraPose() async {
     try {
       final serializedCameraPose =
-          await _channel.invokeMethod<List<dynamic>>('getCameraPose', {});
+          await _invokeOpenSession<List<dynamic>>('getCameraPose', {});
       if (serializedCameraPose == null) {
         return null;
       }
@@ -616,7 +701,7 @@ class ARSessionManager {
         throw Exception("Anchor can not be resolved. Anchor name is empty.");
       }
       final serializedCameraPose =
-          await _channel.invokeMethod<List<dynamic>>('getAnchorPose', {
+          await _invokeOpenSession<List<dynamic>>('getAnchorPose', {
         "anchorId": anchor.name,
       });
       if (serializedCameraPose == null) {
@@ -667,22 +752,43 @@ class ARSessionManager {
 
   //Disable Camera
   void disableCamera() {
-    _channel.invokeMethod<void>('disableCamera');
+    _invokeOpenSession<void>('disableCamera');
   }
 
   //Enable Camera
   void enableCamera() {
-    _channel.invokeMethod<void>('enableCamera');
+    _invokeOpenSession<void>('enableCamera');
   }
 
   //Show or hide planes
   void showPlanes(bool showPlanes) {
-    _channel.invokeMethod<void>('showPlanes', {
+    _invokeOpenSession<void>('showPlanes', {
       "showPlanes": showPlanes,
     });
   }
 
-  Future<void> _platformCallHandler(MethodCall call) {
+  Future<Object?> _platformCallHandler(MethodCall call) async {
+    if (call.method == 'dispose') {
+      await dispose();
+      return null;
+    }
+    if (call.method == 'onCanonicalReady') {
+      final handler = _canonicalReadyHandler;
+      // Native has one send outstanding. Reject unexpected callback floods
+      // before decoding/retaining another payload; fallback polling persists.
+      if (handler == null || _canonicalReadyDeliveryPending || _closeStarted)
+        return false;
+      final hint = CanonicalReadyHintV1.decode(call.arguments);
+      if (hint == null || hint.viewId != channelId) return false;
+      _canonicalReadyDeliveryPending = true;
+      try {
+        return await handler(hint);
+      } catch (_) {
+        return false;
+      } finally {
+        _canonicalReadyDeliveryPending = false;
+      }
+    }
     if (debug) {
       print('_platformCallHandler call ${call.method} ${call.arguments}');
     }
@@ -720,9 +826,6 @@ class ARSessionManager {
             onPlaneDetected!(planeCountResult);
           }
           break;
-        case 'dispose':
-          _channel.invokeMethod<void>("dispose");
-          break;
         default:
           if (debug) {
             print('Unimplemented method ${call.method} ');
@@ -731,7 +834,7 @@ class ARSessionManager {
     } catch (e) {
       print('Error caught: ' + e.toString());
     }
-    return Future.value();
+    return null;
   }
 
   /// Function to initialize the platform-specific AR view. Can be used to initially set or update session settings.
@@ -747,7 +850,7 @@ class ARSessionManager {
     bool handlePans = false, // nodes are not draggable by default
     bool handleRotation = false, // nodes can not be rotated by default
   }) async {
-    await _channel.invokeMethod<void>('init', {
+    await _invokeOpenSession<void>('init', {
       'showAnimatedGuide': showAnimatedGuide,
       'showFeaturePoints': showFeaturePoints,
       'planeDetectionConfig': planeDetectionConfig.index,
@@ -762,20 +865,11 @@ class ARSessionManager {
 
   /// Legacy dispose method for backward compatibility
   /// You should call this before removing the AR view to prevent out of memory errors
-  Future<void> disposeLegacy() async {
-    try {
-      // Dispose capture manager first
-      await _captureManager?.dispose();
-
-      await _channel.invokeMethod<void>("dispose");
-    } catch (e) {
-      print(e);
-    }
-  }
+  Future<void> disposeLegacy() => dispose();
 
   /// Returns a future ImageProvider that contains a screenshot of the current AR Scene
   Future<ImageProvider> snapshot() async {
-    final result = await _channel.invokeMethod<Uint8List>('snapshot');
+    final result = await _invokeOpenSession<Uint8List>('snapshot');
     return MemoryImage(result!);
   }
 }

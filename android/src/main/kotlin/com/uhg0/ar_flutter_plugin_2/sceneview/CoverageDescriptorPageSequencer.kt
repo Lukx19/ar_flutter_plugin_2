@@ -79,7 +79,7 @@ internal class CoverageDescriptorPageSequencer {
         completedDescriptor = null
         failedDescriptor = null
         pendingPages.clear()
-        if (descriptor == null) return
+        if (descriptor == null || !descriptor.enabled) return
 
         val full = previous == null ||
             !predecessorComplete ||

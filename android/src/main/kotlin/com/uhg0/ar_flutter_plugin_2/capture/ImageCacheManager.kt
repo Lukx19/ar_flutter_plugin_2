@@ -74,6 +74,8 @@ class ImageCacheManager(
     private val cacheSequence = AtomicLong(0L)
     private var cacheConfiguration: CacheConfiguration? = null
     private val cacheLock = Any()
+    private var diagnosticMetadataBytes = 0L
+    private var stillCaptureMetadataBytes = 0L
 
     // Memory management
     private val availableMemoryMB: Int = availableMemoryMBOverride ?: getAvailableMemoryMB()
@@ -92,6 +94,37 @@ class ImageCacheManager(
                 "cacheBudgetBytes=$maxAllowedMemoryBytes config=$cacheConfiguration",
         )
     }
+
+    /** Optional fixed diagnostic owners share the ordinary capture envelope. */
+    internal fun reserveDiagnosticMetadata(bytes: Long): Boolean = synchronized(cacheLock) {
+        require(bytes in 1..4096)
+        if (diagnosticMetadataBytes != 0L) return@synchronized false
+        val used = imageCache.values.sumOf { it.sizeBytes } + reservations.values.sumOf { it.reservedBytes }
+        if (used + stillCaptureMetadataBytes + bytes > maxAllowedMemoryBytes) return@synchronized false
+        diagnosticMetadataBytes = bytes
+        true
+    }
+    internal fun releaseDiagnosticMetadata(bytes: Long) = synchronized(cacheLock) {
+        check(diagnosticMetadataBytes == bytes)
+        diagnosticMetadataBytes = 0L
+    }
+    internal fun reserveStillCaptureMetadata(bytes: Long): Boolean = synchronized(cacheLock) {
+        require(bytes == 6400L)
+        if (stillCaptureMetadataBytes != 0L) return@synchronized false
+        val used = imageCache.values.sumOf { it.sizeBytes } + reservations.values.sumOf { it.reservedBytes }
+        if (used + diagnosticMetadataBytes + bytes > maxAllowedMemoryBytes) return@synchronized false
+        stillCaptureMetadataBytes = bytes
+        true
+    }
+    internal fun releaseStillCaptureMetadata(bytes: Long) = synchronized(cacheLock) {
+        check(stillCaptureMetadataBytes == bytes)
+        stillCaptureMetadataBytes = 0L
+    }
+    internal fun diagnosticOwnershipReceipt(): Map<String, Any> = synchronized(cacheLock) { mapOf(
+        "envelopeBytes" to maxAllowedMemoryBytes,
+        "diagnosticMetadataBytes" to diagnosticMetadataBytes,
+        "stillCaptureMetadataBytes" to stillCaptureMetadataBytes,
+    ) }
 
     /// Configure cache based on ARCaptureConfig settings and available memory
     fun configure(): CacheConfiguration {
@@ -202,6 +235,18 @@ class ImageCacheManager(
                     code = "CACHE_FULL",
                     message = "Capture cache is full",
                 )
+            }
+
+            if (diagnosticMetadataBytes > 0L || stillCaptureMetadataBytes > 0L) {
+                val retainedBytes = imageCache.values.sumOf { it.sizeBytes } - (existingImage?.sizeBytes ?: 0L)
+                val incomingBytes = assets.values.sumOf { it.bytes.size.toLong() }
+                val reservedBytes = reservations.values.sumOf { it.reservedBytes }
+                if (retainedBytes + incomingBytes + reservedBytes > effectiveMaxStagedBytes(currentConfig)) {
+                    throw CaptureSessionException(
+                        code = "CACHE_FULL",
+                        message = "Capture cache has reached the funded staged byte budget",
+                    )
+                }
             }
 
             val cachedImage = CachedImage(
@@ -564,15 +609,15 @@ class ImageCacheManager(
     private fun effectiveMaxStagedBytes(configuration: CacheConfiguration): Long {
         val memoryBudget =
             if (maxAllowedMemoryBytes > 0L) {
-                maxAllowedMemoryBytes
+                maxAllowedMemoryBytes - diagnosticMetadataBytes - stillCaptureMetadataBytes
             } else {
                 configuration.memoryUsageEstimate.totalCacheBytes
             }
         val configuredEstimate = configuration.memoryUsageEstimate.totalCacheBytes
         return if (configuredEstimate > 0L) {
-            minOf(configuredEstimate, memoryBudget).coerceAtLeast(1L)
+            minOf(configuredEstimate, memoryBudget).coerceAtLeast(if (diagnosticMetadataBytes > 0 || stillCaptureMetadataBytes > 0) 0L else 1L)
         } else {
-            memoryBudget.coerceAtLeast(1L)
+            memoryBudget.coerceAtLeast(if (diagnosticMetadataBytes > 0 || stillCaptureMetadataBytes > 0) 0L else 1L)
         }
     }
 

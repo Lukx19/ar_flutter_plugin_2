@@ -14,7 +14,7 @@ import org.junit.Test
 
 class NativeCapturePreviewReaderV2Test {
     @Test
-    fun `materializes an immutable preview through reusable copy and digest workspace`() {
+    fun `materializes a smaller preview after original digest validation without rewriting source`() {
         val root = Files.createTempDirectory("preview-reader").toFile()
         try {
             val image = ByteArray(96 * 1024 + 17) { index -> (index * 31).toByte() }
@@ -42,9 +42,14 @@ class NativeCapturePreviewReaderV2Test {
             }
 
             val target = File(root, "preview.jpg")
-            val reader = NativeCapturePreviewReaderV2(root)
+            val thumbnail = image.copyOf(16)
+            val reader = NativeCapturePreviewReaderV2(root,
+                { _, destination, _, _ -> destination.writeBytes(thumbnail); true },
+                { file, _ -> file.isFile && file.readBytes().contentEquals(thumbnail) },
+            )
             assertTrue(reader.materializeJpegPreview(manifestId, captureId, target))
-            assertArrayEquals(image, target.readBytes())
+            assertArrayEquals(thumbnail, target.readBytes())
+            assertArrayEquals(image, File(session, "assets/$captureId/jpeg.$componentHash.blob").readBytes())
 
             val retainedRoot = File(session, "objects/$manifestId.root")
             retainedRoot.writeText(rootText.replace("revision=1", "revision=2"))
@@ -59,7 +64,7 @@ class NativeCapturePreviewReaderV2Test {
             // fails; the source bytes remain the immutable authority.
             target.writeBytes(byteArrayOf(1, 2, 3))
             assertTrue(reader.materializeJpegPreview(manifestId, captureId, target))
-            assertArrayEquals(image, target.readBytes())
+            assertArrayEquals(thumbnail, target.readBytes())
         } finally {
             root.deleteRecursively()
         }
@@ -80,6 +85,76 @@ class NativeCapturePreviewReaderV2Test {
         assertEquals(16L, second.length)
         assertArrayEquals(digest("first-component".toByteArray()), first.digest)
         assertArrayEquals(digest("second-component".toByteArray()), second.digest)
+    }
+
+    @Test fun `older than three roots repairs once from committed ancestor with bounded preview bytes`() {
+        val root = Files.createTempDirectory("older-preview").toFile()
+        try {
+            val fixture = committedChain(root)
+            var writes = 0
+            val thumbnail = byteArrayOf(9, 8, 7, 6)
+            val reader = NativeCapturePreviewReaderV2(root,
+                { _, target, _, _ -> writes++; target.writeBytes(thumbnail); true },
+                { target, _ -> target.isFile && target.readBytes().contentEquals(thumbnail) },
+            )
+            val target = File(root, "display.jpg")
+            repeat(2) { assertTrue(reader.materializeJpegPreview(fixture.first, fixture.second, target)) }
+            assertEquals(1, writes)
+            assertArrayEquals(thumbnail, target.readBytes())
+            assertArrayEquals(fixture.third, File(root, "sessions/session/assets/${fixture.second}/jpeg.${sha256(fixture.third)}.blob").readBytes())
+        } finally { root.deleteRecursively() }
+    }
+
+    @Test fun `off chain immutable object cannot authorize preview and cancelled traversal writes nothing`() {
+        val root = Files.createTempDirectory("cancel-preview").toFile()
+        try {
+            val fixture = committedChain(root)
+            var writes = 0
+            val reader = NativeCapturePreviewReaderV2(root, { _, _, _, _ -> writes++; true }, { _, _ -> false })
+            val target = File(root, "display.jpg")
+            var checks = 0
+            assertFalse(reader.materializeJpegPreview(fixture.first, fixture.second, target, { ++checks > 3 }))
+            val offChain = "schema=5\nrevision=1\nrequest=${"a".repeat(64)}\nprevious=-\nsecondPrevious=-\ncomponent=JPEG:${fixture.third.size}:${sha256(fixture.third)}\n"
+            val hash = sha256(offChain.toByteArray())
+            File(root, "sessions/session/objects/$hash.root").writeText(offChain)
+            assertFalse(reader.materializeJpegPreview(hash, fixture.second, target))
+            assertEquals(0, writes)
+            assertFalse(target.exists())
+        } finally { root.deleteRecursively() }
+    }
+
+    @Test fun `tampered original cannot create thumbnail or change authoritative bytes`() {
+        val root = Files.createTempDirectory("tampered-preview").toFile()
+        try {
+            val fixture = committedChain(root)
+            val source = File(root, "sessions/session/assets/${fixture.second}/jpeg.${sha256(fixture.third)}.blob")
+            val damaged = fixture.third.copyOf().also { it[0] = (it[0] + 1).toByte() }
+            source.writeBytes(damaged)
+            var writes = 0
+            val reader = NativeCapturePreviewReaderV2(root, { _, _, _, _ -> writes++; true }, { _, _ -> false })
+            val target = File(root, "display.jpg")
+            assertFalse(reader.materializeJpegPreview(fixture.first, fixture.second, target))
+            assertEquals(0, writes); assertFalse(target.exists())
+            assertArrayEquals(damaged, source.readBytes())
+        } finally { root.deleteRecursively() }
+    }
+
+    private fun committedChain(root: File): Triple<String, String, ByteArray> {
+        val session = File(root, "sessions/session").apply { mkdirs() }
+        val bytes = ByteArray(4096) { (it * 13).toByte() }
+        val component = sha256(bytes)
+        val capture = "b".repeat(64)
+        File(session, "assets/$capture/jpeg.$component.blob").apply { parentFile!!.mkdirs(); writeBytes(bytes) }
+        var previous = "-"; var secondPrevious = "-"; var first = ""
+        repeat(6) { index ->
+            val content = "schema=5\nrevision=${index + 1}\nrequest=${"d".repeat(64)}\nprevious=$previous\nsecondPrevious=$secondPrevious\ncomponent=JPEG:${bytes.size}:$component\n"
+            val hash = sha256(content.toByteArray())
+            File(session, "objects/$hash.root").apply { parentFile!!.mkdirs(); writeText(content) }
+            if (index == 0) first = hash
+            secondPrevious = previous; previous = hash
+        }
+        File(session, "root-A.ptr").writeText("6\n$previous\n${"e".repeat(64)}\n")
+        return Triple(first, capture, bytes)
     }
 
     @Test

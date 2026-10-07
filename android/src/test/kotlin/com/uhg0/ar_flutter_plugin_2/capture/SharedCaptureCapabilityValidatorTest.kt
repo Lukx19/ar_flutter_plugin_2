@@ -7,6 +7,25 @@ import org.junit.Test
 
 class SharedCaptureCapabilityValidatorTest {
     @Test
+    fun `high resolution JPEG maximum selects exact reader size before shared candidate cache refresh`() {
+        val regular = listOf(4128 to 2580, 1920 to 1080)
+        val advertisedHighResolution = listOf(4128 to 3096, 4128 to 2580)
+        val report = SharedCaptureCapabilityValidator.validateAndReport(
+            capabilities = SharedCaptureCapabilities(
+                supportedOutputSizes = regular,
+                highResolutionOutputSizes = advertisedHighResolution,
+                timestampSource = SharedCaptureCapabilityValidator.TIMESTAMP_SOURCE_REALTIME,
+            ),
+            requestedWidth = 4128,
+            requestedHeight = 3096,
+        )
+        assertEquals(4128, report.effectiveWidth)
+        assertEquals(3096, report.effectiveHeight)
+        assertEquals("exact", report.resolutionSelectionReason)
+        assertEquals(listOf(4128 to 3096, 4128 to 2580, 1920 to 1080), report.supportedOutputSizes)
+    }
+
+    @Test
     fun `accepts supported resolution with realtime timestamp source`() {
         SharedCaptureCapabilityValidator.validate(
             capabilities =

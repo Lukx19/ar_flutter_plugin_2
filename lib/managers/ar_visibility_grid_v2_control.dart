@@ -7,6 +7,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
 import 'ar_visibility_surface_stream.dart';
+import '../models/renderer_attribute.dart';
 
 const int _visibilityWorkerRequestCeilingBytes = 16 * 1024;
 const int _visibilityWorkerResponseCeilingBytes = 64 * 1024;
@@ -19,7 +20,9 @@ enum ARCoveragePresentationMode {
   rawFeatures('rawFeatures'),
   warmProxies('warmProxies'),
   overview('overview'),
-  suppressedDebug('suppressedDebug');
+  suppressedDebug('suppressedDebug'),
+  planarPatches('planarPatches'),
+  directionalBalls('directionalBalls');
 
   const ARCoveragePresentationMode(this.wireName);
   final String wireName;
@@ -145,6 +148,11 @@ final class ARVisibilityRendererControlReceipt {
     required this.palette,
     required this.rowCount,
     required this.rendererGeneration,
+    this.geometrySupported = false,
+    this.effectiveMode,
+    this.basisAvailable = false,
+    this.basisOutcome = 'unavailable',
+    this.observationColorsMeaningful = false,
   });
 
   final bool accepted;
@@ -154,6 +162,11 @@ final class ARVisibilityRendererControlReceipt {
   final ARCoveragePalette palette;
   final int rowCount;
   final int rendererGeneration;
+  final bool geometrySupported;
+  final ARCoveragePresentationMode? effectiveMode;
+  final bool basisAvailable;
+  final String basisOutcome;
+  final bool observationColorsMeaningful;
 
   static ARVisibilityRendererControlReceipt fromMap(Object? raw) {
     final map = _rendererMap(raw, 'renderer control receipt');
@@ -165,6 +178,16 @@ final class ARVisibilityRendererControlReceipt {
       palette: ARCoveragePalette.fromWire(map['palette']),
       rowCount: _rendererInt(map, 'rowCount'),
       rendererGeneration: _rendererInt(map, 'rendererGeneration'),
+      geometrySupported: map['rendererGeometrySupported'] == true,
+      effectiveMode: map['effectiveMode'] == null
+          ? null
+          : ARCoveragePresentationMode.fromWire(map['effectiveMode']),
+      basisAvailable: map['basisAvailable'] == true,
+      observationColorsMeaningful:
+          map['rendererObservationColorsMeaningful'] == true,
+      basisOutcome: map['basisOutcome'] is String
+          ? map['basisOutcome']! as String
+          : 'unavailable',
     );
   }
 }
@@ -185,6 +208,12 @@ final class ARVisibilityRendererStatus {
     this.resourceAvailable = true,
     this.recoveryPending = false,
     this.resourceFailureCount = 0,
+    this.geometrySupported = false,
+    this.effectiveMode,
+    this.basisAvailable = false,
+    this.basisOutcome = 'unavailable',
+    this.shapeCount = 0,
+    this.observationColorsMeaningful = false,
   });
 
   final bool rendererUnavailable;
@@ -201,6 +230,12 @@ final class ARVisibilityRendererStatus {
   final bool resourceAvailable;
   final bool recoveryPending;
   final int resourceFailureCount;
+  final bool geometrySupported;
+  final ARCoveragePresentationMode? effectiveMode;
+  final bool basisAvailable;
+  final String basisOutcome;
+  final int shapeCount;
+  final bool observationColorsMeaningful;
 
   static ARVisibilityRendererStatus fromMap(Object? raw) {
     final map = _rendererMap(raw, 'renderer status');
@@ -214,6 +249,17 @@ final class ARVisibilityRendererStatus {
       rendererGeneration: _rendererInt(map, 'rendererGeneration'),
       geometryRevision: _rendererInt(map, 'geometryRevision'),
       styleRevision: _rendererInt(map, 'styleRevision'),
+      geometrySupported: map['rendererGeometrySupported'] == true,
+      effectiveMode: map['effectiveMode'] == null
+          ? null
+          : ARCoveragePresentationMode.fromWire(map['effectiveMode']),
+      basisAvailable: map['basisAvailable'] == true,
+      basisOutcome: map['basisOutcome'] is String
+          ? map['basisOutcome']! as String
+          : 'unavailable',
+      shapeCount: (map['shapeCount'] as num?)?.toInt() ?? 0,
+      observationColorsMeaningful:
+          map['rendererObservationColorsMeaningful'] == true,
       residentRowCount: map.containsKey('residentRowCount')
           ? _rendererInt(map, 'residentRowCount')
           : 0,
@@ -1724,6 +1770,50 @@ final class ARVisibilityGridV2WorkerBinding {
   /// propagates [PlatformException] or [MissingPluginException].
   Future<Uint8List> stop(Uint8List request) =>
       _control(_V2Control.stop, request);
+
+  static bool _rendererAttributeInvocationReserved = false;
+
+  /// Negotiates optional attributes on this exact existing worker binding.
+  Future<bool> rendererAttributesSupported() async {
+    final result = await _rendererAttributeCall(
+        'rendererAttributesCapabilities', Uint8List(0));
+    return result is Map && result['supported'] == true;
+  }
+
+  /// One optional request, with no ACK/credit meaning. Unknown reply keeps its
+  /// reservation until the actual transport completion; fallback cannot queue.
+  Future<Object?> rendererAttributes(Uint8List bytes) =>
+      _rendererAttributeCall('rendererAttributesV1', bytes);
+
+  Future<Object?> _rendererAttributeCall(String method, Uint8List bytes) async {
+    _ensureOpen();
+    if (_rendererAttributeInvocationReserved) return {'outcome': 'busy'};
+    if (bytes.length > RendererAttributeHeaderV1.pageBytes)
+      return {'outcome': 'malformed'};
+    final qualified = _qualify(bytes);
+    _rendererAttributeInvocationReserved = true;
+    final invocation = _controlChannel.invokeMethod<Object?>(method, qualified);
+    unawaited(invocation.then<void>((_) {
+      _rendererAttributeInvocationReserved = false;
+    }, onError: (Object _, StackTrace __) {
+      _rendererAttributeInvocationReserved = false;
+    }));
+    try {
+      final response = await invocation.timeout(const Duration(seconds: 2));
+      _ensureOpen();
+      if (response is Uint8List &&
+          response.length > RendererAttributeHeaderV1.pageBytes + 32) {
+        return {'outcome': 'malformed'};
+      }
+      return response is Uint8List ? _authenticate(response) : response;
+    } on MissingPluginException {
+      return {'outcome': 'unsupported'};
+    } on PlatformException {
+      return {'outcome': 'unsupported'};
+    } on TimeoutException {
+      return {'outcome': 'unknown'};
+    }
+  }
 
   /// Arms the debug-only first-exchange stall used by the Android T6
   /// recovery tracer. Throws [PlatformException] or

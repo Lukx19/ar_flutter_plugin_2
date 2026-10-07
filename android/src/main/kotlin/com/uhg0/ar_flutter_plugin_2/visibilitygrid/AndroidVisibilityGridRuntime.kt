@@ -41,10 +41,24 @@ internal class AndroidVisibilityGridRuntime(
     private val debugDepthOfferNanoTime: () -> Long = System::nanoTime,
 ) : AutoCloseable {
     private val lock = Any()
-    private val depthCapabilityTransitionLock = Any()
+    private var requestedDepthCapability = VisibilityDepthCapability.UNSUPPORTED
+    private var requestedCapabilityOwnership: VisibilityObservationOwnership? = null
+    private var ingressDrainGeneration = 0L
+    private var ingressDrainScheduled = false
+    private var pendingFeatureDrain = false
+    private var pendingDepthDrain = false
+    private var pendingCapabilityFence = false
+    private var pendingTerminalFence = false
+    private var lifecycleAdmissionBusyDrops = 0L
+    private var ingressDrainFailures = 0L
+    private var ingressDrainFailed = false
     private val lifecycleLock = ReentrantReadWriteLock()
     private var closed = false
+    private var closeCompleted = false
     private var paused = false
+    private var pauseDrainPending = false
+    private var lifecycleGeneration = 0L
+    private val pauseDrainGate = java.util.concurrent.locks.ReentrantLock()
     private var pausedOwnership: VisibilityObservationOwnership? = null
     private var featureLastCopiedTimestampNs = Long.MIN_VALUE
     private var depthLastCopiedTimestampNs = Long.MIN_VALUE
@@ -181,40 +195,30 @@ internal class AndroidVisibilityGridRuntime(
     }
 
     fun setDepthCapability(capability: VisibilityDepthCapability) {
-        synchronized(depthCapabilityTransitionLock) {
+        val needsDrain = synchronized(lock) {
+            if (closed || ingressDrainFailed) return
+            val requestOwnership = ownership()
+            val changed = capability != requestedDepthCapability || requestOwnership != requestedCapabilityOwnership
+            requestedDepthCapability = capability
+            requestedCapabilityOwnership = requestOwnership
+            if (changed) ingressDrainGeneration++
             if (capability == VisibilityDepthCapability.UNSUPPORTED) {
-                beforeDepthCapabilityFence()
-                lifecycleLock.write {
-                    synchronized(lock) {
-                        depthCapability = capability
-                        depthLastHealthyNs = Long.MIN_VALUE
-                        if (depthHealth != VisibilitySourceHealth.FAILED) {
-                            depthHealth = VisibilitySourceHealth.UNSUPPORTED
-                        }
-                    }
-                    val discarded = depthLane.pauseAndDiscard()
-                    synchronized(lock) {
-                        lifecycleDiscardedObservations = Math.addExact(
-                            lifecycleDiscardedObservations, discarded,
-                        )
-                        droppedDepthObservations = Math.addExact(
-                            droppedDepthObservations, discarded,
-                        )
-                    }
-                }
-                afterDepthCapabilityInvalidated()
-                depthLane.awaitIdle()
-                return
-            }
-            synchronized(lock) {
+                val wasSupported = depthCapability != VisibilityDepthCapability.UNSUPPORTED
                 depthCapability = capability
-                if (depthHealth != VisibilitySourceHealth.FAILED &&
-                    depthHealth == VisibilitySourceHealth.UNSUPPORTED
-                ) {
-                    depthHealth = VisibilitySourceHealth.CONFIGURED
+                depthLastHealthyNs = Long.MIN_VALUE
+                if (depthHealth != VisibilitySourceHealth.FAILED) depthHealth = VisibilitySourceHealth.UNSUPPORTED
+                if (wasSupported) {
+                    pendingDepthDrain = true
+                    pendingCapabilityFence = true
                 }
-            }
+                wasSupported
+            } else if (!ingressDrainScheduled && !pendingDepthDrain) {
+                depthCapability = capability
+                if (depthHealth == VisibilitySourceHealth.UNSUPPORTED) depthHealth = VisibilitySourceHealth.CONFIGURED
+                false
+            } else false
         }
+        if (needsDrain) scheduleIngressDrain()
     }
 
     fun configureSyntheticSource(capability: VisibilityDepthCapability) {
@@ -252,7 +256,7 @@ internal class AndroidVisibilityGridRuntime(
     }
 
     fun shouldCopyFeature(timestampNs: Long): Boolean = synchronized(lock) {
-        if (syntheticSource) return@synchronized false
+        if (closed || paused || ingressDrainFailed || syntheticSource) return@synchronized false
         if (featureHealth == VisibilitySourceHealth.FAILED) return@synchronized false
         val unsafeRecoveryProbe = callbackCopyBudgetDegraded && !isCaptureSafe()
         val now = if (unsafeRecoveryProbe) nanoTime() else Long.MIN_VALUE
@@ -283,7 +287,7 @@ internal class AndroidVisibilityGridRuntime(
         // the lane lock before updating runtime counters.
         if (depthLane.hasOutstandingWork()) return false
         return synchronized(lock) {
-            !syntheticSource && !callbackCopyBudgetDegraded &&
+            !closed && !paused && !ingressDrainFailed && !syntheticSource && !callbackCopyBudgetDegraded &&
                 depthCapability != VisibilityDepthCapability.UNSUPPORTED &&
                 depthHealth != VisibilitySourceHealth.FAILED &&
                 claimCopy(timestampNs, depthLastCopyAttemptTimestampNs, depthIntervalNs).also {
@@ -295,7 +299,7 @@ internal class AndroidVisibilityGridRuntime(
     fun offerFeature(
         observation: VisibilityFeatureObservation,
         callbackCopyNs: Long = 0,
-    ): Boolean = lifecycleLock.read {
+    ): Boolean = tryOfferLifecycle(observation) {
         synchronized(lock) {
             offeredFeatureObservations++
             maximumFeatureSamples = maxOf(maximumFeatureSamples, observation.sampleCount)
@@ -303,18 +307,18 @@ internal class AndroidVisibilityGridRuntime(
                 invalidFeatureObservations++
                 droppedFeatureObservations++
                 observation.close()
-                return@read false
+                return@tryOfferLifecycle false
             }
             if (paused) {
                 pausedObservationRejections++
                 droppedFeatureObservations++
                 observation.close()
-                return@read false
+                return@tryOfferLifecycle false
             }
             if (featureHealth == VisibilitySourceHealth.FAILED) {
                 droppedFeatureObservations++
                 observation.close()
-                return@read false
+                return@tryOfferLifecycle false
             }
             if (closed || !isStructurallyValid(observation) ||
                 observation.sampleCount > featureSampleCapacity() ||
@@ -323,19 +327,19 @@ internal class AndroidVisibilityGridRuntime(
                 invalidFeatureObservations++
                 droppedFeatureObservations++
                 observation.close()
-                return@read false
+                return@tryOfferLifecycle false
             }
             if (observation.frame.sourceTimestampNs <= featureLastCopiedTimestampNs) {
                 duplicateFeatureObservations++
                 droppedFeatureObservations++
                 observation.close()
-                return@read false
+                return@tryOfferLifecycle false
             }
             if (ownership() != observation.ownership) {
                 staleGenerationObservations++
                 droppedFeatureObservations++
                 observation.close()
-                return@read false
+                return@tryOfferLifecycle false
             }
             featureLastCopiedTimestampNs = observation.frame.sourceTimestampNs
             featureHealth = VisibilitySourceHealth.HEALTHY
@@ -362,7 +366,7 @@ internal class AndroidVisibilityGridRuntime(
             observation.debugOfferLedger = ledger
             observation.debugOfferId = ledger.start(observation.frame.sourceTimestampNs)
         }
-        return lifecycleLock.read {
+        return tryOfferLifecycle(observation) {
             synchronized(lock) {
                 offeredDepthObservations++
                 maximumDepthSamples = maxOf(maximumDepthSamples, observation.sampleCount)
@@ -370,18 +374,18 @@ internal class AndroidVisibilityGridRuntime(
                     invalidDepthObservations++
                     droppedDepthObservations++
                     observation.close()
-                    return@read false
+                    return@tryOfferLifecycle false
                 }
                 if (paused) {
                     pausedObservationRejections++
                     droppedDepthObservations++
                     observation.close()
-                    return@read false
+                    return@tryOfferLifecycle false
                 }
                 if (depthHealth == VisibilitySourceHealth.FAILED) {
                     droppedDepthObservations++
                     observation.close()
-                    return@read false
+                    return@tryOfferLifecycle false
                 }
                 if (closed || callbackCopyBudgetDegraded ||
                     depthCapability == VisibilityDepthCapability.UNSUPPORTED ||
@@ -390,19 +394,19 @@ internal class AndroidVisibilityGridRuntime(
                     invalidDepthObservations++
                     droppedDepthObservations++
                     observation.close()
-                    return@read false
+                    return@tryOfferLifecycle false
                 }
                 if (observation.frame.sourceTimestampNs <= depthLastCopiedTimestampNs) {
                     duplicateDepthObservations++
                     droppedDepthObservations++
                     observation.close()
-                    return@read false
+                    return@tryOfferLifecycle false
                 }
                 if (ownership() != observation.ownership) {
                     staleGenerationObservations++
                     droppedDepthObservations++
                     observation.close()
-                    return@read false
+                    return@tryOfferLifecycle false
                 }
                 depthLastCopiedTimestampNs = observation.frame.sourceTimestampNs
                 depthHealth = VisibilitySourceHealth.HEALTHY
@@ -469,39 +473,31 @@ internal class AndroidVisibilityGridRuntime(
     }
 
     fun recordFeatureFailure() {
-        val drain = lifecycleLock.write {
-            synchronized(lock) {
-                callbackRecoveryProbeInFlight = false
-                featureFailures++
-                featureHealth = VisibilitySourceHealth.FAILED
-            }
-            discardUnusableIngress(feature = true)
-                .also { afterTerminalIngressInvalidated() }
+        synchronized(lock) {
+            callbackRecoveryProbeInFlight = false
+            featureFailures++
+            featureHealth = VisibilitySourceHealth.FAILED
+            pendingFeatureDrain = true
+            pendingTerminalFence = true
+            ingressDrainGeneration++
         }
-        awaitUnusableIngress(drain)
+        scheduleIngressDrain()
     }
 
     fun recordDepthFailure() {
-        val drain = lifecycleLock.write {
-            val terminal = synchronized(lock) {
-                if (depthCapability != VisibilityDepthCapability.UNSUPPORTED) {
-                    depthFailures++
-                    if (depthFailures >= TERMINAL_FAILURE_THRESHOLD) {
-                        depthHealth = VisibilitySourceHealth.FAILED
-                        true
-                    } else {
-                        depthHealth = VisibilitySourceHealth.TRANSIENT_UNAVAILABLE
-                        false
-                    }
-                } else {
-                    false
-                }
+        val terminal = synchronized(lock) {
+            if (depthCapability == VisibilityDepthCapability.UNSUPPORTED) false else {
+                depthFailures++
+                if (depthFailures >= TERMINAL_FAILURE_THRESHOLD) {
+                    depthHealth = VisibilitySourceHealth.FAILED
+                    pendingDepthDrain = true
+                    pendingTerminalFence = true
+                    ingressDrainGeneration++
+                    true
+                } else { depthHealth = VisibilitySourceHealth.TRANSIENT_UNAVAILABLE; false }
             }
-            if (terminal) {
-                discardUnusableIngress(depth = true).also { afterTerminalIngressInvalidated() }
-            } else UnusableIngressDrain.NONE
         }
-        awaitUnusableIngress(drain)
+        if (terminal) scheduleIngressDrain()
     }
 
     fun recordFeatureStalled() = synchronized(lock) {
@@ -527,66 +523,106 @@ internal class AndroidVisibilityGridRuntime(
     }
 
     /** Rejects new callbacks and discards copied-but-uncommitted lane values. */
-    fun pause() {
-        val claimed = synchronized(lock) {
-            if (closed || paused) return@synchronized false
+    fun lifecycleToken(): Long = synchronized(lock) { lifecycleGeneration }
+    fun isCurrentLifecycle(expected: Long): Boolean = synchronized(lock) { !closed && lifecycleGeneration == expected }
+    fun fencePause(): Long = synchronized(lock) {
+        if (!closed) {
+            lifecycleGeneration++
+            if (!paused) { pausedOwnership = ownership(); pauseCount++ }
             paused = true
-            pausedOwnership = ownership()
-            pauseCount++
-            true
+            pauseDrainPending = true
+            ingressDrainGeneration++
         }
-        if (!claimed) return
-        depthOfferTiming?.finishActive(DepthOfferTimingLedger.LIFECYCLE)
-        // Mapper invalidation happens before lane drain so a callback which
-        // already crossed deliverFeature cannot commit behind the pause cut.
-        mapper.pause()
-        val featureDiscarded = featureLane.pauseAndDiscard()
-        val depthDiscarded = depthLane.pauseAndDiscard()
-        synchronized(lock) {
-            lifecycleDiscardedObservations += featureDiscarded + depthDiscarded
-            droppedFeatureObservations += featureDiscarded
-            droppedDepthObservations += depthDiscarded
-        }
+        lifecycleGeneration
     }
-
-    /** Resumes the exact paused cut, or fences and rolls over to its replacement. */
-    fun resume(): Boolean = lifecycleLock.write {
-        val current = ownership() ?: return@write false
-        val previous = synchronized(lock) {
-            if (closed) return@write false
-            if (!paused) return@write true
-            pausedOwnership
-        }
-        if (previous == current) {
-            synchronized(lock) { sameCutResumeCount++ }
-        } else {
+    /** Worker-only: serialize mapper/barrier work without holding the admission-fence monitor. */
+    fun finishPause(expectedLifecycle: Long = lifecycleToken()) {
+        pauseDrainGate.lock()
+        try {
+            if (!synchronized(lock) { !closed && lifecycleGeneration == expectedLifecycle && pauseDrainPending }) return
+            depthOfferTiming?.finishActive(DepthOfferTimingLedger.LIFECYCLE)
+            // Mapper invalidation happens before lane drain so a callback which
+            // already crossed deliverFeature cannot commit behind the pause cut.
+            mapper.pause()
             val featureDiscarded = featureLane.pauseAndDiscard()
             val depthDiscarded = depthLane.pauseAndDiscard()
-            val ingressBefore = mapper.snapshot().residentObservations
-            mapper.rollover(current)
             synchronized(lock) {
                 lifecycleDiscardedObservations += featureDiscarded + depthDiscarded
                 droppedFeatureObservations += featureDiscarded
                 droppedDepthObservations += depthDiscarded
-                rolloverDiscardedIngressObservations += ingressBefore
-                ownershipRolloverCount++
-                featureLastCopiedTimestampNs = Long.MIN_VALUE
-                depthLastCopiedTimestampNs = Long.MIN_VALUE
-                featureLastCopyAttemptTimestampNs = Long.MIN_VALUE
-                depthLastCopyAttemptTimestampNs = Long.MIN_VALUE
-                depthLastHealthyNs = Long.MIN_VALUE
-                recordOwnership(current)
             }
-        }
-        synchronized(lock) {
-            // Keep runtime ingress paused until the mapper has reopened its
-            // revalidated cut; otherwise a callback can fall into the gap.
+            check(featureLane.awaitIdle(1_000) && depthLane.awaitIdle(1_000)) {
+                "Observation accounting remains owned across pause"
+            }
+            synchronized(lock) {
+                if (lifecycleGeneration == expectedLifecycle) pauseDrainPending = false
+            }
+        } finally { pauseDrainGate.unlock() }
+    }
+    fun pause() { val token = fencePause(); finishPause(token) }
+
+    fun resume(expectedLifecycle: Long = lifecycleToken()): Boolean {
+        finishPause(expectedLifecycle)
+        return lifecycleLock.write {
+            if (!isCurrentLifecycle(expectedLifecycle)) return@write false
+            val current = ownership() ?: run {
+                // Authority is independently checked by every observation
+                // offer. A lifecycle resume without START/baseline ACK must
+                // not leave a permanent pause after authority arrives later.
+                mapper.resume()
+                val accepted = synchronized(lock) {
+                    if (closed || lifecycleGeneration != expectedLifecycle) false else {
+                        paused = false
+                        // Keep an earlier cut until a later qualified resume
+                        // can perform its existing rollover/accounting reset.
+                        resumeCount++
+                        ingressDrainGeneration++
+                        true
+                    }
+                }
+                if (!accepted) mapper.pause()
+                return@write false
+            }
+            val previous = synchronized(lock) {
+                if (closed || lifecycleGeneration != expectedLifecycle) return@write false
+                if (!paused && pausedOwnership == null) return@write true
+                pausedOwnership
+            }
+            if (previous == current) {
+                synchronized(lock) { sameCutResumeCount++ }
+            } else {
+                val featureDiscarded = featureLane.pauseAndDiscard()
+                val depthDiscarded = depthLane.pauseAndDiscard()
+                val ingressBefore = mapper.snapshot().residentObservations
+                mapper.rollover(current)
+                synchronized(lock) {
+                    lifecycleDiscardedObservations += featureDiscarded + depthDiscarded
+                    droppedFeatureObservations += featureDiscarded
+                    droppedDepthObservations += depthDiscarded
+                    rolloverDiscardedIngressObservations += ingressBefore
+                    ownershipRolloverCount++
+                    featureLastCopiedTimestampNs = Long.MIN_VALUE
+                    depthLastCopiedTimestampNs = Long.MIN_VALUE
+                    featureLastCopyAttemptTimestampNs = Long.MIN_VALUE
+                    depthLastCopyAttemptTimestampNs = Long.MIN_VALUE
+                    depthLastHealthyNs = Long.MIN_VALUE
+                    recordOwnership(current)
+                }
+            }
+            // Mapper work must never retain the Main admission-fence monitor.
             mapper.resume()
-            paused = false
-            pausedOwnership = null
-            resumeCount++
+            val accepted = synchronized(lock) {
+                if (closed || lifecycleGeneration != expectedLifecycle || ownership() != current) false else {
+                    paused = false
+                    pausedOwnership = null
+                    resumeCount++
+                    ingressDrainGeneration++
+                    true
+                }
+            }
+            if (!accepted) mapper.pause()
+            accepted
         }
-        true
     }
 
     fun snapshot(): VisibilityObservationHealth {
@@ -672,16 +708,20 @@ internal class AndroidVisibilityGridRuntime(
     }
 
     override fun close() {
-        lifecycleLock.write {
-            synchronized(lock) {
-                if (closed) return
-                closed = true
-            }
-            depthOfferTiming?.finishActive(DepthOfferTimingLedger.LIFECYCLE)
-            featureLane.close()
-            depthLane.close()
-            mapper.close()
+        synchronized(lock) {
+            if (closeCompleted) return
+            if (!closed) ingressDrainGeneration++
+            closed = true
+            lifecycleGeneration++
         }
+        depthOfferTiming?.finishActive(DepthOfferTimingLedger.LIFECYCLE)
+        featureLane.close()
+        depthLane.close()
+        check(featureLane.awaitIdle(1_000) && depthLane.awaitIdle(1_000)) {
+            "Visibility lanes did not release every admitted observation and accounting owner"
+        }
+        lifecycleLock.write { mapper.close() }
+        synchronized(lock) { closeCompleted = true }
         if (ownsScheduler) scheduler.shutdownNow()
     }
 
@@ -691,11 +731,19 @@ internal class AndroidVisibilityGridRuntime(
         val depthEvidence = integration?.depthEvidenceDiagnostics()
         val depthPublicationDeferral = integration?.depthPublicationDeferralSnapshot()
         val depthLookup = integration?.depthLookupDiagnostics()
-        return snapshot().toWireMap() + mapOf(
+        return snapshot().toWireMap() + synchronized(lock) { mapOf(
+            "ingressDrainPending" to ingressDrainScheduled,
+            "ingressDrainGeneration" to ingressDrainGeneration,
+            "ingressDrainFailures" to ingressDrainFailures,
+            "ingressDrainFailed" to ingressDrainFailed,
+            "lifecycleAdmissionBusyDrops" to lifecycleAdmissionBusyDrops,
+        ) } + mapOf(
             "mappingIngress" to mapper.snapshot().toWireMap(),
             "mappingPublicationStatus" to (publication?.status ?: "unavailable"),
             "mappingRejected" to (publication?.rejected ?: 0L),
             "mappingFenced" to (publication?.fenced ?: 0L),
+            "canonicalReadyTiming" to (integration?.canonicalReadyTimingSnapshot() ?: emptyMap<String, Any>()),
+            "canonicalReadyWake" to (integration?.canonicalReadyWakeSnapshot() ?: mapOf("enabled" to false)),
             "depthEvidence" to (depthEvidence ?: emptyMap<String, Any>()),
             "depthLookup" to (depthLookup ?: emptyMap<String, Any>()),
             "depthAdmissionTiming" to mapper.depthAdmissionTiming().toWireMap(),
@@ -895,9 +943,81 @@ internal class AndroidVisibilityGridRuntime(
         return UnusableIngressDrain(drainFeature, drainDepth)
     }
 
-    private fun awaitUnusableIngress(drain: UnusableIngressDrain) {
-        if (drain.feature) featureLane.awaitIdle()
-        if (drain.depth) depthLane.awaitIdle()
+    private inline fun tryOfferLifecycle(observation: VisibilityFeatureObservation, operation: () -> Boolean): Boolean =
+        tryOfferLifecycle({ observation.close() }, operation)
+    private inline fun tryOfferLifecycle(observation: VisibilityDepthObservation, operation: () -> Boolean): Boolean =
+        tryOfferLifecycle({ observation.close() }, operation)
+    private inline fun tryOfferLifecycle(release: () -> Unit, operation: () -> Boolean): Boolean {
+        val reader = lifecycleLock.readLock()
+        if (synchronized(lock) { ingressDrainFailed } || !reader.tryLock()) {
+            synchronized(lock) { lifecycleAdmissionBusyDrops++ }
+            release()
+            return false
+        }
+        return try { operation() } finally { reader.unlock() }
+    }
+
+    private data class IngressDrainClaim(
+        val generation: Long, val ownership: VisibilityObservationOwnership?,
+        val feature: Boolean, val depth: Boolean, val capabilityFence: Boolean, val terminalFence: Boolean,
+    )
+    private fun scheduleIngressDrain() {
+        val schedule = synchronized(lock) {
+            if (closed || ingressDrainScheduled) false else { ingressDrainScheduled = true; true }
+        }
+        if (schedule) enqueueIngressDrain()
+    }
+    private fun enqueueIngressDrain() {
+        try { scheduler.execute(::drainIngressAsync) }
+        catch (failure: RuntimeException) {
+            synchronized(lock) { ingressDrainFailures++; ingressDrainFailed = true; ingressDrainScheduled = false }
+            onMapperFailure(failure)
+        }
+    }
+    private fun drainIngressAsync() {
+        val claim = synchronized(lock) {
+            if (closed) { ingressDrainScheduled = false; return }
+            IngressDrainClaim(ingressDrainGeneration, requestedCapabilityOwnership, pendingFeatureDrain, pendingDepthDrain,
+                pendingCapabilityFence, pendingTerminalFence).also {
+                pendingFeatureDrain = false; pendingDepthDrain = false
+                pendingCapabilityFence = false; pendingTerminalFence = false
+            }
+        }
+        val drain = try {
+            lifecycleLock.write {
+                if (claim.capabilityFence) beforeDepthCapabilityFence()
+                discardUnusableIngress(claim.feature, claim.depth).also {
+                    if (claim.capabilityFence) afterDepthCapabilityInvalidated()
+                    if (claim.terminalFence) afterTerminalIngressInvalidated()
+                }
+            }
+        } catch (failure: RuntimeException) {
+            synchronized(lock) { ingressDrainFailures++; ingressDrainFailed = true; ingressDrainScheduled = false }
+            onMapperFailure(failure)
+            return
+        }
+        val remaining = java.util.concurrent.atomic.AtomicInteger((if (drain.feature) 1 else 0) + (if (drain.depth) 1 else 0))
+        val completed = { if (remaining.decrementAndGet() == 0) completeIngressDrain(claim) }
+        if (remaining.get() == 0) completeIngressDrain(claim) else {
+            if (drain.feature) featureLane.whenIdle(completed)
+            if (drain.depth) depthLane.whenIdle(completed)
+        }
+    }
+    private fun completeIngressDrain(claim: IngressDrainClaim) {
+        val restart = synchronized(lock) {
+            if (closed) { ingressDrainScheduled = false; false }
+            else if (claim.generation != ingressDrainGeneration || pendingFeatureDrain || pendingDepthDrain) true
+            else {
+                ingressDrainScheduled = false
+                if (claim.ownership == ownership() && requestedDepthCapability != VisibilityDepthCapability.UNSUPPORTED &&
+                    depthHealth != VisibilitySourceHealth.FAILED) {
+                    depthCapability = requestedDepthCapability
+                    if (depthHealth == VisibilitySourceHealth.UNSUPPORTED) depthHealth = VisibilitySourceHealth.CONFIGURED
+                }
+                false
+            }
+        }
+        if (restart) enqueueIngressDrain()
     }
 
     private data class UnusableIngressDrain(val feature: Boolean, val depth: Boolean) {
@@ -1302,6 +1422,7 @@ private class LatestObservationLane<T : Any>(
     private var scheduleEpoch = 0L
     private var running = false
     private var accountingPending = false
+    private var idleCompletion: (() -> Unit)? = null
 
     val residentBytes: Long
         get() = synchronized(lock) {
@@ -1346,11 +1467,12 @@ private class LatestObservationLane<T : Any>(
                 if (!running) current?.let(::add)
                 latest?.let(::add)
             }
-            if (!running) current = null
+            if (!running) { current = null; scheduled = false }
             latest = null
         }
         discarded.forEach(onDiscard)
         publishResidentBytes()
+        completeIdleIfReady()
     }
 
     /** Drops every copied value that has not entered mapper admission. */
@@ -1370,12 +1492,40 @@ private class LatestObservationLane<T : Any>(
         }
         discardedValues.forEach(onDiscard)
         publishResidentBytes(beforeDiscardResidentPublication)
+        completeIdleIfReady()
         return discarded
     }
 
+    fun whenIdle(completion: () -> Unit) {
+        val ready = synchronized(lock) {
+            if (isIdleLocked()) true else {
+                check(idleCompletion == null) { "Only one owned lane drain may be outstanding" }
+                idleCompletion = completion
+                false
+            }
+        }
+        if (ready) completion()
+    }
+    private fun isIdleLocked() = !scheduled && current == null && latest == null && !running && !accountingPending
+    private fun completeIdleIfReady() {
+        val completion = synchronized(lock) {
+            if (!isIdleLocked()) null else idleCompletion.also { idleCompletion = null }
+        }
+        completion?.invoke()
+    }
+
     fun awaitIdle() = synchronized(lock) {
-        while (scheduled || current != null || latest != null || running || accountingPending) {
-            (lock as java.lang.Object).wait()
+        while (!isIdleLocked()) (lock as java.lang.Object).wait()
+    }
+    fun awaitIdle(timeoutMillis: Long): Boolean {
+        val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis)
+        return synchronized(lock) {
+            while (!isIdleLocked()) {
+                val remaining = deadline - System.nanoTime()
+                if (remaining <= 0L) return@synchronized false
+                TimeUnit.NANOSECONDS.timedWait(lock, remaining)
+            }
+            true
         }
     }
 
@@ -1430,6 +1580,7 @@ private class LatestObservationLane<T : Any>(
                 (lock as java.lang.Object).notifyAll()
             }
         }
+        completeIdleIfReady()
         if (nextDelay != null) {
             synchronized(lock) {
                 if (!closed && scheduled && epoch == scheduleEpoch) scheduleLocked(nextDelay)

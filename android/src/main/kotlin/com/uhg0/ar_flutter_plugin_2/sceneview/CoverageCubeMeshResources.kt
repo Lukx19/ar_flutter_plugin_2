@@ -190,7 +190,6 @@ internal class CoverageCubeMeshResources(
             ticket,
         )
         setDrawCount(node, page.totalCount)
-        materialInstance.setParameter("pointSize", pointSizePx)
         node.isVisible = enabled && page.totalCount > 0
     }
 
@@ -203,13 +202,18 @@ internal class CoverageCubeMeshResources(
         currentNodeForDescriptor = node
         currentMaterialForDescriptor = materialInstance
         currentPointSizeForDescriptor = pointSizePx
+        if (!descriptor.enabled) {
+            descriptorSequencer.replace(descriptor)
+            retainedSnapshotUploadRequired = true
+            hide(node)
+            return
+        }
         descriptorSequencer.replace(
             descriptor,
             rehydrate = retainedSnapshotUploadRequired,
         )
         retainedSnapshotUploadRequired = false
         setDrawCount(node, descriptor.count)
-        materialInstance.setParameter("pointSize", pointSizePx)
         node.isVisible = descriptor.enabled && descriptor.count > 0
     }
 
@@ -227,6 +231,9 @@ internal class CoverageCubeMeshResources(
     }
 
     override fun hide(node: Node) {
+        // Queued pages are discardable; already submitted tickets still drain normally.
+        descriptorSequencer.clear()
+        retainedSnapshotUploadRequired = true
         setDrawCount(node, 0)
         node.isVisible = false
     }

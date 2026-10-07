@@ -151,6 +151,13 @@ class VisibilitySurfaceStreamChannel(
      */
     @Volatile private var rendererStylePriority = false
     @Volatile private var rendererStyleAcknowledgementPending = false
+    @Volatile private var rendererStyleFinalEmptyRevision = -1L
+    @Volatile private var rendererStyleFinalEmptyRequestSequence = 0L
+    /** Optional display exchanges can observe, never satisfy, the exact style ACK fence. */
+    internal val rendererStyleAcknowledgementComplete: Boolean
+        get() = !rendererStylePriority && !rendererStyleAcknowledgementPending &&
+            rendererStyleFinalEmptyRevision == committedBaseline.styleRevision &&
+            rendererStyleFinalEmptyRequestSequence > 0 && rendererStyleFinalEmptyRequestSequence == lastSequence
     @Volatile private var committedBaseline =
         controlLifecycle?.committedBaseline() ?: CommittedBaselineV1.ZERO
     @Volatile private var queuedTransactionBaseline: CommittedBaselineV1? = null
@@ -346,6 +353,8 @@ class VisibilitySurfaceStreamChannel(
             ).all { it >= 0 },
         )
         synchronized(this) {
+            rendererStyleFinalEmptyRevision = -1L
+            rendererStyleFinalEmptyRequestSequence = 0
             committedBaseline = CommittedBaselineV1(
                 transactionId,
                 geometryRevision,
@@ -374,6 +383,8 @@ class VisibilitySurfaceStreamChannel(
     fun setFreshBindingBaseline(value: CommittedBaselineV1) {
         synchronized(this) {
             committedBaseline = CommittedBaselineV1.forFreshBinding(value)
+            rendererStyleFinalEmptyRevision = -1L
+            rendererStyleFinalEmptyRequestSequence = 0
             controlLifecycle?.setCommittedBaseline(committedBaseline)
         }
     }
@@ -724,6 +735,16 @@ class VisibilitySurfaceStreamChannel(
                                             lastResponse = encoded
                                             telemetry.retainedReplayCache(bytes.size, encoded.retainedBytes)
                                             telemetry.accepted(bytes.size, encoded.size)
+                                            if (request.commandLength == 0 &&
+                                                request.nextStyleRevision == committedBaseline.styleRevision &&
+                                                request.acknowledgedTransactionId == committedBaseline.transactionId &&
+                                                request.acknowledgedGeometryRevision == committedBaseline.geometryRevision &&
+                                                request.acknowledgedLineageRevision == committedBaseline.lineageRevision) {
+                                                // Optional display observation only. No response,
+                                                // ACK, ownership, sequence or credit is changed.
+                                                rendererStyleFinalEmptyRevision = committedBaseline.styleRevision
+                                                rendererStyleFinalEmptyRequestSequence = request.requestSequence
+                                            }
                                             encoded
                                         }
                                     }
@@ -948,6 +969,8 @@ class VisibilitySurfaceStreamChannel(
         lastResponse = null
         resyncPending = false
         lastSequence = null
+        rendererStyleFinalEmptyRevision = -1L
+        rendererStyleFinalEmptyRequestSequence = 0
         nextExpectedSequence = 1L
         // The publication fence has already won. Do not reacquire the worker
         // monitor here: a stalled worker may still hold it while waiting for

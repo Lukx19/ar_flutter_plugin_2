@@ -210,6 +210,10 @@ internal class PresentationDescriptor private constructor(
     val targetDirectionIndex: Int? = null,
     private val backing: PresentationBacking,
     val update: CoveragePointRenderUpdate?,
+    val attributes: RendererAttributeCodec.Header? = null,
+    val shapes: PreparedCoverageShapeReference? = null,
+    val worldFromGroup: DoubleArray? = null,
+    val voxelSizeMeters: Float = 0f,
 ) {
     init {
         require(capacity in 0..CoverageRendererLimits.CENTROID_CAPACITY)
@@ -230,6 +234,26 @@ internal class PresentationDescriptor private constructor(
 
     /** O(1) scalar used by renderer status and telemetry. */
     val glyphCount: Int get() = backing.glyphCount(count)
+    internal fun surfaceIdAt(index: Int): Long = backing.surfaceIdAt(index)
+
+    internal fun withAttributes(header: RendererAttributeCodec.Header, mesh: PreparedCoverageShapeReference): PresentationDescriptor =
+        PresentationDescriptor(qualifier, mode, enabled, capacity, count, sourceCapacity, sourceCount,
+            palette, paletteEpoch, targetSurfaceId, targetDirectionIndex, backing, update,
+            header, mesh, worldFromGroup, voxelSizeMeters)
+
+    /** Replays keep the exact qualified shape body; no old row table is retained. */
+    internal fun withReplayAttributesFrom(previous: PresentationDescriptor?): PresentationDescriptor {
+        if (attributes != null || shapes != null || previous == null ||
+            qualifier != previous.qualifier || mode != previous.mode || palette != previous.palette ||
+            paletteEpoch != previous.paletteEpoch || count != previous.count ||
+            sourceCount != previous.sourceCount || sourceCapacity != previous.sourceCapacity ||
+            voxelSizeMeters != previous.voxelSizeMeters || changedSelectionRows(previous) != 0 ||
+            worldFromGroup == null || previous.worldFromGroup == null ||
+            !worldFromGroup.contentEquals(previous.worldFromGroup)) return this
+        val header = previous.attributes ?: return this
+        val mesh = previous.shapes?.takeIf { it.available } ?: return this
+        return withAttributes(header, mesh)
+    }
 
     /** Compares bounded destination identities without copying or retaining row arrays. */
     internal fun changedSelectionRows(previous: PresentationDescriptor): Int {
@@ -287,6 +311,10 @@ internal class PresentationDescriptor private constructor(
             targetDirectionIndex = targetDirectionIndex,
             backing = backing,
             update = nextUpdate,
+            attributes = if (mode == this.mode && palette == this.palette) attributes else null,
+            shapes = if (mode == this.mode && palette == this.palette) shapes else null,
+            worldFromGroup = worldFromGroup,
+            voxelSizeMeters = voxelSizeMeters,
         )
     }
 
@@ -346,6 +374,8 @@ internal class PresentationDescriptor private constructor(
             update: CoveragePointRenderUpdate?, workspace: PresentationWorkspace,
             pageReader: PresentationPageReader,
             geometryBackingBytes: Long = 0L,
+            worldFromGroup: DoubleArray? = null,
+            voxelSizeMeters: Float = 0f,
         ): PresentationDescriptor {
             require(capacity == mode.presentationCapacity)
             require(selectedSurfaceIds.size <= capacity)
@@ -365,6 +395,8 @@ internal class PresentationDescriptor private constructor(
                 targetDirectionIndex = targetDirectionIndex,
                 backing = backing,
                 update = update?.rangeOnly(),
+                worldFromGroup = worldFromGroup,
+                voxelSizeMeters = voxelSizeMeters,
             )
         }
 

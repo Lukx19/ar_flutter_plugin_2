@@ -393,16 +393,17 @@ class AndroidVisibilityGridRuntimeTest {
             runtime.setDepthCapability(VisibilityDepthCapability.AUTOMATIC)
             assertEquals(VisibilitySourceHealth.FAILED, runtime.snapshot().depthHealth)
             assertEquals("featureOnly", runtime.snapshot().totalGridHealth)
+            await { runtime.snapshotWireMap()["ingressDrainPending"] == false }
 
             assertTrue(runtime.offerFeature(feature(cut.get(), 1, 1), 2_000_001))
             assertEquals(VisibilitySourceHealth.FAILED, runtime.snapshot().depthHealth)
             assertFalse(runtime.shouldCopyDepth(1_000_000_000))
 
             repeat(2) { index ->
-                runtime.offerFeature(feature(cut.get(), 2L + index, 2 + index), 0)
+                assertTrue(runtime.offerFeature(feature(cut.get(), 2L + index, 2 + index), 0))
             }
             clock.addAndGet(30_000_000_000)
-            runtime.offerFeature(feature(cut.get(), 4, 4), 0)
+            assertTrue(runtime.offerFeature(feature(cut.get(), 4, 4), 0))
             assertEquals("withinBudget", runtime.snapshot().callbackCopyBudgetState)
             assertEquals(VisibilitySourceHealth.FAILED, runtime.snapshot().depthHealth)
             assertFalse(runtime.shouldCopyDepth(2_000_000_000))
@@ -977,9 +978,11 @@ class AndroidVisibilityGridRuntimeTest {
                 failureReturned.countDown()
             }.apply { start() }
             assertTrue(failureStarted.await(1, TimeUnit.SECONDS))
-            assertTrue(discardPublicationEntered.await(1, TimeUnit.SECONDS))
+            assertTrue(failureReturned.await(250, TimeUnit.MILLISECONDS))
+            assertTrue(residentAtReturn.get() > 0L)
             cleanupRelease.countDown()
             assertTrue(workerPublicationComplete.await(1, TimeUnit.SECONDS))
+            assertTrue(discardPublicationEntered.await(1, TimeUnit.SECONDS))
             discardPublicationRelease.countDown()
             assertTrue(terminalInvalidated.await(1, TimeUnit.SECONDS))
             assertTrue(failureReturned.await(1, TimeUnit.SECONDS))
@@ -989,7 +992,7 @@ class AndroidVisibilityGridRuntimeTest {
             assertEquals(1, mapped.get())
             assertEquals(1, runtime.snapshot().lifecycleDiscardedObservations)
             assertEquals(0, runtime.snapshot().residentPayloadBytes)
-            assertEquals(0, residentAtReturn.get())
+            assertTrue(residentAtReturn.get() > 0L)
         } finally {
             cleanupRelease.countDown()
             discardPublicationRelease.countDown()
@@ -998,7 +1001,7 @@ class AndroidVisibilityGridRuntimeTest {
     }
 
     @Test
-    fun `terminal failure waits for admitted mapper call then fences later delivery`() {
+    fun `terminal failure returns while admitted mapper is held and fences later delivery`() {
         val cut = AtomicReference(ownership())
         val mapperEntered = CountDownLatch(1)
         val mapperRelease = CountDownLatch(1)
@@ -1025,11 +1028,14 @@ class AndroidVisibilityGridRuntimeTest {
                 runtime.recordFeatureFailure()
                 failureReturned.countDown()
             }.apply { start() }
-            assertFalse(failureReturned.await(25, TimeUnit.MILLISECONDS))
+            assertTrue(failureReturned.await(250, TimeUnit.MILLISECONDS))
+            assertEquals(0, mapped.get())
+            assertFalse(runtime.offerFeature(feature(cut.get(), 2_000_000, 2)))
 
             mapperRelease.countDown()
             assertTrue(failureReturned.await(1, TimeUnit.SECONDS))
             failing.join(1_000)
+            await { runtime.snapshot().admittedFeatureObservations == 1L }
             assertEquals(1, mapped.get())
             assertEquals(1, runtime.snapshot().admittedFeatureObservations)
             assertEquals(VisibilitySourceHealth.FAILED, runtime.snapshot().featureHealth)
@@ -1042,7 +1048,7 @@ class AndroidVisibilityGridRuntimeTest {
     }
 
     @Test
-    fun `unsupported depth transition invalidates pending depth before awaiting blocked delivery cleanup`() {
+    fun `unsupported depth transition returns before blocked delivery and accounting cleanup`() {
         val cut = AtomicReference(ownership())
         val deliveryEntered = CountDownLatch(1)
         val deliveryRelease = CountDownLatch(1)
@@ -1095,6 +1101,9 @@ class AndroidVisibilityGridRuntimeTest {
                 publicationFinishedAtReturn.set(residentPublicationFinished.get())
                 transitionReturned.countDown()
             }.apply { start() }
+            assertTrue(transitionReturned.await(250, TimeUnit.MILLISECONDS))
+            assertFalse(publicationFinishedAtReturn.get())
+            assertFalse(runtime.offerDepth(depth(cut.get(), 3_000_000, 3)))
             assertTrue(transitionEntered.await(1, TimeUnit.SECONDS))
             assertTrue(transitionInvalidated.await(1, TimeUnit.SECONDS))
             deliveryRelease.countDown()
@@ -1105,7 +1114,8 @@ class AndroidVisibilityGridRuntimeTest {
 
             assertEquals(0, mapped.get())
             assertEquals(0, mappedAtReturn.get())
-            assertTrue(publicationFinishedAtReturn.get())
+            await { runtime.snapshotWireMap()["ingressDrainPending"] == false }
+            assertTrue(residentPublicationFinished.get())
             assertEquals(0, runtime.snapshot().admittedDepthObservations)
             assertEquals(2, runtime.snapshot().lifecycleDiscardedObservations)
             assertEquals(0, runtime.snapshot().residentPayloadBytes)
@@ -1121,7 +1131,7 @@ class AndroidVisibilityGridRuntimeTest {
     }
 
     @Test
-    fun `supported depth reconfiguration waits for unsupported drain before accepting fresh depth`() {
+    fun `supported depth reconfiguration returns while old drain fences fresh depth admission`() {
         val cut = AtomicReference(ownership())
         val oldDeliveryEntered = CountDownLatch(1)
         val oldDeliveryRelease = CountDownLatch(1)
@@ -1193,6 +1203,9 @@ class AndroidVisibilityGridRuntimeTest {
                 reconfigurationReturned.countDown()
             }.apply { start() }
             assertTrue(reconfigurationAttempted.await(1, TimeUnit.SECONDS))
+            assertTrue(reconfigurationReturned.await(250, TimeUnit.MILLISECONDS))
+            assertEquals(VisibilityDepthCapability.UNSUPPORTED, runtime.snapshot().depthCapability)
+            assertFalse(runtime.offerDepth(depth(cut.get(), 3_000_000, 3)))
 
             oldDeliveryRelease.countDown()
             disabling.join(1_000)
@@ -1200,8 +1213,9 @@ class AndroidVisibilityGridRuntimeTest {
             assertTrue(reconfigurationReturned.await(1, TimeUnit.SECONDS))
             reenabling.join(1_000)
 
+            await { runtime.snapshotWireMap()["ingressDrainPending"] == false }
             assertTrue(cleanupOrder.get() > 0L)
-            assertTrue(cleanupOrder.get() < reconfigurationOrder.get())
+            assertTrue(reconfigurationOrder.get() < cleanupOrder.get())
             assertEquals(0, runtime.snapshot().residentPayloadBytes)
             assertEquals(VisibilityDepthCapability.AUTOMATIC, runtime.snapshot().depthCapability)
             assertEquals(VisibilitySourceHealth.CONFIGURED, runtime.snapshot().depthHealth)
@@ -1215,6 +1229,92 @@ class AndroidVisibilityGridRuntimeTest {
             oldDeliveryRelease.countDown()
             runtime.close()
         }
+    }
+
+    @Test
+    fun `frame offer refuses a held lifecycle writer and releases its packed lease exactly once`() {
+        val cut = AtomicReference(ownership()); val writerHeld = CountDownLatch(1); val releaseWriter = CountDownLatch(1)
+        val pool = FeatureSamplesLeasePool(4)
+        val runtime = runtime(cut, beforeDepthCapabilityFence = {
+            writerHeld.countDown(); check(releaseWriter.await(2, TimeUnit.SECONDS))
+        })
+        try {
+            runtime.setDepthCapability(VisibilityDepthCapability.AUTOMATIC)
+            runtime.setDepthCapability(VisibilityDepthCapability.UNSUPPORTED)
+            assertTrue(writerHeld.await(1, TimeUnit.SECONDS))
+            val lease = pool.tryAcquire(SampleLeaseGeneration.from(cut.get()))!!
+            lease.append(1, 0.0, 0.0, -1.0, 1.0)
+            val observation = VisibilityFeatureObservation.fromPacked(cut.get(), frame(VisibilityObservationSource.ARCORE_FEATURE, 1),
+                lease.samples, 0)
+            val returned = CountDownLatch(1)
+            val callback = Thread { assertFalse(runtime.offerFeature(observation)); returned.countDown() }.apply { start() }
+            assertTrue(returned.await(250, TimeUnit.MILLISECONDS)); callback.join(1000)
+            assertEquals(0, pool.leasedCount())
+            observation.close(); assertEquals(0, pool.leasedCount())
+            assertEquals(1L, runtime.snapshotWireMap()["lifecycleAdmissionBusyDrops"])
+        } finally { releaseWriter.countDown(); runtime.close(); pool.close() }
+    }
+
+    @Test
+    fun `unbound camera resume succeeds while observation authority stays fenced`() {
+        val current = AtomicReference<VisibilityObservationOwnership?>(null)
+        val runtime = AndroidVisibilityGridRuntime(current::get, AndroidVisibilityGridMappingAdmission(current::get))
+        var resumedCamera = 0
+        try {
+            val token = runtime.lifecycleToken()
+            val observationsReady = com.uhg0.ar_flutter_plugin_2.capture.CaptureLifecycleDrain.resumeCamera(
+                { runtime.resume(token) }, { runtime.isCurrentLifecycle(token) }, { resumedCamera++ },
+            )
+            assertFalse(observationsReady); assertEquals(1, resumedCamera)
+            assertFalse(runtime.snapshot().paused)
+            assertFalse(runtime.offerFeature(feature(ownership(), 1, 1)))
+            assertEquals(0L, runtime.snapshot().admittedFeatureObservations)
+        } finally { runtime.close() }
+    }
+
+    @Test
+    fun `new pause invalidates held resume even while runtime was already paused`() {
+        val cut = AtomicReference(ownership()); val entered = CountDownLatch(1); val release = CountDownLatch(1)
+        val mapperPaused = AtomicBoolean(true); val resumed = AtomicBoolean(true)
+        val mapper = object : VisibilityObservationMapper {
+            override fun admitFeature(observation: VisibilityFeatureObservation) = Unit
+            override fun admitDepth(observation: VisibilityDepthObservation) = Unit
+            override fun snapshot() = VisibilityMappingAdmissionHealth.empty()
+            override fun resume() { entered.countDown(); check(release.await(2, TimeUnit.SECONDS)); mapperPaused.set(false) }
+            override fun pause() { mapperPaused.set(true) }
+        }
+        val runtime = runtime(cut, mapper)
+        try {
+            val first = runtime.fencePause(); runtime.finishPause(first)
+            val worker = Thread { resumed.set(runtime.resume(first)) }.apply { start() }
+            assertTrue(entered.await(1, TimeUnit.SECONDS))
+            val second = runtime.fencePause()
+            assertTrue(second > first); assertFalse(runtime.isCurrentLifecycle(first))
+            assertFalse(runtime.offerFeature(feature(cut.get(), 1, 1)))
+            release.countDown(); worker.join(1000); assertFalse(worker.isAlive)
+            assertFalse(resumed.get()); assertTrue(mapperPaused.get())
+            assertFalse(runtime.offerFeature(feature(cut.get(), 2, 2)))
+        } finally { release.countDown(); runtime.close() }
+    }
+
+    @Test
+    fun `old pause drain completion cannot clear a newer pending pause fence`() {
+        val cut = AtomicReference(ownership()); val entered = CountDownLatch(1); val release = CountDownLatch(1)
+        val pauses = AtomicLong()
+        val runtime = runtime(cut, object : VisibilityObservationMapper {
+            override fun admitFeature(observation: VisibilityFeatureObservation) = Unit
+            override fun admitDepth(observation: VisibilityDepthObservation) = Unit
+            override fun snapshot() = VisibilityMappingAdmissionHealth.empty()
+            override fun pause() { if (pauses.incrementAndGet() == 1L) { entered.countDown(); check(release.await(2, TimeUnit.SECONDS)) } }
+        })
+        try {
+            val first = runtime.fencePause()
+            val worker = Thread { runtime.finishPause(first) }.apply { start() }
+            assertTrue(entered.await(1, TimeUnit.SECONDS))
+            val second = runtime.fencePause(); release.countDown(); worker.join(1000)
+            runtime.finishPause(second)
+            assertEquals(2L, pauses.get()); assertFalse(runtime.offerFeature(feature(cut.get(), 1, 1)))
+        } finally { release.countDown(); runtime.close() }
     }
 
     @Test

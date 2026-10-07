@@ -15,6 +15,48 @@ import org.junit.Test
 import org.junit.rules.TemporaryFolder
 
 class ImageCacheManagerTest {
+    @Test
+    fun `funded diagnostic metadata reduces cache admission and releases exactly its allowance`() {
+        val manager = createManager(maxCacheSize = 4, availableMemoryMBOverride = 1)
+        val original = manager.getCaptureCapacity()["maxStagedBytes"] as Long
+        assertTrue(manager.reserveDiagnosticMetadata(2048L))
+        assertFalse(manager.reserveDiagnosticMetadata(2048L))
+        assertEquals(original - 2048L, manager.getCaptureCapacity()["maxStagedBytes"])
+        val failure = org.junit.Assert.assertThrows(CaptureSessionException::class.java) {
+            manager.cacheImageBytes("funded-boundary", ByteArray(original.toInt()), ImageFormat.JPEG)
+        }
+        assertEquals("CACHE_FULL", failure.code)
+        manager.releaseDiagnosticMetadata(2048L)
+        assertEquals(original, manager.getCaptureCapacity()["maxStagedBytes"])
+        assertTrue(manager.cacheImageBytes("released-boundary", ByteArray(original.toInt()), ImageFormat.JPEG))
+        val unfunded = createManager(maxCacheSize = 1, availableMemoryMBOverride = 0)
+        assertFalse(unfunded.reserveDiagnosticMetadata(2048L))
+    }
+
+    @Test
+    fun `still metadata funds separately beside frame owner and refuses unfunded duplicate growth`() {
+        val manager = createManager(maxCacheSize = 4, availableMemoryMBOverride = 1)
+        val original = manager.getCaptureCapacity()["maxStagedBytes"] as Long
+        assertTrue(manager.reserveDiagnosticMetadata(2048))
+        assertTrue(manager.reserveStillCaptureMetadata(6400))
+        assertFalse(manager.reserveStillCaptureMetadata(6400))
+        assertEquals(original - 8448, manager.getCaptureCapacity()["maxStagedBytes"])
+        val receipt = manager.diagnosticOwnershipReceipt()
+        assertEquals(2048L, receipt["diagnosticMetadataBytes"])
+        assertEquals(6400L, receipt["stillCaptureMetadataBytes"])
+        val error = org.junit.Assert.assertThrows(CaptureSessionException::class.java) {
+            manager.reserveCaptureSlot(original - 8447)
+        }
+        assertEquals("CACHE_FULL", error.code)
+        manager.releaseStillCaptureMetadata(6400)
+        assertEquals(original - 2048, manager.getCaptureCapacity()["maxStagedBytes"])
+        manager.releaseDiagnosticMetadata(2048)
+        assertEquals(original, manager.getCaptureCapacity()["maxStagedBytes"])
+        val unfunded = createManager(maxCacheSize = 1, availableMemoryMBOverride = 0)
+        assertFalse(unfunded.reserveStillCaptureMetadata(6400))
+    }
+
+
     @get:Rule
     val temporaryFolder = TemporaryFolder()
 

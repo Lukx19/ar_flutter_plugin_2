@@ -5,6 +5,7 @@ import kotlin.math.floor
 
 /**
  * Immutable, fixed-point evidence passed from capture ingress to the canonical surface normal kernel.
+ * Sample/camera positions and voxels use the owned group frame.
  * It deliberately has no identity, lineage, or publication fields.
  */
 internal data class FeatureNormalEvidence(
@@ -22,17 +23,22 @@ internal data class FeatureNormalEvidence(
     companion object {
         fun from(observation: VisibilityFeatureObservation): Conversion {
             val pose = observation.frame.pose.worldFromCameraGl
-            val cameraX = intMillimeters(pose[12]) ?: return Conversion.Refused
-            val cameraY = intMillimeters(pose[13]) ?: return Conversion.Refused
-            val cameraZ = intMillimeters(pose[14]) ?: return Conversion.Refused
+            val group = observation.ownership.groupFrame
+            val matrix = group.groupFromWorldGl
+            val cameraX = intMillimeters(groupComponent(matrix, pose[12], pose[13], pose[14], 0)) ?: return Conversion.Refused
+            val cameraY = intMillimeters(groupComponent(matrix, pose[12], pose[13], pose[14], 1)) ?: return Conversion.Refused
+            val cameraZ = intMillimeters(groupComponent(matrix, pose[12], pose[13], pose[14], 2)) ?: return Conversion.Refused
             val converted = ArrayList<FeatureNormalEvidence>(observation.samples.size)
             observation.samples.forEach { sample ->
-                val x = voxel(sample.xWorld) ?: return Conversion.Refused
-                val y = voxel(sample.yWorld) ?: return Conversion.Refused
-                val z = voxel(sample.zWorld) ?: return Conversion.Refused
-                val sampleX = intMillimeters(sample.xWorld) ?: return Conversion.Refused
-                val sampleY = intMillimeters(sample.yWorld) ?: return Conversion.Refused
-                val sampleZ = intMillimeters(sample.zWorld) ?: return Conversion.Refused
+                val xGroup = groupComponent(matrix, sample.xWorld, sample.yWorld, sample.zWorld, 0)
+                val yGroup = groupComponent(matrix, sample.xWorld, sample.yWorld, sample.zWorld, 1)
+                val zGroup = groupComponent(matrix, sample.xWorld, sample.yWorld, sample.zWorld, 2)
+                val x = voxel(xGroup) ?: return Conversion.Refused
+                val y = voxel(yGroup) ?: return Conversion.Refused
+                val z = voxel(zGroup) ?: return Conversion.Refused
+                val sampleX = intMillimeters(xGroup) ?: return Conversion.Refused
+                val sampleY = intMillimeters(yGroup) ?: return Conversion.Refused
+                val sampleZ = intMillimeters(zGroup) ?: return Conversion.Refused
                 val confidence = q15(sample.confidence) ?: return Conversion.Refused
                 if (sampleX == cameraX && sampleY == cameraY && sampleZ == cameraZ) return Conversion.Refused
                 converted += FeatureNormalEvidence(x, y, z, sampleX, sampleY, sampleZ, cameraX, cameraY, cameraZ, confidence)
@@ -44,20 +50,25 @@ internal data class FeatureNormalEvidence(
         fun fromPacked(observation: VisibilityFeatureObservation): Conversion {
             val packed = observation.packedSamples ?: return from(observation)
             val pose = observation.frame.pose.worldFromCameraGl
-            val cameraX = intMillimeters(pose[12]) ?: return Conversion.Refused
-            val cameraY = intMillimeters(pose[13]) ?: return Conversion.Refused
-            val cameraZ = intMillimeters(pose[14]) ?: return Conversion.Refused
+            val group = observation.ownership.groupFrame
+            val matrix = group.groupFromWorldGl
+            val cameraX = intMillimeters(groupComponent(matrix, pose[12], pose[13], pose[14], 0)) ?: return Conversion.Refused
+            val cameraY = intMillimeters(groupComponent(matrix, pose[12], pose[13], pose[14], 1)) ?: return Conversion.Refused
+            val cameraZ = intMillimeters(groupComponent(matrix, pose[12], pose[13], pose[14], 2)) ?: return Conversion.Refused
             val converted = ArrayList<FeatureNormalEvidence>(packed.count)
             for (index in 0 until packed.count) {
                 val xWorld = packed.xWorldAt(index)
                 val yWorld = packed.yWorldAt(index)
                 val zWorld = packed.zWorldAt(index)
-                val x = voxel(xWorld) ?: return Conversion.Refused
-                val y = voxel(yWorld) ?: return Conversion.Refused
-                val z = voxel(zWorld) ?: return Conversion.Refused
-                val sampleX = intMillimeters(xWorld) ?: return Conversion.Refused
-                val sampleY = intMillimeters(yWorld) ?: return Conversion.Refused
-                val sampleZ = intMillimeters(zWorld) ?: return Conversion.Refused
+                val xGroup = groupComponent(matrix, xWorld, yWorld, zWorld, 0)
+                val yGroup = groupComponent(matrix, xWorld, yWorld, zWorld, 1)
+                val zGroup = groupComponent(matrix, xWorld, yWorld, zWorld, 2)
+                val x = voxel(xGroup) ?: return Conversion.Refused
+                val y = voxel(yGroup) ?: return Conversion.Refused
+                val z = voxel(zGroup) ?: return Conversion.Refused
+                val sampleX = intMillimeters(xGroup) ?: return Conversion.Refused
+                val sampleY = intMillimeters(yGroup) ?: return Conversion.Refused
+                val sampleZ = intMillimeters(zGroup) ?: return Conversion.Refused
                 val confidence = q15(packed.confidenceAt(index)) ?: return Conversion.Refused
                 if (sampleX == cameraX && sampleY == cameraY && sampleZ == cameraZ) {
                     return Conversion.Refused
@@ -81,6 +92,10 @@ internal data class FeatureNormalEvidence(
             if (!confidence.isFinite() || confidence !in 0.0..1.0) return null
             return Math.rint(confidence * 32_767.0).toInt().takeIf { it in 0..32_767 }
         }
+
+        /** Allocation-free affine world-to-group conversion; input payloads remain world-space. */
+        internal fun groupComponent(matrix: List<Double>, xWorld: Double, yWorld: Double, zWorld: Double, axis: Int): Double =
+            matrix[axis] * xWorld + matrix[4 + axis] * yWorld + matrix[8 + axis] * zWorld + matrix[12 + axis]
 
         private fun voxel(meters: Double): Int? {
             if (!meters.isFinite()) return null

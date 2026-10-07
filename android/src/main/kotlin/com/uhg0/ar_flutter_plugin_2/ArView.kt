@@ -1,5 +1,8 @@
 package com.uhg0.ar_flutter_plugin_2
 
+import com.uhg0.ar_flutter_plugin_2.diagnostics.NativeFrameSpan
+import com.uhg0.ar_flutter_plugin_2.diagnostics.measureNativeFrame
+
 import android.app.Activity
 import android.content.Context
 import android.content.pm.ApplicationInfo
@@ -43,6 +46,7 @@ import com.uhg0.ar_flutter_plugin_2.visibilitygrid.NativeRendererProjection
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.RendererPublicationTimingScope
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.CanonicalRuntimeResources
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.AndroidVisibilityGridRuntime
+import com.uhg0.ar_flutter_plugin_2.visibilitygrid.CanonicalReadyHintOwner
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.ArCoreVisibilityObservationSource
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.DepthObservationPauseGate
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityObservationDebugChannel
@@ -64,6 +68,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import com.uhg0.ar_flutter_plugin_2.capture.CaptureLifecycleDrain
+import java.util.concurrent.Executor
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -101,7 +107,8 @@ internal class ArView(
     private val afterCapturePauseCallbacks = mutableListOf<() -> Unit>()
     private var disposed = false
     private var disposeCompleted = false
-    private val disposeCompletionCallbacks = mutableListOf<() -> Unit>()
+    private val disposeCompletionCallbacks = mutableListOf<(Result<Unit>) -> Unit>()
+    private var disposeTerminalResult: Result<Unit>? = null
     private var coverageRendererMounted = false
     private val pendingCloudOperations = mutableSetOf<() -> Unit>()
     private val isDebuggable =
@@ -166,6 +173,18 @@ internal class ArView(
                 null
             },
         )
+    private val canonicalReadyHints = if (BuildConfig.COVERAGE_CANONICAL_READY_WAKE) {
+        CanonicalReadyHintOwner.tryCreate(
+            post = { task -> root.post { task() } },
+            send = { bytes, done ->
+                sessionChannel.invokeMethod("onCanonicalReady", bytes, object : MethodChannel.Result {
+                    override fun success(result: Any?) = done(result == true)
+                    override fun error(code: String, message: String?, details: Any?) = done(false)
+                    override fun notImplemented() = done(false)
+                })
+            },
+        )
+    } else null
     private val visibilityGridV2Binding = VisibilityGridV2Binding(
         messenger = messenger,
         viewId = id,
@@ -173,6 +192,7 @@ internal class ArView(
         isDebuggable = isDebuggable,
         onRendererStyleCut = visibilityRendererProjection::applyStyleCut,
         coverageRendererOwner = sceneHost.coverageRendererOwner,
+        canonicalReadyHints = canonicalReadyHints,
     )
     private val visibilityObservationDebugGate = VisibilityObservationDebugGate()
     private val visibilityCanonicalFaultGate = VisibilityCanonicalFaultGate(isDebuggable)
@@ -238,13 +258,27 @@ internal class ArView(
     )
 
     init {
+        visibilityGridV2Binding.configureRendererAttributeBudget { required ->
+            visibilityObservationMappingAdmission.reserveRendererAttributeBytes(required) &&
+                sceneHost.admitRendererAttributeBytes(required)
+        }
         sceneHost.coverageRendererOwner.attachCommittedRowsBorrower(
             visibilityRendererProjection::withCommittedRows,
         )
         visibilityGridV2Binding.attachObservationRuntime(visibilityObservationRuntime)
     }
 
+    private val lifecycleDrain = CaptureLifecycleDrain(
+        background = Executor { command -> scope.launch(Dispatchers.IO) { command.run() } },
+        main = Executor { command -> scope.launch { command.run() } },
+        deadline = { timeoutMillis, expired ->
+            val timer = scope.launch { delay(timeoutMillis); expired() }
+            val cancel: () -> Unit = { timer.cancel() }
+            cancel
+        },
+    )
     private val captureSession = ArCaptureSession(
+        lifecycleDrain = lifecycleDrain,
         sceneHost = sceneHost,
         capabilityQuerier = CameraCapabilityQuerier(context),
         captureChannel = captureChannel,
@@ -376,7 +410,7 @@ internal class ArView(
     private val lifecycleObserver = object : DefaultLifecycleObserver {
         override fun onPause(owner: LifecycleOwner) {
             resumeCoordinator.invalidate(ResumeTerminal.SUPERSEDED)
-            visibilityObservationRuntime.pause()
+            visibilityObservationRuntime.fencePause()
             captureSafetySignalV2.invalidateLifecycleForViewPause()
             prepareCapturePause { result ->
                 result.onFailure { error -> Log.e("ArView", "Native capture pause fence failed", error) }
@@ -411,12 +445,13 @@ internal class ArView(
      * that need a disposal boundary must not proceed until that resume has
      * been paused and the host has released its resources.
      */
-    private fun dispose(onCompleted: (() -> Unit)?) {
+    private fun dispose(onCompleted: ((Result<Unit>) -> Unit)?) {
         if (onCompleted != null) {
-            if (disposeCompleted) onCompleted() else disposeCompletionCallbacks += onCompleted
+            disposeTerminalResult?.let(onCompleted) ?: run { disposeCompletionCallbacks += onCompleted }
         }
         if (disposed) return
         disposed = true
+        canonicalReadyHints?.close()
         sceneHost.blockFutureResumes()
         resumeCoordinator.dispose(ResumeTerminal.CANCELLED, ::disposeAfterResumeDrained)
     }
@@ -425,15 +460,9 @@ internal class ArView(
         poseBatchDispatcher.clear()
         prepareForDispose { result ->
             if (result.isFailure) {
-                Log.e("ArView", "Native capture disposal fence failed", result.exceptionOrNull())
-                // ARCore may already have invalidated this shared session.
-                // A second pause must not abort native owner cleanup.
-                captureSafetySignalV2.invalidateAll()
-                runCatching { sceneHost.pause() }.onFailure { error ->
-                    Log.e("ArView", "ARCore pause failed during disposal", error)
-                }
-                visibilityObservationRuntime.pause()
-                captureSession.finishSharedCameraPause()
+                Log.e("ArView", "Disposal drain failed; AR session and owners retained", result.exceptionOrNull())
+                settleDispose(result)
+                return@prepareForDispose
             }
             disposeAfterPauseFence()
         }
@@ -446,20 +475,29 @@ internal class ArView(
         captureChannel.setMethodCallHandler(null)
         visibilitySmallSceneDebugChannel.dispose()
         visibilityObservationDebugChannel.dispose()
-        visibilityObservationSource.close()
-        visibilityObservationRuntime.close()
-        visibilityStorageBudgetCoordinator.close()
-        visibilityGridV2Binding.dispose()
-        lifecycle.removeObserver(lifecycleObserver)
-        if (!captureSession.dispose { result ->
-                if (result.isFailure) {
-                    Log.e("ArView", "Native capture durable close failed", result.exceptionOrNull())
-                }
-                disposeAfterCaptureClosed()
+        val accepted = lifecycleDrain.run(
+            timeoutMillis = 3_000,
+            barrier = {
+                visibilityObservationSource.close()
+                visibilityObservationRuntime.close()
+            },
+        ) { drainResult ->
+            if (drainResult.isFailure) {
+                Log.e("ArView", "Observation shutdown failed; session and owners retained", drainResult.exceptionOrNull())
+                settleDispose(drainResult)
+                return@run
             }
-        ) {
-            return
+            visibilityStorageBudgetCoordinator.close()
+            visibilityGridV2Binding.dispose()
+            lifecycle.removeObserver(lifecycleObserver)
+            captureSession.dispose { result ->
+                if (result.isFailure) {
+                    Log.e("ArView", "Native capture close failed; session retained", result.exceptionOrNull())
+                    settleDispose(result)
+                } else disposeAfterCaptureClosed()
+            }
         }
+        if (!accepted) settleDispose(Result.failure(IllegalStateException("Observation shutdown already owns its lifecycle drain")))
     }
 
     private fun disposeAfterCaptureClosed() {
@@ -467,9 +505,15 @@ internal class ArView(
         pendingCloudOperations.clear()
         sceneHost.dispose()
         disposeCompleted = true
-        disposeCompletionCallbacks.toList().forEach { it() }
-        disposeCompletionCallbacks.clear()
+        settleDispose(Result.success(Unit))
         scope.cancel()
+    }
+
+    private fun settleDispose(result: Result<Unit>) {
+        if (disposeTerminalResult != null) return
+        disposeTerminalResult = result
+        disposeCompletionCallbacks.toList().forEach { it(result) }
+        disposeCompletionCallbacks.clear()
     }
 
     private fun prepareForDispose(onCompleted: (Result<Unit>) -> Unit) {
@@ -486,20 +530,19 @@ internal class ArView(
 
     private fun prepareCapturePause(onCompleted: (Result<Unit>) -> Unit) {
         depthPauseGate.begin()
+        val pauseToken = visibilityObservationRuntime.fencePause()
         capturePauseOperations += 1
         val settled = AtomicBoolean(false)
-        fun finish(preparation: Result<Unit>) {
+        fun settle(preparation: Result<Unit>) {
             if (!settled.compareAndSet(false, true)) return
-            val terminal = if (preparation.isSuccess) runCatching {
-                check(visibilityObservationSource.awaitDepthIdle(1_000)) {
-                    "Depth image did not drain before pause"
-                }
+            val qualified = if (visibilityObservationRuntime.isCurrentLifecycle(pauseToken)) preparation else
+                Result.failure(IllegalStateException("Pause lifecycle was superseded"))
+            val terminal = CaptureLifecycleDrain.completePause(qualified) {
                 sceneHost.pause()
-                visibilityObservationRuntime.pause()
                 captureSafetySignalV2.invalidateAll()
                 captureSession.finishSharedCameraPause()
                 Unit
-            } else preparation
+            }
             depthPauseGate.complete(terminal.isSuccess)
             try {
                 onCompleted(terminal)
@@ -511,8 +554,22 @@ internal class ArView(
                 }
             }
         }
+        fun finish(preparation: Result<Unit>) {
+            if (preparation.isFailure) settle(preparation) else {
+                resumeCoordinator.afterNativeDrain { drained ->
+                    settle(if (drained) preparation else
+                        Result.failure(IllegalStateException("Prepared pause was superseded")))
+                }
+            }
+        }
         try {
-            if (!captureSession.prepareNativeCaptureForPause(::finish)) {
+            if (!captureSession.prepareNativeCaptureForPause(
+                    backgroundDrain = {
+                        visibilityObservationRuntime.finishPause(pauseToken)
+                        check(visibilityObservationSource.awaitDepthIdle(1_000)) { "Depth image did not drain before pause" }
+                    },
+                    onCompleted = ::finish,
+                )) {
                 finish(Result.failure(IllegalStateException("Native capture durable owner is closing")))
             }
         } catch (error: Exception) {
@@ -526,6 +583,7 @@ internal class ArView(
 
     private fun onSessionCall(call: MethodCall, result: MethodChannel.Result) {
         try {
+            if (visibilityGridV2Binding.handleCanonicalReadyCall(call, result)) return
             when (call.method) {
                 "init" -> {
                     sessionConfig = PluginSessionConfig(
@@ -563,6 +621,8 @@ internal class ArView(
                                 isDebuggable && call.argument<Boolean>("beginWindow") == true,
                             captureDiagnosticTiming = isDebuggable && call.argument<Boolean>("captureDiagnosticTiming") == true,
                             freezeDiagnosticTiming = isDebuggable && call.argument<Boolean>("freezeDiagnosticTiming") == true,
+                            beginShapeMeasurementWindow = call.argument<Boolean>("beginWindow") == true,
+                            endShapeMeasurementWindow = call.argument<Boolean>("endWindow") == true,
                             includeDiagnosticTiming = isDebuggable && call.argument<Boolean>("includeDiagnosticTiming") == true,
                         ),
                     )
@@ -578,7 +638,7 @@ internal class ArView(
                 "disableCamera", "pauseSession" -> {
                     sessionPausedByFlutter = true
                     resumeCoordinator.invalidate(ResumeTerminal.SUPERSEDED)
-                    visibilityObservationRuntime.pause()
+                    visibilityObservationRuntime.fencePause()
                     prepareCapturePause { pauseResult ->
                         pauseResult.fold(
                             onSuccess = { result.success(null) },
@@ -590,7 +650,10 @@ internal class ArView(
                     resumeSessionBounded(result)
                 }
                 "dispose" -> {
-                    dispose { result.success(null) }
+                    dispose { terminal -> terminal.fold(
+                        onSuccess = { result.success(null) },
+                        onFailure = { result.error("SESSION_DISPOSE_FAILED", it.message, null) },
+                    ) }
                 }
                 else -> result.notImplemented()
             }
@@ -641,31 +704,63 @@ internal class ArView(
         clearFlutterPause: Boolean,
         onTerminal: (ResumeTerminal) -> Unit,
     ) {
+        var resumeToken = visibilityObservationRuntime.lifecycleToken()
+        fun fenceResumeAdmission(): Long {
+            val rollbackToken = if (visibilityObservationRuntime.isCurrentLifecycle(resumeToken))
+                visibilityObservationRuntime.fencePause() else visibilityObservationRuntime.lifecycleToken()
+            captureSafetySignalV2.invalidateAll()
+            return rollbackToken
+        }
+        fun rollbackCompletedResume() {
+            // Only the coordinator's native-completion path may physically
+            // pause: a deadline reply can precede the return of Session.resume.
+            val rollbackToken = fenceResumeAdmission()
+            runCatching { sceneHost.pause() }
+                .onFailure { Log.e("ArView", "Camera resume rollback retained its owner", it) }
+                .getOrThrow()
+            scope.launch(Dispatchers.IO) {
+                runCatching { visibilityObservationRuntime.finishPause(rollbackToken) }
+                    .onFailure { Log.e("ArView", "Observation resume rollback retained its fence", it) }
+            }
+        }
         resumeCoordinator.begin(
             timeoutMillis = 5_000,
             next = { terminal ->
-                when (terminal) {
+                val qualifiedTerminal = if (terminal == ResumeTerminal.SUCCESS &&
+                    !visibilityObservationRuntime.isCurrentLifecycle(resumeToken)) ResumeTerminal.SUPERSEDED else terminal
+                when (qualifiedTerminal) {
                     ResumeTerminal.SUCCESS -> {
-                        if (!disposed) {
+                        if (!disposed && visibilityObservationRuntime.isCurrentLifecycle(resumeToken)) {
+                            sceneHost.recoverCoverageRenderer()
                             if (clearFlutterPause) sessionPausedByFlutter = false
                             if (!sessionPausedByFlutter) {
-                                visibilityObservationRuntime.resume()
                                 depthPauseGate.resumed()
                                 captureSession.onSessionResumed()
                             }
                         }
                     }
-                    else -> Unit
+                    else -> fenceResumeAdmission()
                 }
-                onTerminal(terminal)
+                onTerminal(qualifiedTerminal)
             },
             superseded = ResumeTerminal.SUPERSEDED,
             timedOut = ResumeTerminal.TIMEOUT,
             failed = ResumeTerminal.FAILED,
             succeeded = ResumeTerminal.SUCCESS,
-            operation = { sceneHost.resume() },
-            rollbackLateSuccess = { sceneHost.pause() },
+            operation = {
+                CaptureLifecycleDrain.resumeCamera(
+                    observationResume = { visibilityObservationRuntime.resume(resumeToken) },
+                    current = { visibilityObservationRuntime.isCurrentLifecycle(resumeToken) },
+                    resumeCamera = sceneHost::resumeSession,
+                )
+            },
+            rollbackLateSuccess = ::rollbackCompletedResume,
+            rollbackLateFailure = ::rollbackCompletedResume,
+            acceptSuccess = { !disposed && visibilityObservationRuntime.isCurrentLifecycle(resumeToken) },
         )
+        // begin may synchronously supersede an older Main reply before queuing
+        // this successor. Capture that completed fence, not a later pause intent.
+        resumeToken = visibilityObservationRuntime.lifecycleToken()
     }
 
     @Suppress("UNCHECKED_CAST")
@@ -1163,11 +1258,18 @@ internal class ArView(
     }
 
     private fun onFrame(session: Session, frame: Frame) {
-        visibilityObservationSource.onFrame(frame)
-        captureSession.buildPoseUpdate(frame)?.let(poseBatchDispatcher::offer)
-        frame.getUpdatedTrackables(Plane::class.java).forEach { plane ->
-            if (detectedPlanes.add(plane)) {
-                sessionChannel.invokeMethod("onPlaneDetected", detectedPlanes.size)
+        val attribution = sceneHost.nativeFrameAttribution
+        attribution.measureNativeFrame(NativeFrameSpan.OBSERVATION) {
+            visibilityObservationSource.onFrame(frame)
+        }
+        attribution.measureNativeFrame(NativeFrameSpan.POSE) {
+            captureSession.buildPoseUpdate(frame)?.let(poseBatchDispatcher::offer)
+        }
+        attribution.measureNativeFrame(NativeFrameSpan.AR_PLANES) {
+            frame.getUpdatedTrackables(Plane::class.java).forEach { plane ->
+                if (detectedPlanes.add(plane)) {
+                    sessionChannel.invokeMethod("onPlaneDetected", detectedPlanes.size)
+                }
             }
         }
     }

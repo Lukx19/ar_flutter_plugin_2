@@ -1,5 +1,7 @@
 package com.uhg0.ar_flutter_plugin_2.sceneview
 
+import com.uhg0.ar_flutter_plugin_2.diagnostics.NativeFrameAttributionOwner
+
 import android.content.Context
 import androidx.compose.ui.platform.ViewCompositionStrategy
 import androidx.lifecycle.Lifecycle
@@ -186,6 +188,8 @@ internal data class PluginSceneError(
 /** Minimal renderer/session surface consumed by the shared-camera capture pipeline. */
 internal interface SceneViewCaptureHost {
     val context: Context
+    val nativeFrameAttribution: NativeFrameAttributionOwner? get() = null
+    fun bindNativeFrameAttribution(owner: NativeFrameAttributionOwner?): Boolean = false
     val engine: Engine
     val activeSession: Session?
     val cameraTextureIds: IntArray
@@ -407,6 +411,7 @@ internal class BoundedOperationCoordinator<T>(
     private var queued: Operation<T>? = null
     private var disposed = false
     private var onDisposedDrained: (() -> Unit)? = null
+    private var onNativeDrained: ((Boolean) -> Unit)? = null
 
     private class Operation<T>(
         val token: Long,
@@ -415,6 +420,8 @@ internal class BoundedOperationCoordinator<T>(
         val succeeded: T,
         val operation: () -> Unit,
         val rollbackLateSuccess: () -> Unit,
+        val rollbackLateFailure: () -> Unit,
+        val acceptSuccess: () -> Boolean,
     ) {
         var abandonedBeforeStart = false
     }
@@ -428,6 +435,8 @@ internal class BoundedOperationCoordinator<T>(
         succeeded: T,
         operation: () -> Unit,
         rollbackLateSuccess: () -> Unit,
+        rollbackLateFailure: () -> Unit = {},
+        acceptSuccess: () -> Boolean = { true },
     ): Long {
         lateinit var pending: Operation<T>
         var start: Operation<T>? = null
@@ -444,6 +453,8 @@ internal class BoundedOperationCoordinator<T>(
                 succeeded = succeeded,
                 operation = operation,
                 rollbackLateSuccess = rollbackLateSuccess,
+                rollbackLateFailure = rollbackLateFailure,
+                acceptSuccess = acceptSuccess,
             )
             // A not-yet-started request has no native side effect. Replace it
             // outright; BoundedReplyFence has returned its terminal reply as
@@ -511,6 +522,20 @@ internal class BoundedOperationCoordinator<T>(
         tokens.forEach { fence.settle(it, invalidated) }
     }
 
+    /** One coalesced prepared pause, completed on Main before successor/disposal. */
+    fun afterNativeDrain(completion: (Boolean) -> Unit) {
+        var replaced: ((Boolean) -> Unit)? = null
+        val immediate = synchronized(lock) {
+            if (running == null) true else {
+                replaced = onNativeDrained
+                onNativeDrained = completion
+                false
+            }
+        }
+        replaced?.invoke(false)
+        if (immediate) completion(true)
+    }
+
     private fun launch(pending: Operation<T>) {
         launchOperation {
             val success = runCatching(pending.operation).isSuccess
@@ -518,17 +543,28 @@ internal class BoundedOperationCoordinator<T>(
                 // A timeout, supersede, or disposal has fenced the Dart reply,
                 // but ARCore may still have completed Session.resume. Pause it
                 // before another resume or host disposal can proceed.
+                val qualifiedSuccess = success && pending.acceptSuccess()
                 val accepted = fence.settle(
                     pending.token,
-                    if (success) pending.succeeded else pending.failed,
+                    if (qualifiedSuccess) pending.succeeded else pending.failed,
                 )
-                if (success && !accepted) pending.rollbackLateSuccess()
+                // Failed native operations can still have partially resumed
+                // the camera. Roll back after native return even when their
+                // failure reply was accepted. A failed rollback retains this
+                // running owner; it cannot release a successor or disposal.
+                if (!success) pending.rollbackLateFailure()
+                else if (!accepted || !qualifiedSuccess) pending.rollbackLateSuccess()
                 finish(pending)
             }
         }
     }
 
     private fun finish(completed: Operation<T>) {
+        val pauseCompletion = synchronized(lock) {
+            if (running !== completed) return
+            onNativeDrained.also { onNativeDrained = null }
+        }
+        pauseCompletion?.invoke(true)
         var next: Operation<T>? = null
         var drained: (() -> Unit)? = null
         synchronized(lock) {

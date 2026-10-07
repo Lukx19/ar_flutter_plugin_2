@@ -1029,6 +1029,8 @@ class VisibilityGridRendererState(
             workspace = presentationWorkspace,
             pageReader = pageReader,
             geometryBackingBytes = geometry.portableBytes,
+            worldFromGroup = group?.worldFromGroupGl,
+            voxelSizeMeters = group?.voxelSizeMeters?.toFloat() ?: 0f,
         )
     }
 

@@ -1,5 +1,9 @@
 package com.uhg0.ar_flutter_plugin_2.sceneview
 
+import com.uhg0.ar_flutter_plugin_2.diagnostics.NativeFrameAttributionOwner
+import com.uhg0.ar_flutter_plugin_2.diagnostics.NativeFrameSpan
+import com.uhg0.ar_flutter_plugin_2.diagnostics.measureNativeFrame
+
 import android.app.Activity
 import android.content.Context
 import android.os.Handler
@@ -105,6 +109,15 @@ internal class SceneViewHost(
     private val onTouch: (MotionEvent, List<PluginHitResult>) -> Unit = { _, _ -> },
     private val onNodeGesture: (String, String, PluginTransform?) -> Unit = { _, _, _ -> },
 ) : SceneViewCaptureHost {
+    @Volatile override var nativeFrameAttribution: NativeFrameAttributionOwner? = null
+        private set
+    override fun bindNativeFrameAttribution(owner: NativeFrameAttributionOwner?): Boolean {
+        val retired = nativeFrameAttribution
+        nativeFrameAttribution = owner
+        if (retired !== owner) retired?.close()
+        return true
+    }
+
     private val lifecycleOwner = activity as? LifecycleOwner
         ?: error("The Flutter activity must implement LifecycleOwner")
     private val viewModelStoreOwner = activity as? ViewModelStoreOwner
@@ -166,6 +179,22 @@ internal class SceneViewHost(
     @Volatile private var configuredCameraFpsUpper = 0
     private val rendererTelemetry = RendererTelemetry()
     private val rendererAllocationLedger = CoverageRendererAllocationLedger(rendererTelemetry)
+    private val shapeResourceBudget = CoverageShapeResourceBudget(
+        { rendererTelemetry.ownedBufferBytesSnapshot().toLong() },
+        rendererTelemetry::setOwnedBufferBytes, rendererTelemetry::removeOwner)
+    private var shapeAllowanceBytes = 0
+    private val shapeResourceUpgrade = CoverageShapeResourceUpgrade()
+    /** CPU/codec model only; every physical GPU/page generation is charged separately. */
+    internal fun admitRendererAttributeBytes(required: Long): Boolean = synchronized(rendererTelemetry) {
+        if (disposed || required !in 0..Int.MAX_VALUE.toLong()) return@synchronized false
+        val reserved = maxOf(required, shapeAllowanceBytes.toLong())
+        val remainingOwners = rendererTelemetry.ownedBufferBytesSnapshot().toLong() - shapeAllowanceBytes
+        if (remainingOwners + reserved > CoverageRendererLimits.ACTIVE_RENDERER_OWNED_LIMIT_BYTES ||
+            remainingOwners + reserved > CoverageRendererLimits.COMBINED_RENDERER_OWNED_LIMIT_BYTES) return@synchronized false
+        rendererTelemetry.setOwnedBufferBytes("coverage-renderer-attributes-and-shapes", reserved.toInt())
+        shapeAllowanceBytes = reserved.toInt()
+        true
+    }
     private val coverageResourceFactory = CoverageRendererResourceFactory(
         onAcquisition = rendererTelemetry::recordResourceAcquisition,
         onReplacement = rendererTelemetry::recordResourceReplacement,
@@ -530,20 +559,25 @@ internal class SceneViewHost(
                             rendererTelemetry.beginRendererFrame()
                             consumeCoveragePublications()
                             coverageUploadFramePending.set(false)
-                            coverageMeshRef.get()?.onRendererFrame()
+                            nativeFrameAttribution.measureNativeFrame(NativeFrameSpan.UPLOAD) {
+                                coverageMeshRef.get()?.onRendererFrame()
+                            }
                             val callbackArrivalNs = System.nanoTime()
                             frameCadenceTracker.record(callbackArrivalNs)
+                            coverageRendererOwner.recordShapeMeasurementFrame(callbackArrivalNs)
                             cameraFrameCadenceTracker.record(frame.timestamp, callbackArrivalNs)
                         }
                         sessionRef.set(session)
                         frameRef.set(frame)
-                        frame.getUpdatedTrackables(Plane::class.java).forEach { plane ->
-                            if (plane.subsumedBy == null &&
-                                plane.trackingState != com.google.ar.core.TrackingState.STOPPED
-                            ) {
-                                detectedPlanes[plane] = Unit
-                            } else {
-                                detectedPlanes.remove(plane)
+                        nativeFrameAttribution.measureNativeFrame(NativeFrameSpan.HOST_PLANES) {
+                            frame.getUpdatedTrackables(Plane::class.java).forEach { plane ->
+                                if (plane.subsumedBy == null &&
+                                    plane.trackingState != com.google.ar.core.TrackingState.STOPPED
+                                ) {
+                                    detectedPlanes[plane] = Unit
+                                } else {
+                                    detectedPlanes.remove(plane)
+                                }
                             }
                         }
                         onSessionUpdated(session, frame)
@@ -803,6 +837,7 @@ internal class SceneViewHost(
     ) {
         checkCoverageRendererThread()
         if (descriptor == null || config == null) {
+            shapeResourceUpgrade.reset()
             coverageRendererOwner.clearLatest()
             coverageMeshRef.get()?.disposeForReplacement()
             coverageResourceFactory.clear()
@@ -826,6 +861,17 @@ internal class SceneViewHost(
             voxelRenderMode = controls.mode.toVoxelRenderMode(),
         )
         val current = coverageRenderConfig.value
+        if (!controls.visible) {
+            // CPU authority advances; the hidden mounted resource only drains prior work.
+            val install = coverageRendererOwner.installPresentation(descriptor, effectiveConfig)
+            if (install.stale) return
+            if (!coverageRendererOwner.controlsConfigured()) {
+                coverageRendererOwner.setControls(controls)
+            }
+            if (current != null) coverageRenderConfig.value = current.copy(enabled = false)
+            coverageRendererOwner.refreshPresentation()
+            return
+        }
         val visualChange = current == null ||
             current.renderCapacity != effectiveConfig.renderCapacity ||
             current.pointSizePx != effectiveConfig.pointSizePx ||
@@ -833,6 +879,8 @@ internal class SceneViewHost(
             current.voxelSizeMeters != effectiveConfig.voxelSizeMeters ||
             current.cubeSizeFactor != effectiveConfig.cubeSizeFactor
         val requiresReplacement = current == null || visualChange ||
+            (descriptor.shapes?.shapeCount ?: 0) > 0 &&
+                coverageMeshRef.get()?.supportsShapeCapacity(descriptor.attributes?.total ?: 0) != true ||
             current.rendererGeneration != effectiveConfig.rendererGeneration
         val admission = if (requiresReplacement) {
             rendererAllocationLedger.admitResourceReplacement(
@@ -910,6 +958,17 @@ internal class SceneViewHost(
             voxelRenderMode = controls.mode.toVoxelRenderMode(),
         )
         val current = coverageRenderConfig.value
+        if (!controls.visible) {
+            // CPU authority advances; the hidden mounted resource only drains prior work.
+            val install = coverageRendererOwner.install(snapshot.toVisibilityRendererSnapshot(requestedConfig))
+            if (install.stale) return
+            if (!coverageRendererOwner.controlsConfigured()) {
+                coverageRendererOwner.setControls(controls)
+            }
+            if (current != null) coverageRenderConfig.value = current.copy(enabled = false)
+            coverageRendererOwner.refreshPresentation()
+            return
+        }
         val visualChange = current == null ||
             current.renderCapacity != requestedConfig.renderCapacity ||
             current.pointSizePx != requestedConfig.pointSizePx ||
@@ -998,8 +1057,15 @@ internal class SceneViewHost(
             rendererTelemetry.recordPresentation(controls.mode)
             return true
         }
+        if (!controls.visible) {
+            coverageRenderConfig.value = current.copy(enabled = false)
+            rendererTelemetry.recordPresentation(controls.mode)
+            return true
+        }
         val nextMode = controls.mode.toVoxelRenderMode()
-        val modeChanged = current.voxelRenderMode != nextMode
+        val modeChanged = current.voxelRenderMode != nextMode ||
+            coverageRendererOwner.status().mode != controls.mode ||
+            current.rendererGeneration != coverageRendererOwner.status().rendererGeneration
         return runCatching {
             if (modeChanged) {
                 val admission = rendererAllocationLedger.admitResourceReplacement(
@@ -1022,10 +1088,10 @@ internal class SceneViewHost(
             coverageRenderConfig.value = current.copy(
                 enabled = controls.visible,
                 voxelRenderMode = nextMode,
-                rendererGeneration = current.rendererGeneration,
+                rendererGeneration = coverageRendererOwner.status().rendererGeneration,
             )
             if (modeChanged) {
-                coverageRendererOwner.issueResourceToken()?.let { coverageResourceEpoch.value = it.epoch }
+                coverageResourceEpoch.value++
             }
             rendererTelemetry.recordPresentation(controls.mode)
             true
@@ -1038,18 +1104,19 @@ internal class SceneViewHost(
         .onFailure { rendererTelemetry.recordResourceFailure() }
         .getOrNull()
 
-    fun resume() {
+    fun resumeSession() {
         checkNotDisposed()
         check(!futureResumesBlocked) { "SceneView host is shutting down" }
-        rendererProvenance("resume")
         activeSession?.resume()
-        recoverCoverageRenderer()
     }
+
+    fun resume() { resumeSession(); recoverCoverageRenderer() }
 
     /** Rehydrates the latest committed renderer cut after a renderer-only loss. */
     fun recoverCoverageRenderer() {
         checkNotDisposed()
         check(!futureResumesBlocked) { "SceneView host is shutting down" }
+        shapeResourceUpgrade.reset()
         val recovery = coverageRendererOwner.resume()
         if (recovery.recovered) {
             coverageRenderConfig.value?.let { current ->
@@ -1180,7 +1247,11 @@ internal class SceneViewHost(
         captureDiagnosticTiming: Boolean = false,
         freezeDiagnosticTiming: Boolean = false,
         includeDiagnosticTiming: Boolean = false,
+        beginShapeMeasurementWindow: Boolean = false,
+        endShapeMeasurementWindow: Boolean = false,
     ): Map<String, Any> {
+        if (beginShapeMeasurementWindow) coverageRendererOwner.beginShapeMeasurementWindow()
+        if (endShapeMeasurementWindow) coverageRendererOwner.endShapeMeasurementWindow()
         if (beginMeasurementWindow) {
             frameCadenceTracker.beginMeasurementWindow(captureDiagnosticTiming)
             cameraFrameCadenceTracker.beginMeasurementWindow(captureDiagnosticTiming)
@@ -1231,7 +1302,8 @@ internal class SceneViewHost(
             "rendererPresentationRowCount" to status.selectedRowCount,
             "rendererGeometryRevision" to status.geometryRevision,
             "rendererStyleRevision" to status.styleRevision,
-        ) + cameraMeasurement + (rendererMainApplyAttribution?.snapshot()
+        ) + coverageRendererOwner.rendererGeometryStatus() + coverageRendererOwner.shapeMeasurementSnapshot() +
+            shapeResourceBudget.snapshot() + cameraMeasurement + (rendererMainApplyAttribution?.snapshot()
             ?: RendererMainApplyAttribution.disabledSnapshot()) +
             (if (includeDiagnosticTiming && debugGapTimingEnabled) mapOf(
                 "frameGapTiming" to mapOf(
@@ -1277,30 +1349,35 @@ internal class SceneViewHost(
             ) return@request
             rendererTelemetry.beginRendererFrame()
             consumeCoveragePublications()
-            coverageMeshRef.get()?.onRendererFrame()
+            nativeFrameAttribution.measureNativeFrame(NativeFrameSpan.UPLOAD) {
+                coverageMeshRef.get()?.onRendererFrame()
+            }
             frameCadenceTracker.record(System.nanoTime())
         }
     }
 
     private fun consumeCoveragePublications() {
-        checkCoverageRendererThread()
-        if (disposed || rendererPaused || coveragePublications.isClosed) return
-        val pending = coveragePublications.take()
-        if (pending == null && !coveragePresentationRefreshPending.get()) return
-        val attribution = rendererMainApplyAttribution
-        if (attribution == null) {
-            applyPendingCoveragePublication(pending)
-            return
-        }
-        val allocatedBefore = rendererMainApplyAllocatedBytes()
-        Trace.beginSection(RendererMainApplyAttribution.TRACE_SECTION)
-        val startedNanos = System.nanoTime()
-        try {
-            applyPendingCoveragePublication(pending)
-        } finally {
-            val elapsedNanos = (System.nanoTime() - startedNanos).coerceAtLeast(0L)
-            Trace.endSection()
-            attribution.record(elapsedNanos, allocatedBefore, rendererMainApplyAllocatedBytes())
+        nativeFrameAttribution.measureNativeFrame(NativeFrameSpan.PUBLICATION) {
+            checkCoverageRendererThread()
+            if (disposed || rendererPaused || coveragePublications.isClosed) return
+            val pending = coveragePublications.take()
+            if (pending == null && !coveragePresentationRefreshPending.get()) return
+            val attribution = rendererMainApplyAttribution
+            if (attribution == null) {
+                applyPendingCoveragePublication(pending)
+                return
+            }
+            val allocatedBefore = rendererMainApplyAllocatedBytes()
+            Trace.beginSection(RendererMainApplyAttribution.TRACE_SECTION)
+            val startedNanos = System.nanoTime()
+            try {
+                applyPendingCoveragePublication(pending)
+            } finally {
+                val elapsedNanos = (System.nanoTime() - startedNanos).coerceAtLeast(0L)
+                Trace.endSection()
+                attribution.record(elapsedNanos, allocatedBefore, rendererMainApplyAllocatedBytes())
+            }
+
         }
     }
 
@@ -1340,6 +1417,38 @@ internal class SceneViewHost(
         }
         if (!coveragePresentationRefreshPending.getAndSet(false)) return
         val status = coverageRendererOwner.status()
+        if (!status.visible) {
+            coverageMeshRef.get()?.hideRetainingUploadOwnership()
+            return
+        }
+        val descriptor = coverageRendererOwner.presentationDescriptor()
+        val mesh = descriptor?.shapes
+        val shapeRows = descriptor?.attributes?.total ?: 0
+        val config = coverageRenderConfig.value
+        if (config != null && descriptor != null && mesh != null &&
+            shapeResourceUpgrade.request(
+                status.mode, config.rendererGeneration, mesh.header.selectionGeneration,
+                coverageMeshRef.get() != null && descriptor.enabled && descriptor.mode == status.mode &&
+                    mesh.available && mesh.shapeCount > 0,
+                coverageMeshRef.get()?.supportsShapeCapacity(shapeRows) == true,
+            )) {
+            // Optional attributes arrive after the ordinary point resource is mounted.
+            // Reuse resource admission without reinstalling canonical/presentation data.
+            // The selection fence also preserves a truthful point fallback on refusal.
+            val admission = rendererAllocationLedger.admitResourceReplacement(
+                config.voxelRenderMode, sourceCapacity = descriptor.sourceCapacity,
+                retainedCount = descriptor.count,
+            )
+            if (admission.strategy != CoverageRendererTransitionStrategy.REJECT) {
+                if (admission.strategy == CoverageRendererTransitionStrategy.CLEAR_FIRST) {
+                    coverageRendererOwner.currentResourceToken()?.let { coverageRendererOwner.markResourceFailure(it) }
+                    coverageMeshRef.get()?.disposeForReplacement()
+                    coverageResourceFactory.clear()
+                    rendererAllocationLedger.releaseRendererResources()
+                }
+                coverageRendererOwner.requestResourceReplacement()
+            }
+        }
         val token = coverageRendererOwner.issueResourceToken() ?: return
         if (!coverageRendererOwner.acceptsResourceToken(token)) return
         coverageResourceEpoch.value = token.epoch
@@ -1348,7 +1457,6 @@ internal class SceneViewHost(
         )
         val binding = coverageMeshRef.get() ?: return
         if (fullRefresh) binding.requireFullRefresh()
-        val descriptor = coverageRendererOwner.presentationDescriptor()
         if (descriptor != null) {
             binding.updateCoverageDescriptor(descriptor, status.mode.toVoxelRenderMode())
         } else {
@@ -1371,6 +1479,7 @@ internal class SceneViewHost(
         visibilityGridDepthModeCache.current()
 
     fun dispose() {
+        bindNativeFrameAttribution(null)
         if (!ownership.onDispose()) return
         rendererProvenance("dispose-request")
         disposed = true
@@ -1636,6 +1745,22 @@ internal class SceneViewHost(
         return CoverageMeshAttachment(node, binding)
     }
 
+    private fun createAttributedResources(engine: Engine, capacity: Int,
+        mode: CoveragePresentationMode, rows: Int, token: CoverageResourceToken,
+        telemetry: RendererTelemetry, pointOwner: String): CoverageVoxelMeshResources {
+        val baseBytes = CoverageRendererLimits.ownershipReceipt(VoxelRenderMode.CENTROIDS).totalBytes.toLong()
+        if (!shapeResourceBudget.reserve(token, CoverageShapeResourceBudget.bytes(mode, rows),
+            shapeAllowanceBytes.toLong(), baseBytes)) return CoveragePointMeshResources(engine, capacity, telemetry, pointOwner)
+        return try {
+            CoverageAttributedMeshResources(engine, capacity, mode, rows, token, coverageRendererOwner,
+                telemetry, shapeResourceBudget)
+        } catch (failure: RuntimeException) {
+            // Partial native construction is unknown. Keep the token charged;
+            // no later candidate can turn it into an uncounted third owner.
+            throw failure
+        }
+    }
+
     @Composable
     private fun CoverageActiveCentroidNode(
         engine: Engine,
@@ -1644,6 +1769,10 @@ internal class SceneViewHost(
         coverage: PointCloudNativeConfig,
         token: CoverageResourceToken?,
     ): CoverageMeshAttachment? {
+        val selectedShapeRows = coverageRendererOwner.presentationDescriptor()?.let {
+            if ((it.shapes?.shapeCount ?: 0) > 0 && it.shapes?.available == true) it.attributes?.total ?: 0 else 0
+        } ?: 0
+        val shapeMode = coverageRendererOwner.status().mode
         val resources = remember(engine) {
             createCoverageResource {
                 coverageResourceFactory.replacePoint(
@@ -1652,7 +1781,12 @@ internal class SceneViewHost(
                     "coverage-centroids",
                     rendererGeneration = coverage.rendererGeneration,
                     token = token,
-                    create = { _, capacity, owner -> CoveragePointMeshResources(engine, capacity, telemetry, owner) },
+                    create = { _, capacity, owner ->
+                        if (selectedShapeRows > 0 && token != null &&
+                            (shapeMode == CoveragePresentationMode.PLANAR_PATCHES || shapeMode == CoveragePresentationMode.DIRECTIONAL_BALLS))
+                            createAttributedResources(engine, capacity, shapeMode, selectedShapeRows, token, telemetry, owner)
+                        else CoveragePointMeshResources(engine, capacity, telemetry, owner)
+                    },
                     release = CoverageVoxelMeshResources::destroy,
                 )
             }
@@ -1683,7 +1817,11 @@ internal class SceneViewHost(
             )
         }
         val node = remember(engine, resources, material, materialInstance) {
-            CoverageOwnedMeshNode(
+            if (resources is CoverageAttributedMeshResources) CoverageOwnedAttributedNode(
+                engine, resources, CoveragePointMeshResources.DEFAULT_BOUNDING_BOX, materialInstance,
+                binding::clearNode, { releaseCoverageResources(token, resources) },
+                { materialLoader.destroyMaterialInstance(materialInstance); materialLoader.destroyMaterial(material) },
+            ).also(binding::setNode) else CoverageOwnedMeshNode(
                 engine,
                 resources,
                 CoveragePointMeshResources.DEFAULT_BOUNDING_BOX,
@@ -1906,6 +2044,32 @@ internal class SceneViewHost(
         }
     }
 
+    private class CoverageOwnedAttributedNode(
+        engine: Engine,
+        private val resources: CoverageAttributedMeshResources,
+        boundingBox: com.google.android.filament.Box,
+        material: com.google.android.filament.MaterialInstance,
+        private val beforeDestroy: () -> Unit,
+        private val releaseResources: () -> Unit,
+        private val releaseMaterial: () -> Unit,
+    ) : Node(engine) {
+        private var closed = false
+        init {
+            RenderableManager.Builder(3).boundingBox(boundingBox).culling(true)
+                .geometry(0, RenderableManager.PrimitiveType.POINTS, resources.vertexBuffer, resources.indexBuffer, 0, 0)
+                .material(0, material)
+                .geometry(1, RenderableManager.PrimitiveType.TRIANGLES, resources.shapeVertexBuffer, resources.shapeIndexBuffer, 0, 0)
+                .material(1, material)
+                .geometry(2, RenderableManager.PrimitiveType.POINTS, resources.shapeVertexBuffer, resources.shapeIndexBuffer, 0, 0)
+                .material(2, material).build(engine, entity)
+            isVisible = false
+        }
+        override fun destroy() {
+            if (closed) return
+            closed = true; beforeDestroy(); super.destroy(); releaseResources(); releaseMaterial()
+        }
+    }
+
     private class CoverageOwnedCubeNode(
         engine: Engine,
         private val resources: CoverageCubeMeshResources,
@@ -2001,6 +2165,13 @@ internal class SceneViewHost(
             if (disposed || requestedMode != mode) return
             if (attached) updateActiveTarget()
         }
+        fun hideRetainingUploadOwnership() {
+            if (disposed) return
+            target.node?.let(target.resources::hide)
+        }
+
+        fun supportsShapeCapacity(rows: Int): Boolean =
+            (target.resources as? CoverageAttributedMeshResources)?.selectedCapacity?.let { it >= rows } == true
 
         fun updateCoverageDescriptor(
             descriptor: BoundedCoveragePresentation?,
@@ -2046,6 +2217,8 @@ internal class SceneViewHost(
             val descriptor = latestPresentationDescriptor ?: readCoverageDescriptor()
             if (descriptor != null) {
                 when (val resources = target.resources) {
+                    is CoverageAttributedMeshResources -> resources.updateDescriptor(currentNode, descriptor,
+                        target.materialInstance, pointSizePx)
                     is CoveragePointMeshResources -> resources.updateDescriptor(
                         node = currentNode,
                         descriptor = descriptor,
@@ -2060,7 +2233,7 @@ internal class SceneViewHost(
                     )
                     else -> Unit
                 }
-                if (target.resources is CoveragePointMeshResources ||
+                if (target.resources is CoverageAttributedMeshResources || target.resources is CoveragePointMeshResources ||
                     target.resources is CoverageCubeMeshResources
                 ) return
             }

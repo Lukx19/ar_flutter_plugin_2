@@ -7,20 +7,24 @@ import java.util.UUID
 /** Owns only the persistent JPEG display copies named by immutable V2 references. */
 internal class NativeCapturePreviewOwnerV2(
     appFiles: File,
-    private val copyPreview: (String, String, File) -> Boolean =
+    private val copyPreview: (String, String, File, () -> Boolean, Int) -> Boolean =
         NativeCapturePreviewReaderV2(File(appFiles, "capture-v2-native/store"))::materializeJpegPreview,
 ) {
     private val root = File(appFiles.canonicalFile, "capture-v2-previews")
     private val startup = synchronized(startups) { startups.getOrPut(root.absolutePath) { Startup() } }
     private val lock = startup.lock
 
-    fun materialize(manifestId: String, captureId: String): String? = synchronized(lock) {
+    fun materialize(manifestId: String, captureId: String, cancelled: () -> Boolean = { false }, edge: Int = 512): String? = synchronized(lock) {
+        require(edge == 512 || edge == 1024)
         val key = key(manifestId, captureId)
         checkRoot()
+        if (cancelled()) return@synchronized null
         if (!startup.reconciled) return@synchronized null
         if (File(root, "$key.deleted").exists()) return@synchronized null
-        val target = ownedFile("$key.jpg")
-        if (copyPreview(manifestId, captureId, target)) target.absolutePath else null
+        val target = ownedFile(if (edge == 512) "$key.jpg" else "$key.detail.jpg")
+        if (!copyPreview(manifestId, captureId, target, cancelled, edge)) return@synchronized null
+        if (edge == 1024) trimDetailedCopies(target)
+        target.absolutePath
     }
 
     /** Resolves each interrupted deletion using successfully loaded persisted references. */
@@ -34,18 +38,23 @@ internal class NativeCapturePreviewOwnerV2(
             for (pending in transaction.listFiles().orEmpty().filter { it.name.endsWith(".pending") }) {
                 val key = pending.name.removeSuffix(".pending")
                 check(KEY.matches(key))
-                val staged = File(transaction, "$key.jpg")
-                check(staged.canonicalFile == staged.absoluteFile)
                 val marker = ownedFile("$key.deleted")
                 if (key in liveKeys) {
-                    if (staged.exists()) check(staged.renameTo(ownedFile("$key.jpg")))
+                    for (name in previewNames(key)) {
+                        val staged = File(transaction, name)
+                        check(staged.canonicalFile == staged.absoluteFile)
+                        if (staged.exists()) check(staged.renameTo(ownedFile(name)))
+                    }
                     if (marker.exists()) check(marker.delete())
                 } else {
                     // Retain the fence even after an interrupted rollback removed it.
                     durableWrite(marker, byteArrayOf())
-                    if (staged.exists()) check(staged.delete())
-                    val preview = ownedFile("$key.jpg")
-                    if (preview.exists()) check(preview.delete())
+                    for (name in previewNames(key)) {
+                        val staged = File(transaction, name)
+                        if (staged.exists()) check(staged.delete())
+                        val preview = ownedFile(name)
+                        if (preview.exists()) check(preview.delete())
+                    }
                 }
                 check(pending.delete())
             }
@@ -68,8 +77,10 @@ internal class NativeCapturePreviewOwnerV2(
                 if (marker.exists()) continue
                 durableWrite(File(transaction, "$key.pending"), byteArrayOf())
                 durableWrite(marker, byteArrayOf())
-                val preview = ownedFile("$key.jpg")
-                if (preview.exists()) check(preview.renameTo(File(transaction, "$key.jpg")))
+                for (name in previewNames(key)) {
+                    val preview = ownedFile(name)
+                    if (preview.exists()) check(preview.renameTo(File(transaction, name)))
+                }
             }
             token
         } catch (error: Throwable) {
@@ -88,9 +99,10 @@ internal class NativeCapturePreviewOwnerV2(
         for (pending in transaction.listFiles().orEmpty().filter { it.name.endsWith(".pending") }) {
             val key = pending.name.removeSuffix(".pending")
             check(KEY.matches(key))
-            val staged = File(transaction, "$key.jpg")
-            val preview = ownedFile("$key.jpg")
-            if (staged.exists()) check(staged.renameTo(preview))
+            for (name in previewNames(key)) {
+                val staged = File(transaction, name)
+                if (staged.exists()) check(staged.renameTo(ownedFile(name)))
+            }
             val marker = ownedFile("$key.deleted")
             if (marker.exists()) check(marker.delete())
         }
@@ -124,6 +136,26 @@ internal class NativeCapturePreviewOwnerV2(
 
     private fun durableWrite(file: File, bytes: ByteArray) {
         FileOutputStream(file).use { it.write(bytes); it.fd.sync() }
+    }
+
+    private fun previewNames(key: String) = arrayOf("$key.jpg", "$key.detail.jpg")
+
+    /** Keep the viewed display plus at most two others; disk thumbnails remain persistent. */
+    private fun trimDetailedCopies(viewed: File) {
+        viewed.setLastModified(System.currentTimeMillis())
+        val retained = ArrayList<File>(3)
+        java.nio.file.Files.newDirectoryStream(root.toPath(), "*.detail.jpg").use { entries ->
+            for (entry in entries) {
+                val file = ownedFile(entry.fileName.toString())
+                if (file == viewed) continue
+                retained.add(file)
+                if (retained.size > 2) {
+                    val oldest = retained.minBy { it.lastModified() }
+                    check(oldest.delete())
+                    retained.remove(oldest)
+                }
+            }
+        }
     }
 
     private companion object {

@@ -108,6 +108,71 @@ class FeatureFusionKernelTest {
     }
 
     @Test
+    fun `world feature payloads produce identical group voxels and normals under translated rotated origins`() {
+        val identity = identityVisibilityGridTransform()
+        val rotated = doubleArrayOf(0.0, 0.0, -1.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+            1.0, 0.0, 0.0, 0.0, 1.0, 0.3, 2.0, 1.0)
+        val inverse = doubleArrayOf(0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+            -1.0, 0.0, 0.0, 0.0, 2.0, -0.3, -1.0, 1.0)
+        val voxelMicrometres = 100_000
+        for (nonidentity in listOf(false, true)) {
+            val worldFromGroup = if (nonidentity) rotated else identity
+            val groupFromWorld = if (nonidentity) inverse else identity
+            val owner = VisibilityObservationOwnership(
+                "a".repeat(32), 1, "b".repeat(32), 1, 1, "c".repeat(32), "d".repeat(32),
+                1, "e".repeat(32), "f".repeat(32), 1, 1, 1,
+                VisibilityGroupFrame.copyOf(groupFromWorld, worldFromGroup, voxelMicrometres, 100_000),
+            )
+            val groupSamples = listOf(
+                VisibilityFeatureSample(1, 0.025, 0.025, -0.975, 1.0),
+                VisibilityFeatureSample(2, 0.025, 0.025, -1.275, 1.0),
+            )
+            val worldSamples = groupSamples.map { point -> if (nonidentity)
+                VisibilityFeatureSample(point.id, 1.0 + point.zWorld, 0.3 + point.yWorld, 2.0 - point.xWorld, point.confidence)
+                else point }
+            val cameraGroup = identity.copyOf().also { it[12] = 0.025; it[13] = 0.025; it[14] = 0.025 }
+            val cameraWorld = if (nonidentity) rotated.copyOf().also {
+                it[12] = 1.025; it[13] = 0.325; it[14] = 1.975
+            } else cameraGroup
+            fun frame(pose: DoubleArray) = VisibilityObservationFrame(
+                VisibilityObservationSource.SYNTHETIC_FEATURE, 1, 1, 1, "camera", true,
+                "landscape_right_x_right_y_down_v1", VisibilityCameraPose.copyOf(pose),
+                VisibilityCameraIntrinsics(1, 1, 1.0, 1.0, 0.0, 0.0), VisibilityDepthCapability.RAW_DEPTH,
+            )
+            fun observation(cut: VisibilityObservationOwnership, pose: DoubleArray, samples: List<VisibilityFeatureSample>) =
+                VisibilityFeatureObservation(ownership = cut, frame = frame(pose), samples = samples,
+                    sourceRejectedSamples = 0, payloadBytes = VisibilityFeatureObservation.FEATURE_FIXED_BYTES +
+                        samples.size * VisibilityFeatureObservation.FEATURE_SAMPLE_BYTES)
+            val referenceOwner = owner.copy(groupFrame = VisibilityGroupFrame.copyOf(identity, identity, voxelMicrometres, 100_000))
+            val reference = observation(referenceOwner, cameraGroup, groupSamples)
+            val world = observation(owner, cameraWorld, worldSamples)
+            val expectedNormals = (FeatureNormalEvidence.from(reference) as FeatureNormalEvidence.Conversion.Accepted).evidence
+            val actualNormals = (FeatureNormalEvidence.from(world) as FeatureNormalEvidence.Conversion.Accepted).evidence
+            assertEquals(expectedNormals, actualNormals)
+            val expected = FeatureFusionKernel().accept(FeatureFusionBatch(1, 1,
+                groupSamples.zip(expectedNormals).map { (point, normal) ->
+                    FeatureFusionEvidence(point.xWorld, point.yWorld, point.zWorld, 2, point.id, normal)
+                })) as FeatureFusionResult.Accepted
+            assertEquals("separate parallel walls retain distinct canonical cells", 2, expected.delta.size)
+            val pool = FeatureSamplesLeasePool(capacity = 2)
+            try {
+                val lease = requireNotNull(pool.tryAcquire(owner))
+                worldSamples.forEach { point ->
+                    assertTrue(lease.acceptId(point.id))
+                    assertTrue(lease.append(point.id, point.xWorld, point.yWorld, point.zWorld, point.confidence))
+                }
+                val packed = VisibilityFeatureObservation.fromPacked(owner, frame(cameraWorld), lease.samples, 0)
+                try {
+                    assertEquals(actualNormals, (FeatureNormalEvidence.fromPacked(packed) as FeatureNormalEvidence.Conversion.Accepted).evidence)
+                    assertEquals(expected, FeatureFusionKernel().preparePacked(packed, 1))
+                    assertEquals(worldSamples.first().xWorld, packed.packedSamples!!.xWorldAt(0), 0.0)
+                } finally { packed.close() }
+                assertEquals(0, pool.leasedCount())
+            } finally { pool.close(); world.close(); reference.close() }
+        }
+    }
+
+    @Test
     fun `packed feature staging matches list evidence and keeps old results after lease reuse`() {
         val identity = doubleArrayOf(1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
             0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0)

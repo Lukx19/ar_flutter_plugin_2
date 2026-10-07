@@ -54,4 +54,18 @@ class BoundedDepthObservationProcessorTest {
             assertFalse(processor.canAccept())
         }
     }
+    @Test fun `timed out depth close retains running image until worker terminal release`() {
+        val entered = CountDownLatch(1); val release = CountDownLatch(1); val closed = AtomicInteger()
+        val processor = BoundedDepthObservationProcessor<AutoCloseable, Int>(
+            process = { entered.countDown(); check(release.await(2, TimeUnit.SECONDS)); 1 }, publish = { _, _ -> },
+        )
+        try {
+            assertTrue(processor.offer(AutoCloseable { closed.incrementAndGet() }, 0))
+            assertTrue(entered.await(1, TimeUnit.SECONDS))
+            assertFalse(processor.closeAndAwait(10)); assertFalse(processor.canAccept()); assertEquals(0, closed.get())
+            release.countDown(); assertTrue(processor.closeAndAwait(1000)); assertEquals(1, closed.get())
+            processor.close(); assertEquals(1, closed.get())
+        } finally { release.countDown(); processor.close() }
+    }
+
 }

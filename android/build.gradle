@@ -7,8 +7,10 @@ version '1.0-SNAPSHOT'
 // the define as the APK-build fallback so matched Flutter builds do not depend
 // on daemon process environment inheritance.
 def coverageSelectionReuseProperty = project.findProperty('coverageSelectionReuse')?.toString()
+def coveragePublicationDiagnosticsProperty = project.findProperty('coveragePublicationDiagnostics')?.toString()
 def encodedDartDefines = project.findProperty('dart-defines')?.toString()
 def coverageDefinePrefix = 'CAPTURE3D_COVERAGE_SELECTION_REUSE='
+def publicationDiagnosticsDefinePrefix = 'CAPTURE3D_PUBLICATION_DIAGNOSTICS='
 def coverageDefineValues = encodedDartDefines?.split(',')?.collect { encoded ->
         try {
             new String(
@@ -19,6 +21,16 @@ def coverageDefineValues = encodedDartDefines?.split(',')?.collect { encoded ->
             null
         }
     }?.findAll { value -> value?.startsWith(coverageDefinePrefix) }
+def publicationDiagnosticsDefineValues = encodedDartDefines?.split(',')?.collect { encoded ->
+        try {
+            new String(
+                java.util.Base64.decoder.decode(encoded),
+                java.nio.charset.StandardCharsets.UTF_8,
+            )
+        } catch (Exception ignored) {
+            null
+        }
+    }?.findAll { value -> value?.startsWith(publicationDiagnosticsDefinePrefix) }
 if (coverageDefineValues != null && coverageDefineValues.size() > 1) {
     throw new GradleException(
         "Duplicate $coverageDefinePrefix dart-defines are not allowed",
@@ -26,6 +38,14 @@ if (coverageDefineValues != null && coverageDefineValues.size() > 1) {
 }
 if (coverageSelectionReuseProperty == null && coverageDefineValues?.size() == 1) {
     coverageSelectionReuseProperty = coverageDefineValues[0].substring(coverageDefinePrefix.length())
+}
+if (publicationDiagnosticsDefineValues != null && publicationDiagnosticsDefineValues.size() > 1) {
+    throw new GradleException(
+        "Duplicate $publicationDiagnosticsDefinePrefix dart-defines are not allowed",
+    )
+}
+if (coveragePublicationDiagnosticsProperty == null && publicationDiagnosticsDefineValues?.size() == 1) {
+    coveragePublicationDiagnosticsProperty = publicationDiagnosticsDefineValues[0].substring(publicationDiagnosticsDefinePrefix.length())
 }
 def normalizedCoverageSelectionReuse = coverageSelectionReuseProperty?.trim()
 if (normalizedCoverageSelectionReuse != null &&
@@ -35,6 +55,90 @@ if (normalizedCoverageSelectionReuse != null &&
     )
 }
 def coverageSelectionReuse = normalizedCoverageSelectionReuse?.equalsIgnoreCase('true') ?: false
+def normalizedCoveragePublicationDiagnostics = coveragePublicationDiagnosticsProperty?.trim()
+if (normalizedCoveragePublicationDiagnostics != null &&
+    !['true', 'false'].any { value -> value.equalsIgnoreCase(normalizedCoveragePublicationDiagnostics) }) {
+    throw new GradleException(
+        "$publicationDiagnosticsDefinePrefix must be true or false, got '$coveragePublicationDiagnosticsProperty'",
+    )
+}
+def coveragePublicationDiagnostics = normalizedCoveragePublicationDiagnostics?.equalsIgnoreCase('true') ?: false
+
+def canonicalReadyWakeProperty = project.findProperty('coverageCanonicalReadyWake')?.toString()
+def canonicalReadyWakePrefix = 'CAPTURE3D_CANONICAL_READY_WAKE='
+def canonicalReadyWakeValues = encodedDartDefines?.split(',')?.collect { encoded ->
+    try { new String(java.util.Base64.decoder.decode(encoded), java.nio.charset.StandardCharsets.UTF_8) }
+    catch (Exception ignored) { null }
+}?.findAll { value -> value?.startsWith(canonicalReadyWakePrefix) }
+if (canonicalReadyWakeValues != null && canonicalReadyWakeValues.size() > 1) {
+    throw new GradleException("Duplicate $canonicalReadyWakePrefix dart-defines are not allowed")
+}
+if (canonicalReadyWakeProperty == null && canonicalReadyWakeValues?.size() == 1) {
+    canonicalReadyWakeProperty = canonicalReadyWakeValues[0].substring(canonicalReadyWakePrefix.length())
+}
+def normalizedCanonicalReadyWake = canonicalReadyWakeProperty?.trim()
+if (normalizedCanonicalReadyWake != null &&
+    !['true', 'false'].any { value -> value.equalsIgnoreCase(normalizedCanonicalReadyWake) }) {
+    throw new GradleException("$canonicalReadyWakePrefix must be true or false, got '$canonicalReadyWakeProperty'")
+}
+def coverageCanonicalReadyWake = normalizedCanonicalReadyWake?.equalsIgnoreCase('true') ?: false
+
+def frameAttributionPrefix = 'CAPTURE3D_NATIVE_FRAME_ATTRIBUTION='
+def frameAttributionProperty = project.findProperty('nativeFrameAttribution')?.toString()
+def frameAttributionValues = encodedDartDefines?.split(',')?.collect { encoded ->
+    try { new String(java.util.Base64.decoder.decode(encoded), java.nio.charset.StandardCharsets.UTF_8) }
+    catch (Exception ignored) { null }
+}?.findAll { value -> value?.startsWith(frameAttributionPrefix) }
+if (frameAttributionValues != null && frameAttributionValues.size() > 1) {
+    throw new GradleException("Duplicate $frameAttributionPrefix dart-defines are not allowed")
+}
+if (frameAttributionProperty == null && frameAttributionValues?.size() == 1) {
+    frameAttributionProperty = frameAttributionValues[0].substring(frameAttributionPrefix.length())
+}
+if (frameAttributionProperty != null &&
+    !['true', 'false'].any { it.equalsIgnoreCase(frameAttributionProperty.trim()) }) {
+    throw new GradleException("$frameAttributionPrefix must be true or false")
+}
+def nativeFrameAttribution = frameAttributionProperty?.trim()?.equalsIgnoreCase('true') ?: false
+
+def stillPreviewFpsPrefix = 'CAPTURE3D_MATCH_STILL_PREVIEW_FPS='
+def stillPreviewFpsProperty = project.findProperty('matchStillPreviewFps')?.toString()
+def stillPreviewFpsValues = encodedDartDefines?.split(',')?.collect { encoded ->
+    try { new String(java.util.Base64.decoder.decode(encoded), java.nio.charset.StandardCharsets.UTF_8) }
+    catch (Exception ignored) { null }
+}?.findAll { value -> value?.startsWith(stillPreviewFpsPrefix) }
+if (stillPreviewFpsValues != null && stillPreviewFpsValues.size() > 1) {
+    throw new GradleException("Duplicate $stillPreviewFpsPrefix dart-defines are not allowed")
+}
+if (stillPreviewFpsProperty == null && stillPreviewFpsValues?.size() == 1) {
+    stillPreviewFpsProperty = stillPreviewFpsValues[0].substring(stillPreviewFpsPrefix.length())
+}
+if (stillPreviewFpsProperty != null &&
+    !['true', 'false'].any { it.equalsIgnoreCase(stillPreviewFpsProperty.trim()) }) {
+    throw new GradleException("$stillPreviewFpsPrefix must be true or false")
+}
+def matchStillPreviewFps = stillPreviewFpsProperty?.trim()?.equalsIgnoreCase('true') ?: false
+
+def videoSnapshotPrefix = 'CAPTURE3D_VIDEO_SNAPSHOT_JPEG='
+def videoSnapshotProperty = project.findProperty('videoSnapshotJpeg')?.toString()
+def videoSnapshotValues = encodedDartDefines?.split(',')?.collect { encoded ->
+    try { new String(java.util.Base64.decoder.decode(encoded), java.nio.charset.StandardCharsets.UTF_8) }
+    catch (Exception ignored) { null }
+}?.findAll { value -> value?.startsWith(videoSnapshotPrefix) }
+if (videoSnapshotValues != null && videoSnapshotValues.size() > 1) {
+    throw new GradleException("Duplicate $videoSnapshotPrefix dart-defines are not allowed")
+}
+if (videoSnapshotProperty == null && videoSnapshotValues?.size() == 1) {
+    videoSnapshotProperty = videoSnapshotValues[0].substring(videoSnapshotPrefix.length())
+}
+if (videoSnapshotProperty != null &&
+    !['true', 'false'].any { it.equalsIgnoreCase(videoSnapshotProperty.trim()) }) {
+    throw new GradleException("$videoSnapshotPrefix must be true or false")
+}
+def videoSnapshotJpeg = videoSnapshotProperty?.trim()?.equalsIgnoreCase('true') ?: false
+if (matchStillPreviewFps && videoSnapshotJpeg) {
+    throw new GradleException('Still FPS match and video snapshot JPEG experiments are mutually exclusive')
+}
 
 buildscript {
     ext.kotlin_version = '2.4.20'
@@ -84,6 +188,9 @@ android {
     }
 
     defaultConfig {
+        buildConfigField('boolean', 'NATIVE_FRAME_ATTRIBUTION', nativeFrameAttribution.toString())
+        buildConfigField('boolean', 'MATCH_STILL_PREVIEW_FPS', matchStillPreviewFps.toString())
+        buildConfigField('boolean', 'VIDEO_SNAPSHOT_JPEG', videoSnapshotJpeg.toString())
         minSdkVersion 28
         targetSdkVersion 34
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
@@ -112,10 +219,16 @@ android {
     }
 
     defaultConfig {
+        buildConfigField('boolean', 'COVERAGE_CANONICAL_READY_WAKE', coverageCanonicalReadyWake.toString())
         buildConfigField(
             'boolean',
             'COVERAGE_SELECTION_REUSE',
             coverageSelectionReuse.toString(),
+        )
+        buildConfigField(
+            'boolean',
+            'COVERAGE_PUBLICATION_DIAGNOSTICS',
+            coveragePublicationDiagnostics.toString(),
         )
     }
 

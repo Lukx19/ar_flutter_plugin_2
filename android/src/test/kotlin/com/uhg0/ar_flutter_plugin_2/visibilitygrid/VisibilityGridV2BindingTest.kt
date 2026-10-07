@@ -42,6 +42,9 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertSame
 import org.junit.Test
 
 class VisibilityGridV2BindingTest {
@@ -336,15 +339,20 @@ class VisibilityGridV2BindingTest {
     }
 
     @Test
-    fun `renderer style command is qualified by active binding and group before callback`() {
+    fun `qualified renderer style publication does not block frame ownership`() {
         val messenger = MethodTestMessenger()
         var applied: QualifiedRendererStyleCut? = null
+        val styleEntered = CountDownLatch(1)
+        val releaseStyle = CountDownLatch(1)
+        val calls = java.util.concurrent.Executors.newFixedThreadPool(2)
         val binding = VisibilityGridV2Binding(
             messenger = messenger,
             viewId = 2140,
             CommittedBaselineAuthority = CommittedBaselineAuthority(),
             postToMain = { it() },
             onRendererStyleCut = { cut ->
+                styleEntered.countDown()
+                check(releaseStyle.await(2, TimeUnit.SECONDS))
                 applied = cut
                 RendererStyleCutResult.Applied(
                     cut.styleRevision,
@@ -449,7 +457,19 @@ class VisibilityGridV2BindingTest {
             )
             assertEquals(0, progress.errorId)
             assertEquals(0L, progress.acceptedStyleRevision)
-            val response = exchange(5, 1, 1, 1, validPages.last(), 1)
+            val beforeStyle = requireNotNull(binding.currentObservationOwnership())
+            val publication = calls.submit<PacketCodec.Response> {
+                exchange(5, 1, 1, 1, validPages.last(), 1)
+            }
+            assertTrue(styleEntered.await(2, TimeUnit.SECONDS))
+            val frameRead = calls.submit<VisibilityObservationOwnership?> {
+                binding.currentObservationOwnership()
+            }
+            assertSame(beforeStyle, frameRead.get(500, TimeUnit.MILLISECONDS))
+            assertEquals(1L, releaseStyle.count)
+            releaseStyle.countDown()
+            val response = publication.get(2, TimeUnit.SECONDS)
+            assertSame(beforeStyle, binding.currentObservationOwnership())
             assertEquals(
                 "error=${response.errorId} seq=${response.requestSequence} next=${response.nextExpectedRequestSequence}",
                 0,
@@ -460,6 +480,8 @@ class VisibilityGridV2BindingTest {
             assertEquals(cut.bindingGeneration, applied!!.ownership.bindingGeneration)
             assertArrayEquals(cut.captureGroupId, uuid(40).bytes)
         } finally {
+            releaseStyle.countDown()
+            calls.shutdownNow()
             binding.dispose()
         }
     }
@@ -591,6 +613,93 @@ class VisibilityGridV2BindingTest {
     }
 
     @Test
+    fun `unbound camera resume admits both sources after qualified START baseline without another resume`() {
+        assertUnboundResumeBaselineActivation(pauseBeforeAuthority = false)
+    }
+
+    @Test
+    fun `qualified START baseline cannot reopen a newer lifecycle pause`() {
+        assertUnboundResumeBaselineActivation(pauseBeforeAuthority = true)
+    }
+
+    private fun assertUnboundResumeBaselineActivation(pauseBeforeAuthority: Boolean) {
+        val messenger = MethodTestMessenger()
+        val binding = VisibilityGridV2Binding(messenger, 2140, CommittedBaselineAuthority(), postToMain = { it() })
+        val delivered = CountDownLatch(2)
+        val mapperPaused = AtomicBoolean(true)
+        val mapper = object : VisibilityObservationMapper {
+            override fun admitFeature(observation: VisibilityFeatureObservation) {
+                check(!mapperPaused.get()); delivered.countDown()
+            }
+            override fun admitDepth(observation: VisibilityDepthObservation) {
+                check(!mapperPaused.get()); delivered.countDown()
+            }
+            override fun snapshot() = VisibilityMappingAdmissionHealth.empty()
+            override fun resume() { mapperPaused.set(false) }
+            override fun pause() { mapperPaused.set(true) }
+        }
+        val runtime = AndroidVisibilityGridRuntime(binding::currentObservationOwnership, mapper)
+        binding.attachObservationRuntime(runtime)
+        var cameraResumes = 0
+        try {
+            val pause = runtime.fencePause()
+            runtime.finishPause(pause)
+            assertFalse(com.uhg0.ar_flutter_plugin_2.capture.CaptureLifecycleDrain.resumeCamera(
+                { runtime.resume(pause) }, { runtime.isCurrentLifecycle(pause) }, { cameraResumes++ }))
+            assertFalse(runtime.snapshot().paused)
+            assertEquals(null, binding.currentObservationOwnership())
+            val snapshot = binding.snapshot()
+            val qualifier = snapshot.nativeStreamToken + snapshot.workerBindingToken
+            val result = RecordingResult()
+            MethodChannel(messenger, "visibility_grid_v2_control_2140").invokeMethod(
+                "start", qualifier + ControlCodec.encodeRequest(startRequest()), result)
+            assertTrue(result.completed.await(2, TimeUnit.SECONDS))
+            val response = ControlCodec.decodeResponse(stripQualifier(result.successValue as ByteArray, qualifier))
+            assertEquals(0, response.outcome)
+            assertEquals(null, binding.currentObservationOwnership())
+            if (pauseBeforeAuthority) runtime.fencePause()
+            for ((sequence, transaction) in listOf(1L to 0L, 2L to 0L, 3L to 1L)) {
+                val reply = RecordingBinaryReply()
+                messenger.send("visibility_surface_stream_2140", ByteBuffer.wrap(qualifier +
+                    PacketCodec.encodeRequest(PacketCodec.Request(
+                        0, response.streamToken, transaction, transaction, transaction, 0,
+                        TransactionResponseProfileV1.ordinary.responseCeilingBytes,
+                        emptyList(), byteArrayOf(), sequence))), reply)
+                assertTrue(reply.completed.await(2, TimeUnit.SECONDS))
+            }
+            val cut = requireNotNull(binding.currentObservationOwnership())
+            runtime.setDepthCapability(VisibilityDepthCapability.RAW_DEPTH)
+            fun frame(source: VisibilityObservationSource) = VisibilityObservationFrame(
+                source, 1, 1, 1, "synthetic-camera", true,
+                "landscape_right_x_right_y_down_v1",
+                VisibilityCameraPose.copyOf(identityVisibilityGridTransform()),
+                VisibilityCameraIntrinsics(16, 12, 10.0, 10.0, 8.0, 6.0),
+                if (source == VisibilityObservationSource.SYNTHETIC_DEPTH) VisibilityDepthCapability.RAW_DEPTH
+                else VisibilityDepthCapability.UNSUPPORTED)
+            val feature = VisibilityFeatureObservation(ownership = cut,
+                frame = frame(VisibilityObservationSource.SYNTHETIC_FEATURE),
+                samples = VisibilityFeatureObservation.copySamples(listOf(VisibilityFeatureSample(1, 0.0, 0.0, -1.0, 1.0))),
+                sourceRejectedSamples = 0,
+                payloadBytes = VisibilityFeatureObservation.FEATURE_FIXED_BYTES + VisibilityFeatureObservation.FEATURE_SAMPLE_BYTES)
+            val depth = VisibilityDepthObservation(ownership = cut,
+                frame = frame(VisibilityObservationSource.SYNTHETIC_DEPTH),
+                samples = VisibilityDepthObservation.copySamples(listOf(VisibilityDepthSample(1, 1, 1_000, 255))),
+                sourceRejectedSamples = 0,
+                payloadBytes = VisibilityDepthObservation.DEPTH_FIXED_BYTES + VisibilityDepthObservation.DEPTH_SAMPLE_BYTES)
+            assertEquals(!pauseBeforeAuthority, runtime.offerFeature(feature))
+            assertEquals(!pauseBeforeAuthority, runtime.offerDepth(depth))
+            assertEquals(1, cameraResumes)
+            if (!pauseBeforeAuthority) {
+                assertTrue(delivered.await(2, TimeUnit.SECONDS))
+                assertFalse(mapperPaused.get())
+            } else {
+                assertTrue(runtime.snapshot().paused)
+                assertEquals(2L, delivered.count)
+            }
+        } finally { runtime.close(); binding.dispose() }
+    }
+
+    @Test
     fun `accepted START exposes exact immutable group frame and disposal clears it`() {
         val messenger = MethodTestMessenger()
         val binding = VisibilityGridV2Binding(
@@ -671,6 +780,89 @@ class VisibilityGridV2BindingTest {
             binding.dispose()
         }
         assertEquals(null, binding.currentObservationOwnership())
+    }
+
+    @Test
+    fun `accepted STOP invalidates frame ownership before publication completes`() {
+        val messenger = MethodTestMessenger()
+        val holdStop = AtomicBoolean(false)
+        val stopEntered = CountDownLatch(1)
+        val releaseStop = CountDownLatch(1)
+        val binding = VisibilityGridV2Binding(
+            messenger, 2152, CommittedBaselineAuthority(), postToMain = { it() },
+            beforeControlPublication = {
+                if (holdStop.get()) {
+                    stopEntered.countDown()
+                    check(releaseStop.await(2, TimeUnit.SECONDS))
+                }
+            },
+        )
+        try {
+            val before = binding.snapshot()
+            val qualifier = before.nativeStreamToken + before.workerBindingToken
+            val channel = MethodChannel(messenger, "visibility_grid_v2_control_2152")
+            val started = RecordingResult()
+            channel.invokeMethod("start", qualifier + ControlCodec.encodeRequest(startRequest()), started)
+            assertTrue(started.completed.await(2, TimeUnit.SECONDS))
+            assertEquals(0, started.errorCount)
+            assertNull(binding.currentObservationOwnership())
+            val stream = ControlCodec.decodeResponse(stripQualifier(started.successValue as ByteArray, qualifier))
+            for (sequence in 1L..3L) {
+                val reply = RecordingBinaryReply()
+                val acknowledged = if (sequence == 3L) 1L else 0L
+                messenger.send("visibility_surface_stream_2152", ByteBuffer.wrap(qualifier +
+                    PacketCodec.encodeRequest(PacketCodec.Request(0, stream.streamToken,
+                        acknowledged, acknowledged, acknowledged, 0,
+                        TransactionResponseProfileV1.ordinary.responseCeilingBytes,
+                        emptyList(), byteArrayOf(), sequence))), reply)
+                assertTrue(reply.completed.await(2, TimeUnit.SECONDS))
+                assertEquals(0, PacketCodec.decodeResponse(stripQualifier(requireNotNull(reply.bytes), qualifier)).errorId)
+            }
+            assertNotNull(binding.currentObservationOwnership())
+            val payload = ByteArray(88).also { bytes ->
+                ByteBuffer.wrap(bytes).order(java.nio.ByteOrder.LITTLE_ENDIAN).apply {
+                    put(0, 2); put(1, 1); putLong(8, 1)
+                }
+            }
+            holdStop.set(true)
+            val stopped = RecordingResult()
+            channel.invokeMethod("stop", qualifier + ControlCodec.encodeRequest(startRequest().copy(
+                operation = ControlOperation.STOP, controlRequestId = uuid(90),
+                streamToken = stream.streamToken, payload = payload)), stopped)
+            assertTrue(stopEntered.await(2, TimeUnit.SECONDS))
+            assertNull(binding.currentObservationOwnership())
+            assertEquals(1L, releaseStop.count)
+            releaseStop.countDown()
+            assertTrue(stopped.completed.await(2, TimeUnit.SECONDS))
+            assertEquals(0, stopped.errorCount)
+            assertNull(binding.currentObservationOwnership())
+        } finally { releaseStop.countDown(); binding.dispose() }
+    }
+
+    @Test
+    fun `disposal fences delayed START ownership publication permanently`() {
+        val messenger = MethodTestMessenger()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val binding = VisibilityGridV2Binding(
+            messenger, 2153, CommittedBaselineAuthority(), postToMain = { it() },
+            beforeControlPublication = { entered.countDown(); release.await(2, TimeUnit.SECONDS) },
+        )
+        try {
+            val snapshot = binding.snapshot()
+            val result = RecordingResult()
+            MethodChannel(messenger, "visibility_grid_v2_control_2153").invokeMethod("start",
+                snapshot.nativeStreamToken + snapshot.workerBindingToken + ControlCodec.encodeRequest(startRequest()), result)
+            assertTrue(entered.await(2, TimeUnit.SECONDS))
+            assertNull(binding.currentObservationOwnership())
+            binding.dispose()
+            assertNull(binding.currentObservationOwnership())
+            release.countDown()
+            assertTrue(result.completed.await(2, TimeUnit.SECONDS))
+            assertEquals(0, result.successCount)
+            assertEquals(1, result.errorCount)
+            assertNull(binding.currentObservationOwnership())
+        } finally { release.countDown(); binding.dispose() }
     }
 
     @Test

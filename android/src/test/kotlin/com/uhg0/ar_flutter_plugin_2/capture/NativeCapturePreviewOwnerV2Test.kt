@@ -17,7 +17,7 @@ class NativeCapturePreviewOwnerV2Test {
     private val other = "c".repeat(64)
     private val reference = "native-v2://$manifest/$capture"
     private val bytes = byteArrayOf(1, 2, 3)
-    private fun owner() = NativeCapturePreviewOwnerV2(root) { _, _, target ->
+    private fun owner() = NativeCapturePreviewOwnerV2(root) { _, _, target, _, _ ->
         requireNotNull(target.parentFile).mkdirs(); target.writeBytes(bytes); true
     }
     @Before fun initialize() { owner().reconcile(emptyList()) }
@@ -47,7 +47,7 @@ class NativeCapturePreviewOwnerV2Test {
     @Test fun `late queued load cannot recreate a preview after deletion`() {
         val entered = CountDownLatch(1)
         val release = CountDownLatch(1)
-        val owner = NativeCapturePreviewOwnerV2(root) { _, _, target ->
+        val owner = NativeCapturePreviewOwnerV2(root) { _, _, target, _, _ ->
             entered.countDown()
             check(release.await(5, TimeUnit.SECONDS))
             requireNotNull(target.parentFile).mkdirs(); target.writeBytes(bytes); true
@@ -100,6 +100,31 @@ class NativeCapturePreviewOwnerV2Test {
         assertFalse(File(root, "capture-v2-previews").walkTopDown().any { it.isFile && it.extension == "jpg" })
     }
 
+    @Test fun `deletion and rollback fence both small thumbnail and lazy detailed copy`() {
+        val owner = owner()
+        val thumbnail = requireNotNull(owner.materialize(manifest, capture))
+        val detailed = requireNotNull(owner.materialize(manifest, capture, edge = 1024))
+        val token = owner.beginDeletion(listOf(reference))
+        assertFalse(File(thumbnail).exists()); assertFalse(File(detailed).exists())
+        assertNull(owner.materialize(manifest, capture, edge = 1024))
+        owner.rollbackDeletion(token)
+        assertArrayEquals(bytes, File(thumbnail).readBytes()); assertArrayEquals(bytes, File(detailed).readBytes())
+        owner.commitDeletion(owner.beginDeletion(listOf(reference)))
+        assertNull(owner.materialize(manifest, capture)); assertNull(owner.materialize(manifest, capture, edge = 1024))
+    }
+
+    @Test fun `detailed disk LRU keeps three copies without evicting persistent thumbnails`() {
+        val owner = owner()
+        repeat(5) { index ->
+            val id = index.toString().padStart(64, '0')
+            owner.materialize(manifest, id)
+            owner.materialize(manifest, id, edge = 1024)
+        }
+        val files = File(root, "capture-v2-previews").listFiles().orEmpty()
+        assertEquals(3, files.count { it.name.endsWith(".detail.jpg") })
+        assertEquals(5, files.count { it.name.endsWith(".jpg") && !it.name.endsWith(".detail.jpg") })
+    }
+
     @Test fun `startup reconciles each mixed transaction key independently and repeats safely`() {
         val keptPath = requireNotNull(owner().materialize(manifest, capture))
         val removedPath = requireNotNull(owner().materialize(manifest, other))
@@ -121,7 +146,7 @@ class NativeCapturePreviewOwnerV2Test {
     @Test fun `materialization waits for valid authoritative startup reconciliation`() {
         val files = File(root, "fresh-process")
         var copies = 0
-        val restarted = NativeCapturePreviewOwnerV2(files) { _, _, target ->
+        val restarted = NativeCapturePreviewOwnerV2(files) { _, _, target, _, _ ->
             copies++; target.writeBytes(bytes); true
         }
         assertNull(restarted.materialize(manifest, capture))

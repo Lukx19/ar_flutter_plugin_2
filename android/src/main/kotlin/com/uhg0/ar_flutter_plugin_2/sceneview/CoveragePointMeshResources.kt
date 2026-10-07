@@ -159,6 +159,12 @@ internal class CoveragePointMeshResources(
         currentNodeForDescriptor = node
         currentMaterialForDescriptor = materialInstance
         currentPointSizeForDescriptor = pointSizePx
+        if (!descriptor.enabled) {
+            descriptorSequencer.replace(descriptor)
+            retainedSnapshotUploadRequired = true
+            hide(node)
+            return
+        }
         descriptorSequencer.replace(
             descriptor,
             rehydrate = retainedSnapshotUploadRequired,
@@ -189,6 +195,9 @@ internal class CoveragePointMeshResources(
     private var currentPointSizeForDescriptor = 0f
 
     override fun hide(node: Node) {
+        // Queued pages are discardable; already submitted tickets still drain normally.
+        descriptorSequencer.clear()
+        retainedSnapshotUploadRequired = true
         setDrawCount(node, 0)
         node.isVisible = false
     }

@@ -40,6 +40,67 @@ import org.openjdk.jol.info.GraphLayout
 /** Locks Option A's BINDING-LIFECYCLE-ACK seeded CREATE cut without a Flutter payload seam. */
 class VisibilityGridIntegrationTest {
     @Test
+    fun `selected renderer reservation funds live mapper and pending depth without refusing canonical work`() { proveRendererReservation(true) }
+    @Test
+    fun `selected renderer reservation counts the durable kernel partition once`() { proveRendererReservation(false) }
+    private fun proveRendererReservation(live: Boolean) {
+        val directory = Files.createTempDirectory("renderer-attribute-mapper-budget").toFile()
+        val coordinator = budget(directory)
+        val messenger = MethodTestMessenger()
+        val view = 2170
+        val binding = VisibilityGridV2Binding(messenger, view, CommittedBaselineAuthority(), postToMain = { it() })
+        val integration = VisibilityGridIntegration(binding, binding::currentObservationOwnership, directory,
+            resourcesForGroup = { group -> if (live) CanonicalRuntimeResources.openLive(directory, group, coordinator)
+                else CanonicalRuntimeResources.open(directory, group, coordinator) })
+        try {
+            val stream = start(binding, messenger, view)
+            exchange(messenger, view, stream, 1, 0, 0, 0); exchange(messenger, view, stream, 2, 0, 0, 0)
+            exchange(messenger, view, stream, 3, 1, 1, 1)
+            val ownership = requireNotNull(binding.currentObservationOwnership())
+            integration.admitFeature(feature(ownership, 10))
+            var patchRows = 4096
+            var patches = com.uhg0.ar_flutter_plugin_2.sceneview.RendererAttributeOwner.modeledAllowance(1, patchRows)
+            var ballRows = 256
+            var balls = com.uhg0.ar_flutter_plugin_2.sceneview.RendererAttributeOwner.modeledAllowance(2, ballRows)
+            println("RENDERER_ATTRIBUTE_MAPPER_PRE=${integration.rendererAttributeReservationReceipt()}")
+            while (!integration.reserveRendererAttributeBytes(patches) && patchRows > 1) {
+                patchRows /= 2
+                patches = com.uhg0.ar_flutter_plugin_2.sceneview.RendererAttributeOwner.modeledAllowance(1, patchRows)
+            }
+            assertTrue("${integration.rendererAttributeReservationReceipt()}", integration.reserveRendererAttributeBytes(patches))
+            while (!integration.reserveRendererAttributeBytes(balls) && ballRows > 1) {
+                ballRows /= 2
+                balls = com.uhg0.ar_flutter_plugin_2.sceneview.RendererAttributeOwner.modeledAllowance(2, ballRows)
+            }
+            assertTrue("${integration.rendererAttributeReservationReceipt()}", integration.reserveRendererAttributeBytes(balls))
+            assertTrue(ballRows > 0)
+            val funded = integration.rendererAttributeReservationReceipt()
+            val ceiling = funded["rendererAttributeCanonicalCeilingBytes"] as Long
+            val reserve = funded["rendererAttributeReservedBytes"] as Long
+            assertEquals(maxOf(patches, balls), reserve)
+            assertTrue(ceiling + reserve <= 64L * 1024 * 1024)
+            assertTrue((funded["rendererAttributePendingDepthCeilingBytes"] as Long) > 0)
+            assertEquals(4L * 1024 * 1024, funded["rendererAttributeDepthPlanningCeilingBytes"])
+            assertFalse(integration.reserveRendererAttributeBytes(64L * 1024 * 1024))
+            assertEquals(reserve, integration.rendererAttributeReservationReceipt()["rendererAttributeReservedBytes"])
+            val committed = integration.integrationReceipt()
+            var sequence = 3L
+            var ended = false
+            repeat(64) { if (!ended) ended = exchange(messenger, view, stream, ++sequence, 1, 1, 1).first.messageKind == 4 }
+            assertTrue(ended)
+            exchange(messenger, view, stream, ++sequence, committed.transactionId,
+                committed.geometryRevision, committed.lineageRevision)
+            await { integration.integrationReceipt().status == "acknowledged" }
+            integration.admitDepth(depth(ownership, 11))
+            assertFalse(integration.integrationReceipt().status.startsWith("renderer"))
+            assertTrue("${integration.integrationReceipt()}", integration.snapshot().admittedDepths > 0)
+            assertEquals(reserve, integration.portableOwnerMemoryReceipt().rendererAttributeReservationBytes)
+            assertTrue((integration.rendererAttributeReservationReceipt()["rendererAttributeCanonicalCeilingBytes"] as Long) + reserve <= 64L*1024*1024)
+            println("RENDERER_ATTRIBUTE_MAPPER ceiling=$ceiling reserve=$reserve patchRows=$patchRows ballRows=$ballRows headroom=${64L*1024*1024-ceiling-reserve} actualHeapMeasured=false")
+            println("RENDERER_ATTRIBUTE_MAPPER_COMPONENTS=$funded")
+        } finally { integration.close(); binding.dispose(); coordinator.close(); directory.deleteRecursively() }
+    }
+    @Test
     fun `admission health read never waits for canonical monitor`() {
         val directory = Files.createTempDirectory("admission-health-contention").toFile()
         val binding = VisibilityGridV2Binding(MethodTestMessenger(), 2161, CommittedBaselineAuthority(), postToMain = { it() })
@@ -2398,6 +2459,126 @@ class VisibilityGridIntegrationTest {
     }
 
     @Test
+    fun `nonidentity feature and depth ingress publish one group wall with one world projection`() {
+        val identity = identityVisibilityGridTransform()
+        val rotated = doubleArrayOf(0.0, 0.0, -1.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+            1.0, 0.0, 0.0, 0.0, 1.0, 0.3, 2.0, 1.0)
+        val inverse = doubleArrayOf(0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+            -1.0, 0.0, 0.0, 0.0, 2.0, -0.3, -1.0, 1.0)
+        for ((nonidentity, packedFeatures) in listOf(false to true, true to false, true to true)) {
+            val voxelMicrometres = 100_000
+            val worldFromGroup = if (nonidentity) rotated else identity
+            val groupFromWorld = if (nonidentity) inverse else identity
+            val directory = Files.createTempDirectory("canonical-group-coordinate-parity").toFile()
+            val coordinator = budget(directory)
+            val messenger = MethodTestMessenger()
+            val viewId = 2151
+            val binding = VisibilityGridV2Binding(messenger, viewId, CommittedBaselineAuthority(), postToMain = { it() })
+            val rendered = mutableListOf<com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot>()
+            val cuts = mutableListOf<CommittedGeometryCut>()
+            val projection = NativeRendererProjection(render = { snapshot, _ -> snapshot?.let(rendered::add) })
+            lateinit var featureKernel: FeatureFusionKernel
+            lateinit var liveResources: CanonicalRuntimeResources
+            val integration = VisibilityGridIntegration(
+                binding, binding::currentObservationOwnership, directory,
+                resourcesForGroup = { group -> CanonicalRuntimeResources.openLive(directory, group, coordinator).also { liveResources = it } },
+                featureKernelFactory = { FeatureFusionKernel().also { featureKernel = it } },
+                depthKernelFactory = { DepthEvidenceKernel(DepthEvidenceConfiguration(occupiedEvidenceToShow = 1)) },
+                renderer = object : CommittedRendererProjection by projection {
+                    override fun applyGeometry(cut: CommittedGeometryCut): RendererProjectionResult {
+                        cuts += cut
+                        return projection.applyGeometry(cut)
+                    }
+                },
+            )
+            val pool = FeatureSamplesLeasePool(capacity = 1)
+            try {
+                val payload = startRequest().payload.copyOf()
+                val data = ByteBuffer.wrap(payload).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                data.putInt(36, voxelMicrometres)
+                repeat(16) { data.putDouble(136 + it * 8, groupFromWorld[it]); data.putDouble(264 + it * 8, worldFromGroup[it]) }
+                val stream = start(binding, messenger, viewId, startRequest().copy(payload = payload))
+                exchange(messenger, viewId, stream, 1, 0, 0, 0)
+                exchange(messenger, viewId, stream, 2, 0, 0, 0)
+                exchange(messenger, viewId, stream, 3, 1, 1, 1)
+                val cut = requireNotNull(binding.currentObservationOwnership())
+                val pose = worldFromGroup.copyOf().also {
+                    it[12] = if (nonidentity) 1.025 else 0.025
+                    it[13] = if (nonidentity) 0.325 else 0.025
+                    it[14] = if (nonidentity) 1.975 else 0.025
+                }
+                fun frame(source: VisibilityObservationSource, timestamp: Long) = VisibilityObservationFrame(
+                    source, timestamp, timestamp, timestamp, "camera", true, "landscape_right_x_right_y_down_v1",
+                    VisibilityCameraPose.copyOf(pose), VisibilityCameraIntrinsics(1, 1, 1.0, 1.0, 0.0, 0.0), VisibilityDepthCapability.RAW_DEPTH,
+                )
+                integration.admitDepth(VisibilityDepthObservation(ownership = cut,
+                    frame = frame(VisibilityObservationSource.SYNTHETIC_DEPTH, 10),
+                    samples = listOf(VisibilityDepthSample(0, 0, 1000, 255)), sourceRejectedSamples = 0,
+                    payloadBytes = VisibilityDepthObservation.DEPTH_FIXED_BYTES + VisibilityDepthObservation.DEPTH_SAMPLE_BYTES))
+                assertEquals("pendingAck", integration.integrationReceipt().status)
+                exchange(messenger, viewId, stream, 4, 1, 1, 1)
+                exchange(messenger, viewId, stream, 5, 1, 1, 1)
+                exchange(messenger, viewId, stream, 6, 1, 1, 1)
+                exchange(messenger, viewId, stream, 7, 2, 2, 1)
+                await { integration.integrationReceipt().status == "acknowledged" }
+                val depthSnapshot = rendered.last()
+                assertEquals(1, depthSnapshot.count)
+                val expectedVoxel = Voxel(0, 0, -10)
+                assertEquals(expectedVoxel, cuts.last { it.upserts.isNotEmpty() }.upserts.single().voxel)
+                fun canonicalWall() = requireNotNull(liveResources.withFeaturePlanningCurrent(1) { current ->
+                    val row = requireNotNull(current.findByVoxel(expectedVoxel))
+                    val source = requireNotNull((current.readSourceById(row.id) as? CanonicalPageRead.Complete)?.value)
+                    row to source.allocationFingerprint
+                })
+                val depthCanonical = canonicalWall()
+                assertEquals(depthSnapshot.surfaceIds.single(), depthCanonical.first.id.value)
+                val sample = if (nonidentity) VisibilityFeatureSample(7, 0.025, 0.325, 1.975, 1.0)
+                    else VisibilityFeatureSample(7, 0.025, 0.025, -0.975, 1.0)
+                val featureFrame = frame(VisibilityObservationSource.SYNTHETIC_FEATURE, 20)
+                val observation = if (packedFeatures) {
+                    val lease = requireNotNull(pool.tryAcquire(cut))
+                    assertTrue(lease.acceptId(sample.id)); assertTrue(lease.append(sample.id, sample.xWorld, sample.yWorld, sample.zWorld, sample.confidence))
+                    VisibilityFeatureObservation.fromPacked(cut, featureFrame, lease.samples, 0)
+                } else VisibilityFeatureObservation(ownership = cut, frame = featureFrame, samples = listOf(sample),
+                    sourceRejectedSamples = 0, payloadBytes = VisibilityFeatureObservation.FEATURE_FIXED_BYTES + VisibilityFeatureObservation.FEATURE_SAMPLE_BYTES)
+                val associationsBefore = featureKernel.resourceReceipt().associationCount
+                integration.admitFeature(observation)
+                val pending = integration.integrationReceipt()
+                if (pending.status == "pendingAck") {
+                    exchange(messenger, viewId, stream, 8, 2, 2, 1)
+                    exchange(messenger, viewId, stream, 9, 2, 2, 1)
+                    exchange(messenger, viewId, stream, 10, 2, 2, 1)
+                    exchange(messenger, viewId, stream, 11, pending.transactionId, pending.geometryRevision, pending.lineageRevision)
+                    await { integration.integrationReceipt().status == "acknowledged" }
+                }
+                // This can be a valid nonmaterial feature refinement. Prove its
+                // actual support association instead of requiring a new commit.
+                assertEquals(associationsBefore + 1, featureKernel.resourceReceipt().associationCount)
+                assertEquals(1, featureKernel.resourceReceipt().surfaceCount)
+                // Local support may have no canonical assignment after a no-op;
+                // the live canonical store remains the provenance authority.
+                val fusedCanonical = canonicalWall()
+                assertEquals(depthCanonical.first, fusedCanonical.first)
+                assertEquals(depthCanonical.second, fusedCanonical.second)
+                assertEquals(1L, integration.snapshot().admittedDepths)
+                val fused = rendered.last()
+                assertEquals("one physical wall must not become nested feature/depth walls", 1, fused.count)
+                assertArrayEquals(depthSnapshot.keys, fused.keys)
+                assertArrayEquals(depthSnapshot.surfaceIds, fused.surfaceIds)
+                val row = cuts.last { it.upserts.isNotEmpty() }.upserts.single()
+                assertEquals(expectedVoxel, row.voxel)
+                assertEquals(0, row.packedNormal)
+                val half = voxelMicrometres / 2_000_000.0
+                val centerZ = (expectedVoxel.z + 0.5) * voxelMicrometres / 1_000_000.0
+                val expectedWorld = if (nonidentity) floatArrayOf((1.0 + centerZ).toFloat(), (0.3 + half).toFloat(), (2.0 - half).toFloat())
+                    else floatArrayOf(half.toFloat(), half.toFloat(), centerZ.toFloat())
+                assertArrayEquals(expectedWorld, fused.positions, 1e-6f)
+                assertEquals(0, pool.leasedCount())
+            } finally { integration.close(); pool.close(); binding.dispose(); coordinator.close(); directory.deleteRecursively() }
+        }
+    }
+
+    @Test
     fun `real binding publishes one depth wall create through canonical renderer and v2`() {
         val directory = Files.createTempDirectory("canonical-surface-runtime-depth-integration").toFile()
         val coordinator = budget(directory)
@@ -2483,9 +2664,11 @@ class VisibilityGridIntegrationTest {
         val binding = VisibilityGridV2Binding(messenger, viewId, CommittedBaselineAuthority(), postToMain = { it() })
         lateinit var depthKernel: DepthEvidenceKernel
         val renderedCuts = mutableListOf<CommittedGeometryCut>()
+        val integrationExecutor = Executors.newSingleThreadExecutor()
         val integration = VisibilityGridIntegration(
             binding, binding::currentObservationOwnership, directory,
             resourcesForGroup = resources(directory, coordinator),
+            executor = integrationExecutor,
             depthKernelFactory = {
                 DepthEvidenceKernel(DepthEvidenceConfiguration(occupiedEvidenceToShow = 1)).also { depthKernel = it }
             },
@@ -2520,10 +2703,29 @@ class VisibilityGridIntegrationTest {
             assertTrue(integration.portableOwnerMemoryReceipt().deferredDepthObservationBytes > 0L)
             assertEquals(0L, integration.snapshot().admittedDepths)
 
-            exchange(messenger, viewId, stream, 4, 1, 1, 1)
-            exchange(messenger, viewId, stream, 5, 1, 1, 1)
-            exchange(messenger, viewId, stream, 6, 1, 1, 1)
-            exchange(messenger, viewId, stream, 7, 2, 2, 1)
+            fun assertHeader(response: PacketCodec.Response, sequence: Long, kind: Int) {
+                assertEquals(0, response.errorId)
+                assertEquals(sequence, response.requestSequence)
+                assertEquals(sequence + 1, response.nextExpectedRequestSequence)
+                assertEquals(kind, response.messageKind)
+                assertEquals(2L, response.transactionId)
+            }
+            val featureChunk = exchange(messenger, viewId, stream, 4, 1, 1, 1).first
+            assertHeader(featureChunk, 4, 2)
+            assertEquals(0, featureChunk.chunkIndex)
+            assertEquals(1, featureChunk.chunkCount)
+            assertEquals(2L, featureChunk.targetGeometryRevision)
+            assertEquals(1L, featureChunk.targetLineageRevision)
+            assertHeader(exchange(messenger, viewId, stream, 5, 1, 1, 1).first, 5, 3)
+            assertHeader(exchange(messenger, viewId, stream, 6, 1, 1, 1).first, 6, 4)
+            val featureAck = exchange(messenger, viewId, stream, 7, 2, 2, 1).first
+            assertHeader(featureAck, 7, 0)
+            assertEquals(2L, featureAck.targetGeometryRevision)
+            assertEquals(1L, featureAck.targetLineageRevision)
+            // The stream enqueues the exact ACK listener before replying.
+            // Settle its owned serial retry on the test thread, rather than
+            // treating an immutable health read as a blocking worker barrier.
+            integrationExecutor.submit {}.get(2, TimeUnit.SECONDS)
             await { integration.snapshot().admittedDepths == 1L }
 
             val retried = integration.depthPublicationDeferralSnapshot()
@@ -2541,9 +2743,14 @@ class VisibilityGridIntegrationTest {
             assertEquals(2, renderedCuts.size)
             assertEquals(0, depthKernel.resourceReceipt().preparedEvidenceRows)
         } finally {
-            integration.close()
-            assertEquals(0L, integration.portableOwnerMemoryReceipt().deferredDepthObservationBytes)
-            binding.dispose(); coordinator.close(); directory.deleteRecursively()
+            try {
+                integration.close()
+                assertEquals(0L, integration.portableOwnerMemoryReceipt().deferredDepthObservationBytes)
+            } finally {
+                integrationExecutor.shutdownNow()
+                assertTrue("Fixture integration executor must terminate", integrationExecutor.awaitTermination(2, TimeUnit.SECONDS))
+                binding.dispose(); coordinator.close(); directory.deleteRecursively()
+            }
         }
     }
 

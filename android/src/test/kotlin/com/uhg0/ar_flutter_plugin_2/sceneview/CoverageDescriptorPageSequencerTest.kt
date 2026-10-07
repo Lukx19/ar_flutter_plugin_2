@@ -298,12 +298,22 @@ class CoverageDescriptorPageSequencerTest {
     }
 
     @Test
-    fun `page submission carries descriptor visibility`() {
+    fun `hidden descriptors admit no new upload pages and show rehydrates latest cut`() {
         val sequencer = CoverageDescriptorPageSequencer()
-        sequencer.replace(descriptor(count = 1, enabled = false))
-
-        val submission = checkNotNull(sequencer.nextPage())
-        assertFalse(submission.enabled)
+        sequencer.replace(descriptor(count = 513))
+        val held = checkNotNull(sequencer.nextPage())
+        sequencer.replace(descriptor(count = 2, enabled = false))
+        assertNull(sequencer.nextPage())
+        assertTrue(sequencer.hasInFlightPage)
+        sequencer.release(held.ticket)
+        assertFalse(sequencer.hasInFlightPage)
+        assertNull(sequencer.nextPage())
+        sequencer.replace(descriptor(count = 3, enabled = true))
+        val shown = checkNotNull(sequencer.nextPage())
+        assertTrue(shown.reset)
+        assertTrue(shown.enabled)
+        assertEquals(3, shown.page.count)
+        sequencer.release(shown.ticket)
     }
 
     private fun descriptor(

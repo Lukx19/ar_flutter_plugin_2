@@ -821,6 +821,32 @@ class CoverageRendererOwnerTest {
     }
 
     @Test
+    fun `admitted hidden shape intent survives unavailable resources and recovery`() {
+        val owner = NativeCoverageRendererOwner()
+        owner.install(snapshot())
+        assertTrue(owner.markResourceFailure(5L))
+        val hidden = owner.setControls(CoverageRendererControls(
+            visible = false, mode = CoveragePresentationMode.SEMANTIC_CENTROIDS,
+            palette = CoverageRendererPalette.COVERAGE,
+        ))
+        assertTrue(hidden.accepted)
+        assertTrue(hidden.rendererUnavailable)
+        assertFalse(hidden.visible)
+        val shape = owner.setControls(CoverageRendererControls(
+            visible = false, mode = CoveragePresentationMode.PLANAR_PATCHES,
+            palette = CoverageRendererPalette.COVERAGE,
+        ))
+        assertTrue(shape.accepted)
+        assertTrue(shape.rendererUnavailable)
+        assertFalse(shape.visible)
+        assertEquals(CoveragePresentationMode.PLANAR_PATCHES, owner.status().mode)
+        assertTrue(owner.markResourceMounted(5L))
+        assertFalse(owner.status().visible)
+        assertEquals(CoveragePresentationMode.PLANAR_PATCHES, owner.status().mode)
+        assertFalse(owner.status().rendererUnavailable)
+    }
+
+    @Test
     fun `owner control transition keeps prior cut on rejected resource admission`() {
         var admitted = false
         val owner = NativeCoverageRendererOwner(

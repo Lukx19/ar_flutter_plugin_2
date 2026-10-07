@@ -1556,6 +1556,8 @@ internal class MutableCanonicalOverlay private constructor(
         // the wire record remains constrained by JOURNAL_RESERVE_BYTES and
         // caller config.
         private const val DEPTH_PLANNER_RESERVE_BYTES = 4L * 1_048_576L
+        /** Read-only owner ceiling; includes retained input and construction overlap. */
+        internal val maximumDepthPlanningBytes: Long get() = DEPTH_PLANNER_RESERVE_BYTES
         private const val DEPTH_READ_CACHE_FIXED_BYTES = 256L
         private const val DEPTH_READ_CACHE_ENTRY_BYTES = 64L
         private const val DEPTH_SUPPORT_DETAILS_BYTES_PER_RECORD = 128L

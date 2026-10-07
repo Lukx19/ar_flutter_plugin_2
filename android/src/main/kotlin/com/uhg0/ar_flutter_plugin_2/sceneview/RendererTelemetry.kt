@@ -59,6 +59,8 @@ internal class RendererTelemetry {
             CoveragePresentationMode.WARM_PROXIES -> "warmProxyCount"
             CoveragePresentationMode.OVERVIEW -> "coldOverviewCount"
             CoveragePresentationMode.SUPPRESSED_DEBUG -> "debugCount"
+            CoveragePresentationMode.PLANAR_PATCHES -> "planarPatchCount"
+            CoveragePresentationMode.DIRECTIONAL_BALLS -> "directionalBallCount"
         }
         presentationCounts[key] = (presentationCounts[key] ?: 0) + 1
     }
