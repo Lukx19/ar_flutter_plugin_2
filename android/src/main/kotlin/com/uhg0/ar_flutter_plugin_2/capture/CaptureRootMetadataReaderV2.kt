@@ -10,6 +10,9 @@ internal data class CaptureRootMetadataV2(
     val previous: String?,
     val secondPrevious: String?,
     val components: List<CaptureRootComponentV2>,
+    val exposureTimestampNanoseconds: Long? = null,
+    val qualityAssessment: CaptureQualityAssessmentV1? = null,
+    val qualityAssessmentHash: String? = null,
 )
 internal data class CaptureRootPointerV2(val revision: Long, val hash: String, val commit: String)
 
@@ -42,11 +45,16 @@ internal class CaptureRootMetadataReaderV2 {
         var previous: String? = null
         var secondPrevious: String? = null
         var malformedComponent = false
+        var malformedLine = false
+        val fields = LinkedHashMap<String, String>()
+        val duplicateKeys = mutableSetOf<String>()
         val components = ArrayList<CaptureRootComponentV2>(5)
         forEachLine(count) { line ->
             val separator = line.indexOf('=')
             if (separator >= 0) {
                 val value = line.substring(separator + 1)
+                val key = line.substring(0, separator)
+                if (key != "component" && fields.put(key, value) != null) duplicateKeys.add(key)
                 when (line.substring(0, separator)) {
                     "schema" -> schema = value
                     "revision" -> revision = value.toLongOrNull()
@@ -65,11 +73,38 @@ internal class CaptureRootMetadataReaderV2 {
                         } else malformedComponent = true
                     }
                 }
-            }
+            } else malformedLine = true
         }
-        if (malformedComponent) return null
+        if (malformedComponent || "schema" in duplicateKeys) return null
+        var assessment: CaptureQualityAssessmentV1? = null
+        var assessmentHash: String? = null
+        var exposure: Long? = null
+        when (schema) {
+            "5" -> {
+                // Explicit legacy branch: existing schema-5 records keep their interpretation.
+                if (fields.keys.any { it.startsWith("quality") || it == "exposureTimestampNanoseconds" }) return null
+            }
+            "6" -> {
+                val expected = setOf("schema", "revision", "request", "previous", "secondPrevious",
+                    "exposureTimestampNanoseconds", "qualityAssessmentHash") + CaptureQualityAssessmentV1.ROOT_KEYS
+                if (malformedLine || duplicateKeys.isNotEmpty() || fields.keys != expected) return null
+                if (revision == null || revision!! <= 0L || !isHash(request)) return null
+                if (!(previous == "-" || isHash(previous)) || !(secondPrevious == "-" || isHash(secondPrevious))) return null
+                if (components.isEmpty() || components.size > CaptureComponentKind.entries.size ||
+                    components.map { it.kind }.toSet().size != components.size ||
+                    components.none { it.kind == "JPEG" } || components.any { component ->
+                        component.length <= 0L || CaptureComponentKind.entries.none { it.name == component.kind }
+                    }) return null
+                exposure = fields.getValue("exposureTimestampNanoseconds").toLongOrNull() ?: return null
+                if (exposure!! < 0L) return null
+                assessment = CaptureQualityAssessmentV1.fromRootFields(fields) ?: return null
+                assessmentHash = fields.getValue("qualityAssessmentHash")
+                if (assessmentHash != CaptureQualityAssessmentV1.boundHash(request!!, assessment)) return null
+            }
+            else -> return null
+        }
         val parsed = CaptureRootMetadataV2(schema, revision, request, previous, secondPrevious,
-            java.util.Collections.unmodifiableList(components))
+            java.util.Collections.unmodifiableList(components), exposure, assessment, assessmentHash)
         parsedRootCount++
         cache[expectedHash] = parsed
         return parsed

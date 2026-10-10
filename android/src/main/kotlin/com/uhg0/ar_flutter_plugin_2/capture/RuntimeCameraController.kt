@@ -36,13 +36,24 @@ internal enum class RuntimeFlashMode {
     torch,
 }
 
-internal class RuntimeCameraSettingsState {
+internal fun ordinaryAutofocusMode(available: IntArray?): Int = when {
+    available?.contains(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE) == true -> CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+    available?.contains(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO) == true -> CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO
+    available?.contains(CaptureRequest.CONTROL_AF_MODE_AUTO) == true -> CaptureRequest.CONTROL_AF_MODE_AUTO
+    else -> CaptureRequest.CONTROL_AF_MODE_OFF
+}
+
+internal class RuntimeCameraSettingsState(
+    private val ordinaryAfMode: Int = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE,
+    private val regionAfMode: Int = CaptureRequest.CONTROL_AF_MODE_AUTO,
+    private val supportsAfMetering: Boolean = true,
+) {
     private var currentISO: Int? = null
     private var currentExposureTimeNs: Long? = null
     private var currentExposureCompensationSteps: Int = 0
     private var currentFocusDistanceDiopters: Float? = null
     private var currentFocusMode: RuntimeFocusMode = RuntimeFocusMode.auto
-    private var isAutofocusEnabled = true
+    private var isAutofocusEnabled = ordinaryAfMode != CaptureRequest.CONTROL_AF_MODE_OFF
     private var isAutoExposureEnabled = true
     private var isExposureLocked = false
     private var currentWhiteBalanceMode: RuntimeWhiteBalanceMode = RuntimeWhiteBalanceMode.auto
@@ -50,6 +61,7 @@ internal class RuntimeCameraSettingsState {
     private var isWhiteBalanceLocked = false
     private var currentFlashMode: RuntimeFlashMode = RuntimeFlashMode.off
     private var currentFocusRegion: MeteringRegion? = null
+    private var focusRegionResetRequested = false
     private var currentWhiteBalanceRegion: MeteringRegion? = null
 
     fun applyCurrentSettings(requestBuilder: CaptureRequest.Builder) {
@@ -137,35 +149,45 @@ internal class RuntimeCameraSettingsState {
             requestBuilder.set(CaptureRequest.CONTROL_AWB_LOCK, isWhiteBalanceLocked)
         }
 
-        val afMode =
-            when {
-                !isAutofocusEnabled -> CaptureRequest.CONTROL_AF_MODE_OFF
-                currentFocusMode == RuntimeFocusMode.macro -> CaptureRequest.CONTROL_AF_MODE_MACRO
-                currentFocusMode == RuntimeFocusMode.edof -> CaptureRequest.CONTROL_AF_MODE_EDOF
-                currentFocusMode == RuntimeFocusMode.continuous ->
-                    CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
-                else -> CaptureRequest.CONTROL_AF_MODE_AUTO
-            }
-        requestBuilder.set(CaptureRequest.CONTROL_AF_MODE, afMode)
-        currentFocusRegion?.let { focusRegion ->
-            requestBuilder.set(
-                CaptureRequest.CONTROL_AF_REGIONS,
-                arrayOf(focusRegion.toMeteringRectangle()),
-            )
-            requestBuilder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START)
-        }
-
-        if (afMode == CaptureRequest.CONTROL_AF_MODE_OFF) {
-            requestBuilder.set(
-                CaptureRequest.LENS_FOCUS_DISTANCE,
-                currentFocusDistanceDiopters ?: 0f,
-            )
-        }
+        applyCurrentFocusSettings(requestBuilder)
         if (currentWhiteBalanceRegion != null && currentColorTemperatureK == null) {
             requestBuilder.set(
                 CaptureRequest.CONTROL_AWB_REGIONS,
                 arrayOf(currentWhiteBalanceRegion!!.toMeteringRectangle()),
             )
+        }
+    }
+
+    fun supportsAutofocus(): Boolean = ordinaryAfMode != CaptureRequest.CONTROL_AF_MODE_OFF
+
+    fun supportsFocusRegions(): Boolean = supportsAfMetering
+
+    // Null preserves template regions; reset intent applies to every retained/control builder.
+    fun focusRegionForRequest(): MeteringRegion? = when {
+        !supportsAfMetering -> null
+        currentFocusRegion != null -> currentFocusRegion
+        focusRegionResetRequested -> MeteringRegion(0, 0, 1, 1, 0)
+        else -> null
+    }
+
+    fun resolvedAutofocusMode(): Int = when {
+        !isAutofocusEnabled -> CaptureRequest.CONTROL_AF_MODE_OFF
+        currentFocusMode == RuntimeFocusMode.macro -> CaptureRequest.CONTROL_AF_MODE_MACRO
+        currentFocusMode == RuntimeFocusMode.edof -> CaptureRequest.CONTROL_AF_MODE_EDOF
+        currentFocusRegion != null -> regionAfMode
+        else -> ordinaryAfMode
+    }
+
+    /** START/CANCEL are one-shot control captures, never repeating or still-photo state. */
+    fun applyCurrentFocusSettings(requestBuilder: CaptureRequest.Builder) {
+        val mode = resolvedAutofocusMode()
+        requestBuilder.set(CaptureRequest.CONTROL_AF_MODE, mode)
+        requestBuilder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_IDLE)
+        focusRegionForRequest()?.let { region ->
+            requestBuilder.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(region.toMeteringRectangle()))
+        }
+        if (mode == CaptureRequest.CONTROL_AF_MODE_OFF) {
+            requestBuilder.set(CaptureRequest.LENS_FOCUS_DISTANCE, currentFocusDistanceDiopters ?: 0f)
         }
     }
 
@@ -192,7 +214,7 @@ internal class RuntimeCameraSettingsState {
         currentFocusDistanceDiopters = distance
         currentFocusMode = RuntimeFocusMode.fixed
         isAutofocusEnabled = false
-        currentFocusRegion = null
+        clearFocusRegion()
     }
 
     fun setAutoExposure(enabled: Boolean) {
@@ -240,18 +262,14 @@ internal class RuntimeCameraSettingsState {
     }
 
     fun setAutofocusEnabled(enabled: Boolean) {
-        isAutofocusEnabled = enabled
-        if (enabled && (currentFocusMode == RuntimeFocusMode.fixed || currentFocusMode == RuntimeFocusMode.infinity)) {
+        isAutofocusEnabled = enabled && supportsAutofocus()
+        clearFocusRegion()
+        if (isAutofocusEnabled) {
             currentFocusMode = RuntimeFocusMode.auto
-        }
-        if (!enabled && currentFocusMode == RuntimeFocusMode.auto) {
+            currentFocusDistanceDiopters = null
+        } else {
             currentFocusMode = RuntimeFocusMode.fixed
-            if (currentFocusDistanceDiopters == null) {
-                currentFocusDistanceDiopters = 0f
-            }
-        }
-        if (!enabled) {
-            currentFocusRegion = null
+            if (currentFocusDistanceDiopters == null) currentFocusDistanceDiopters = 0f
         }
     }
 
@@ -262,14 +280,15 @@ internal class RuntimeCameraSettingsState {
             RuntimeFocusMode.macro,
             RuntimeFocusMode.edof,
             RuntimeFocusMode.continuous -> {
-                isAutofocusEnabled = true
+                isAutofocusEnabled = supportsAutofocus()
                 currentFocusDistanceDiopters = null
+                if (mode == RuntimeFocusMode.auto || mode == RuntimeFocusMode.continuous) clearFocusRegion()
             }
 
             RuntimeFocusMode.infinity -> {
                 isAutofocusEnabled = false
                 currentFocusDistanceDiopters = 0f
-                currentFocusRegion = null
+                clearFocusRegion()
             }
 
             RuntimeFocusMode.fixed -> {
@@ -277,13 +296,19 @@ internal class RuntimeCameraSettingsState {
                 if (currentFocusDistanceDiopters == null) {
                     currentFocusDistanceDiopters = 0f
                 }
-                currentFocusRegion = null
+                clearFocusRegion()
             }
         }
     }
 
+    private fun clearFocusRegion() {
+        if (currentFocusRegion != null) focusRegionResetRequested = true
+        currentFocusRegion = null
+    }
+
     fun setFocusRegion(region: MeteringRegion) {
         currentFocusRegion = region
+        focusRegionResetRequested = false
         currentFocusMode = RuntimeFocusMode.auto
         isAutofocusEnabled = true
         currentFocusDistanceDiopters = null
@@ -350,8 +375,8 @@ internal class RuntimeCameraSettingsState {
         currentExposureTimeNs = null
         currentFocusDistanceDiopters = null
         currentFocusMode = RuntimeFocusMode.auto
-        isAutofocusEnabled = true
-        currentFocusRegion = null
+        isAutofocusEnabled = supportsAutofocus()
+        clearFocusRegion()
         isAutoExposureEnabled = true
         currentExposureCompensationSteps = 0
         isExposureLocked = false
@@ -397,18 +422,48 @@ internal class RuntimeCameraSettingsState {
 internal class RuntimeCameraController(
     private val applySettingsToBaseRequest: (RuntimeCameraSettingsState) -> Unit,
     private val onSettingsChanged: ((RuntimeCameraSettingsState) -> Unit)? = null,
+    ordinaryAfMode: Int = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE,
+    regionAfMode: Int = CaptureRequest.CONTROL_AF_MODE_AUTO,
+    private val onFocusTrigger: ((RuntimeCameraSettingsState, Int) -> Unit)? = null,
+    supportsAfMetering: Boolean = true,
 ) {
-    private val state = RuntimeCameraSettingsState()
+    private val state = RuntimeCameraSettingsState(ordinaryAfMode, regionAfMode, supportsAfMetering)
+    private var ordinaryFocusInitialized = false
 
     constructor(
         baseRequestBuilder: CaptureRequest.Builder,
         onSettingsChanged: ((RuntimeCameraSettingsState) -> Unit)? = null,
+        ordinaryAfMode: Int = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE,
+        regionAfMode: Int = CaptureRequest.CONTROL_AF_MODE_AUTO,
+        onFocusTrigger: ((RuntimeCameraSettingsState, Int) -> Unit)? = null,
+        supportsAfMetering: Boolean = true,
     ) : this(
         applySettingsToBaseRequest = { runtimeState ->
             runtimeState.applyCurrentSettings(baseRequestBuilder)
         },
         onSettingsChanged = onSettingsChanged,
+        ordinaryAfMode = ordinaryAfMode,
+        regionAfMode = regionAfMode,
+        onFocusTrigger = onFocusTrigger,
+        supportsAfMetering = supportsAfMetering,
     )
+
+    fun applyCurrentFocusSettings(requestBuilder: CaptureRequest.Builder) = state.applyCurrentFocusSettings(requestBuilder)
+
+    fun initializeOrdinaryAutofocus() {
+        if (ordinaryFocusInitialized) return
+        ordinaryFocusInitialized = true
+        if (state.resolvedAutofocusMode() == CaptureRequest.CONTROL_AF_MODE_AUTO) {
+            onFocusTrigger?.invoke(state, CaptureRequest.CONTROL_AF_TRIGGER_START)
+        }
+    }
+
+    private fun restorationTrigger(previousMode: Int, hadRegion: Boolean): Int? = when (state.resolvedAutofocusMode()) {
+        CaptureRequest.CONTROL_AF_MODE_AUTO, CaptureRequest.CONTROL_AF_MODE_MACRO -> CaptureRequest.CONTROL_AF_TRIGGER_START
+        CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO ->
+            if (hadRegion || previousMode != state.resolvedAutofocusMode()) CaptureRequest.CONTROL_AF_TRIGGER_CANCEL else null
+        else -> null
+    }
 
     fun applyCurrentSettings(requestBuilder: CaptureRequest.Builder) {
         try {
@@ -548,8 +603,10 @@ internal class RuntimeCameraController(
 
     fun setAutofocusEnabled(enabled: Boolean): Boolean =
         try {
+            val previousMode = state.resolvedAutofocusMode()
+            val hadRegion = state.getCurrentFocusRegion() != null
             state.setAutofocusEnabled(enabled)
-            updateCameraSettings()
+            updateCameraSettings(if (enabled) restorationTrigger(previousMode, hadRegion) else null)
             Log.i("RuntimeCameraController", "Set autofocus to $enabled")
             true
         } catch (e: Exception) {
@@ -559,8 +616,10 @@ internal class RuntimeCameraController(
 
     fun setFocusMode(mode: RuntimeFocusMode): Boolean =
         try {
+            val previousMode = state.resolvedAutofocusMode()
+            val hadRegion = state.getCurrentFocusRegion() != null
             state.setFocusMode(mode)
-            updateCameraSettings()
+            updateCameraSettings(restorationTrigger(previousMode, hadRegion))
             Log.i("RuntimeCameraController", "Set focus mode to ${mode.name}")
             true
         } catch (e: Exception) {
@@ -570,10 +629,14 @@ internal class RuntimeCameraController(
 
     fun setFocusRegion(region: MeteringRegion): Boolean =
         try {
-            state.setFocusRegion(region)
-            updateCameraSettings()
-            Log.i("RuntimeCameraController", "Set focus region to $region")
-            true
+            if (!state.supportsAutofocus() || !state.supportsFocusRegions()) {
+                false
+            } else {
+                state.setFocusRegion(region)
+                updateCameraSettings(CaptureRequest.CONTROL_AF_TRIGGER_START)
+                Log.i("RuntimeCameraController", "Set focus region to $region")
+                true
+            }
         } catch (e: Exception) {
             Log.e("RuntimeCameraController", "Failed to set focus region to $region", e)
             false
@@ -624,8 +687,10 @@ internal class RuntimeCameraController(
 
     fun resetToAutoMode(): Boolean =
         try {
+            val previousMode = state.resolvedAutofocusMode()
+            val hadRegion = state.getCurrentFocusRegion() != null
             state.resetToAutoMode()
-            updateCameraSettings()
+            updateCameraSettings(restorationTrigger(previousMode, hadRegion))
             Log.i("RuntimeCameraController", "Reset to auto mode")
             true
         } catch (e: Exception) {
@@ -633,10 +698,11 @@ internal class RuntimeCameraController(
             false
         }
 
-    private fun updateCameraSettings() {
+    private fun updateCameraSettings(focusTrigger: Int? = null) {
         try {
             applySettingsToBaseRequest(state)
             onSettingsChanged?.invoke(state)
+            focusTrigger?.let { onFocusTrigger?.invoke(state, it) }
         } catch (e: Exception) {
             Log.e("RuntimeCameraController", "Failed to update camera settings", e)
         }

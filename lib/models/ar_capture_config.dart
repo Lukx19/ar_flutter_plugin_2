@@ -9,6 +9,10 @@ class ARCaptureConfig {
   /// Enable high-resolution capture capability
   final bool enableHighResCapture;
 
+  /// Immutable construction mode for new assessed originals. Readers remain
+  /// disposition-aware when this producer mode is off; Android debug only.
+  final bool retainAssessedOriginals;
+
   /// Automatic capture interval in milliseconds (0 = manual only)
   final int captureIntervalMs;
 
@@ -44,6 +48,7 @@ class ARCaptureConfig {
 
   const ARCaptureConfig({
     this.enableHighResCapture = false,
+    this.retainAssessedOriginals = false,
     this.captureIntervalMs = 5000,
     required this.resolution,
     required this.format,
@@ -61,6 +66,7 @@ class ARCaptureConfig {
   factory ARCaptureConfig.fromMap(Map<String, dynamic> map) {
     return ARCaptureConfig(
       enableHighResCapture: map['enableHighResCapture'] as bool? ?? false,
+      retainAssessedOriginals: map['retainAssessedOriginals'] as bool? ?? false,
       captureIntervalMs: map['captureIntervalMs'] as int? ?? 5000,
       resolution:
           CameraResolution.fromMap(map['resolution'] as Map<String, dynamic>),
@@ -85,6 +91,7 @@ class ARCaptureConfig {
   Map<String, dynamic> toMap() {
     return {
       'enableHighResCapture': enableHighResCapture,
+      'retainAssessedOriginals': retainAssessedOriginals,
       'captureIntervalMs': captureIntervalMs,
       'resolution': resolution.toMap(),
       'format': format.wireValue,
@@ -223,6 +230,7 @@ class ARCaptureConfig {
   /// Create copy with modified parameters
   ARCaptureConfig copyWith({
     bool? enableHighResCapture,
+    bool? retainAssessedOriginals,
     int? captureIntervalMs,
     CameraResolution? resolution,
     CaptureFormat? format,
@@ -237,6 +245,7 @@ class ARCaptureConfig {
   }) {
     return ARCaptureConfig(
       enableHighResCapture: enableHighResCapture ?? this.enableHighResCapture,
+      retainAssessedOriginals: retainAssessedOriginals ?? this.retainAssessedOriginals,
       captureIntervalMs: captureIntervalMs ?? this.captureIntervalMs,
       resolution: resolution ?? this.resolution,
       format: format ?? this.format,
@@ -276,6 +285,7 @@ class ARCaptureConfig {
     if (identical(this, other)) return true;
     return other is ARCaptureConfig &&
         other.enableHighResCapture == enableHighResCapture &&
+        other.retainAssessedOriginals == retainAssessedOriginals &&
         other.captureIntervalMs == captureIntervalMs &&
         other.resolution == resolution &&
         other.format == format &&
@@ -292,6 +302,7 @@ class ARCaptureConfig {
   @override
   int get hashCode {
     return enableHighResCapture.hashCode ^
+        retainAssessedOriginals.hashCode ^
         captureIntervalMs.hashCode ^
         resolution.hashCode ^
         format.hashCode ^

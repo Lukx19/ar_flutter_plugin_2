@@ -4,6 +4,8 @@ import java.io.File
 import java.io.FileInputStream
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
+import java.util.Properties
+import java.security.MessageDigest
 
 /**
  * Read-only access to committed V2 JPEGs for History/detail screens.
@@ -37,7 +39,7 @@ internal class NativeCapturePreviewReaderV2(
             if (cancelled()) return false
             val session = entry.toFile()
             if (!session.isDirectory || session.canonicalFile != session.absoluteFile || File(session, "tombstone").exists()) continue
-            val descriptor = committedRoot(session, manifestId, cancelled)?.components
+            val descriptor = committedRoot(session, manifestId, captureId, cancelled)?.components
                 ?.firstOrNull { it.kind == "JPEG" }?.let { Descriptor(it.length, it.hash) }
                 ?: continue
             val source = File(
@@ -68,15 +70,15 @@ internal class NativeCapturePreviewReaderV2(
     }
 
     /** Walk immutable ancestors with one open descriptor and scalar state, not a root-sized set. */
-    private fun committedRoot(session: File, wanted: String, cancelled: () -> Boolean): CaptureRootMetadataV2? {
+    private fun committedRoot(session: File, wanted: String, captureId: String, cancelled: () -> Boolean): CaptureRootMetadataV2? {
         val selected = selectedRoot(session) ?: return null
         var hash = selected.hash
         var revision = selected.revision
         while (revision > 0 && !cancelled()) {
             val root = readRootMetadata(session, hash) ?: return null
-            if (root.schema != "5" || root.revision != revision || !CaptureRootMetadataReaderV2.isHash(root.request)) return null
+            if (!knownQualitySchema(root) || root.revision != revision || !CaptureRootMetadataReaderV2.isHash(root.request)) return null
             if (revision == 1L && (root.previous != "-" || root.secondPrevious != "-")) return null
-            if (hash == wanted) return root
+            if (hash == wanted) return root.takeIf { boundReceipt(session, hash, captureId, it, cancelled) }
             hash = root.previous?.takeIf(HASH::matches) ?: return null
             revision--
         }
@@ -100,7 +102,7 @@ internal class NativeCapturePreviewReaderV2(
     private fun validRoot(session: File, hash: String, revision: Long, depth: Int): Boolean {
         if (depth > MAX_ROOT_DEPTH || !HASH.matches(hash)) return false
         val values = readRootMetadata(session, hash) ?: return false
-        if (values.schema != "5" ||
+        if (!knownQualitySchema(values) ||
             values.revision != revision ||
             !CaptureRootMetadataReaderV2.isHash(values.request)
         ) return false
@@ -111,6 +113,55 @@ internal class NativeCapturePreviewReaderV2(
         if (previous.isNullOrEmpty() || previous == "-") return false
         if (!validRoot(session, previous, revision - 1L, depth + 1)) return false
         return depth != 0 || revision < 3L || secondPrevious == rootPrevious(session, previous)
+    }
+
+    private fun knownQualitySchema(root: CaptureRootMetadataV2): Boolean = when (root.schema) {
+        "5" -> root.qualityAssessment == null && root.qualityAssessmentHash == null && root.exposureTimestampNanoseconds == null
+        "6" -> root.qualityAssessment != null && root.request != null && root.exposureTimestampNanoseconds != null &&
+            root.qualityAssessmentHash == CaptureQualityAssessmentV1.boundHash(root.request, root.qualityAssessment)
+        else -> false
+    }
+
+    /** Root descriptors alone cannot authorize a different capture with coincidentally equal JPEG bytes. */
+    private fun boundReceipt(session: File, manifestId: String, captureId: String,
+        root: CaptureRootMetadataV2, cancelled: () -> Boolean): Boolean {
+        val attempts = File(session, "attempts")
+        if (!attempts.isDirectory || attempts.canonicalFile != attempts.absoluteFile) return false
+        Files.newDirectoryStream(attempts.toPath()).use { entries ->
+            for (entry in entries) {
+                if (cancelled()) return false
+                val directory = entry.toFile()
+                if (!directory.isDirectory || directory.canonicalFile != directory.absoluteFile) continue
+                val file = File(directory, "receipt.properties")
+                if (!file.isFile || file.canonicalFile != file.absoluteFile || file.length() > MAX_RECEIPT_BYTES) continue
+                val values = runCatching { FileInputStream(file).use { Properties().apply { load(it) } } }.getOrNull() ?: continue
+                if (values.getProperty("kind") != CaptureTerminalKind.COMMITTED_PICTURE.name ||
+                    values.getProperty("rootHash") != manifestId || values.getProperty("captureId") != captureId) continue
+                if (values.getProperty("requestHash") != root.request || values.getProperty("revision")?.toLongOrNull() != root.revision ||
+                    values.getProperty("receiptHash") != MessageDigest.getInstance("SHA-256")
+                        .digest("${root.request}|$manifestId".toByteArray()).toCaptureHashHex()) return false
+                val jpeg = root.components.singleOrNull { it.kind == "JPEG" } ?: return false
+                val dng = root.components.singleOrNull { it.kind == "DNG" }
+                when (root.schema) {
+                    "5" -> {
+                        if (values.stringPropertyNames().any { it.startsWith("quality") }) return false
+                        if (values.getProperty("jpegSizeBytes")?.let { it.toLongOrNull() != jpeg.length } == true ||
+                            values.getProperty("dngSizeBytes")?.let { it.toLongOrNull() != dng?.length } == true) return false
+                    }
+                    "6" -> {
+                        val fields = values.stringPropertyNames().associateWith { values.getProperty(it) }
+                        if (CaptureQualityAssessmentV1.fromRootFields(fields) != root.qualityAssessment ||
+                            values.getProperty("qualityAssessmentHash") != root.qualityAssessmentHash ||
+                            values.getProperty("jpegSizeBytes")?.toLongOrNull() != jpeg.length ||
+                            values.getProperty("dngSizeBytes")?.toLongOrNull() != dng?.length ||
+                            (dng == null && values.getProperty("dngSizeBytes") != null)) return false
+                    }
+                    else -> return false
+                }
+                return true
+            }
+        }
+        return false
     }
 
     private fun readRootMetadata(session: File, hash: String): CaptureRootMetadataV2? {
@@ -139,6 +190,7 @@ internal class NativeCapturePreviewReaderV2(
 
     private companion object {
         const val MAX_ROOT_DEPTH = 2
+        const val MAX_RECEIPT_BYTES = 64L * 1024L
         val HASH = Regex("[0-9a-f]{64}")
     }
 }

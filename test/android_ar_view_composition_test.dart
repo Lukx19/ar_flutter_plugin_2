@@ -66,6 +66,7 @@ void main() {
           ByteData.sublistView(arguments['params']! as Uint8List));
       expect(parameters, {
         'enableHighResCapture': true,
+        'retainAssessedOriginals': false,
         'rearCameraId': '0',
       });
       expect(createdIds, [arguments['id']]);
@@ -86,6 +87,26 @@ void main() {
           arguments['id']);
     }, variant: TargetPlatformVariant.only(TargetPlatform.android));
   }
+
+  testWidgets('Android review mode recreates the view and reaches native creation with the same manager config', (tester) async {
+    final ids = <int>[];
+    await tester.pumpWidget(_view(AndroidARView(), ids));
+    await tester.pumpAndSettle();
+    final offKey = tester.widget<PlatformViewLink>(find.byType(PlatformViewLink)).key;
+    await tester.pumpWidget(_view(AndroidARView(), ids, retainAssessedOriginals: true));
+    await tester.pumpAndSettle();
+    final onKey = tester.widget<PlatformViewLink>(find.byType(PlatformViewLink)).key;
+    expect(onKey, isNot(offKey));
+    expect(ids, hasLength(2));
+    final creates = calls.where((call) => call.method == 'create').toList();
+    final params = const StandardMessageCodec().decodeMessage(ByteData.sublistView(
+      (creates.last.arguments as Map<Object?, Object?>)['params']! as Uint8List,
+    )) as Map<Object?, Object?>;
+    expect(params['retainAssessedOriginals'], isTrue);
+    expect(calls.where((call) => call.method == 'dispose'), hasLength(1));
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pumpAndSettle();
+  }, variant: TargetPlatformVariant.only(TargetPlatform.android));
 
   testWidgets(
       'Android AR composition change recreates rather than reuses the platform view',
@@ -114,19 +135,22 @@ void main() {
   }, variant: TargetPlatformVariant.only(TargetPlatform.android));
 }
 
-Widget _view(AndroidARView view, List<int> createdIds) => MaterialApp(
+Widget _view(AndroidARView view, List<int> createdIds, {bool retainAssessedOriginals = false}) => MaterialApp(
       home: Builder(
           builder: (context) => view.build(
                 context: context,
                 planeDetectionConfig: PlaneDetectionConfig.none,
-                captureConfig: const ARCaptureConfig(
+                captureConfig: ARCaptureConfig(
                   enableHighResCapture: true,
-                  resolution: CameraResolution(width: 4128, height: 3096),
+                  retainAssessedOriginals: retainAssessedOriginals,
+                  resolution: const CameraResolution(width: 4128, height: 3096),
                   format: CaptureFormat.jpeg,
                 ),
                 rearCameraId: '0',
                 arViewCreatedCallback: (session, objects, anchors, location) {
                   createdIds.add(session.channelId);
+                  expect(session.captureManager!.config.retainAssessedOriginals, retainAssessedOriginals);
+                  expect(session.captureManager!.allowAssessedQuality, isTrue);
                 },
               )),
     );

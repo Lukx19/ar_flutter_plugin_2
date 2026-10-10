@@ -271,7 +271,8 @@ final class ARNativeCaptureAdmissionResultV2 {
     this.terminal,
   });
 
-  factory ARNativeCaptureAdmissionResultV2.fromMap(Map<String, dynamic> map) {
+  factory ARNativeCaptureAdmissionResultV2.fromMap(Map<String, dynamic> map,
+      {bool allowAssessedQuality = false}) {
     _requireExactKeys(map, const {
       'wireVersion',
       'attemptId',
@@ -295,7 +296,8 @@ final class ARNativeCaptureAdmissionResultV2 {
           ? null
           : terminal is Map
               ? ARNativeCaptureEventV2.fromMap(
-                  Map<String, dynamic>.from(terminal))
+                  Map<String, dynamic>.from(terminal),
+                  allowAssessedQuality: allowAssessedQuality)
               : throw const FormatException(
                   'Native capture terminal must be a map.'),
     );
@@ -363,6 +365,120 @@ final class ARNativeCaptureHealthV2 {
   final int readyPictureSets;
 }
 
+/// Assessed events are opt-in until publication and credit isolation are integrated.
+const nativeCaptureQualityV1WireVersion = 'native_capture_quality_v1';
+
+enum ARNativeCaptureQualityDispositionV1 { policyPassed, reviewRequired }
+enum ARNativeCaptureQualityReasonV1 {
+  policyPassed,
+  belowThreshold,
+  analysisUnavailable,
+}
+enum ARNativeCaptureQualityUnavailableReasonV1 {
+  decodeFailed,
+  analysisFailed,
+  evidenceMissing,
+}
+
+/// Immutable bounded scalar assessment; unavailable evidence cannot decode as passed.
+final class ARNativeCaptureQualityAssessmentV1 {
+  const ARNativeCaptureQualityAssessmentV1._({
+    required this.schemaVersion,
+    required this.policyVersion,
+    required this.disposition,
+    required this.reason,
+    required this.score,
+    required this.threshold,
+    required this.sampleWidth,
+    required this.sampleHeight,
+    required this.unavailableReason,
+  });
+
+  factory ARNativeCaptureQualityAssessmentV1.fromMap(Map<String, dynamic> map) {
+    _requireExactKeys(map, const {
+      'schemaVersion', 'policyVersion', 'disposition', 'reason', 'score',
+      'threshold', 'sampleWidth', 'sampleHeight', 'unavailableReason',
+    });
+    final schemaVersion = _integer(map, 'schemaVersion');
+    final policyVersion = _nonEmptyString(map, 'policyVersion');
+    if (schemaVersion != 1 || policyVersion.length > 128 ||
+        !RegExp(r'^[A-Za-z0-9._:-]+$').hasMatch(policyVersion)) {
+      throw const FormatException('Unsupported or malformed quality policy.');
+    }
+    T enumValue<T extends Enum>(Iterable<T> values, String name) {
+      final value = values.where((value) => value.name == name).firstOrNull;
+      if (value == null) throw FormatException('Unknown quality value: $name');
+      return value;
+    }
+    double? metric(String key, {required bool positive}) {
+      final value = map[key];
+      if (value == null) return null;
+      if (value is! num || !value.toDouble().isFinite ||
+          (positive ? value <= 0 : value < 0)) {
+        throw FormatException('$key must be a finite quality metric.');
+      }
+      return value.toDouble();
+    }
+    int? dimension(String key) {
+      if (map[key] == null) return null;
+      final value = _positiveInteger(map, key);
+      if (value > 4096) throw FormatException('$key exceeds quality bounds.');
+      return value;
+    }
+    final disposition = enumValue(ARNativeCaptureQualityDispositionV1.values,
+        _string(map, 'disposition'));
+    final reason = enumValue(ARNativeCaptureQualityReasonV1.values,
+        _string(map, 'reason'));
+    final score = metric('score', positive: false);
+    final threshold = metric('threshold', positive: true);
+    final sampleWidth = dimension('sampleWidth');
+    final sampleHeight = dimension('sampleHeight');
+    final unavailableReason = map['unavailableReason'] == null ? null :
+        enumValue(ARNativeCaptureQualityUnavailableReasonV1.values,
+            _string(map, 'unavailableReason'));
+    if ((sampleWidth == null) != (sampleHeight == null)) {
+      throw const FormatException('Quality sample dimensions must be paired.');
+    }
+    final complete = score != null && threshold != null &&
+        sampleWidth != null && sampleHeight != null;
+    final valid = switch (reason) {
+      ARNativeCaptureQualityReasonV1.policyPassed =>
+        disposition == ARNativeCaptureQualityDispositionV1.policyPassed &&
+        unavailableReason == null && complete && score! >= threshold!,
+      ARNativeCaptureQualityReasonV1.belowThreshold =>
+        disposition == ARNativeCaptureQualityDispositionV1.reviewRequired &&
+        unavailableReason == null && complete && score! < threshold!,
+      ARNativeCaptureQualityReasonV1.analysisUnavailable =>
+        disposition == ARNativeCaptureQualityDispositionV1.reviewRequired &&
+        unavailableReason != null && score == null,
+    };
+    if (!valid) throw const FormatException('Quality disposition contradicts evidence.');
+    return ARNativeCaptureQualityAssessmentV1._(
+      schemaVersion: schemaVersion, policyVersion: policyVersion,
+      disposition: disposition, reason: reason, score: score, threshold: threshold,
+      sampleWidth: sampleWidth, sampleHeight: sampleHeight,
+      unavailableReason: unavailableReason,
+    );
+  }
+
+  final int schemaVersion;
+  final String policyVersion;
+  final ARNativeCaptureQualityDispositionV1 disposition;
+  final ARNativeCaptureQualityReasonV1 reason;
+  final double? score;
+  final double? threshold;
+  final int? sampleWidth;
+  final int? sampleHeight;
+  final ARNativeCaptureQualityUnavailableReasonV1? unavailableReason;
+
+  Map<String, Object?> toMap() => {
+    'schemaVersion': schemaVersion, 'policyVersion': policyVersion,
+    'disposition': disposition.name, 'reason': reason.name,
+    'score': score, 'threshold': threshold, 'sampleWidth': sampleWidth,
+    'sampleHeight': sampleHeight, 'unavailableReason': unavailableReason?.name,
+  };
+}
+
 final class ARNativeCaptureEventV2 {
   const ARNativeCaptureEventV2({
     required this.kind,
@@ -375,10 +491,15 @@ final class ARNativeCaptureEventV2 {
     this.reason,
     this.health,
     this.recoveryContext,
+    this.qualityAssessment,
+    this.qualityAssessmentHash,
   });
 
-  factory ARNativeCaptureEventV2.fromMap(Map<String, dynamic> map) {
-    if (map['wireVersion'] != nativeCaptureV2WireVersion) {
+  factory ARNativeCaptureEventV2.fromMap(Map<String, dynamic> map,
+      {bool allowAssessedQuality = false}) {
+    final assessed = map['wireVersion'] == nativeCaptureQualityV1WireVersion;
+    if (map['wireVersion'] != nativeCaptureV2WireVersion &&
+        !(assessed && allowAssessedQuality)) {
       throw const FormatException('Unsupported native capture wire version.');
     }
     final kindName = _string(map, 'kind');
@@ -387,6 +508,9 @@ final class ARNativeCaptureEventV2 {
         .firstOrNull;
     if (kind == null) {
       throw FormatException('Unknown native capture event: $kindName');
+    }
+    if (assessed && kind != ARNativeCaptureEventKindV2.committed) {
+      throw const FormatException('Assessed wire requires a committed terminal.');
     }
     switch (kind) {
       case ARNativeCaptureEventKindV2.accepted:
@@ -432,11 +556,29 @@ final class ARNativeCaptureEventV2 {
           'captureId',
           'captureRevision',
           'manifestId',
-          if (map.containsKey('jpegSizeBytes')) 'jpegSizeBytes',
+          if (assessed || map.containsKey('jpegSizeBytes')) 'jpegSizeBytes',
           if (map.containsKey('dngSizeBytes')) 'dngSizeBytes',
           'reason',
           'recoveryContext',
+          if (assessed) 'qualityDisposition',
+          if (assessed) 'qualityAssessmentHash',
+          if (assessed) 'qualityAssessment',
         });
+        ARNativeCaptureQualityAssessmentV1? qualityAssessment;
+        String? qualityAssessmentHash;
+        if (assessed) {
+          final qualityMap = map['qualityAssessment'];
+          if (qualityMap is! Map) {
+            throw const FormatException('Quality assessment must be a map.');
+          }
+          qualityAssessment = ARNativeCaptureQualityAssessmentV1.fromMap(
+              Map<String, dynamic>.from(qualityMap));
+          qualityAssessmentHash = _nonEmptyString(map, 'qualityAssessmentHash');
+          if (!RegExp(r'^[0-9a-f]{64}$').hasMatch(qualityAssessmentHash) ||
+              _string(map, 'qualityDisposition') != qualityAssessment.disposition.name) {
+            throw const FormatException('Quality assessment identity or disposition is invalid.');
+          }
+        }
         final jpegSizeBytes = map.containsKey('jpegSizeBytes')
             ? _positiveInteger(map, 'jpegSizeBytes')
             : null;
@@ -454,6 +596,8 @@ final class ARNativeCaptureEventV2 {
           manifestId: _nonEmptyString(map, 'manifestId'),
           jpegSizeBytes: jpegSizeBytes,
           dngSizeBytes: dngSizeBytes,
+          qualityAssessment: qualityAssessment,
+          qualityAssessmentHash: qualityAssessmentHash,
           reason: _nonEmptyString(map, 'reason'),
           recoveryContext: ARNativeCaptureRecoveryContextV2.fromMap(
               Map<String, dynamic>.from(map['recoveryContext'] as Map)),
@@ -501,6 +645,10 @@ final class ARNativeCaptureEventV2 {
   final String? reason;
   final ARNativeCaptureHealthV2? health;
   final ARNativeCaptureRecoveryContextV2? recoveryContext;
+  final ARNativeCaptureQualityAssessmentV1? qualityAssessment;
+  final String? qualityAssessmentHash;
+
+  ARNativeCaptureQualityDispositionV1? get qualityDisposition => qualityAssessment?.disposition;
 
   bool get isTerminal =>
       kind == ARNativeCaptureEventKindV2.committed ||

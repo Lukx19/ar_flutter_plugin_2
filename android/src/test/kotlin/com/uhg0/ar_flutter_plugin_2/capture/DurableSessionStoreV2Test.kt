@@ -120,23 +120,52 @@ class DurableSessionStoreV2Test {
         val terminal = requireNotNull(receipt.terminal)
         val manifestId = requireNotNull(terminal.manifestId)
         val captureId = requireNotNull(terminal.captureId)
-        val reader = NativeCapturePreviewReaderV2(File(root, "store"))
+        val rootFile = File(root, "store").walkTopDown().single { it.name == "$manifestId.root" }
+        val metadata = rootFile.inputStream().use { input ->
+            requireNotNull(CaptureRootMetadataReaderV2().root(manifestId, input::read))
+        }
+        assertEquals("5", metadata.schema)
+        assertNull(metadata.qualityAssessment)
+        val descriptor = metadata.components.single { it.kind == "JPEG" }
+        assertEquals(jpeg.size.toLong(), descriptor.length)
+        assertEquals(sha(jpeg).toCaptureHashHex(), descriptor.hash)
+        var previewWrites = 0
+        // Host storage coverage keeps real root/receipt/hash validation and replaces bitmap decoding only.
+        val reader = NativeCapturePreviewReaderV2(File(root, "store"),
+            writePreview = { source, destination, cancelled, edge ->
+                assertFalse(cancelled())
+                assertEquals(512, edge)
+                assertArrayEquals(jpeg, source.readBytes())
+                previewWrites++
+                destination.writeBytes(source.readBytes())
+                true
+            },
+            validPreview = { file, edge ->
+                edge == 512 && file.isFile && file.readBytes().contentEquals(jpeg)
+            },
+        )
         val target = File(root, "preview-cache/reader.jpg")
 
         assertTrue(reader.materializeJpegPreview(manifestId, captureId, target))
         assertArrayEquals(jpeg, target.readBytes())
         assertTrue(reader.materializeJpegPreview(manifestId, captureId, target))
+        assertEquals(1, previewWrites)
+        assertFalse(reader.materializeJpegPreview("f".repeat(64), captureId, File(root, "wrong-manifest.jpg")))
+        assertFalse(reader.materializeJpegPreview(manifestId, "f".repeat(64), File(root, "wrong-capture.jpg")))
+        assertEquals(1, previewWrites)
 
         target.writeBytes("stale-preview".toByteArray())
         assertTrue(reader.materializeJpegPreview(manifestId, captureId, target))
         assertArrayEquals(jpeg, target.readBytes())
+        assertEquals(2, previewWrites)
 
         target.delete()
         val asset = File(root, "store").walkTopDown()
             .first { it.name.startsWith("jpeg.") && it.name.endsWith(".blob") }
-        asset.writeBytes("tampered".toByteArray())
+        asset.writeBytes(jpeg.copyOf().also { it[0] = (it[0] + 1).toByte() })
         assertFalse(reader.materializeJpegPreview(manifestId, captureId, target))
         assertFalse(target.exists())
+        assertEquals(2, previewWrites)
     }
 
     @Test fun `changed bytes conflict without moving selected root and abandonment releases once for later success`() {

@@ -50,6 +50,7 @@ void main() {
   dynamic initializeCaptureResponse;
   Completer<dynamic>? initializeGate;
   Map<String, dynamic>? nativeAdmissionResponse;
+  List<Map<String, dynamic>> nativeRecoveryResponse = <Map<String, dynamic>>[];
   Map<String, dynamic>? syntheticPoseResponse;
   bool debugSyntheticRouteInstalled = true;
 
@@ -72,6 +73,7 @@ void main() {
     initializeCaptureResponse = <String, dynamic>{'mode': 'sharedCamera'};
     initializeGate = null;
     nativeAdmissionResponse = null;
+    nativeRecoveryResponse = <Map<String, dynamic>>[];
     syntheticPoseResponse = <String, dynamic>{
       'position': <String, dynamic>{'x': 0.0, 'y': 0.0, 'z': 0.0},
       'rotation': <String, dynamic>{'x': 0.0, 'y': 0.0, 'z': 0.0, 'w': 1.0},
@@ -447,6 +449,8 @@ void main() {
           return true;
         case 'admitNativeCaptureV2':
           return nativeAdmissionResponse;
+        case 'replayNativeCaptureRecoveryV2':
+          return nativeRecoveryResponse;
         default:
           return null;
       }
@@ -522,6 +526,162 @@ void main() {
       ),
       throwsA(isA<FormatException>()),
     );
+  });
+
+  for (final configured in [false, true]) {
+    for (final producer in [false, true]) {
+      test('integrated ${configured ? "configured" : "legacy"} reader preserves assessed recovery with producer $producer', () async {
+        final admission = _nativeAdmission();
+        final terminal = _retainedReviewTerminal(admission);
+        nativeAdmissionResponse = <String, dynamic>{
+          'wireVersion': nativeCaptureV2WireVersion, 'attemptId': 'attempt',
+          'phase': 'committed_picture', 'durable': true, 'terminal': terminal,
+        };
+        nativeRecoveryResponse = <Map<String, dynamic>>[terminal];
+        final config = captureConfig.copyWith(retainAssessedOriginals: producer);
+        const sessionChannel = MethodChannel('arsession_42');
+        final messenger = TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+        messenger.setMockMethodCallHandler(sessionChannel, (_) async => null);
+        final session = configured
+            ? ARSessionManager.withConfig(id: 42, buildContext: _FakeBuildContext(),
+                arConfig: ARConfiguration(enableCapture: true, captureConfig: config))
+            : ARSessionManager(42, _FakeBuildContext(), PlaneDetectionConfig.horizontal, captureConfig: config);
+        final events = <ARNativeCaptureEventV2>[];
+        StreamSubscription<ARNativeCaptureEventV2>? subscription;
+        try {
+          if (configured) {
+            await session.initialize();
+          }
+          final manager = session.captureManager!;
+          expect(manager.allowAssessedQuality, isTrue);
+          expect(manager.config.retainAssessedOriginals, producer);
+          subscription = manager.nativeCaptureV2Events.listen(events.add);
+          await manager.getCurrentExposureState();
+          await Future<void>.delayed(Duration.zero);
+          final result = await manager.admitNativeCaptureV2(admission);
+          expect(result.terminal!.qualityDisposition, ARNativeCaptureQualityDispositionV1.reviewRequired);
+          final recovered = await manager.replayNativeCaptureRecoveryV2();
+          expect(recovered.single.qualityAssessment!.toMap(), result.terminal!.qualityAssessment!.toMap());
+          expect(recovered.single.qualityAssessmentHash, result.terminal!.qualityAssessmentHash);
+          await messenger.handlePlatformMessage(captureChannel.name,
+            const StandardMethodCodec().encodeMethodCall(MethodCall('onNativeCaptureV2Event', terminal)), (_) {});
+          await Future<void>.delayed(Duration.zero);
+          expect(events.where((event) => event.isTerminal), hasLength(1));
+          nativeRecoveryResponse = <Map<String, dynamic>>[
+            {...terminal, 'qualityAssessmentHash': 'not-a-hash'},
+          ];
+          await expectLater(manager.replayNativeCaptureRecoveryV2(), throwsA(isA<FormatException>()));
+          expect(manager.allowAssessedQuality, isTrue);
+        } finally {
+          await subscription?.cancel();
+          await session.dispose();
+          messenger.setMockMethodCallHandler(sessionChannel, null);
+        }
+      });
+    }
+  }
+
+  test('assessed quality decode is default disabled on admission replay and live routes', () async {
+    final admission = _nativeAdmission();
+    final terminal = _retainedReviewTerminal(admission);
+    nativeAdmissionResponse = <String, dynamic>{
+      'wireVersion': nativeCaptureV2WireVersion,
+      'attemptId': 'attempt',
+      'phase': 'committed_picture',
+      'durable': true,
+      'terminal': terminal,
+    };
+    // Initialize through an explicitly legacy ready record so strict failures
+    // below come from each requested route, not the startup recovery wrapper.
+    nativeRecoveryResponse = <Map<String, dynamic>>[
+      <String, dynamic>{
+        'wireVersion': nativeCaptureV2WireVersion,
+        'kind': 'ready',
+        'reason': 'native-owner-ready',
+      },
+    ];
+    final sessionManager = ARSessionManager(42, _FakeBuildContext(), PlaneDetectionConfig.horizontal);
+    final manager = ARCaptureManager(sessionManager, captureConfig, _FakeBuildContext());
+    final events = <ARNativeCaptureEventV2>[];
+    final subscription = manager.nativeCaptureV2Events.listen(events.add);
+    try {
+      expect(manager.allowAssessedQuality, isFalse);
+      await manager.getCurrentExposureState();
+      await Future<void>.delayed(Duration.zero);
+      expect(manager.initializationResult, isNotNull);
+      expect(methodCalls.map((call) => call.method), <String>[
+        'initializeCapture',
+        'replayNativeCaptureRecoveryV2',
+        'getCurrentExposureState',
+      ]);
+      expect(events.map((event) => event.kind), <ARNativeCaptureEventKindV2>[
+        ARNativeCaptureEventKindV2.ready,
+      ]);
+      events.clear();
+      nativeRecoveryResponse = <Map<String, dynamic>>[terminal];
+      await expectLater(manager.admitNativeCaptureV2(admission), throwsA(isA<FormatException>()));
+      expect(methodCalls.last.method, 'admitNativeCaptureV2');
+      await expectLater(manager.replayNativeCaptureRecoveryV2(), throwsA(isA<FormatException>()));
+      expect(methodCalls.last.method, 'replayNativeCaptureRecoveryV2');
+      expect(methodCalls.where((call) => call.method == 'initializeCapture'), hasLength(1));
+      expect(methodCalls.where((call) => call.method == 'replayNativeCaptureRecoveryV2'), hasLength(2));
+      var liveReplyDelivered = false;
+      await TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.handlePlatformMessage(
+        captureChannel.name,
+        const StandardMethodCodec().encodeMethodCall(MethodCall('onNativeCaptureV2Event', terminal)),
+        (_) { liveReplyDelivered = true; },
+      );
+      await Future<void>.delayed(Duration.zero);
+      expect(liveReplyDelivered, isTrue);
+      expect(events, isEmpty);
+      expect(manager.allowAssessedQuality, isFalse);
+    } finally {
+      await subscription.cancel();
+      await manager.dispose();
+    }
+  });
+
+  test('explicit assessed decode carries review unchanged across admission replay and live identities', () async {
+    final admission = _nativeAdmission();
+    final terminal = _retainedReviewTerminal(admission);
+    nativeAdmissionResponse = <String, dynamic>{
+      'wireVersion': nativeCaptureV2WireVersion,
+      'attemptId': 'attempt',
+      'phase': 'committed_picture',
+      'durable': true,
+      'terminal': terminal,
+    };
+    nativeRecoveryResponse = <Map<String, dynamic>>[terminal];
+    final sessionManager = ARSessionManager(42, _FakeBuildContext(), PlaneDetectionConfig.horizontal);
+    final manager = ARCaptureManager(sessionManager, captureConfig, _FakeBuildContext(), allowAssessedQuality: true);
+    final events = <ARNativeCaptureEventV2>[];
+    final errors = <Object>[];
+    final subscription = manager.nativeCaptureV2Events.listen(events.add, onError: errors.add);
+    try {
+      final result = await manager.admitNativeCaptureV2(admission);
+      expect(result.terminal?.qualityDisposition, ARNativeCaptureQualityDispositionV1.reviewRequired);
+      final replay = await manager.replayNativeCaptureRecoveryV2();
+      expect(replay.single.qualityAssessmentHash, result.terminal?.qualityAssessmentHash);
+      expect(replay.single.qualityAssessment?.toMap(), result.terminal?.qualityAssessment?.toMap());
+      for (final event in <Map<String, dynamic>>[
+        terminal,
+        <String, dynamic>{...terminal, 'reason': 'recovered-committed'},
+        <String, dynamic>{...terminal, 'qualityAssessmentHash': 'd' * 64},
+      ]) {
+        await TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.handlePlatformMessage(
+          captureChannel.name,
+          const StandardMethodCodec().encodeMethodCall(MethodCall('onNativeCaptureV2Event', event)),
+          (_) {},
+        );
+      }
+      await Future<void>.delayed(Duration.zero);
+      expect(events.where((event) => event.isTerminal), hasLength(1));
+      expect(events.single.qualityDisposition, ARNativeCaptureQualityDispositionV1.reviewRequired);
+      expect(errors, <Object>[isA<StateError>()]);
+    } finally {
+      await subscription.cancel();
+      await manager.dispose();
+    }
   });
 
   test('admission terminal is exact once across result and live callback',
@@ -2717,3 +2877,28 @@ ARNativeCaptureAdmissionV2 _nativeAdmission() {
     ),
   );
 }
+
+Map<String, dynamic> _retainedReviewTerminal(ARNativeCaptureAdmissionV2 admission) => <String, dynamic>{
+  'wireVersion': nativeCaptureQualityV1WireVersion,
+  'kind': 'committed',
+  'attemptId': 'attempt',
+  'captureId': 'a' * 64,
+  'captureRevision': 1,
+  'manifestId': 'b' * 64,
+  'jpegSizeBytes': 1024,
+  'reason': 'committed',
+  'recoveryContext': admission.recoveryContext.toMap(),
+  'qualityDisposition': 'reviewRequired',
+  'qualityAssessmentHash': 'c' * 64,
+  'qualityAssessment': <String, dynamic>{
+    'schemaVersion': 1,
+    'policyVersion': 'jpegLaplacianVarianceV1:threshold110',
+    'disposition': 'reviewRequired',
+    'reason': 'belowThreshold',
+    'score': 58.6645,
+    'threshold': 110.0,
+    'sampleWidth': 516,
+    'sampleHeight': 387,
+    'unavailableReason': null,
+  },
+};

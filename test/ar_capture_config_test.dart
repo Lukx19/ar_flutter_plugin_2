@@ -5,6 +5,19 @@ import 'package:ar_flutter_plugin_2/models/camera_resolution.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
+  test('assessed producer config defaults off and preserves explicit copy map identity', () {
+    const legacy = ARCaptureConfig(resolution: CameraResolution(width: 4128, height: 3096), format: CaptureFormat.jpeg);
+    expect(legacy.retainAssessedOriginals, isFalse);
+    final assessed = legacy.copyWith(retainAssessedOriginals: true);
+    expect(ARCaptureConfig.fromMap(assessed.toMap()), assessed);
+    expect(assessed.copyWith(jpegQuality: 95).retainAssessedOriginals, isTrue);
+    expect(assessed.copyWith(retainAssessedOriginals: false), legacy);
+    expect(assessed, isNot(legacy));
+    expect(ARCaptureConfig.fromMap({...legacy.toMap()}..remove('retainAssessedOriginals')).retainAssessedOriginals, isFalse);
+    expect(assessed.resolution, legacy.resolution);
+    expect(assessed.jpegQuality, 95);
+  });
+
   const baseConfig = ARCaptureConfig(
     enableHighResCapture: true,
     captureIntervalMs: 5000,
