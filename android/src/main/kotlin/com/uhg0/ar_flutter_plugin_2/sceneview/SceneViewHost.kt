@@ -66,6 +66,10 @@ import com.uhg0.ar_flutter_plugin_2.visibilitygrid.ArCoreDepthModeController
 import io.github.sceneview.SurfaceType
 import io.github.sceneview.ar.ARSceneView
 import io.github.sceneview.ar.camera.ARCameraStream
+import io.github.sceneview.ar.arcore.ARSession
+import com.uhg0.ar_flutter_plugin_2.playback.ArPlaybackAction
+import com.uhg0.ar_flutter_plugin_2.playback.ArPlaybackController
+import com.uhg0.ar_flutter_plugin_2.playback.ArPlaybackSessionPort
 import io.github.sceneview.ar.rememberARCameraStream
 import io.github.sceneview.math.Position
 import io.github.sceneview.math.Rotation
@@ -110,7 +114,12 @@ internal class SceneViewHost(
     private val onCoverageRendererMounted: (Boolean, Long) -> Unit = { _, _ -> },
     private val onTouch: (MotionEvent, List<PluginHitResult>) -> Unit = { _, _ -> },
     private val onNodeGesture: (String, String, PluginTransform?) -> Unit = { _, _, _ -> },
+    /** Debug/profile ARCore playback test mode; null runs the camera. */
+    private val playback: ArPlaybackController? = null,
+    /** Playback reached the dataset end and the view must be rebuilt (restart=view). */
+    private val onPlaybackViewRestart: (Map<String, Any>) -> Unit = {},
 ) : SceneViewCaptureHost {
+    private val playbackHandler = android.os.Handler(android.os.Looper.getMainLooper())
     @Volatile override var nativeFrameAttribution: NativeFrameAttributionOwner? = null
         private set
     override fun bindNativeFrameAttribution(owner: NativeFrameAttributionOwner?): Boolean {
@@ -507,25 +516,10 @@ internal class SceneViewHost(
                 },
                 planeRenderer = config.showPlanes && config.customPlaneTexturePath == null,
                 sessionConfiguration = { session, arConfig ->
-                    val requestedId = requestedRearCameraId ?: session.cameraConfig.cameraId
-                    val matchingConfigs =
-                        session.getSupportedCameraConfigs(CameraConfigFilter(session))
-                            .filter {
-                                it.cameraId == requestedId &&
-                                    it.facingDirection == CameraConfig.FacingDirection.BACK
-                            }
-                    val selectedConfig =
-                        preferHighestFpsConfig(matchingConfigs) { it.fpsRange.upper }
-                    if (selectedConfig == null) {
-                        Log.w("SceneViewHost", "Requested ARCore rear camera $requestedId is unavailable")
-                    } else {
-                        session.cameraConfig = selectedConfig
-                        Log.i(
-                            "SceneViewHost",
-                            "Selected ARCore rear camera $requestedId at " +
-                                "${selectedConfig.fpsRange} fps",
-                        )
-                    }
+                    // Playback: the dataset decides the camera stream; keep the
+                    // default camera config (it matched the recording in the
+                    // benchmark replay) instead of selecting a camera.
+                    val selectedConfig = if (playback != null) null else selectRearCameraConfig(session)
                     val activeCameraConfig = selectedConfig ?: session.cameraConfig
                     configuredCameraFpsLower = activeCameraConfig.fpsRange.lower
                     configuredCameraFpsUpper = activeCameraConfig.fpsRange.upper
@@ -546,6 +540,9 @@ internal class SceneViewHost(
                 },
                 onSessionCreated = { session ->
                     sessionRef.set(session)
+                    // SceneView set the texture names already; the dataset
+                    // resets them, so the controller sets them again after it.
+                    playback?.onSessionCreated(ArSessionPlaybackPort(session), cameraStream.cameraTextureIds)
                     onSessionCreated(session)
                 },
                 onSessionResumed = { session ->
@@ -591,6 +588,7 @@ internal class SceneViewHost(
                             }
                         }
                         onSessionUpdated(session, frame)
+                        if (playback != null) onPlaybackFrame(playback, session)
                     } finally {
                         rendererCallbackDepth.decrementAndGet()
                     }
@@ -796,6 +794,37 @@ internal class SceneViewHost(
 
     val view: View
         get() = composeView
+
+    private fun selectRearCameraConfig(session: Session): CameraConfig? {
+        val requestedId = requestedRearCameraId ?: session.cameraConfig.cameraId
+        val matchingConfigs =
+            session.getSupportedCameraConfigs(CameraConfigFilter(session))
+                .filter {
+                    it.cameraId == requestedId &&
+                        it.facingDirection == CameraConfig.FacingDirection.BACK
+                }
+        val selectedConfig = preferHighestFpsConfig(matchingConfigs) { it.fpsRange.upper }
+        if (selectedConfig == null) {
+            Log.w("SceneViewHost", "Requested ARCore rear camera $requestedId is unavailable")
+        } else {
+            session.cameraConfig = selectedConfig
+            Log.i("SceneViewHost", "Selected ARCore rear camera $requestedId at ${selectedConfig.fpsRange} fps")
+        }
+        return selectedConfig
+    }
+
+    private fun onPlaybackFrame(controller: ArPlaybackController, session: Session) {
+        when (controller.onFrame(session.playbackStatus.name)) {
+            ArPlaybackAction.NONE -> Unit
+            ArPlaybackAction.RESTART_VIEW -> onPlaybackViewRestart(controller.finishedEvent())
+            // Never pause inside SceneView's frame callback: restart after it.
+            ArPlaybackAction.RESTART_SESSION -> playbackHandler.post {
+                if (!disposed && sessionRef.get() === session) {
+                    controller.restartSession(ArSessionPlaybackPort(session), cameraTextureIds)
+                }
+            }
+        }
+    }
 
     override val activeSession: Session?
         get() = sessionRef.get()
@@ -2350,4 +2379,14 @@ internal class VisibilityGridDepthModeCache {
         configuredSession = null
         activeMode = null
     }
+}
+
+/** ARCore session seen by the playback lifecycle. */
+private class ArSessionPlaybackPort(private val session: Session) : ArPlaybackSessionPort {
+    override val isResumed: Boolean get() = (session as? ARSession)?.isResumed ?: false
+    override fun setPlaybackDataset(path: String) =
+        session.setPlaybackDatasetUri(android.net.Uri.fromFile(java.io.File(path)))
+    override fun setCameraTextureNames(textureIds: IntArray) = session.setCameraTextureNames(textureIds)
+    override fun pause() = session.pause()
+    override fun resume() = session.resume()
 }

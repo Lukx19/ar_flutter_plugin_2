@@ -1,6 +1,7 @@
 import 'package:ar_flutter_plugin_2/managers/ar_anchor_manager.dart';
 import 'package:ar_flutter_plugin_2/managers/ar_location_manager.dart';
 import 'package:ar_flutter_plugin_2/models/ar_capture_config.dart';
+import 'package:ar_flutter_plugin_2/models/ar_playback_config.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
@@ -34,7 +35,8 @@ abstract class PlatformARView {
       @required ARViewCreatedCallback arViewCreatedCallback,
       @required PlaneDetectionConfig planeDetectionConfig,
       ARCaptureConfig? captureConfig,
-      String? rearCameraId});
+      String? rearCameraId,
+      ARPlaybackConfig? playback});
 
   /// Callback function that is executed once the view is established
   void onPlatformViewCreated(int id);
@@ -92,7 +94,8 @@ class AndroidARView implements PlatformARView {
       ARViewCreatedCallback? arViewCreatedCallback,
       PlaneDetectionConfig? planeDetectionConfig,
       ARCaptureConfig? captureConfig,
-      String? rearCameraId}) {
+      String? rearCameraId,
+      ARPlaybackConfig? playback}) {
     _context = context;
     _arViewCreatedCallback = arViewCreatedCallback;
     _planeDetectionConfig = planeDetectionConfig;
@@ -107,15 +110,18 @@ class AndroidARView implements PlatformARView {
       'enableHighResCapture': captureConfig?.enableHighResCapture ?? false,
       'retainAssessedOriginals': captureConfig?.retainAssessedOriginals ?? false,
       'rearCameraId': rearCameraId,
+      // Debug/profile playback test mode; absent in normal and release builds.
+      ...?playback?.toCreationParams(),
     };
 
     return PlatformViewLink(
-      key: ValueKey<(bool, String?, bool, bool)>(
+      key: ValueKey<(bool, String?, bool, bool, ARPlaybackConfig?)>(
         (
           captureConfig?.enableHighResCapture ?? false,
           rearCameraId,
           useHybridComposition,
           captureConfig?.retainAssessedOriginals ?? false,
+          playback,
         ),
       ),
       viewType: viewType,
@@ -164,10 +170,12 @@ class IosARView implements PlatformARView {
       ARViewCreatedCallback? arViewCreatedCallback,
       PlaneDetectionConfig? planeDetectionConfig,
       ARCaptureConfig? captureConfig,
-      String? rearCameraId}) {
+      String? rearCameraId,
+      ARPlaybackConfig? playback}) {
     _context = context;
     _arViewCreatedCallback = arViewCreatedCallback;
     _planeDetectionConfig = planeDetectionConfig;
+    // ARCore playback is Android only; iOS ignores [playback].
     // Assessed-original production is unsupported on iOS. Reader capability is
     // independent; do not advertise a producer mode this platform cannot honor.
     _captureConfig = captureConfig?.copyWith(retainAssessedOriginals: false);
@@ -211,6 +219,10 @@ class ARView extends StatefulWidget {
   /// safely hot-swap cameras.
   final String? rearCameraId;
 
+  /// Debug/profile ARCore playback test mode (Android only). Null in release
+  /// builds; changes rebuild the native platform view.
+  final ARPlaybackConfig? playback;
+
   /// Configures whether or not to display the device's platform type above the AR view. Defaults to false
   final bool showPlatformType;
 
@@ -220,6 +232,7 @@ class ARView extends StatefulWidget {
       this.planeDetectionConfig = PlaneDetectionConfig.none,
       this.captureConfig,
       this.rearCameraId,
+      this.playback,
       this.showPlatformType = false,
       this.permissionPromptDescription =
           "Camera permission must be given to the app for AR functions to work",
@@ -291,7 +304,8 @@ class _ARViewState extends State<ARView> {
                     arViewCreatedCallback: widget.onARViewCreated,
                     planeDetectionConfig: widget.planeDetectionConfig,
                     captureConfig: widget.captureConfig,
-                    rearCameraId: widget.rearCameraId)),
+                    rearCameraId: widget.rearCameraId,
+                    playback: widget.playback)),
           ]);
         }
       case (PermissionStatus.denied):

@@ -116,6 +116,11 @@ class ARSessionManager {
 
   /// Callback that is triggered once error is triggered
   ErrorHandler? onError;
+
+  /// Debug/profile ARCore playback: the dataset reached its end. The argument
+  /// map carries `path`, `restart` (view, session or off) and `restarts`.
+  void Function(Map<String, Object?> event)? onArPlaybackFinished;
+
   CanonicalReadyHintHandler? _canonicalReadyHandler;
   bool _canonicalReadyDeliveryPending = false;
   bool _canonicalReadyRegistrationPending = false;
@@ -822,6 +827,12 @@ class ARSessionManager {
             }).toList();
             onPlaneOrPointTap!(hitTestResults);
           }
+          break;
+        case 'onArPlaybackFinished':
+          final arguments = call.arguments;
+          onArPlaybackFinished?.call(arguments is Map
+              ? Map<String, Object?>.from(arguments)
+              : const <String, Object?>{});
           break;
         case 'onPlaneDetected':
           if (onPlaneDetected != null) {

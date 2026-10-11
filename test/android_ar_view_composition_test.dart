@@ -1,6 +1,8 @@
 import 'package:ar_flutter_plugin_2/datatypes/config_planedetection.dart';
 import 'package:ar_flutter_plugin_2/datatypes/image_format.dart';
+import 'package:ar_flutter_plugin_2/managers/ar_session_manager.dart';
 import 'package:ar_flutter_plugin_2/models/ar_capture_config.dart';
+import 'package:ar_flutter_plugin_2/models/ar_playback_config.dart';
 import 'package:ar_flutter_plugin_2/models/camera_resolution.dart';
 import 'package:ar_flutter_plugin_2/widgets/ar_view.dart';
 import 'package:flutter/material.dart';
@@ -109,6 +111,67 @@ void main() {
   }, variant: TargetPlatformVariant.only(TargetPlatform.android));
 
   testWidgets(
+      'Android playback passes the dataset and a restart generation recreates the view',
+      (tester) async {
+    final ids = <int>[];
+    final finished = <Map<String, Object?>>[];
+    const playback = ARPlaybackConfig(datasetPath: 'recordings/walk1.mp4');
+    await tester.pumpWidget(_view(AndroidARView(), ids,
+        playback: playback,
+        onSession: (session) => session.onArPlaybackFinished = finished.add));
+    await tester.pumpAndSettle();
+    Map<Object?, Object?> lastParams() =>
+        const StandardMessageCodec().decodeMessage(ByteData.sublistView(
+          (calls.where((call) => call.method == 'create').last.arguments
+              as Map<Object?, Object?>)['params']! as Uint8List,
+        )) as Map<Object?, Object?>;
+    expect(lastParams(), {
+      'enableHighResCapture': true,
+      'retainAssessedOriginals': false,
+      'rearCameraId': '0',
+      'arcorePlaybackDataset': 'recordings/walk1.mp4',
+      'arcorePlaybackRestart': 'view',
+      'arcorePlaybackRestartGeneration': 0,
+    });
+
+    await messenger.handlePlatformMessage(
+      'arsession_${ids.single}',
+      const StandardMethodCodec().encodeMethodCall(const MethodCall(
+          'onArPlaybackFinished',
+          {'path': '/data/walk1.mp4', 'restart': 'view', 'restarts': 0})),
+      (_) {},
+    );
+    expect(finished, [
+      {'path': '/data/walk1.mp4', 'restart': 'view', 'restarts': 0}
+    ]);
+
+    await tester.pumpWidget(_view(AndroidARView(), ids,
+        playback: playback.withRestartGeneration(1)));
+    await tester.pumpAndSettle();
+    expect(ids, hasLength(2));
+    expect(lastParams()['arcorePlaybackRestartGeneration'], 1);
+    expect(calls.where((call) => call.method == 'dispose'), hasLength(1));
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pumpAndSettle();
+  }, variant: TargetPlatformVariant.only(TargetPlatform.android));
+
+  test('ARPlaybackConfig is ignored in release builds and by empty paths', () {
+    expect(
+        ARPlaybackConfig.forBuild(
+            datasetPath: 'recordings/walk1.mp4', isReleaseBuild: true),
+        isNull);
+    expect(ARPlaybackConfig.forBuild(datasetPath: ' ', isReleaseBuild: false),
+        isNull);
+    expect(
+        ARPlaybackConfig.forBuild(
+                datasetPath: 'recordings/walk1.mp4',
+                restart: 'off',
+                isReleaseBuild: false)!
+            .restart,
+        ARPlaybackRestart.off);
+  });
+
+  testWidgets(
       'Android AR composition change recreates rather than reuses the platform view',
       (tester) async {
     final createdIds = <int>[];
@@ -135,7 +198,11 @@ void main() {
   }, variant: TargetPlatformVariant.only(TargetPlatform.android));
 }
 
-Widget _view(AndroidARView view, List<int> createdIds, {bool retainAssessedOriginals = false}) => MaterialApp(
+Widget _view(AndroidARView view, List<int> createdIds,
+        {bool retainAssessedOriginals = false,
+        ARPlaybackConfig? playback,
+        void Function(ARSessionManager session)? onSession}) =>
+    MaterialApp(
       home: Builder(
           builder: (context) => view.build(
                 context: context,
@@ -147,8 +214,10 @@ Widget _view(AndroidARView view, List<int> createdIds, {bool retainAssessedOrigi
                   format: CaptureFormat.jpeg,
                 ),
                 rearCameraId: '0',
+                playback: playback,
                 arViewCreatedCallback: (session, objects, anchors, location) {
                   createdIds.add(session.channelId);
+                  onSession?.call(session);
                   expect(session.captureManager!.config.retainAssessedOriginals, retainAssessedOriginals);
                   expect(session.captureManager!.allowAssessedQuality, isTrue);
                 },
