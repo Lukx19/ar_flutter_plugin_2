@@ -269,6 +269,16 @@ android {
         unitTests.returnDefaultValues = true
     }
 
+    if (gridMarkers) {
+        // The marker detector and the OpenCV prefab both ship the shared C++
+        // runtime; the instrumented test APK keeps one copy.
+        packagingOptions {
+            jniLibs {
+                pickFirsts += ['**/libc++_shared.so']
+            }
+        }
+    }
+
     buildFeatures {
         compose true
         prefab gridMarkers
