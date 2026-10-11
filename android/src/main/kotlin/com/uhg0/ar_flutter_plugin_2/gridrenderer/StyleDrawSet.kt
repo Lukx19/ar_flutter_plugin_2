@@ -208,7 +208,10 @@ internal class StyleDrawSet(
         GLES30.glUniform1i(p.grey, 0)
     }
 
-    /** Draws the overlay segments of [batch] as one line list after the grid styles. */
+    /**
+     * Draws the overlay segments of [batch] after the grid styles: the
+     * depth-tested part, then the on-top part without the depth test.
+     */
     fun drawLines(batch: GridLineBatch, view: GridFrameView) {
         if (batch.segments == 0) return
         GLES30.glUseProgram(lines.id)
@@ -227,8 +230,17 @@ internal class StyleDrawSet(
         GLES30.glVertexAttribDivisor(1, 0)
         GLES30.glVertexAttribPointer(0, 3, GLES30.GL_FLOAT, false, GridLineBatch.VERTEX_BYTES, 0)
         GLES30.glVertexAttribPointer(1, 4, GLES30.GL_UNSIGNED_BYTE, true, GridLineBatch.VERTEX_BYTES, 12)
-        GLES30.glDrawArrays(GLES30.GL_LINES, 0, batch.segments * 2)
-        counters.drawCalls++
+        val tested = batch.depthTestedSegments
+        if (tested > 0) {
+            GLES30.glDrawArrays(GLES30.GL_LINES, 0, tested * 2)
+            counters.drawCalls++
+        }
+        if (batch.segments > tested) {
+            GLES30.glDisable(GLES30.GL_DEPTH_TEST)
+            GLES30.glDrawArrays(GLES30.GL_LINES, tested * 2, (batch.segments - tested) * 2)
+            GLES30.glEnable(GLES30.GL_DEPTH_TEST)
+            counters.drawCalls++
+        }
         GLES30.glDisable(GLES30.GL_BLEND)
         GLES30.glBindVertexArray(0)
         GLES30.glUseProgram(0)

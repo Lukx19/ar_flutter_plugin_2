@@ -69,6 +69,9 @@ internal class VisibilityGridRendererHost(
     private val camera = CameraSnapshot()
 
     @Volatile private var anchor: View? = null
+
+    /** Display density of the overlay view (pixels per dp) for screen-sized overlay elements. */
+    @Volatile private var pxPerDp = 1f
     @Volatile private var enabled = false
     @Volatile private var textureView: TextureView? = null
     @Volatile private var renderThread: GridRenderThread? = null
@@ -187,6 +190,7 @@ internal class VisibilityGridRendererHost(
             })
             return
         }
+        pxPerDp = host.resources.displayMetrics.density
         val view = TextureView(host.context).apply {
             isOpaque = false
             isClickable = false
@@ -374,7 +378,9 @@ internal class VisibilityGridRendererHost(
                 draws.scope = core.scopeOverlay()
                 draws.draw(core.mode, frameView)
                 val cam = overlayFrame.cameraPosition
-                if (core.buildOverlayLines(cam[0], cam[1], cam[2], lineBatch) > 0) draws.drawLines(lineBatch, frameView)
+                if (core.buildOverlayLines(cam[0], cam[1], cam[2], lineBatch, frameView.focalPx, pxPerDp) > 0) {
+                    draws.drawLines(lineBatch, frameView)
+                }
                 overlayFrame.widthPx = width
                 overlayFrame.heightPx = height
                 overlayFrame.frameNumber = core.frameNumber

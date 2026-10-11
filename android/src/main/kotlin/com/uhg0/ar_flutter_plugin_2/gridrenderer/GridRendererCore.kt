@@ -49,10 +49,31 @@ internal class GridRendererCore(
         return display.onMessage(src, offset, length)
     }
 
-    /** Render thread: collects this frame's overlay segments into [batch]. */
-    fun buildOverlayLines(camX: Float, camY: Float, camZ: Float, batch: GridLineBatch): Int {
+    /**
+     * Render thread: collects this frame's overlay segments into [batch],
+     * depth-tested overlays first, then [GridLineOverlay.drawOnTop] ones.
+     * [focalPx] and [pxPerDp] reach overlays that size elements on screen.
+     */
+    fun buildOverlayLines(
+        camX: Float,
+        camY: Float,
+        camZ: Float,
+        batch: GridLineBatch,
+        focalPx: Float = 0f,
+        pxPerDp: Float = 1f,
+    ): Int {
         batch.clear()
-        for (overlay in lineOverlays) overlay.buildLines(camX, camY, camZ, batch)
+        for (overlay in lineOverlays) {
+            if (overlay.drawOnTop) continue
+            overlay.setView(focalPx, pxPerDp)
+            overlay.buildLines(camX, camY, camZ, batch)
+        }
+        batch.endDepthTested()
+        for (overlay in lineOverlays) {
+            if (!overlay.drawOnTop) continue
+            overlay.setView(focalPx, pxPerDp)
+            overlay.buildLines(camX, camY, camZ, batch)
+        }
         return batch.segments
     }
 
