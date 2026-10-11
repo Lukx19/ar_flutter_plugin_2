@@ -32,6 +32,18 @@ class NativeSessionLogBufferTest {
     }
 
     @Test
+    fun userActionRefusalsUseTheirTwoSecondBudget() {
+        assertTrue(buffer.occur("CAPTURE_REFUSED_STALE_POSE"))
+        now += 1_999_000_000L
+        assertFalse(buffer.occur("CAPTURE_REFUSED_STALE_POSE"))
+        now += 1_000_000L
+        assertTrue("a second refusal 2 s later is written in full", buffer.occur("CAPTURE_REFUSED_STALE_POSE"))
+        assertTrue(buffer.occur("DEPTH_STALE"))
+        now += 2_000_000_000L
+        assertFalse("anomalies keep 5 per minute", buffer.occur("DEPTH_STALE"))
+    }
+
+    @Test
     fun aFullBufferCountsInsteadOfGrowing() {
         for (i in 0 until 6) buffer.record("CODE_$i", "m", variant = "v")
         val drained = buffer.drain()

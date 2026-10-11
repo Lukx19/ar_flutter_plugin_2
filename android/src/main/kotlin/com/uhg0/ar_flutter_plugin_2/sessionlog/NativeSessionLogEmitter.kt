@@ -36,6 +36,11 @@ object NativeSessionLogEmitter {
     var active: Boolean = false
         private set
 
+    /** Increments each time a record window opens; counters re-baseline on a change. */
+    @Volatile
+    var activeGeneration = 0L
+        private set
+
     private var context: Context? = null
     private var memoryCallbacks: ComponentCallbacks2? = null
     private var thermalListener: PowerManager.OnThermalStatusChangedListener? = null
@@ -43,6 +48,7 @@ object NativeSessionLogEmitter {
     /** Opens or closes the record window; a change forgets pending records. */
     internal fun setActive(on: Boolean) {
         if (on != active) buffer.reset()
+        if (on && !active) activeGeneration++
         active = on
     }
 
@@ -95,11 +101,32 @@ object NativeSessionLogEmitter {
         return total
     }
 
+    /**
+     * The catalogue code (`session_log_codes.dart`) of a refusal by the
+     * exposure motion [gate]: gates without their own code map to the nearest
+     * reason, invalid samples to `CAPTURE_REFUSED_OTHER`; the record keeps the
+     * gate in `gate` and `originalCode`.
+     */
+    internal fun motionRefusalCode(gate: PoseDataExtractor.ExposureMotionGate): String = when (gate) {
+        PoseDataExtractor.ExposureMotionGate.APPROVED -> throw IllegalArgumentException("an approved shutter is no refusal")
+        PoseDataExtractor.ExposureMotionGate.NO_POSE -> "CAPTURE_REFUSED_NO_POSE"
+        PoseDataExtractor.ExposureMotionGate.STALE -> "CAPTURE_REFUSED_STALE_POSE"
+        PoseDataExtractor.ExposureMotionGate.NOT_TRACKING,
+        PoseDataExtractor.ExposureMotionGate.OLDER_NOT_TRACKING -> "CAPTURE_REFUSED_NOT_TRACKING"
+        PoseDataExtractor.ExposureMotionGate.INVALID_GAP,
+        PoseDataExtractor.ExposureMotionGate.INVALID_POSE,
+        PoseDataExtractor.ExposureMotionGate.INVALID_QUATERNION -> "CAPTURE_REFUSED_OTHER"
+        PoseDataExtractor.ExposureMotionGate.MOVING_TOO_FAST -> "CAPTURE_REFUSED_MOVING_TOO_FAST"
+        PoseDataExtractor.ExposureMotionGate.INSUFFICIENT_DWELL -> "CAPTURE_REFUSED_INSUFFICIENT_DWELL"
+    }
+
     /** A shutter refused by the exposure motion gate, with its scalar diagnostics. */
     internal fun recordMotionRefusal(attemptId: String, d: PoseDataExtractor.ExposureMotionDiagnostic) {
         if (!active || d.gate == PoseDataExtractor.ExposureMotionGate.APPROVED) return
-        val code = "CAPTURE_REFUSED_${d.gate.name}"
-        if (!buffer.occur(code)) return
+        val code = motionRefusalCode(d.gate)
+        // The gate is the variant, so each gate folded into one code is written once in full.
+        val variant = d.gate.name
+        if (!buffer.occur(code, variant)) return
         val refusing = d.firstRefusingPair
         buffer.record(
             code,
@@ -108,6 +135,7 @@ object NativeSessionLogEmitter {
                 "stage" to "native_shutter",
                 "attemptId" to attemptId,
                 "gate" to d.gate.name,
+                "originalCode" to "CAPTURE_REFUSED_${d.gate.name}",
                 "ageMs" to d.ageMs,
                 "dwellMs" to d.stableDwellMs,
                 "requiredDwellMs" to 400,
@@ -128,14 +156,15 @@ object NativeSessionLogEmitter {
                 "refusingPairGapMs" to refusing?.let { it.cameraGapNs / 1e6 },
                 "refusingPairTracking" to refusing?.newer?.trackingState,
             ),
+            variant = variant,
             admitted = true,
         )
     }
 
     /**
      * Runs a method channel handler body; an exception becomes a
-     * `NATIVE_HANDLER_ERROR` record and an error reply instead of a crash or
-     * a null reply.
+     * `NATIVE_HANDLER_ERROR` record and a status map reply
+     * (`status: error`) instead of a crash, a null or an error reply.
      */
     inline fun guard(channel: String, call: MethodCall, result: MethodChannel.Result, body: () -> Unit) {
         try {
@@ -151,7 +180,9 @@ object NativeSessionLogEmitter {
                     admitted = true,
                 )
             }
-            result.error("NATIVE_HANDLER_ERROR", e.message, null)
+            result.success(
+                mapOf("status" to "error", "code" to "NATIVE_HANDLER_ERROR", "message" to (e.message ?: "")),
+            )
         }
     }
 
@@ -203,20 +234,7 @@ object NativeSessionLogEmitter {
     private fun registerSystemListeners(ctx: Context) {
         if (memoryCallbacks == null) {
             memoryCallbacks = object : ComponentCallbacks2 {
-                override fun onTrimMemory(level: Int) {
-                    if (level < ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW &&
-                        level != ComponentCallbacks2.TRIM_MEMORY_RUNNING_MODERATE) return
-                    val runtime = Runtime.getRuntime()
-                    record(
-                        "MEMORY_PRESSURE",
-                        "System memory pressure (trim level $level)",
-                        mapOf(
-                            "trimLevel" to level,
-                            "javaHeapUsedMb" to (runtime.totalMemory() - runtime.freeMemory()) / (1024 * 1024),
-                        ),
-                        variant = "trim$level",
-                    )
-                }
+                override fun onTrimMemory(level: Int) = recordTrimMemory(level)
 
                 override fun onConfigurationChanged(newConfig: Configuration) = Unit
 
@@ -241,6 +259,46 @@ object NativeSessionLogEmitter {
         }
     }
 
+    /**
+     * Log level of a trim [level], or null when it is no memory pressure:
+     * `UI_HIDDEN` and `BACKGROUND` arrive on every backgrounding. Running-low,
+     * running-critical and complete are warnings; moderate (the backgrounded
+     * process is in the middle of the kill list) is info.
+     */
+    @Suppress("DEPRECATION")
+    internal fun memoryPressureLevel(level: Int): String? = when (level) {
+        ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW,
+        ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL,
+        ComponentCallbacks2.TRIM_MEMORY_COMPLETE -> NativeSessionLogBuffer.LEVEL_WARNING
+        ComponentCallbacks2.TRIM_MEMORY_MODERATE -> NativeSessionLogBuffer.LEVEL_INFO
+        else -> null
+    }
+
+    /** A `ComponentCallbacks2.onTrimMemory` call: `MEMORY_PRESSURE` for real pressure only. */
+    internal fun recordTrimMemory(level: Int) {
+        val logLevel = memoryPressureLevel(level) ?: return
+        if (!active) return
+        val runtime = Runtime.getRuntime()
+        record(
+            "MEMORY_PRESSURE",
+            "System memory pressure (trim level $level)",
+            mapOf(
+                "trimLevel" to level,
+                "javaHeapUsedMb" to (runtime.totalMemory() - runtime.freeMemory()) / (1024 * 1024),
+            ),
+            variant = "trim$level",
+            level = logLevel,
+        )
+    }
+
+    /**
+     * Whether [canonicalPath] names a file inside the export folder
+     * [canonicalRoot] (a sibling folder sharing the root's name as a prefix
+     * does not count).
+     */
+    internal fun isInsideExportRoot(canonicalRoot: String, canonicalPath: String): Boolean =
+        canonicalPath.startsWith(canonicalRoot + File.separator)
+
     private fun arCoreVersion(ctx: Context): String = try {
         @Suppress("DEPRECATION")
         ctx.packageManager.getPackageInfo("com.google.ar.core", 0).versionName ?: "unavailable"
@@ -254,7 +312,7 @@ object NativeSessionLogEmitter {
         val uris = ArrayList<android.net.Uri>()
         for (path in paths) {
             val file = File(path)
-            if (!file.canonicalPath.startsWith(exportRoot) || !file.isFile) return false
+            if (!isInsideExportRoot(exportRoot, file.canonicalPath) || !file.isFile) return false
             uris.add(FileProvider.getUriForFile(ctx, "${ctx.packageName}.sessionlog.fileprovider", file))
         }
         if (uris.isEmpty()) return false

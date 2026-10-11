@@ -62,6 +62,36 @@ class IngestPullHandlerTest {
     }
 
     @Test
+    fun `a drain pull with nothing of its kinds queued is answered idle without parking`() {
+        // The grid isolate's drain mask (grid_isolate_loop.dart drainKindMask).
+        val drainMask = (1 shl IngestMessageLayout.KIND_PHOTO_SAVED) or (1 shl IngestMessageLayout.KIND_PHOTO_TIE_POINTS)
+        assertEquals(0x110, drainMask)
+        offer(IngestMessageLayout.KIND_DEPTH_IMAGE, 8)
+        offer(IngestMessageLayout.KIND_SESSION_EVENT, IngestMessageLayout.SESSION_EVENT_BYTES)
+        handler.onPull(pullRequest(drainMask), reply)
+        assertEquals("answered on the fake clock without a tick", 1, reply.count)
+        assertEquals(IngestMessageLayout.KIND_IDLE, reply.kind())
+        assertFalse(handler.isParked)
+        assertEquals(-1L, handler.tick())
+
+        // A queued photo is still delivered to the drain, then the next drain pull is idle.
+        offer(IngestMessageLayout.KIND_PHOTO_SAVED, 16)
+        handler.onPull(pullRequest(drainMask), reply)
+        assertEquals(IngestMessageLayout.KIND_PHOTO_SAVED, reply.kind())
+        handler.onPull(pullRequest(drainMask), reply)
+        assertEquals(3, reply.count)
+        assertEquals(IngestMessageLayout.KIND_IDLE, reply.kind())
+
+        // Regular pulls still get the other kinds, then park.
+        handler.onPull(pullRequest(), reply)
+        assertEquals(IngestMessageLayout.KIND_SESSION_EVENT, reply.kind())
+        handler.onPull(pullRequest(), reply)
+        assertEquals(IngestMessageLayout.KIND_DEPTH_IMAGE, reply.kind())
+        handler.onPull(pullRequest(), reply)
+        assertTrue(handler.isParked)
+    }
+
+    @Test
     fun `malformed pulls and pulls after close are answered idle at once`() {
         handler.onPull(ByteBuffer.allocate(3), reply)
         assertEquals(IngestMessageLayout.KIND_IDLE, reply.kind())

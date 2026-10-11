@@ -37,7 +37,11 @@ internal interface IngestMessageSink {
  * Background isolates cannot receive platform-initiated messages, so the grid
  * isolate pulls: each 8 B pull request is answered with the freshest unsent
  * accepted message, or parked until one is offered; a parked pull is answered
- * with an idle message after [IDLE_AFTER_NS]. Only one pull is in flight.
+ * with an idle message after [IDLE_AFTER_NS]. A drain pull (its mask accepts
+ * only the photo saved and tie point queues, [DRAIN_KIND_MASK]) is never
+ * parked: with nothing of those kinds queued it is answered idle at once, so a
+ * group stop or switch does not wait for the idle timeout. Only one pull is in
+ * flight.
  *
  * Buffers are allocated once. Offered messages are copied into per-kind slots;
  * delivery copies the slot into one of two alternating reply buffers
@@ -62,6 +66,10 @@ internal class IngestPullHandler(
         /** Header, `C3TB` batch header and up to 128 native tie point records of 64 B. */
         const val TIE_POINT_MESSAGE_BYTES = IngestMessageLayout.HEADER_BYTES + 64 + 128 * 64
         private const val KINDS = 9
+
+        /** Kinds a group drain pulls (photo saved, photo tie points); a pull accepting only these never parks. */
+        const val DRAIN_KIND_MASK = (1 shl IngestMessageLayout.KIND_PHOTO_SAVED) or
+            (1 shl IngestMessageLayout.KIND_PHOTO_TIE_POINTS)
 
         /** Delivery order of the freshest-only kinds. */
         private val LATEST_ORDER = intArrayOf(
@@ -198,7 +206,11 @@ internal class IngestPullHandler(
                 replyIdleLocked(reply)
                 return
             }
-            if (!deliverLocked(reply, mask)) {
+            if (deliverLocked(reply, mask)) return
+            if ((mask and DRAIN_KIND_MASK.inv()) == 0) {
+                // A drain: the queues are empty now; waiting would only delay the stop.
+                replyIdleLocked(reply)
+            } else {
                 pending = reply
                 pendingMask = mask
                 pendingSinceNs = clock.nowNs()

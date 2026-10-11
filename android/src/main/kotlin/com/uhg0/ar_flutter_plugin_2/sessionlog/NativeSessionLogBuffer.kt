@@ -6,10 +6,12 @@ package com.uhg0.ar_flutter_plugin_2.sessionlog
  *
  * Applies the app's flood policy before anything is queued: the first
  * occurrence of a code and of each new variant (at most [MAX_VARIANTS]) is a
- * full record; after that a code repeating faster than [minFullIntervalNs]
- * (5 per minute) is only counted. Counted occurrences leave as one
- * `['C', code, count, lastMessage]` record per drain; a repeat costs a map
- * lookup and an int increment, no allocation.
+ * full record; after that a code repeating faster than its interval is only
+ * counted: [minFullIntervalNs] (5 per minute) for anomalies and
+ * [userActionIntervalNs] (30 per minute) for the user-action codes
+ * `CAPTURE_REFUSED_*`, matching the catalogue budgets. Counted occurrences
+ * leave as one `['C', code, count, lastMessage]` record per drain; a repeat
+ * costs a map lookup and an int increment, no allocation.
  *
  * Records are lists the Dart side decodes with `SessionLogRecordCodec`:
  * `['F', code, level, message, data, variant]`.
@@ -18,8 +20,9 @@ class NativeSessionLogBuffer(
     private val capacity: Int = 256,
     private val minFullIntervalNs: Long = 12_000_000_000L,
     private val nowNs: () -> Long = System::nanoTime,
+    private val userActionIntervalNs: Long = 2_000_000_000L,
 ) {
-    private class CodeState {
+    private class CodeState(val intervalNs: Long) {
         var lastFullNs = Long.MIN_VALUE
         var counted = 0
         var lastMessage = ""
@@ -33,11 +36,11 @@ class NativeSessionLogBuffer(
 
     /** Whether this occurrence should be recorded in full ([record] with `admitted`). */
     fun occur(code: String, variant: String? = null, message: String = ""): Boolean = synchronized(lock) {
-        val state = codes.getOrPut(code) { CodeState() }
+        val state = stateLocked(code)
         val now = nowNs()
         val newVariant = variant != null && state.variants.size < MAX_VARIANTS && variant !in state.variants
         if (newVariant) state.variants.add(variant!!)
-        if (state.lastFullNs == Long.MIN_VALUE || newVariant || now - state.lastFullNs >= minFullIntervalNs) {
+        if (state.lastFullNs == Long.MIN_VALUE || newVariant || now - state.lastFullNs >= state.intervalNs) {
             state.lastFullNs = now
             true
         } else {
@@ -64,7 +67,7 @@ class NativeSessionLogBuffer(
         synchronized(lock) {
             if (records.size >= capacity) {
                 droppedFull++
-                codes.getOrPut(code) { CodeState() }.let {
+                stateLocked(code).let {
                     it.counted++
                     it.lastMessage = message
                 }
@@ -72,6 +75,10 @@ class NativeSessionLogBuffer(
             }
             records.add(listOf("F", code, level, message, data, variant))
         }
+    }
+
+    private fun stateLocked(code: String): CodeState = codes.getOrPut(code) {
+        CodeState(if (code.startsWith(USER_ACTION_PREFIX)) userActionIntervalNs else minFullIntervalNs)
     }
 
     /** Full records and counts since the previous drain. */
@@ -107,6 +114,9 @@ class NativeSessionLogBuffer(
 
     companion object {
         const val MAX_VARIANTS = 8
+
+        /** Codes caused by a user action (catalogue budget `userAction`). */
+        const val USER_ACTION_PREFIX = "CAPTURE_REFUSED_"
         const val LEVEL_WARNING = "warning"
         const val LEVEL_ERROR = "error"
         const val LEVEL_INFO = "info"

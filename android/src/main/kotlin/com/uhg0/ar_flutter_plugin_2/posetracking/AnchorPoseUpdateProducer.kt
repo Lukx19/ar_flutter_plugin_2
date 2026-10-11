@@ -73,6 +73,10 @@ internal class AnchorPoseUpdateProducer(
             .apply { setMessageHandler { message, reply -> onQuery(message, reply) } }
     }
 
+    /** Queries answered with [STATUS_QUERY_REFUSED] (refused or failing tracker). */
+    @Volatile var queriesRefused = 0L
+        private set
+
     /**
      * Channel handler; runs on the background task queue. Never replies null
      * (the grid isolate sends through `BackgroundIsolateBinaryMessenger`): a
@@ -80,10 +84,6 @@ internal class AnchorPoseUpdateProducer(
      * is answered with the 4-byte status [STATUS_QUERY_REFUSED]; a pose reply is
      * always longer than 4 bytes (ingest header first).
      */
-    /** Queries answered with [STATUS_QUERY_REFUSED] (refused or failing tracker). */
-    @Volatile var queriesRefused = 0L
-        private set
-
     fun onQuery(message: ByteBuffer?, reply: BasicMessageChannel.Reply<ByteBuffer>) {
         synchronized(replyLock) {
             val next = 1 - lastReply
@@ -94,11 +94,11 @@ internal class AnchorPoseUpdateProducer(
                 NativeSessionLogEmitter.failure(
                     "NATIVE_HANDLER_ERROR", "poseTracking/query/${e.javaClass.simpleName}", "Pose tracking query failed",
                 ) { mapOf("channel" to "poseTracking", "method" to "query", "error" to (e.message ?: "")) }
-                -2
+                QUERY_FAILED
             }
             if (length < 0) {
                 queriesRefused++
-                if (length == -1) {
+                if (length == AnchorPoseTracker.QUERY_MALFORMED) {
                     NativeSessionLogEmitter.failure("POSE_REFUSED", "anchorQuery", "Anchor pose query refused") {
                         mapOf("reason" to "malformedOrClosed", "queriesRefused" to queriesRefused)
                     }
@@ -171,6 +171,9 @@ internal class AnchorPoseUpdateProducer(
     companion object {
         /** 4-byte status reply of a refused query (malformed, or the tracker is closed). */
         const val STATUS_QUERY_REFUSED = 2
+
+        /** Reply length standing for a tracker that threw (logged as a handler error, not a refusal). */
+        private const val QUERY_FAILED = -2
 
         private fun direct(): ByteBuffer =
             ByteBuffer.allocateDirect(AnchorPoseUpdateLayout.MAX_MESSAGE_BYTES).order(ByteOrder.LITTLE_ENDIAN)

@@ -386,7 +386,10 @@ internal class VisibilityGridRendererHost(
                 }
             }
             target.endFrame()
-            EGL14.eglSwapBuffers(display, surface)
+            if (!EGL14.eglSwapBuffers(display, surface)) {
+                // A lost context draws nothing again: stop so the host reports and recovers.
+                GlFailureCheck.swapFailure(EGL14.eglGetError())?.let { throw IllegalStateException(it) }
+            }
             // Keep draining a backlog even when the camera is still.
             if (core.scheduler.queuedMessages > 0) lock.withLock { renderRequested = true }
         }

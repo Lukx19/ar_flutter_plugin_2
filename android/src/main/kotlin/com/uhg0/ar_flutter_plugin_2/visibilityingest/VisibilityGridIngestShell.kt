@@ -219,6 +219,11 @@ internal class VisibilityGridIngestShell(
             }
             lastDepthMode = mode
         }
+        val logGeneration = NativeSessionLogEmitter.activeGeneration
+        if (logGeneration != countedLogGeneration) {
+            countedLogGeneration = logGeneration
+            rebaselineSessionCounters()
+        }
         // Before the tracking check, so a run also shows depth stopping while not tracking.
         if (depthTelemetry != null || NativeSessionLogEmitter.active) depthTelemetryTick(ts, tracking)
         if (tracking != IngestTrackingState.TRACKING) return
@@ -244,6 +249,21 @@ internal class VisibilityGridIngestShell(
     private var loggedIdentityRefused = 0L
     private var loggedStaleAutomatic = 0L
     private var loggedFrameFailures = 0L
+
+    // Session log opening seen by the counters (NativeSessionLogEmitter.activeGeneration).
+    private var countedLogGeneration = 0L
+
+    /**
+     * A session log was opened since the last frame: growth until now
+     * belongs to no log, so the new log reports only its own.
+     */
+    private fun rebaselineSessionCounters() {
+        loggedStale = depth.staleDropped
+        loggedDuplicate = depth.duplicateDropped
+        loggedIdentityRefused = depth.identityRefused
+        loggedStaleAutomatic = depth.identityStaleAutomatic
+        loggedFrameFailures = frameFailures
+    }
 
     /** At most once a second (shell clock): the telemetry line and the session log counters. */
     private fun depthTelemetryTick(frameNs: Long, tracking: Int) {
