@@ -74,7 +74,7 @@ internal class PhotoTiePointProducer(
     private val sink: TiePointBatchSink,
     dictionary: Int = MarkerDetectorNative.DICTIONARY_ARUCO_MIP_36H12,
     private val maxRecords: Int = MarkerDetectorNative.MAX_MARKERS,
-) : AutoCloseable {
+) : AutoCloseable, TiePointPhotoTarget {
     private val thread = HandlerThread("capture3d-marker-tie-points").apply { start() }
     private val worker = Handler(thread.looper)
     private var handle: Long =
@@ -112,11 +112,40 @@ internal class PhotoTiePointProducer(
         jpegPath: String,
         groupEpoch: Int,
         distortion: DoubleArray? = null,
+    ) = onPhotoDurable(photoId, eventBytes, { jpegPath }, groupEpoch, distortion)
+
+    /** As above; [jpegPath] is resolved on the detection thread (it may list the store). */
+    override fun onPhotoDurable(
+        photoId: ByteArray,
+        eventBytes: ByteArray,
+        jpegPath: () -> String?,
+        groupEpoch: Int,
+        distortion: DoubleArray?,
     ) {
         if (!available) return
         val id = photoId.copyOf()
         val ev = eventBytes.copyOf()
-        worker.post { detect(id, ev, jpegPath, groupEpoch, distortion) }
+        worker.post {
+            val path = jpegPath()
+            if (path == null) {
+                failures++
+                event.clear()
+                event.put(ev, 0, PhotoSavedLayout.BYTES)
+                send(id, 0, 0, 0, groupEpoch, event.getLong(PhotoSavedLayout.EXPOSURE_TIMESTAMP_NS),
+                    MarkerDetectorNative.STATUS_ARGUMENT, SystemClock.elapsedRealtimeNanos())
+            } else {
+                detect(id, ev, path, groupEpoch, distortion)
+            }
+        }
+    }
+
+    private var configuredSize = Double.NaN
+
+    /** [configure] once per distinct free marker size. */
+    override fun ensureMarkerSize(markerSizeMetres: Double) {
+        if (markerSizeMetres == configuredSize) return
+        configuredSize = markerSizeMetres
+        configure(markerSizeMetres)
     }
 
     private fun detect(photoId: ByteArray, eventBytes: ByteArray, jpegPath: String, groupEpoch: Int, distortion: DoubleArray?) {

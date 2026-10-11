@@ -11,7 +11,17 @@ abstract final class IngestKind {
   static const int photoSaved = 4;
   static const int markerDetections = 5;
   static const int sessionEvent = 6;
-  static const int count = 7;
+
+  /// Reserved for the anchor pose update of pose stability (plan 2.14).
+  static const int reservedAnchorPoses = 7;
+
+  /// Marker tie points of one saved photo, after its durable commit:
+  /// payload is the 64 B `C3TB` batch header and 64 B native tie point
+  /// records (decoded by the marker stage); header time and pose fields are
+  /// zero, the group epoch is the photo's. Queued in order, never dropped
+  /// for a fresher one. Contract amendment of the grid integration.
+  static const int photoTiePoints = 8;
+  static const int count = 9;
 }
 
 /// Source flags (header byte 7). Bit 0 depth, bit 1 points, bit 2
@@ -378,8 +388,10 @@ abstract final class SessionEventPayload {
   }
 }
 
-/// 8 B pull request from the grid isolate: magic `C3VP`, u16 version, u8
-/// accepted kind mask (bit k accepts kind k, kinds 1-6), u8 reserved.
+/// 8 B pull request from the grid isolate: magic `C3VP`, u16 version, u16
+/// accepted kind mask (bit k accepts kind k). Byte 7 was reserved (zero) in
+/// the first contract, so an 8-bit mask reads the same; kind 8 needs the
+/// high byte.
 final class IngestPullRequestView extends ContractRecordView {
   static final int magic = contractMagic('C3VP');
   static const int version = 1;
@@ -394,9 +406,8 @@ final class IngestPullRequestView extends ContractRecordView {
   void write(int acceptedKindMask) {
     setU32(0, magic);
     setU16(4, version);
-    setU8(6, acceptedKindMask);
-    setU8(7, 0);
+    setU16(6, acceptedKindMask);
   }
 
-  int get acceptedKindMask => u8(6);
+  int get acceptedKindMask => u16(6);
 }

@@ -27,6 +27,9 @@ internal class StyleDrawCounters {
     var instances = 0L
     var visibleSurfaceSlices = 0
     var visibleVoxelSlices = 0
+
+    /** Voxel instances drawn (padding entries included; they collapse in the shader). */
+    var voxelInstances = 0L
 }
 
 /**
@@ -161,6 +164,7 @@ internal class StyleDrawSet(
     fun draw(mode: GridDisplayState, view: GridFrameView) {
         counters.drawCalls = 0
         counters.instances = 0
+        counters.voxelInstances = 0
         extractPlanes(view.viewProjection)
         cullSlices(store.surfaceSlices, isVoxel = false)
         cullSlices(store.voxelSlices, isVoxel = true)
@@ -261,23 +265,47 @@ internal class StyleDrawSet(
         }
     }
 
+    /**
+     * Soft splats in two passes ("visibility splatting"). Overlapping splats
+     * of one surface patch are coplanar: drawn in one pass with depth
+     * writes, the first splat to touch a pixel (often its nearly transparent
+     * rim) wrote the depth and every later splat at the same depth failed
+     * the test, leaving holes in the middle of a fully covered patch. Pass 1
+     * writes only depth, pushed back by a polygon offset; pass 2 blends the
+     * colour of every splat in front of that depth without writing depth,
+     * so coplanar splats accumulate while hidden surfaces stay hidden.
+     */
     private fun drawSplats(mode: GridDisplayState, view: GridFrameView) {
         val name = buffers.bufferName(GridBuffer.SURFACES)
         if (name == 0) return
         use(splat, mode, view)
-        GLES30.glEnable(GLES30.GL_BLEND)
-        GLES30.glBlendFunc(GLES30.GL_SRC_ALPHA, GLES30.GL_ONE_MINUS_SRC_ALPHA)
         GLES30.glBindVertexArray(vao[VAO_SPLATS])
         GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, name)
+        GLES30.glColorMask(false, false, false, false)
+        GLES30.glEnable(GLES30.GL_POLYGON_OFFSET_FILL)
+        GLES30.glPolygonOffset(SPLAT_DEPTH_OFFSET_FACTOR, SPLAT_DEPTH_OFFSET_UNITS)
+        splatRuns(colour = false)
+        GLES30.glDisable(GLES30.GL_POLYGON_OFFSET_FILL)
+        GLES30.glColorMask(true, true, true, true)
+        GLES30.glDepthMask(false)
+        GLES30.glDepthFunc(GLES30.GL_LEQUAL)
+        GLES30.glEnable(GLES30.GL_BLEND)
+        GLES30.glBlendFunc(GLES30.GL_SRC_ALPHA, GLES30.GL_ONE_MINUS_SRC_ALPHA)
+        splatRuns(colour = true)
+        GLES30.glDisable(GLES30.GL_BLEND)
+        GLES30.glDepthFunc(GLES30.GL_LESS)
+        GLES30.glDepthMask(true)
+    }
+
+    private fun splatRuns(colour: Boolean) {
         for (r in 0 until surfaceRunCount) {
             val n = surfaceRunEnd[r] - surfaceRunStart[r]
             surfacePointers(surfaceRunStart[r], divisor = 1)
             GLES30.glUniform1i(splat.grey, if (surfaceRunGrey[r]) 1 else 0)
             GLES30.glDrawArraysInstanced(GLES30.GL_TRIANGLE_STRIP, 0, 4, n)
             counters.drawCalls++
-            counters.instances += n
+            if (colour) counters.instances += n
         }
-        GLES30.glDisable(GLES30.GL_BLEND)
     }
 
     private fun drawSpikes(mode: GridDisplayState, view: GridFrameView) {
@@ -314,6 +342,7 @@ internal class StyleDrawSet(
             GLES30.glDrawArraysInstanced(GLES30.GL_TRIANGLE_STRIP, 0, 14, n)
             counters.drawCalls++
             counters.instances += n
+            counters.voxelInstances += n
         }
     }
 
@@ -543,6 +572,8 @@ internal class StyleDrawSet(
         private const val LOC_VOXEL = 11
         private const val SPIKES_PER_SURFACE = 24
         private const val SPIKE_BALL_PX = 10f
+        private const val SPLAT_DEPTH_OFFSET_FACTOR = 1f
+        private const val SPLAT_DEPTH_OFFSET_UNITS = 4f
         private const val RESIDENCY_SUMMARY_ONLY = 2
         const val BRICK_METRES = GridBrickKey.BRICK_METRES
         private val BRICK_RADIUS = BRICK_METRES * sqrt(3f) * 0.5f

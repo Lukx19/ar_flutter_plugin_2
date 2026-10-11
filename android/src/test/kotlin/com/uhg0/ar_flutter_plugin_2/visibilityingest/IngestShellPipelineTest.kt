@@ -223,12 +223,22 @@ class IngestShellPipelineTest {
             }
         }
         run(2_000) // warm up, JIT
+        // HotSpot keeps compiling (and occasionally deoptimising, which
+        // rematerialises scalar-replaced objects on the heap) for thousands
+        // of frames after warm-up; such one-off events land in a different
+        // window depending on the loaded class set. A per-frame allocation
+        // (at least one 16 B object per frame) shows in every window, so
+        // steady state is the quietest window and no window may average a
+        // byte per frame.
         val probe = AllocationProbe()
         val overhead = probe.measure { }
-        val allocated = probe.measure { run(1_000) } - overhead
+        val windows = LongArray(STEADY_WINDOWS) { probe.measure { run(STEADY_WINDOW_FRAMES) } - overhead }
         assertTrue(shell.depthProducer.published > 100)
         assertTrue(shell.pointProducer.published > 100)
-        assertEquals("bytes allocated in steady state", 0L, allocated)
+        assertEquals("bytes allocated in the quietest steady-state window ${windows.toList()}", 0L, windows.min())
+        for (bytes in windows) {
+            assertTrue("per-frame allocation in ${windows.toList()}", bytes < STEADY_WINDOW_FRAMES)
+        }
     }
 
     /** Thread allocation counter through reflection (the Android compile classpath has no java.lang.management). */
@@ -251,6 +261,8 @@ class IngestShellPipelineTest {
     }
 
     private companion object {
+        const val STEADY_WINDOWS = 8
+        const val STEADY_WINDOW_FRAMES = 500
         val SESSION = Any()
         val OTHER_SESSION = Any()
     }

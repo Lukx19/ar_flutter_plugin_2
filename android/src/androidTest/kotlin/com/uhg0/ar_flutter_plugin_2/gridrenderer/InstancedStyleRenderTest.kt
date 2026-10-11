@@ -174,6 +174,15 @@ class InstancedStyleRenderTest {
         offer()
     }
 
+    /** Window pixel (x, y from the top) of world point ([x], [y], [z]). */
+    private fun pixelOf(x: Float, y: Float, z: Float): IntArray {
+        val clip = FloatArray(4)
+        Matrix.multiplyMV(clip, 0, view.viewProjection, 0, floatArrayOf(x, y, z, 1f), 0)
+        val px = ((clip[0] / clip[3]) * 0.5f + 0.5f) * SIZE
+        val py = (0.5f - (clip[1] / clip[3]) * 0.5f) * SIZE
+        return intArrayOf(px.toInt(), py.toInt())
+    }
+
     private fun red(rgba: Int) = rgba ushr 24
     private fun green(rgba: Int) = (rgba ushr 16) and 0xff
     private fun alpha(rgba: Int) = rgba and 0xff
@@ -193,15 +202,31 @@ class InstancedStyleRenderTest {
         render()
         val centre = probe(SIZE / 2, SIZE / 2)
         assertTrue("centre $centre", red(centre) > 60 && alpha(centre) > 0)
+        // Overlapping coplanar splats leave no hole inside the patch (one
+        // splat's transparent rim must not hide its neighbours by depth).
+        for (dy in -9..9 step 3) for (dx in -9..9 step 3) {
+            val rgba = probe(SIZE / 2 + dx, SIZE / 2 + dy)
+            assertTrue("($dx, $dy) $rgba", red(rgba) > 60 && alpha(rgba) > 0)
+        }
+
     }
 
     @Test
     fun compactVoxelsDrawAndPaddingCollapses() {
         mode(GridDisplayCodes.BASE_VOXELS)
         render()
-        assertTrue(red(probe(SIZE / 2, SIZE / 2)) > 60)
-        assertEquals(16L, draws.counters.instances)
+        // Cubes are 9 cm in 10 cm cells: the screen centre lies in the 1 cm
+        // gap between the four voxels, so probe each voxel's centre.
+        for (v in arrayOf(intArrayOf(-1, -1), intArrayOf(0, -1), intArrayOf(-1, 0), intArrayOf(0, 0))) {
+            val p = pixelOf((v[0] + 0.5f) * 0.1f, (v[1] + 0.5f) * 0.1f, -1.95f)
+            val rgba = probe(p[0], p[1])
+            assertTrue("voxel ${v.toList()} at ${p.toList()}: $rgba", red(rgba) > 60 && alpha(rgba) > 0)
+        }
+        // Twelve padding entries are drawn and collapse off screen.
+        assertEquals(16L, draws.counters.voxelInstances)
         assertEquals(1, draws.counters.visibleVoxelSlices)
+        val cube = (0.09f / 1.905f * view.focalPx).toInt()
+        assertTrue("drawn ${drawnPixels()}", drawnPixels() in 4 * (cube - 2) * (cube - 2)..4 * (cube + 3) * (cube + 3))
     }
 
     @Test

@@ -173,8 +173,8 @@ final class VisibilityGridIngestPullClient {
   bool _inFlight = false;
   bool _closed = false;
 
-  /// Bit k accepts ingest kind k (kinds 1-6).
-  static const int acceptAll = 0x7e;
+  /// Bit k accepts ingest kind k (kinds 1-6 and 8, photo tie points).
+  static const int acceptAll = 0x17e;
 
   Future<ByteData> pull([int acceptedKindMask = acceptAll]) async {
     if (_closed) {

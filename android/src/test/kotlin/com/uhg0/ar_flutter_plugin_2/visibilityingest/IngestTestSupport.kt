@@ -39,7 +39,7 @@ internal class CapturingReply : BasicMessageChannel.Reply<ByteBuffer> {
 
 internal fun pullRequest(mask: Int = 0x7e): ByteBuffer {
     val b = ByteBuffer.allocateDirect(IngestMessageLayout.PULL_REQUEST_BYTES).order(ByteOrder.LITTLE_ENDIAN)
-    b.putInt(0, IngestMessageLayout.PULL_REQUEST_MAGIC).putShort(4, 1).put(6, mask.toByte())
+    b.putInt(0, IngestMessageLayout.PULL_REQUEST_MAGIC).putShort(4, 1).putShort(6, mask.toShort())
     return b
 }
 
