@@ -48,7 +48,9 @@ internal class CoveragePointMeshResources(
     private var retainedSnapshotUploadRequired = true
     private val descriptorSequencer = CoverageDescriptorPageSequencer()
     private var destroyed = false
+    private var destroyRequested = false
     @Volatile private var onUploadPageReleased: () -> Unit = {}
+    @Volatile private var onResourceDrained: () -> Unit = {}
     private val uploadCoordinator = CoveragePointUploadCoordinator(
         capacity = capacity,
         uploader = FilamentCoveragePointVertexUploader(engine, vertexBuffer),
@@ -61,12 +63,13 @@ internal class CoveragePointMeshResources(
         onDestroyedUploadCallback = {
             telemetry?.recordFencedDestroyedUploadCallback()
         },
-        onUploadPageReleasedWithTicket = { ticket ->
-            descriptorSequencer.release(ticket)
+        onUploadPageSettled = { ticket, successful ->
+            descriptorSequencer.finishUpload(ticket, successful)
         },
         onUploadPageReleased = {
             onUploadPageReleased()
         },
+        onTerminalStateSettled = { finishDestroyIfDrained() },
     )
     private val allocationLedger = telemetry?.let(::CoverageRendererAllocationLedger)
     private var indexStaging: java.nio.IntBuffer? = null
@@ -93,6 +96,8 @@ internal class CoveragePointMeshResources(
         ) {
             indexStaging = null
             allocationLedger?.completePointStartup(telemetryOwner)
+            if (!destroyed) onUploadPageReleased()
+            finishDestroyIfDrained()
         }
     }
 
@@ -112,6 +117,7 @@ internal class CoveragePointMeshResources(
         check(presentation.colors.size == presentation.count)
         val uploadQualifier = presentation.uploadQualifier()
         if (uploadQualifier != lastUploadQualifier || retainedSnapshotUploadRequired) {
+            descriptorSequencer.clear()
             if (presentation.count > 0) {
                 if (retainedSnapshotUploadRequired) {
                     uploadCoordinator.submitForResourceGeneration(presentation)
@@ -139,6 +145,7 @@ internal class CoveragePointMeshResources(
         ticket: CoverageDescriptorPageTicket?,
         enabled: Boolean,
     ) {
+        if (ticket == null || !descriptorSequencer.owns(ticket)) descriptorSequencer.clear()
         uploadCoordinator.submitPage(
             page,
             RendererUploadPageOrigin.RESOURCE_GENERATION_RESET.takeIf { reset }
@@ -165,10 +172,9 @@ internal class CoveragePointMeshResources(
             hide(node)
             return
         }
-        descriptorSequencer.replace(
-            descriptor,
-            rehydrate = retainedSnapshotUploadRequired,
-        )
+        if (!descriptorSequencer.isCurrent(descriptor) || retainedSnapshotUploadRequired) {
+            descriptorSequencer.replace(descriptor, rehydrate = retainedSnapshotUploadRequired)
+        }
         retainedSnapshotUploadRequired = false
         setDrawCount(node, descriptor.count)
         materialInstance.setParameter("pointSize", pointSizePx)
@@ -211,9 +217,25 @@ internal class CoveragePointMeshResources(
         if (!descriptorSequencer.hasInFlightPage) queueNextDescriptorPage()
     }
 
+    override fun isWholeDescriptorUploadComplete(descriptor: BoundedCoveragePresentation): Boolean =
+        descriptorUploadReady(descriptorSequencer, uploadCoordinator, descriptor,
+            indexUploadPending = indexStaging != null, destroyed = destroyed)
+
+    override fun releaseCompletedDescriptorSource() {
+        descriptorSequencer.clear()
+    }
+
     override fun setOnUploadPageReleased(listener: () -> Unit) {
         onUploadPageReleased = listener
     }
+
+    override fun setOnResourceDrained(listener: () -> Unit) {
+        onResourceDrained = listener
+        if (destroyed) listener() else finishDestroyIfDrained()
+    }
+
+    override val resourceDrainComplete: Boolean
+        get() = destroyed
 
     private fun setDrawCount(node: Node, count: Int) {
         val renderableManager = engine.renderableManager
@@ -230,17 +252,29 @@ internal class CoveragePointMeshResources(
     }
 
     override fun destroy() {
-        if (destroyed) return
-        destroyed = true
+        if (destroyRequested) return
+        destroyRequested = true
         onUploadPageReleased = {}
         uploadCoordinator.destroy()
-        indexStaging = null
         descriptorSequencer.clear()
         currentNodeForDescriptor = null
         currentMaterialForDescriptor = null
-        allocationLedger?.releasePointResources(telemetryOwner)
-        engine.destroyVertexBuffer(vertexBuffer)
-        engine.destroyIndexBuffer(indexBuffer)
+        finishDestroyIfDrained()
+    }
+
+    private val destructionCompletion = CoverageResourceDrainCompletion(
+        isDrained = { indexStaging == null && uploadCoordinator.isDrained() },
+        complete = {
+            engine.destroyVertexBuffer(vertexBuffer)
+            engine.destroyIndexBuffer(indexBuffer)
+            destroyed = true
+            allocationLedger?.releasePointResources(telemetryOwner)
+            onResourceDrained()
+        },
+    )
+
+    private fun finishDestroyIfDrained() {
+        if (destroyRequested) destructionCompletion.requestDestroy()
     }
 
     internal companion object {
@@ -270,6 +304,16 @@ internal class CoveragePointMeshResources(
         // while the color upload below uses a raw ByteBuffer and therefore uses
         // bytes. Passing position bytes here overflows the FloatBuffer on the
         // first non-empty point-cloud snapshot.
+        /** The production readiness seam is shared with connected held-callback fixtures. */
+        internal fun descriptorUploadReady(
+            sequencer: CoverageDescriptorPageSequencer,
+            coordinator: CoveragePointUploadCoordinator,
+            descriptor: BoundedCoveragePresentation,
+            indexUploadPending: Boolean,
+            destroyed: Boolean,
+        ): Boolean = !destroyed && !indexUploadPending &&
+            sequencer.isSuccessfullyComplete(descriptor) && coordinator.isIdleAndSuccessful()
+
         internal fun positionBufferElementCount(pointCount: Int): Int =
             pointCount * POSITION_COMPONENTS
 
@@ -329,7 +373,9 @@ internal class CoveragePointUploadCoordinator(
     private val onUploadCompletedAttributed: (Long, RendererUploadPageOrigin) -> Unit = { _, _ -> },
     private val onDestroyedUploadCallback: () -> Unit = {},
     private val onUploadPageReleasedWithTicket: (CoverageDescriptorPageTicket) -> Unit = {},
+    private val onUploadPageSettled: (CoverageDescriptorPageTicket, Boolean) -> Unit = { _, _ -> },
     private val onUploadPageReleased: () -> Unit = {},
+    private val onTerminalStateSettled: () -> Unit = {},
     private val clockNanos: () -> Long = System::nanoTime,
 ) {
     private val buffers = CoveragePointUploadBuffers(capacity)
@@ -369,14 +415,15 @@ internal class CoveragePointUploadCoordinator(
         ticket: CoverageDescriptorPageTicket? = null,
     ) {
         if (destroyed) {
-            if (ticket != null) onUploadPageReleasedWithTicket(ticket)
+            if (ticket != null) settlePageTicket(ticket, successful = false)
             return
         }
         val cancelledPage = pendingPages.removeFirstOrNull()
         pendingUploads.clear()
         pendingPages.addLast(PendingPage(page, origin, ticket))
         // Install the replacement before release: its callback may enqueue a newer page.
-        cancelledPage?.ticket?.let(onUploadPageReleasedWithTicket)
+        cancelledPage?.ticket?.let { settlePageTicket(it, successful = false) }
+        if (isDrained()) onTerminalStateSettled()
     }
 
     private fun enqueue(
@@ -403,7 +450,7 @@ internal class CoveragePointUploadCoordinator(
         // current range. Once its two callbacks return, a newer revision
         // supersedes every remaining chunk from the old snapshot.
         if (uploadBusy) pendingRanges.clear()
-        cancelledPage?.ticket?.let(onUploadPageReleasedWithTicket)
+        cancelledPage?.ticket?.let { settlePageTicket(it, successful = false) }
     }
 
     /** Rehydrates a new Filament resource generation from the retained cut. */
@@ -420,6 +467,14 @@ internal class CoveragePointUploadCoordinator(
 
     fun onRendererFrame() = drain()
 
+    fun isIdleAndSuccessful(): Boolean =
+        !destroyed && !uploadBusy && pendingUploads.isEmpty() && pendingPages.isEmpty() && pendingRanges.isEmpty() &&
+            !activeUploadFailed && !submissionInProgress
+
+    fun isDrained(): Boolean =
+        !uploadBusy && pendingUploads.isEmpty() && pendingPages.isEmpty() && pendingRanges.isEmpty() &&
+            !submissionInProgress && activePage == null && activeSnapshot == null
+
     fun destroy() {
         if (destroyed) return
         destroyed = true
@@ -428,15 +483,22 @@ internal class CoveragePointUploadCoordinator(
         pendingRanges.clear()
         // Submitted direct storage and its page owner survive until consumption.
         if (!uploadBusy) releaseActivePage()
-        cancelledPage?.ticket?.let(onUploadPageReleasedWithTicket)
+        cancelledPage?.ticket?.let { settlePageTicket(it, successful = false) }
+        if (isDrained()) onTerminalStateSettled()
     }
 
-    private fun releaseActivePage() {
+    private fun settlePageTicket(ticket: CoverageDescriptorPageTicket, successful: Boolean) {
+        // Proof arrives before the legacy drain callback can inspect or recycle this page.
+        onUploadPageSettled(ticket, successful)
+        onUploadPageReleasedWithTicket(ticket)
+    }
+
+    private fun releaseActivePage(successful: Boolean = false) {
         activeSnapshot = null
         activePage = null
         val ticket = activePageTicket
         activePageTicket = null
-        if (ticket != null) onUploadPageReleasedWithTicket(ticket)
+        if (ticket != null) settlePageTicket(ticket, successful)
     }
 
     private fun drain() {
@@ -563,15 +625,17 @@ internal class CoveragePointUploadCoordinator(
         val origin = activeOrigin
         val elapsedNanos = (clockNanos() - activeUploadStartedNanos).coerceAtLeast(0L)
         uploadBusy = false
-        if (pendingRanges.isEmpty()) {
-            releaseActivePage()
+        try {
+            if (pendingRanges.isEmpty()) releaseActivePage(successful = completed && !destroyed)
+            if (!destroyed && completed) {
+                onUploadCompleted(elapsedNanos)
+                if (!destroyed) onUploadCompletedAttributed(elapsedNanos, origin)
+            }
+            if (!destroyed) onUploadPageReleased()
+        } finally {
+            // All busy/submission/source/page fields settle before destruction observes them.
+            if (isDrained()) onTerminalStateSettled()
         }
-        if (destroyed) return
-        if (completed) {
-            onUploadCompleted(elapsedNanos)
-            if (!destroyed) onUploadCompletedAttributed(elapsedNanos, origin)
-        }
-        if (!destroyed) onUploadPageReleased()
         // A completed callback only releases the page; a renderer frame admits the next one.
     }
 

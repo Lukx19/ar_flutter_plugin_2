@@ -2,6 +2,10 @@ package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
 import java.util.Collections
 
+internal enum class DepthPlaneFitStrategy { PER_SAMPLE_SUPPORT, REUSABLE_SAMPLE_SUPPORT, BULK_CELL_MOMENTS }
+
+internal enum class DepthSurfaceEstimationMode { DISABLED, LOCAL_NORMALS, COMPATIBLE_LOCAL_PLANES }
+
 /** Locked, primitive-only calibration for one depth-evidence kernel. */
 internal data class DepthEvidenceConfiguration(
     val confidenceMinimum: Int = 128,
@@ -15,6 +19,9 @@ internal data class DepthEvidenceConfiguration(
     val sampleCapacity: Int = V2_DEPTH_SAMPLE_CAPACITY,
     val rayVisitCapacity: Int = 65_536,
     val surfaceCapacity: Int = 100_000,
+    val surfaceEstimationMode: DepthSurfaceEstimationMode = DepthSurfaceEstimationMode.DISABLED,
+    val planeFitStrategy: DepthPlaneFitStrategy = DepthPlaneFitStrategy.PER_SAMPLE_SUPPORT,
+    val reuseCurrentEstimatePlaneSupport: Boolean = false,
 ) {
     init {
         require(confidenceMinimum in 0..255)
@@ -536,3 +543,83 @@ internal enum class DepthEvidenceRefusal {
     ARITHMETIC_OVERFLOW,
     CANONICAL_LOOKUP_FAILED,
 }
+
+/** Latest selected-sample estimator work, independent of renderer thickness. */
+internal data class DepthSurfaceEstimationReceipt(
+    val mode: DepthSurfaceEstimationMode,
+    val locallyFittedSamples: Int,
+    val independentPlaneFits: Int,
+    val associatedSamples: Int,
+    val localNeighborWorkUnits: Int,
+    val associationCellLookups: Int,
+    val fullFitAttempts: Int = 0,
+    val fullFitSuccesses: Int = 0,
+    val reuseAttempts: Int = 0,
+    val reuseQualifiedPoints: Int = 0,
+    val reuseRefusals: Int = 0,
+    val reuseWitnessWork: Int = 0,
+    val reuseScratchWork: Int = 0,
+)
+
+/** One directly addressed compact position and publication support, capped at four estimates. */
+internal data class DepthSurfacePositionEstimate(
+    val xMillimetres: Double,
+    val yMillimetres: Double,
+    val zMillimetres: Double,
+    val packedNormal: Int,
+    val independentSupportsToPublication: Int,
+)
+
+/** Scalar access to phase-dead relation words, valid only during synchronous sample ingestion. */
+internal interface CurrentEstimatePlaneSupportWords {
+    fun readPlaneSupportWord(index: Int): Int
+    fun writePlaneSupportWord(index: Int, value: Int)
+}
+
+/** One 64-word certificate; all referenced samples belong to the current immutable estimate. */
+internal object CurrentEstimatePlaneSupportLayout {
+    const val WORDS = 64
+    const val KEY_LOW = 0
+    const val KEY_HIGH = 1
+    const val DESTINATION = 2
+    const val SEED = 3
+    const val LEFT = 4
+    const val RIGHT = 5
+    const val TOP = 6
+    const val BOTTOM = 7
+    const val HULL_COUNT = 8
+    const val HULL = 9
+    const val LEFT_POINT = 14
+    const val RIGHT_POINT = 20
+    const val TOP_POINT = 26
+    const val BOTTOM_POINT = 32
+    const val RAY_SUM_U = 38
+    const val RAY_SUM_V = 40
+    const val SUPPORT_SAMPLES = 42
+    const val SEED_SAMPLE = 58
+
+    fun readDouble(words: CurrentEstimatePlaneSupportWords, index: Int): Double = java.lang.Double.longBitsToDouble(
+        (words.readPlaneSupportWord(index).toLong() and 0xffff_ffffL) or
+            (words.readPlaneSupportWord(index + 1).toLong() shl 32),
+    )
+
+    fun writeDouble(words: CurrentEstimatePlaneSupportWords, index: Int, value: Double) {
+        val bits = java.lang.Double.doubleToRawLongBits(value)
+        words.writePlaneSupportWord(index, bits.toInt())
+        words.writePlaneSupportWord(index + 1, (bits ushr 32).toInt())
+    }
+}
+
+internal data class DepthBulkPlaneReceipt(
+    val strategy: DepthPlaneFitStrategy,
+    val accumulatorCapacity: Int,
+    val populatedCells: Int,
+    val qualifiedCells: Int,
+    val rejectedCells: Int,
+    val covarianceSolves: Int,
+    val certificateAttempts: Int,
+    val allPointResidualWork: Int,
+    val scratchWork: Int,
+    val projectedSamples: Int,
+    val wholeEstimateUnrefined: Boolean,
+)

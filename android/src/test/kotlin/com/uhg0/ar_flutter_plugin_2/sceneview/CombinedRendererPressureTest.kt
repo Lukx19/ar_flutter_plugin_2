@@ -19,7 +19,7 @@ class CombinedRendererPressureTest {
         repeat(3) { cycle ->
             resources.openCycle(cycle)
             val active = resources.telemetry.pressureSnapshot()
-            assertEquals(13_358_756, active.rendererOwnedBytes)
+            assertEquals(13_366_948, active.rendererOwnedBytes)
             assertTrue(active.rendererOwnedBytes <= CoverageRendererLimits.ACTIVE_RENDERER_OWNED_LIMIT_BYTES)
             assertTrue(resources.peakTransitionBytes <= CoverageRendererLimits.COMBINED_RENDERER_OWNED_LIMIT_BYTES)
             assertTrue(resources.peakReplacementBytes <= CoverageRendererLimits.TRANSITION_HEADROOM_BYTES)
@@ -28,7 +28,7 @@ class CombinedRendererPressureTest {
         }
         val renderer = resources.telemetry.pressureSnapshot()
         val pages = resources.pages.pressureSnapshot()
-        assertEquals(19_246_756, resources.peakTransitionBytes)
+        assertEquals(19_254_948, resources.peakTransitionBytes)
         assertEquals(5_888_000, resources.peakReplacementBytes)
         assertEquals(64L * 1024L, renderer.maxUploadBytesPerFrame)
         assertEquals(6, renderer.rendererResourcesAcquired)

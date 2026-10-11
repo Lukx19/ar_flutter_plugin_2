@@ -13,6 +13,9 @@ import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageCommittedRows
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRowsQualifier
 import com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode
 import com.uhg0.ar_flutter_plugin_2.pointcloud.identityGridRotation
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.RendererStyleCutPayloadV1
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.SparseRendererStyleCommandV1
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererAge
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererPalette
 import com.uhg0.ar_flutter_plugin_2.sceneview.BoundedCoveragePresentation
 import com.uhg0.ar_flutter_plugin_2.sceneview.CoveragePresentationMode
@@ -168,6 +171,11 @@ class VisibilityGridRendererState(
     private var targetSurfaceIdValue: Long? = null
     private var targetDirectionIndexValue: Int? = null
     private var lastStyleCut: QualifiedRendererStyleCut? = null
+    private var lastSparseDigest: ByteArray? = null
+    private var sparseBaselineAvailable = false
+    private var globalStyleAge: Int? = null
+    private var globalSemanticGeneration = 0L
+    private var globalStyleGeneration = 0L
 
     // Descriptor pages use frozen geometry and an atomic committed-cut fence.
     // They never wait for the mutable row monitor on the camera/render thread.
@@ -296,6 +304,8 @@ class VisibilityGridRendererState(
         installedGroupId = nextOwnership.captureGroupId
         installedGroupGeneration = nextOwnership.groupGeneration
         installedTransactionId = 0L
+        sparseBaselineAvailable = false
+        lastSparseDigest = null
         invalidateGeometryPage()
         publishReadableCut()
         return true
@@ -342,7 +352,7 @@ class VisibilityGridRendererState(
                 require(index in 0 until count)
                 val source = index * COVERAGE_RENDERER_STYLE_ROW_BYTES
                 CoverageRendererStyleRowV1.validateEncoded(styleRows, source)
-                styleRows.copyInto(destination, offset, source, source + COVERAGE_RENDERER_STYLE_ROW_BYTES)
+                this@VisibilityGridRendererState.copyStyleAt(index, destination, offset)
             }
             override fun packedNormalAt(index: Int): Int {
                 require(index in 0 until count)
@@ -354,7 +364,7 @@ class VisibilityGridRendererState(
             }
             override fun rowAt(index: Int): CoverageCommittedRow {
                 require(index in 0 until count)
-                val style = CoverageRendererStyleRowV1.decode(styleRows, index * COVERAGE_RENDERER_STYLE_ROW_BYTES)
+                val style = styleAt(index)
                 return CoverageCommittedRow(
                     surfaceId = surfaceIds[index],
                     key = voxelKeys[index],
@@ -595,6 +605,7 @@ class VisibilityGridRendererState(
             upsertRows.any { it.surfaceId in removalSurfaceIds.toSet() }
         ) return false
 
+        materializeGlobalStyles()
         if (reset) {
             clearRows()
             upsertRows.forEach(::admitCandidate)
@@ -653,10 +664,13 @@ class VisibilityGridRendererState(
             val row = rowsByIdentity[patchKeys[index]] ?: return@forEach
             val source = index * COVERAGE_RENDERER_STYLE_ROW_BYTES
             val current = row * COVERAGE_RENDERER_STYLE_ROW_BYTES
-            if (patchStyleRows.styleGenerationAt(source + 8) < styleRows.styleGenerationAt(current + 8) ||
-                patchStyleRows.styleGenerationAt(source + 12) < styleRows.styleGenerationAt(current + 12)
+            if (patchStyleRows.styleGenerationAt(source + 8) <
+                (if (globalStyleAge != null) globalSemanticGeneration else styleRows.styleGenerationAt(current + 8)) ||
+                patchStyleRows.styleGenerationAt(source + 12) <
+                (if (globalStyleAge != null) globalStyleGeneration else styleRows.styleGenerationAt(current + 12))
             ) return false
         }
+        materializeGlobalStyles()
         patchKeys.indices.forEach { index ->
             val row = rowsByIdentity[patchKeys[index]]
             if (row == null) {
@@ -689,6 +703,8 @@ class VisibilityGridRendererState(
         cut: QualifiedRendererStyleCut,
     ): RendererStyleCutResult {
         if (disposed) return RendererStyleCutResult.Rejected(RendererStyleCutRejection.CLOSED)
+
+        if (cut.sparseContext != null) return applySparseStyleCut(cut)
 
         // Copy mutable payloads at the seam.  The copied cut is also retained
         // as the exact replay receipt, so a caller cannot mutate replay state.
@@ -870,6 +886,11 @@ class VisibilityGridRendererState(
         targetSurfaceIdValue = candidate.targetSurfaceId
         targetDirectionIndexValue = candidate.targetDirectionIndex
         lastStyleCut = candidate
+        lastSparseDigest = null
+        globalStyleAge = null
+        sparseBaselineAvailable = candidate.reset &&
+            (0 until rowCount).all { (candidate.styleRows[it * 16 + 3].toInt() and 12) ==
+                (candidate.styleRows.getOrNull(3)?.toInt()?.and(12) ?: 0) }
         renderRevision++
         publishReadableCut()
         return RendererStyleCutResult.Applied(
@@ -878,6 +899,105 @@ class VisibilityGridRendererState(
             changedRows = changedRows,
             targetSurfaceId = candidate.targetSurfaceId,
         )
+    }
+
+    /** Bounded decoded records are borrowed synchronously from the serial stream.
+     * Only a fixed digest is retained; no source-sized replay cut is cloned. */
+    private fun applySparseStyleCut(cut: QualifiedRendererStyleCut): RendererStyleCutResult {
+        fun reject(reason: RendererStyleCutRejection) = RendererStyleCutResult.Rejected(reason)
+        val context = checkNotNull(cut.sparseContext)
+        if (cut.surfaceIds.size > SparseRendererStyleCommandV1.MAX_CHANGED_ROWS ||
+            cut.styleRows.size != cut.surfaceIds.size * 16 || context.digest.size != 32) {
+            return reject(RendererStyleCutRejection.MALFORMED_LENGTH)
+        }
+        if (context.age !in 0..3 || cut.semanticRevision !in 0..0xffffffffL || cut.styleRevision !in 0..0xffffffffL ||
+            context.baseStyleRevision < 0 || context.baseSemanticRevision < 0 || context.baseCoverageRevision < 0 ||
+            context.baseResidencyRevision < 0 || context.baseTargetRevision < 0) {
+            return reject(RendererStyleCutRejection.MALFORMED_STYLE)
+        }
+        val digestCut = try { RendererStyleCutPayloadV1(
+            cut.ownership.captureGroupId.replace("-", "").let { id ->
+                require(id.length == 32)
+                ByteArray(16) { id.substring(it * 2, it * 2 + 2).toInt(16).toByte() }
+            }, cut.ownership.bindingGeneration, cut.ownership.groupGeneration, cut.transactionId,
+            cut.geometryRevision, cut.lineageRevision, cut.semanticRevision, cut.coverageRevision,
+            cut.styleRevision, cut.residencyRevision, cut.targetRevision, true, cut.surfaceIds,
+            cut.styleRows, cut.targetSurfaceId, cut.targetDirectionIndex, context)
+        } catch (_: IllegalArgumentException) { return reject(RendererStyleCutRejection.MALFORMED_STYLE) }
+        if (!SparseRendererStyleCommandV1.completeDigest(digestCut).contentEquals(context.digest)) {
+            return reject(RendererStyleCutRejection.REPLAY_MISMATCH)
+        }
+        if (cut.ownership != installedOwnership) return reject(RendererStyleCutRejection.STALE_OWNERSHIP)
+        if (cut.transactionId != installedTransactionId) return reject(RendererStyleCutRejection.TRANSACTION_MISMATCH)
+        if (cut.geometryRevision != geometryRevision) return reject(RendererStyleCutRejection.GEOMETRY_REVISION_MISMATCH)
+        if (cut.lineageRevision != installedLineageRevision) return reject(RendererStyleCutRejection.LINEAGE_REVISION_MISMATCH)
+        if (lastSparseDigest?.contentEquals(context.digest) == true) return RendererStyleCutResult.Replayed(cut.styleRevision)
+        // The decoded 12-KiB area replaces larger already-funded full replay
+        // arrays. Small row sets use full publication instead of new headroom.
+        if (!sparseBaselineAvailable || count < 512 || context.totalRows != count) return reject(RendererStyleCutRejection.CAPACITY)
+        if (context.baseStyleRevision != styleRevision || context.baseSemanticRevision != semanticRevision ||
+            context.baseCoverageRevision != coverageRevision || context.baseResidencyRevision != residencyRevision ||
+            context.baseTargetRevision != targetRevision) return reject(RendererStyleCutRejection.REPLAY_MISMATCH)
+        validateStyleRevisions(cut)?.let { return reject(it) }
+        if (context.age !in 0..3 || cut.semanticRevision !in 0..0xffffffffL || cut.styleRevision !in 0..0xffffffffL) {
+            return reject(RendererStyleCutRejection.MALFORMED_STYLE)
+        }
+        if ((cut.targetSurfaceId == null) != (cut.targetDirectionIndex == null)) return reject(RendererStyleCutRejection.TARGET_NOT_SUPPLIED)
+        if (cut.targetDirectionIndex != null && cut.targetDirectionIndex !in 0..23) return reject(RendererStyleCutRejection.TARGET_DIRECTION_INVALID)
+        if (cut.targetSurfaceId != null && !rowsByIdentity.containsKey(cut.targetSurfaceId)) return reject(RendererStyleCutRejection.UNKNOWN_SURFACE_ID)
+        var previousId = 0L
+        var includesPreviousTarget = targetSurfaceIdValue == null || targetSurfaceIdValue == cut.targetSurfaceId
+        var includesNextTarget = cut.targetSurfaceId == null ||
+            (cut.targetSurfaceId == targetSurfaceIdValue && cut.targetDirectionIndex == targetDirectionIndexValue)
+        for (index in cut.surfaceIds.indices) {
+            val id = cut.surfaceIds[index]
+            if (id == previousId) return reject(RendererStyleCutRejection.DUPLICATE_SURFACE_ID)
+            if (id < previousId) return reject(RendererStyleCutRejection.UNSORTED_SURFACE_IDS)
+            previousId = id
+            if (id !in 1 until 0x1_0000_0000L || !rowsByIdentity.containsKey(id)) return reject(RendererStyleCutRejection.UNKNOWN_SURFACE_ID)
+            val row = try { CoverageRendererStyleRowV1.decode(cut.styleRows, index * 16) }
+                catch (_: IllegalArgumentException) { return reject(RendererStyleCutRejection.MALFORMED_STYLE) }
+            if (row.semanticGeneration != cut.semanticRevision || row.styleGeneration != cut.styleRevision || row.age.code != context.age) {
+                return reject(RendererStyleCutRejection.MALFORMED_STYLE)
+            }
+            val isTarget = id == cut.targetSurfaceId
+            if (row.target != (if (isTarget) CoverageRendererTarget.PRIMARY else CoverageRendererTarget.NONE) ||
+                (isTarget && (row.directionBin != cut.targetDirectionIndex || row.glyph != CoverageRendererGlyph.DESIRED_DIRECTION))) {
+                return reject(RendererStyleCutRejection.MALFORMED_STYLE)
+            }
+            if (id == targetSurfaceIdValue) includesPreviousTarget = true
+            if (isTarget) includesNextTarget = true
+        }
+        if (!includesPreviousTarget || !includesNextTarget) return reject(RendererStyleCutRejection.TARGET_NOT_SUPPLIED)
+        // All validation precedes the first byte or revision mutation.
+        val previousAge = globalStyleAge ?: (styleRows.getOrNull(3)?.toInt()?.ushr(2)?.and(3) ?: 0)
+        for (index in cut.surfaceIds.indices) {
+            val row = checkNotNull(rowsByIdentity[cut.surfaceIds[index]])
+            cut.styleRows.copyInto(styleRows, row * 16, index * 16, index * 16 + 8)
+            dirtyRows.add(row)
+        }
+        globalSemanticGeneration = cut.semanticRevision
+        globalStyleGeneration = cut.styleRevision
+        globalStyleAge = context.age
+        // Age/palette and selection work can still require the full source scan.
+        // No generation-only row bytes are rewritten or dirty-marked here.
+        if (previousAge != context.age) dirtyRows.addRange(count)
+        if (retainWorldPositions) {
+            for (row in 0 until count) colors[row] = semanticColorAt(row)
+        }
+        semanticRevision = cut.semanticRevision
+        coverageRevision = cut.coverageRevision
+        styleRevision = cut.styleRevision
+        residencyRevision = cut.residencyRevision
+        targetRevision = cut.targetRevision
+        visibilityRevision = cut.coverageRevision
+        targetSurfaceIdValue = cut.targetSurfaceId
+        targetDirectionIndexValue = cut.targetDirectionIndex
+        lastStyleCut = null
+        lastSparseDigest = context.digest.copyOf()
+        renderRevision++
+        publishReadableCut()
+        return RendererStyleCutResult.Applied(cut.styleRevision, cut.targetRevision, cut.surfaceIds.size, cut.targetSurfaceId)
     }
 
     @Synchronized
@@ -915,7 +1035,9 @@ class VisibilityGridRendererState(
             surfaceIds = surfaceIds.copyOf(count),
             positions = snapshotPositions,
             colors = snapshotColors,
-            styleRows = styleRows.copyOf(count * COVERAGE_RENDERER_STYLE_ROW_BYTES),
+            styleRows = ByteArray(count * COVERAGE_RENDERER_STYLE_ROW_BYTES).also { result ->
+                for (row in 0 until count) copyStyleAt(row, result, row * 16)
+            },
             gridRotationWorld = identityGridRotation(),
             update = update,
             bindingGeneration = installedOwnership?.bindingGeneration ?: 0L,
@@ -973,12 +1095,7 @@ class VisibilityGridRendererState(
         repeat(boundedCount) { destination ->
             val source = slots[destination]
             ids[destination] = surfaceIds[source]
-            styleRows.copyInto(
-                styles,
-                destination * COVERAGE_RENDERER_STYLE_ROW_BYTES,
-                source * COVERAGE_RENDERER_STYLE_ROW_BYTES,
-                (source + 1) * COVERAGE_RENDERER_STYLE_ROW_BYTES,
-            )
+            copyStyleAt(source, styles, destination * COVERAGE_RENDERER_STYLE_ROW_BYTES)
             val styleOffset = destination * COVERAGE_RENDERER_STYLE_ROW_BYTES
             CoverageRendererStyleRowV1.validateEncoded(styles, styleOffset)
             if ((styles[styleOffset + 2].toInt() and 0xf) != palette.code) {
@@ -1232,7 +1349,7 @@ class VisibilityGridRendererState(
     private fun colorAt(row: Int): Int = if (retainWorldPositions) {
         colors[row]
     } else {
-        CoverageRendererStyleRowV1.validatedPackedColor(styleRows, row * COVERAGE_RENDERER_STYLE_ROW_BYTES)
+        semanticColorAt(row)
     }
 
     private fun setColor(row: Int, value: Int) {
@@ -1289,10 +1406,9 @@ class VisibilityGridRendererState(
                     startSlot = start,
                     positions = positions.copyOfRange(start * 3, (end + 1) * 3),
                     colors = IntArray(end - start + 1) { offset -> colorAt(start + offset) },
-                    styleRows = styleRows.copyOfRange(
-                        start * COVERAGE_RENDERER_STYLE_ROW_BYTES,
-                        (end + 1) * COVERAGE_RENDERER_STYLE_ROW_BYTES,
-                    ),
+                    styleRows = ByteArray((end - start + 1) * 16).also { result ->
+                        for (row in start..end) copyStyleAt(row, result, (row - start) * 16)
+                    },
                 )
             } else {
                 CoveragePointSpan(
@@ -1382,6 +1498,9 @@ class VisibilityGridRendererState(
     }
 
     private fun resetStyleCutState() {
+        globalStyleAge = null
+        sparseBaselineAvailable = false
+        lastSparseDigest = null
         semanticRevision = 0L
         coverageRevision = 0L
         styleRevision = 0L
@@ -1393,7 +1512,17 @@ class VisibilityGridRendererState(
     }
 
     /** Geometry identity changed; an old style receipt can never be replayed. */
+    private fun materializeGlobalStyles() {
+        if (globalStyleAge != null) {
+            for (row in 0 until count) copyStyleAt(row, styleRows, row * 16)
+        }
+        globalStyleAge = null
+        sparseBaselineAvailable = false
+        lastSparseDigest = null
+    }
+
     private fun invalidateStyleCutAfterGeometryChange(reset: Boolean) {
+        materializeGlobalStyles()
         lastStyleCut = null
         if (reset) {
             targetSurfaceIdValue = null
@@ -1427,11 +1556,27 @@ class VisibilityGridRendererState(
         check(!disposed) { "VisibilityGridRendererState is disposed" }
     }
 
-    private fun styleAt(row: Int): CoverageRendererStyleRowV1 =
-        CoverageRendererStyleRowV1.decode(
-            styleRows,
-            row * COVERAGE_RENDERER_STYLE_ROW_BYTES,
-        )
+    private fun copyStyleAt(row: Int, destination: ByteArray, offset: Int) {
+        styleRows.copyInto(destination, offset, row * 16, row * 16 + 16)
+        val age = globalStyleAge ?: return
+        destination[offset + 3] = ((destination[offset + 3].toInt() and 0xf3) or (age shl 2)).toByte()
+        for (byte in 0 until 4) {
+            destination[offset + 8 + byte] = (globalSemanticGeneration ushr (byte * 8)).toByte()
+            destination[offset + 12 + byte] = (globalStyleGeneration ushr (byte * 8)).toByte()
+        }
+    }
+
+    private fun semanticColorAt(row: Int): Int {
+        val offset = row * 16
+        return CoverageRendererStyleRowV1.validatedPackedColor(styleRows, offset, globalStyleAge ?: -1)
+    }
+
+    private fun styleAt(row: Int): CoverageRendererStyleRowV1 {
+        val style = CoverageRendererStyleRowV1.decode(styleRows, row * 16)
+        val age = globalStyleAge ?: return style
+        return style.copy(semanticGeneration = globalSemanticGeneration,
+            styleGeneration = globalStyleGeneration, age = CoverageRendererAge.values()[age])
+    }
 
     /** Unsigned generation read from a row already accepted by validateEncoded. */
     private fun ByteArray.styleGenerationAt(offset: Int): Long =

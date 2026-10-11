@@ -21,6 +21,7 @@ internal data class QualifiedRendererStyleCut(
     val styleRows: ByteArray,
     val targetSurfaceId: Long?,
     val targetDirectionIndex: Int?,
+    val sparseContext: com.uhg0.ar_flutter_plugin_2.visibilityprotocol.SparseRendererStyleContextV1? = null,
 )
 
 internal sealed interface RendererStyleCutResult {

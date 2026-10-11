@@ -34,7 +34,7 @@ internal sealed interface VisibilityDepthCopyResult {
             frame = VisibilityObservationFrame(
                 source = VisibilityObservationSource.ARCORE_RAW_DEPTH,
                 frameSequence = frameSequence,
-                frameTimestampNs = frameTimestampNs,
+                frameTimestampNs = metadata.arFrameTimestampNs,
                 sourceTimestampNs = metadata.timestampNs,
                 cameraIdentity = "arcore-rear-camera",
                 tracking = metadata.tracking,
@@ -53,9 +53,11 @@ internal sealed interface VisibilityDepthCopyResult {
             packedSamples = lease.samples,
             sourceRejectedSamples = lease.samples.rejectedCount,
             confidenceTimestampNs = metadata.confidenceTimestampNs,
+            cameraImageTimestampNs = metadata.cameraImageTimestampNs,
             sourceImageWidth = metadata.sourceImageWidth,
             sourceImageHeight = metadata.sourceImageHeight,
             acquisitionMode = metadata.acquisitionMode,
+            projectionProvenance = qualifiedDepthProjectionProvenance(metadata),
         )
     }
 
@@ -339,6 +341,8 @@ internal class ArCoreVisibilityObservationAdapter(
             onResourceAcquired = resourceAcquired,
             onResourceClosed = resourceClosed,
             depthMode = depthCapability.toArCoreDepthMode(),
+            rawCandidate = rawDepthCandidateForPreference(ownership.groupFrame.depthSourcePreference),
+            denseCurrentFrameExperiment = denseCurrentFrameExperimentForPreference(ownership.groupFrame.depthSourcePreference),
         ).acquire(frame, ownership.groupGeneration, ownership.sessionGeneration)
         return convertDepthResult(
             result, ownership, depthCapability, frameSequence, frame.timestamp,
@@ -360,6 +364,8 @@ internal class ArCoreVisibilityObservationAdapter(
             onResourceAcquired = resourceAcquired,
             onResourceClosed = resourceClosed,
             depthMode = depthCapability.toArCoreDepthMode(),
+            rawCandidate = rawDepthCandidateForPreference(ownership.groupFrame.depthSourcePreference),
+            denseCurrentFrameExperiment = denseCurrentFrameExperimentForPreference(ownership.groupFrame.depthSourcePreference),
         ).acquirePacked(
             frame = frame,
             ownership = ownership,
@@ -373,7 +379,7 @@ internal class ArCoreVisibilityObservationAdapter(
                     ownership,
                     depthCapability,
                     frameSequence,
-                    frame.timestamp,
+                    result.metadata.arFrameTimestampNs,
                 )
             PackedDepthAcquisitionResult.TransientUnavailable ->
                 VisibilityDepthCopyResult.TransientUnavailable
@@ -397,10 +403,12 @@ internal class ArCoreVisibilityObservationAdapter(
             onResourceAcquired = resourceAcquired,
             onResourceClosed = resourceClosed,
             depthMode = depthCapability.toArCoreDepthMode(),
-        ).prepare(frame, ownership.groupGeneration, ownership.sessionGeneration)) {
+            rawCandidate = rawDepthCandidateForPreference(ownership.groupFrame.depthSourcePreference),
+            denseCurrentFrameExperiment = denseCurrentFrameExperimentForPreference(ownership.groupFrame.depthSourcePreference),
+        ).prepare(frame, ownership.groupGeneration, ownership.sessionGeneration, frameSequence)) {
             is PreparedRawDepthResult.Ready -> PreparedVisibilityDepthResult.Ready(
                 PreparedVisibilityDepthFrame(
-                    result.frame, ownership, depthCapability, frameSequence, frame.timestamp,
+                    result.frame, ownership, depthCapability, frameSequence, result.frame.metadata.arFrameTimestampNs,
                 ),
             )
             PreparedRawDepthResult.TransientUnavailable ->
@@ -416,10 +424,15 @@ internal class ArCoreVisibilityObservationAdapter(
             prepared.frameSequence, prepared.frameTimestampNs,
         )
 
-    fun finishDepthPacked(prepared: PreparedVisibilityDepthFrame): VisibilityDepthCopyResult =
+    fun finishDepthPacked(
+        prepared: PreparedVisibilityDepthFrame,
+        diagnostic: DepthCopyTransientObserver? = null,
+    ): VisibilityDepthCopyResult =
         when (val result = prepared.raw.processPacked(
             depthSamplePool,
             SampleLeaseGeneration.from(prepared.ownership),
+            prepared.ownership,
+            diagnostic,
         )) {
             is PackedDepthAcquisitionResult.Observation ->
                 VisibilityDepthCopyResult.PackedObservation(
@@ -498,36 +511,7 @@ internal class ArCoreVisibilityObservationAdapter(
         )
     }
 
-    private fun rawDepthMetadata(
-        frame: Frame,
-        ownership: VisibilityObservationOwnership,
-        width: Int,
-        height: Int,
-    ): RawDepthFrameMetadata {
-        val intrinsics = frame.camera.imageIntrinsics
-        val focal = intrinsics.focalLength
-        val principal = intrinsics.principalPoint
-        val dimensions = intrinsics.imageDimensions
-        val pose = FloatArray(16)
-        frame.camera.pose.toMatrix(pose, 0)
-        val scaleX = width.toDouble() / dimensions[0]
-        val scaleY = height.toDouble() / dimensions[1]
-        return RawDepthFrameMetadata(
-            timestampNs = frame.timestamp,
-            groupGeneration = ownership.groupGeneration,
-            sessionGeneration = ownership.sessionGeneration,
-            tracking = frame.camera.trackingState == TrackingState.TRACKING,
-            width = width,
-            height = height,
-            intrinsics = DepthIntrinsics(
-                fx = focal[0] * scaleX,
-                fy = focal[1] * scaleY,
-                cx = principal[0] * scaleX,
-                cy = principal[1] * scaleY,
-            ),
-            worldFromCameraGl = DoubleArray(16) { pose[it].toDouble() },
-        )
-    }
+
 }
 
 /**
@@ -563,7 +547,7 @@ internal fun convertDepthObservationResult(
                     frame = VisibilityObservationFrame(
                         source = VisibilityObservationSource.ARCORE_RAW_DEPTH,
                         frameSequence = frameSequence,
-                        frameTimestampNs = frameTimestampNs,
+                        frameTimestampNs = if (source.projectionFrameTimestampNs > 0L) source.projectionFrameTimestampNs else frameTimestampNs,
                         sourceTimestampNs = source.timestampNs,
                         cameraIdentity = "arcore-rear-camera",
                         tracking = source.tracking,
@@ -582,9 +566,12 @@ internal fun convertDepthObservationResult(
                     samples = copied,
                     sourceRejectedSamples = source.sourceRejectedPixels,
                     confidenceTimestampNs = source.confidenceTimestampNs,
+                    cameraImageTimestampNs = source.cameraImageTimestampNs,
                     sourceImageWidth = source.sourceImageWidth,
                     sourceImageHeight = source.sourceImageHeight,
                     acquisitionMode = source.acquisitionMode,
+                    projectionProvenance = if (source.projectionFrameTimestampNs > 0L) source.acquisitionMode.projectionProvenance
+                        else DepthProjectionProvenance.UNQUALIFIED,
                     payloadBytes = VisibilityDepthObservation.DEPTH_FIXED_BYTES +
                         copied.size * VisibilityDepthObservation.DEPTH_SAMPLE_BYTES,
                 ),
@@ -622,7 +609,7 @@ internal class ArCoreVisibilityObservationSource(
     private val depthProcessor = BoundedDepthObservationProcessor<
         PreparedVisibilityDepthFrame, VisibilityDepthCopyResult
     >(
-        process = adapter::finishDepthPacked,
+        process = this::finishPreparedDepthPacked,
         publish = { result, callbackCopyNs ->
             when (result) {
                 is VisibilityDepthCopyResult.Observation ->
@@ -650,6 +637,9 @@ internal class ArCoreVisibilityObservationSource(
             runtime.recordDepthFailure()
         },
     )
+
+    private fun finishPreparedDepthPacked(prepared: PreparedVisibilityDepthFrame) =
+        adapter.finishDepthPacked(prepared, runtime)
 
     private val depthAdmissionLock = Any()
     private var depthSuspended = false

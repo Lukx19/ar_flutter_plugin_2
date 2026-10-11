@@ -101,6 +101,8 @@ class VisibilitySurfaceStreamChannel(
     private val onStructuralTransactionAcknowledged: ((CommittedBaselineV1) -> Unit)? = null,
     private val admitRendererStylePage: ((RendererStyleCommandV1.Page) -> Boolean)? = null,
     private val onRendererStyleCut: ((RendererStyleCutPayloadV1) -> RendererStyleCommandApplyResultV1)? = null,
+    private val admitSparseRendererStyle: ((RendererStyleCutPayloadV1) -> Boolean)? = null,
+    private val onSparseRendererStyleCut: ((RendererStyleCutPayloadV1) -> RendererStyleCommandApplyResultV1)? = null,
     private val onCommittedBaselineAdvanced:
         ((CommittedBaselineV1, CommittedBaselineV1) -> Unit)? = null,
 ) {
@@ -474,6 +476,7 @@ class VisibilitySurfaceStreamChannel(
                             } else {
                                 var decodedRequest: PacketCodec.Request? = null
                                 var rendererStyleCommand: RendererStyleCommandV1.Page? = null
+                                var sparseRendererStyleCommand: RendererStyleCutPayloadV1? = null
                                 val encoded = try {
                                     val request = PacketCodec.decodeRequestView(bytes)
                                     decodedRequest = request
@@ -534,7 +537,8 @@ class VisibilitySurfaceStreamChannel(
                                                         request.requestFlags and RESYNC_REQUEST_FLAG == 0
                                                 ) {
                                                     if (request.styleCount != 0 ||
-                                                        !RendererStyleCommandV1.isKind(request.commandBytes, request.commandOffset, request.commandLength)
+                                                        (!RendererStyleCommandV1.isKind(request.commandBytes, request.commandOffset, request.commandLength) &&
+                                                            !SparseRendererStyleCommandV1.isKind(request.commandBytes, request.commandOffset, request.commandLength))
                                                     ) {
                                                         throw BindingError(MALFORMED_PACKET_ERROR_ID)
                                                     }
@@ -542,11 +546,29 @@ class VisibilitySurfaceStreamChannel(
                                                     // admission until after that ACK has cleared the previous
                                                     // renderer staging. A style page can describe the current
                                                     // style revision on the newly acknowledged geometry cut.
-                                                    RendererStyleCommandV1.decode(request.commandBytes, request.commandOffset, request.commandLength)
+                                                    if (SparseRendererStyleCommandV1.isKind(request.commandBytes, request.commandOffset, request.commandLength)) {
+                                                        val sparse = SparseRendererStyleCommandV1.decode(request.commandBytes, request.commandOffset, request.commandLength)
+                                                        // Sparse bases cannot acknowledge a different structural cut.
+                                                        if (admitSparseRendererStyle?.invoke(sparse) != true ||
+                                                            request.nextStyleRevision != sparse.styleRevision ||
+                                                            sparse.sparseContext!!.baseStyleRevision != committedBaseline.styleRevision ||
+                                                            sparse.transactionId != committedBaseline.transactionId ||
+                                                            sparse.geometryRevision != committedBaseline.geometryRevision ||
+                                                            sparse.lineageRevision != committedBaseline.lineageRevision ||
+                                                            request.acknowledgedTransactionId != committedBaseline.transactionId ||
+                                                            request.acknowledgedGeometryRevision != committedBaseline.geometryRevision ||
+                                                            request.acknowledgedLineageRevision != committedBaseline.lineageRevision) {
+                                                            throw BindingError(TRANSACTION_STATE_ERROR_ID)
+                                                        }
+                                                        sparseRendererStyleCommand = sparse
+                                                        null
+                                                    } else {
+                                                        RendererStyleCommandV1.decode(request.commandBytes, request.commandOffset, request.commandLength)
+                                                    }
                                                 } else {
                                                     null
                                                 }
-                                                val requiresResync = requiresResync(request, rendererStyleCommand)
+                                                val requiresResync = requiresResync(request, rendererStyleCommand, sparseRendererStyleCommand)
                                                 if (!requiresResync) {
                                                     acknowledgedStructuralBaseline =
                                                         acknowledgePendingStructuralTransaction(request)
@@ -586,7 +608,8 @@ class VisibilitySurfaceStreamChannel(
                                                 } == true
                                                 val deferStructuralForStyle =
                                                     !requiresResync &&
-                                                        ((styleMatchesCommittedBaseline && stylePageNeedsPriority) ||
+                                                        (sparseRendererStyleCommand != null ||
+                                                            (styleMatchesCommittedBaseline && stylePageNeedsPriority) ||
                                                             (rendererStylePriority &&
                                                                 rendererStyleAcknowledgementPending &&
                                                                 request.commandLength == 0 &&
@@ -641,6 +664,15 @@ class VisibilitySurfaceStreamChannel(
                                                         // lease may defer returning that frame, but it still proves
                                                         // that the retained structural response fits this request.
                                                         validateNextStructuralResponse(request)
+                                                        sparseRendererStyleCommand?.let { sparse ->
+                                                            rendererStylePriority = true
+                                                            rendererStyleAcknowledgementPending = true
+                                                            val applied = onSparseRendererStyleCut?.invoke(sparse)
+                                                                ?: throw IllegalStateException("Sparse renderer-style owner is unavailable")
+                                                            require(applied.acceptedStyleRevision == sparse.styleRevision)
+                                                            committedBaseline = committedBaseline.copy(styleRevision = applied.acceptedStyleRevision)
+                                                            controlLifecycle?.setCommittedBaselineLocally(committedBaseline)
+                                                        }
                                                         rendererStyleCommand?.let { page ->
                                                             if (styleMatchesCommittedBaseline && stylePageNeedsPriority) {
                                                                 rendererStylePriority = true
@@ -1037,6 +1069,7 @@ class VisibilitySurfaceStreamChannel(
     private fun requiresResync(
         request: PacketCodec.Request,
         rendererStyleCommand: RendererStyleCommandV1.Page? = null,
+        sparseRendererStyleCommand: RendererStyleCutPayloadV1? = null,
     ): Boolean {
         val structuralAcknowledgement =
             (request.acknowledgedTransactionId != 0L ||
@@ -1056,7 +1089,7 @@ class VisibilitySurfaceStreamChannel(
             (request.acknowledgedTransactionId != committedBaseline.transactionId ||
                 request.acknowledgedGeometryRevision != committedBaseline.geometryRevision ||
                 request.acknowledgedLineageRevision != committedBaseline.lineageRevision)
-        val styleMismatch = if (rendererStyleCommand != null) {
+        val styleMismatch = if (rendererStyleCommand != null || sparseRendererStyleCommand != null) {
             false
         } else {
             !StyleRevisionSemantics.accepts(

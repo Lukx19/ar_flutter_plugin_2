@@ -49,7 +49,7 @@ class CombinedVisibilityPressureTest {
                 ),
             )
 
-            assertEquals(13_358_756, receipt.rendererOwnedBytes)
+            assertEquals(13_366_948, receipt.rendererOwnedBytes)
             assertEquals(10, receipt.featureOffered)
             assertEquals(2, receipt.featureAdmitted)
             assertEquals(8, receipt.featureCoalesced)

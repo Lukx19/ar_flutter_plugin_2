@@ -34,6 +34,7 @@ internal data class CoverageRendererOwnershipReceipt(
     val pageReaderCapturedMappingBytes: Int,
     val stagingBytes: Int,
     val meshBytes: Int,
+    val commonPresentationMetadataBytes: Int = 0,
     val combinedRendererOwnedLimitBytes: Int = CoverageRendererLimits.COMBINED_RENDERER_OWNED_LIMIT_BYTES,
     val transitionHeadroomBytes: Int = CoverageRendererLimits.TRANSITION_HEADROOM_BYTES,
 ) {
@@ -44,6 +45,7 @@ internal data class CoverageRendererOwnershipReceipt(
         require(pageReaderCapturedMappingBytes >= 0)
         require(stagingBytes >= 0)
         require(meshBytes >= 0)
+        require(commonPresentationMetadataBytes >= 0)
         require(combinedRendererOwnedLimitBytes >= 0)
         require(transitionHeadroomBytes >= 0)
     }
@@ -54,7 +56,7 @@ internal data class CoverageRendererOwnershipReceipt(
             descriptorBackingBytes +
             pageReaderCapturedMappingBytes +
             stagingBytes +
-            meshBytes
+            meshBytes + commonPresentationMetadataBytes
 
     companion object {
         /** Compatibility receipt for test/fake admissions without owner detail. */
@@ -72,6 +74,29 @@ internal data class CoverageRendererOwnershipReceipt(
 
 /** Chapter 17 fixed presentation maxima; semantic-grid capacity is separate. */
 internal object CoverageRendererLimits {
+    /**
+     * Portable bounded common inventory, per occupied physical slot:
+     * resident: token Long, qualifier six Longs, mode/palette references,
+     * enabled/observation flags, count/glyph Ints, shape reference with one
+     * Long/five Ints, nullable target Long/direction Int and deadline Long,
+     * sealed Long, qualifier reference; rounded portable allowance 256 bytes;
+     * validity: qualifier reference/six Longs, lifecycle/palette/admitted
+     * deadline Longs, two enum references, nullable target/direction/older
+     * deadline references and values, transform reference/16 doubles, voxel
+     * Float, config reference with Int/three Floats/flag/enum/Long; 512 bytes;
+     * binding/slot/factory/drain: token/config/resource/release/node/material/
+     * descriptor/resident/listener references and flags, epoch/index masks;
+     * budgeted 32 scalars and 32 references, 512 bytes;
+     * 16 retained callback captures at 64 portable bytes, 1024 bytes;
+     * collection entries/wrappers and conservative alignment reserve, 1792 bytes.
+     * 4096 bytes per slot, two slots including cancellation/unknown drain.
+     * No backing, shape page/GPU/body bytes here. Shape's existing 512-byte
+     * allowance pays only its shape uploader/budget bookkeeping, disjoint
+     * from this common receipt/validity/slot/destruction inventory.
+     * Portable funding is conservative modeling, not JVM/ART/driver measurement.
+     */
+    const val COMMON_METADATA_BYTES_PER_SLOT = 4096
+    const val COMMON_PRESENTATION_METADATA_BYTES = 2 * COMMON_METADATA_BYTES_PER_SLOT
     const val RAW_POINT_CAPACITY = 2_000
     const val CENTROID_CAPACITY = 20_000
     const val CUBE_CAPACITY = 8_000
@@ -166,6 +191,7 @@ internal object CoverageRendererLimits {
             pageReaderCapturedMappingBytes = 0,
             stagingBytes = PAGE_STAGING_BYTES,
             meshBytes = resourcePeakBytes(mode),
+            commonPresentationMetadataBytes = COMMON_PRESENTATION_METADATA_BYTES,
         )
     }
 
@@ -205,6 +231,22 @@ internal class CoverageRendererAllocationLedger(
     private val telemetry: RendererTelemetry,
 ) {
     private val resourceOwners = linkedSetOf<String>()
+    /** Partial native construction remains fenced until its exact ledger owner releases. */
+    internal fun hasResourceOwnership(token: CoverageResourceToken): Boolean =
+        resourceOwners.any { it.endsWith("-epoch-${token.epoch}") }
+    private var commonMetadataReserved = false
+    /** Fund both bounded slots before owner/host retains receipt or validity fields. */
+    fun reserveCommonPresentationMetadata(): Boolean {
+        if (commonMetadataReserved) return true
+        val current = telemetry.ownedBufferBytesSnapshot()
+        // setOwnedBufferBytes replaces one fixed shared charge; never charge a slot twice.
+        if (current + CoverageRendererLimits.COMMON_PRESENTATION_METADATA_BYTES >
+            CoverageRendererLimits.COMBINED_RENDERER_OWNED_LIMIT_BYTES) return false
+        telemetry.setOwnedBufferBytes(COMMON_METADATA_OWNER,
+            CoverageRendererLimits.COMMON_PRESENTATION_METADATA_BYTES)
+        commonMetadataReserved = true
+        return true
+    }
     /**
      * Read-only admission for a fixed-capacity replacement.  The candidate
      * peak includes the shared state, hand-off and startup staging that the
@@ -311,6 +353,8 @@ internal class CoverageRendererAllocationLedger(
             ownership.pageReaderCapturedMappingBytes,
         )
         telemetry.setOwnedBufferBytes(PAGE_STAGING_OWNER, CoverageRendererLimits.PAGE_STAGING_BYTES)
+        telemetry.setOwnedBufferBytes(COMMON_METADATA_OWNER, CoverageRendererLimits.COMMON_PRESENTATION_METADATA_BYTES)
+        commonMetadataReserved = true
         // Auxiliary arrays are lazy. A mode-specific auxiliary owner is
         // charged only by the concrete proxy/glyph resource when requested.
         telemetry.removeOwner(AUXILIARY_OWNER)
@@ -356,6 +400,8 @@ internal class CoverageRendererAllocationLedger(
         telemetry.removeOwner(PAGE_READER_MAPPING_OWNER)
         telemetry.removeOwner(PAGE_STAGING_OWNER)
         telemetry.removeOwner(SNAPSHOT_HANDOFF_OWNER)
+        telemetry.removeOwner(COMMON_METADATA_OWNER)
+        commonMetadataReserved = false
     }
 
     /**
@@ -369,6 +415,12 @@ internal class CoverageRendererAllocationLedger(
         resourceOwners.forEach(telemetry::removeOwner)
         resourceOwners.clear()
         telemetry.removeCoverageMeshOwners()
+    }
+
+    /** Drops transient staging; mesh owners remain charged until resource drain. */
+    fun releaseRendererStaging() {
+        telemetry.removeOwner(PAGE_STAGING_OWNER)
+        telemetry.removeOwner(SNAPSHOT_HANDOFF_OWNER)
     }
 
     fun installPointResources(owner: String, capacity: Int) {
@@ -437,6 +489,7 @@ internal class CoverageRendererAllocationLedger(
         const val PAGE_READER_MAPPING_OWNER = "coverage-page-reader-mapping"
         const val PAGE_STAGING_OWNER = "coverage-page-staging"
         const val SNAPSHOT_HANDOFF_OWNER = "coverage-snapshot-handoff"
+        const val COMMON_METADATA_OWNER = "coverage-presentation-metadata"
     }
 }
 

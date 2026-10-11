@@ -127,6 +127,7 @@ class VisibilityGridV2Binding internal constructor(
     private val disposed = AtomicBoolean(false)
     private val controlHandlerInstalled = AtomicBoolean(true)
     @Volatile private var acceptedRendererStyleHeader: ByteArray? = null
+    @Volatile private var sparseStyleNegotiated = false
     private var rendererAttributeBudget: ((Long) -> Boolean)? = null
     internal fun configureRendererAttributeBudget(admit: (Long) -> Boolean) {
         rendererAttributeBudget = admit
@@ -138,7 +139,8 @@ class VisibilityGridV2Binding internal constructor(
     }
 
     private fun handleRendererAttributeCall(call: MethodCall, result: MethodChannel.Result): Boolean {
-        if (call.method != "rendererAttributesCapabilities" && call.method != "rendererAttributesV1") return false
+        if (call.method != "rendererAttributesCapabilities" && call.method != "rendererAttributesV1" &&
+            call.method != "sparseStylePublicationCapabilities") return false
         val raw = call.arguments as? ByteArray
         if (raw == null || raw.size > RendererAttributeCodec.PAGE_BYTES + 32) {
             result.success(mapOf("outcome" to "malformed")); return true
@@ -147,6 +149,12 @@ class VisibilityGridV2Binding internal constructor(
         val owner = coverageRendererOwner as? NativeCoverageRendererOwner
         if (admission == null || admission.payload.size > RendererAttributeCodec.PAGE_BYTES) {
             result.success(mapOf("outcome" to "malformed")); return true
+        }
+        if (call.method == "sparseStylePublicationCapabilities") {
+            val supported = onRendererStyleCut != null
+            sparseStyleNegotiated = supported
+            result.success(mapOf("supported" to supported, "version" to 2, "maximumChangedRows" to 512))
+            return true
         }
         if (owner == null || rendererAttributeBudget == null) {
             result.success(mapOf("supported" to false, "outcome" to "unsupported")); return true
@@ -299,6 +307,8 @@ class VisibilityGridV2Binding internal constructor(
         debugTransportProbe = issue98Probe,
         admitRendererStylePage = ::admitRendererStylePage,
         onRendererStyleCut = ::applyRendererStyleCutCommand,
+        admitSparseRendererStyle = ::admitSparseRendererStyle,
+        onSparseRendererStyleCut = ::applyRendererStyleCutCommand,
         onCommittedBaselineAdvanced = ::publishCommittedBaselineAdvance,
     )
 
@@ -327,6 +337,50 @@ class VisibilityGridV2Binding internal constructor(
     init {
         cleanupAuthority.publishCurrent(currentIdentity())
         controlChannel.setMethodCallHandler(::onControlCall)
+    }
+
+    private data class BindingScalarCut(
+        val bindingGeneration: Long,
+        val sessionGeneration: Long,
+        val groupGeneration: Long,
+        val viewId: Int,
+        val viewGeneration: Long,
+        val lifecycleSequence: Long,
+        val operationGeneration: Long,
+        val disposed: Boolean,
+        val initialTransactionQueued: Boolean,
+    )
+
+    /** Copies only scalars before reading the independent source publication. */
+    private fun bindingScalarSnapshot(): Map<String, Any?> {
+        val started = System.nanoTime()
+        val owner = currentObservationOwnership()
+        val cut = synchronized(this) {
+            BindingScalarCut(currentBindingGeneration, activeSessionGeneration, activeGroupGeneration,
+                viewId, viewGeneration, lifecycleSequence, operationGeneration, disposed.get(), initialTransactionQueued)
+        }
+        val source = observationRuntime?.scalarSnapshot(owner) ?: emptyMap()
+        val sourceSampling = source["sampling"] as? Map<*, *> ?: emptyMap<Any, Any>()
+        return source + mapOf(
+            "qualifiers" to mapOf(
+                "bindingGeneration" to cut.bindingGeneration,
+                "sessionGeneration" to cut.sessionGeneration,
+                "groupGeneration" to cut.groupGeneration,
+                "viewId" to cut.viewId,
+                "viewGeneration" to cut.viewGeneration,
+                "lifecycleSequence" to cut.lifecycleSequence,
+                "operationGeneration" to cut.operationGeneration,
+                "disposed" to cut.disposed,
+                "initialTransactionQueued" to cut.initialTransactionQueued,
+                "observationOwnershipReady" to (owner != null && owner.bindingGeneration == cut.bindingGeneration &&
+                    owner.sessionGeneration == cut.sessionGeneration && owner.groupGeneration == cut.groupGeneration &&
+                    owner.lifecycleSequence == cut.lifecycleSequence && owner.operationGeneration == cut.operationGeneration),
+            ),
+            "sampling" to sourceSampling + mapOf(
+                "bindingCapturedStartNs" to started.toString(),
+                "bindingCapturedEndNs" to System.nanoTime().toString(),
+            ),
+        )
     }
 
     data class Snapshot(
@@ -394,6 +448,9 @@ class VisibilityGridV2Binding internal constructor(
             15L * 40L + // stream callbacks/method references owned by this binding
             7L * 32L + // bounded deques/maps/sets and their empty envelopes
             16L + // executor capability (thread infrastructure is platform-managed, not retained payload)
+            8L + (if (depthSurfaceSelection == null) 0L else 168L) + // preset reference, selection and two owned UUID byte arrays
+            8L + (if (depthSourceSelection == null) 0L else 168L) + // source reference and qualified selection
+            16L + // accepted group-frame preset and source references
             800L + // assigned portable atomic publication, immutable DTO/UUID strings; VM padding unmeasured
             identityPayload + tracePayload + transportPayload + (canonicalReadyHints?.portableOwnedBytes() ?: 0L)
     }
@@ -780,8 +837,9 @@ class VisibilityGridV2Binding internal constructor(
             residencyRevision = command.residencyRevision,
             targetRevision = command.targetRevision,
             reset = command.reset,
-            surfaceIds = command.surfaceIds.copyOf(),
-            styleRows = command.styleRows.copyOf(),
+            surfaceIds = if (command.sparseContext == null) command.surfaceIds.copyOf() else command.surfaceIds,
+            styleRows = if (command.sparseContext == null) command.styleRows.copyOf() else command.styleRows,
+            sparseContext = command.sparseContext,
             targetSurfaceId = command.targetSurfaceId,
             targetDirectionIndex = command.targetDirectionIndex,
         )
@@ -828,7 +886,7 @@ class VisibilityGridV2Binding internal constructor(
                 command.residencyRevision, command.targetRevision)) header.putLong(ordinal)
             header.put(if (command.reset) 1 else 0).put(0).putShort(0)
             header.putLong(command.targetSurfaceId ?: -1L).putInt(command.targetDirectionIndex ?: -1)
-                .putInt(command.surfaceIds.size)
+                .putInt(command.sparseContext?.totalRows ?: command.surfaceIds.size)
         }
         return RendererStyleCommandApplyResultV1(command.styleRevision)
     }
@@ -846,6 +904,22 @@ class VisibilityGridV2Binding internal constructor(
                 "geometry=${command.geometryRevision} lineage=${command.lineageRevision} " +
                 "style=${command.styleRevision} elapsedMicros=$elapsedMicros",
         )
+    }
+
+    private fun admitSparseRendererStyle(command: RendererStyleCutPayloadV1): Boolean {
+        if (!sparseStyleNegotiated || rendererPublicationApplicationPending() ||
+            !streamChannel.rendererStyleAcknowledgementComplete) return false
+        val context = command.sparseContext ?: return false
+        val ownership = currentObservationOwnership() ?: return false
+        val baseline = lifecycle.committedBaseline()
+        return context.totalRows >= 512 &&
+            command.bindingGeneration == ownership.bindingGeneration &&
+            command.groupGeneration == ownership.groupGeneration &&
+            command.captureGroupId.contentEquals(parseUuid(ownership.captureGroupId).bytes) &&
+            command.transactionId == baseline.transactionId &&
+            command.geometryRevision == baseline.geometryRevision &&
+            command.lineageRevision == baseline.lineageRevision &&
+            context.baseStyleRevision == baseline.styleRevision
     }
 
     /** Rejects stale inner qualifiers before they can reserve page staging. */
@@ -1026,7 +1100,84 @@ class VisibilityGridV2Binding internal constructor(
         return false
     }
 
+    private var depthSurfaceSelection: DepthSurfaceSelection? = null
+    private var depthSourceSelection: DepthSourceSelection? = null
+
+    private fun configureDepthSurfaceEstimator(call: MethodCall, result: MethodChannel.Result) {
+        val admission = admitControl(call.arguments as? ByteArray)
+        if (admission == null) {
+            result.error("VG_PROTOCOL_INVALID", "Depth selection requires current binding tokens", null)
+            return
+        }
+        val pending = PendingControlResult(result) { pendingControlResults.remove(it) }
+        pendingControlResults.add(pending)
+        try {
+            executor.execute {
+                val outcome = runCatching {
+                    checkCurrentBinding(admission.generation, admission.qualifier)
+                    val selection = DepthSurfaceSelection.decode(admission.payload)
+                    synchronized(publicationFence) {
+                        checkCurrentBinding(admission.generation, admission.qualifier)
+                        selection.validateReplacement(depthSurfaceSelection, lifecycle.state() == ControlLifecycle.State.IDLE)
+                        depthSurfaceSelection = selection
+                        qualify(admission.payload)
+                    }
+                }
+                post {
+                    if (pending.tryClaim()) outcome.fold(pending.result::success) {
+                        pending.result.error("VG_DEPTH_PRESET_REJECTED", it.message, null)
+                    }
+                }
+            }
+        } catch (_: RejectedExecutionException) {
+            if (pending.tryClaim()) result.error("VG_NOT_INITIALIZED", "V2 binding executor is closed", null)
+        }
+    }
+
+    private fun configureDepthSource(call: MethodCall, result: MethodChannel.Result) {
+        if (!isDebuggable) {
+            result.error("VG_DEBUG_ONLY", "Depth source selection is debug-only", null)
+            return
+        }
+        val admission = admitControl(call.arguments as? ByteArray)
+        if (admission == null) {
+            result.error("VG_PROTOCOL_INVALID", "Depth selection requires current binding tokens", null)
+            return
+        }
+        val pending = PendingControlResult(result) { pendingControlResults.remove(it) }
+        pendingControlResults.add(pending)
+        try {
+            executor.execute {
+                val outcome = runCatching {
+                    checkCurrentBinding(admission.generation, admission.qualifier)
+                    val selection = DepthSourceSelection.decode(admission.payload)
+                    synchronized(publicationFence) {
+                        checkCurrentBinding(admission.generation, admission.qualifier)
+                        selection.validateReplacement(depthSourceSelection, lifecycle.state() == ControlLifecycle.State.IDLE)
+                        depthSourceSelection = selection
+                        qualify(admission.payload)
+                    }
+                }
+                post {
+                    if (pending.tryClaim()) outcome.fold(pending.result::success) {
+                        pending.result.error("VG_DEPTH_SOURCE_REJECTED", it.message, null)
+                    }
+                }
+            }
+        } catch (_: RejectedExecutionException) {
+            if (pending.tryClaim()) result.error("VG_NOT_INITIALIZED", "V2 binding executor is closed", null)
+        }
+    }
+
     private fun onControlCall(call: MethodCall, result: MethodChannel.Result) {
+        if (call.method == "configureDepthSource") {
+            configureDepthSource(call, result)
+            return
+        }
+        if (call.method == "configureDepthSurfaceEstimator") {
+            configureDepthSurfaceEstimator(call, result)
+            return
+        }
         if (handleRendererAttributeCall(call, result)) return
         if (onRendererControlCall(call, result)) return
         if (call.method == "configureDebugV2ExchangeStall") {
@@ -1175,6 +1326,27 @@ class VisibilityGridV2Binding internal constructor(
                             it != "staleRequestBytes"
                     } + probeReceipt,
                 )
+            }
+            return
+        }
+        if (call.method == "bindingScalarSnapshot") {
+            val pending = PendingControlResult(result) { pendingControlResults.remove(it) }
+            pendingControlResults.add(pending)
+            try {
+                executor.execute {
+                    try {
+                        val reply = bindingScalarSnapshot()
+                        post {
+                            if (pending.tryClaim()) pending.result.success(reply)
+                        }
+                    } catch (_: RuntimeException) {
+                        post {
+                            if (pending.tryClaim()) pending.result.error("DIAGNOSTICS_UNAVAILABLE", "unavailable", null)
+                        }
+                    }
+                }
+            } catch (_: RejectedExecutionException) {
+                if (pending.tryClaim()) result.error("VG_NOT_INITIALIZED", "closed", null)
             }
             return
         }
@@ -1360,6 +1532,14 @@ class VisibilityGridV2Binding internal constructor(
                         }
                     } else {
                         val wasIdle = lifecycle.state() == ControlLifecycle.State.IDLE
+                        if (wasIdle && operation == ControlOperation.START) {
+                            check(depthSurfaceSelection?.matches(request) != false) {
+                                "Depth surface selection belongs to another capture group"
+                            }
+                            check(depthSourceSelection?.matches(request) != false) {
+                                "Depth source selection belongs to another capture group"
+                            }
+                        }
                         val response = lifecycle.handle(request, admission.payload)
                         val decoded = ControlCodec.decodeResponse(response)
                         if (operation == ControlOperation.STOP && decoded.outcome == 0) {
@@ -1389,6 +1569,8 @@ class VisibilityGridV2Binding internal constructor(
                                     worldFromGroupGl = configuration.worldFromGroupGl.toDoubleArray(),
                                     voxelSizeMicrometres = configuration.voxelSizeMicrometres,
                                     modelCapacity = configuration.negotiatedModelCapacity,
+                                    depthSurfacePreset = depthSurfaceSelection?.preset ?: DepthSurfacePreset.VIEW_RAY_WEIGHTED,
+                                    depthSourcePreference = depthSourceSelection?.preference,
                                 )
                                 operationGeneration++
                                 canonicalReadyHints?.reset()
@@ -1677,6 +1859,8 @@ class VisibilityGridV2Binding internal constructor(
             )
             currentBindingGeneration = nextBindingGeneration.incrementAndGet()
             activeGroupFrame = null
+            depthSurfaceSelection = null
+            depthSourceSelection = null
             nativeStreamToken = newOpaqueToken()
             workerBindingToken = newOpaqueToken()
             streamChannel = newStreamChannel()
@@ -1947,6 +2131,7 @@ class VisibilityGridV2Binding internal constructor(
         "canonicalReadyWake" to (canonicalReadyHints?.snapshot() ?: mapOf("enabled" to false)),
         "executorTrace" to executorTrace,
         "sourceHealth" to observationRuntime?.snapshotWireMap(),
+        "depthSurfacePreset" to (activeGroupFrame?.depthSurfacePreset ?: DepthSurfacePreset.VIEW_RAY_WEIGHTED).wireName,
     )
 
     private fun Map<String, Any?>.withCleanupBalances(

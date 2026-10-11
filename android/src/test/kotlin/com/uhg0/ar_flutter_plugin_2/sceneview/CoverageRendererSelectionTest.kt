@@ -1042,7 +1042,7 @@ class CoverageRendererSelectionTest {
         assertEquals(2_000, CoverageRendererLimits.RAW_POINT_CAPACITY)
         assertEquals(20_000, CoverageRendererLimits.CENTROID_CAPACITY)
         assertEquals(8_000, CoverageRendererLimits.CUBE_CAPACITY)
-        assertEquals(13_358_756, CoverageRendererLimits.maximumActiveRendererBytes)
+        assertEquals(13_366_948, CoverageRendererLimits.maximumActiveRendererBytes)
         com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.entries.forEach { mode ->
             assertTrue(
                 "$mode startup peak must fit the active renderer cap",
@@ -1081,7 +1081,8 @@ class CoverageRendererSelectionTest {
         assertEquals(0, receipt.pageReaderCapturedMappingBytes)
         assertEquals(65_536, receipt.stagingBytes)
         assertEquals(5_888_000, receipt.meshBytes)
-        assertEquals(13_358_756, receipt.totalBytes)
+        assertEquals(8192, receipt.commonPresentationMetadataBytes)
+        assertEquals(13_366_948, receipt.totalBytes)
         assertTrue(receipt.canonicalStateBytes > 0)
         assertTrue(receipt.mutableProjectionSelectorBytes > 0)
         assertTrue(receipt.descriptorBackingBytes > 0)
@@ -1095,7 +1096,7 @@ class CoverageRendererSelectionTest {
                 receipt.descriptorBackingBytes +
                 receipt.pageReaderCapturedMappingBytes +
                 receipt.stagingBytes +
-                receipt.meshBytes,
+                receipt.meshBytes + receipt.commonPresentationMetadataBytes,
         )
 
         val telemetry = RendererTelemetry()
@@ -1144,7 +1145,7 @@ class CoverageRendererSelectionTest {
 
         ledger.releaseRendererResources()
 
-        assertEquals(7_405_220, telemetry.snapshot().getValue("ownedBufferBytes"))
+        assertEquals(7_413_412, telemetry.snapshot().getValue("ownedBufferBytes"))
         assertEquals(
             5_645_056,
             telemetry.snapshot().getValue("ownedBufferBytesByOwner").let { owners ->
@@ -1167,12 +1168,12 @@ class CoverageRendererSelectionTest {
         ledger.installPointResources("coverage-centroids-epoch-1", CoverageRendererLimits.CENTROID_CAPACITY)
         ledger.releaseRendererResources()
         ledger.releaseRendererResources()
-        assertEquals(7_405_220, telemetry.snapshot().getValue("ownedBufferBytes"))
+        assertEquals(7_413_412, telemetry.snapshot().getValue("ownedBufferBytes"))
 
         ledger.installPersistentCoverageState(VoxelRenderMode.CENTROIDS)
-        assertEquals(7_470_756, telemetry.snapshot().getValue("ownedBufferBytes"))
+        assertEquals(7_478_948, telemetry.snapshot().getValue("ownedBufferBytes"))
         ledger.releaseRendererResources()
-        assertEquals(7_405_220, telemetry.snapshot().getValue("ownedBufferBytes"))
+        assertEquals(7_413_412, telemetry.snapshot().getValue("ownedBufferBytes"))
     }
 
     @Test
@@ -1227,7 +1228,7 @@ class CoverageRendererSelectionTest {
         )
 
         assertNull(failed)
-        assertEquals(7_405_220, telemetry.snapshot().getValue("ownedBufferBytes"))
+        assertEquals(7_413_412, telemetry.snapshot().getValue("ownedBufferBytes"))
     }
 
     @Test
@@ -1262,7 +1263,7 @@ class CoverageRendererSelectionTest {
         )
 
         assertNull(failed)
-        assertEquals(7_405_220, telemetry.snapshot().getValue("ownedBufferBytes"))
+        assertEquals(7_413_412, telemetry.snapshot().getValue("ownedBufferBytes"))
         ledger.clearCoverageState()
         ledger.clearCoverageState()
         assertEquals(0, telemetry.snapshot().getValue("ownedBufferBytes"))
@@ -1276,7 +1277,7 @@ class CoverageRendererSelectionTest {
         ledger.installCubeResources("coverage-cubes-epoch-1", CoverageRendererLimits.CUBE_CAPACITY)
 
         ledger.releaseRendererResources()
-        assertEquals(7_405_220, telemetry.snapshot().getValue("ownedBufferBytes"))
+        assertEquals(7_413_412, telemetry.snapshot().getValue("ownedBufferBytes"))
         ledger.clearCoverageState()
         ledger.clearCoverageState()
         assertEquals(0, telemetry.snapshot().getValue("ownedBufferBytes"))
@@ -1325,7 +1326,8 @@ class CoverageRendererSelectionTest {
                     receipt.mutableProjectionSelectorBytes +
                     receipt.descriptorBackingBytes +
                     receipt.pageReaderCapturedMappingBytes +
-                    receipt.stagingBytes
+                    receipt.stagingBytes +
+                    receipt.commonPresentationMetadataBytes
             } +
                 CoverageRendererLimits.snapshotHandoffBytes(
                     com.uhg0.ar_flutter_plugin_2.pointcloud.VoxelRenderMode.CENTROIDS,

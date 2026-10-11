@@ -1,6 +1,9 @@
 package com.uhg0.ar_flutter_plugin_2.sceneview
 
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRowsQualifier
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererPalette
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererStyleRowV1
 import com.uhg0.ar_flutter_plugin_2.pointcloud.uploadQualifier
 import com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_STYLE_ROW_BYTES
 import java.nio.ByteBuffer
@@ -730,6 +733,132 @@ class CoveragePointUploadCoordinatorTest {
             assertEquals(cancelled + successor, released)
         }
     }
+    @Test
+    fun `point descriptor receipt waits for both callbacks and index consumption in either order`() {
+        for (colorFirst in listOf(false, true)) {
+            val uploader = FakeUploader()
+            val sequencer = CoverageDescriptorPageSequencer()
+            val descriptor = pointReceiptDescriptor(1)
+            val outcomes = mutableListOf<Pair<CoverageDescriptorPageTicket, Boolean>>()
+            val coordinator = CoveragePointUploadCoordinator(2, uploader,
+                onUploadPageSettled = { ticket, successful -> outcomes += ticket to successful; sequencer.finishUpload(ticket, successful) },
+                onUploadPageReleasedWithTicket = { ticket -> assertTrue(outcomes.last().first === ticket) })
+            sequencer.replace(descriptor)
+            val page = checkNotNull(sequencer.nextPage())
+            coordinator.submitPage(page.page, RendererUploadPageOrigin.ORDINARY, page.ticket)
+            coordinator.onRendererFrame()
+            uploader.pendingCallbacks.removeAt(if (colorFirst) 1 else 0).invoke()
+            assertTrue(outcomes.isEmpty())
+            assertFalse(sequencer.isSuccessfullyComplete(descriptor))
+            uploader.completeAll()
+            assertEquals(listOf(page.ticket to true), outcomes)
+            assertFalse(CoveragePointMeshResources.descriptorUploadReady(sequencer, coordinator, descriptor, indexUploadPending = true, destroyed = false))
+            assertTrue(CoveragePointMeshResources.descriptorUploadReady(sequencer, coordinator, descriptor, indexUploadPending = false, destroyed = false))
+            assertFalse(CoveragePointMeshResources.descriptorUploadReady(sequencer, coordinator, descriptor, indexUploadPending = false, destroyed = true))
+            assertFalse(CoveragePointMeshResources.descriptorUploadReady(sequencer, coordinator, pointReceiptDescriptor(1), indexUploadPending = false, destroyed = false))
+        }
+    }
+
+    @Test
+    fun `point page rejection and kick failure report unsuccessful before ownership release`() {
+        for (failure in listOf("positions", "colors", "kick")) {
+            for (synchronous in listOf(false, true)) {
+                val uploader = FakeUploader().apply { rejection = failure; consumePositionsSynchronously = synchronous; consumeColorsSynchronously = synchronous }
+                val sequencer = CoverageDescriptorPageSequencer()
+                val descriptor = pointReceiptDescriptor(600)
+                val outcomes = mutableListOf<Pair<CoverageDescriptorPageTicket, Boolean>>()
+                val coordinator = CoveragePointUploadCoordinator(600, uploader,
+                    onUploadPageSettled = { ticket, successful -> outcomes += ticket to successful; sequencer.finishUpload(ticket, successful) },
+                    onUploadPageReleasedWithTicket = { ticket -> assertEquals(ticket to false, outcomes.last()) })
+                sequencer.replace(descriptor)
+                val page = checkNotNull(sequencer.nextPage())
+                coordinator.submitPage(page.page, RendererUploadPageOrigin.ORDINARY, page.ticket)
+                assertThrows(IllegalStateException::class.java) { coordinator.onRendererFrame() }
+                if (uploader.pendingCallbacks.isNotEmpty()) {
+                    assertTrue(outcomes.isEmpty())
+                    assertTrue(sequencer.hasInFlightPage)
+                }
+                uploader.completeAll()
+                assertEquals(listOf(page.ticket to false), outcomes)
+                assertFalse(sequencer.isSuccessfullyComplete(descriptor))
+                assertFalse(CoveragePointMeshResources.descriptorUploadReady(sequencer, coordinator, descriptor, indexUploadPending = false, destroyed = false))
+                assertTrue(sequencer.nextPage() == null)
+                uploader.callbackHistory.forEach { it() }
+                assertEquals(1, outcomes.size)
+            }
+        }
+    }
+
+    @Test
+    fun `pending point cancellation and destroyed callback drain never grant success`() {
+        for (cancelWithSnapshot in listOf(false, true)) {
+            val uploader = FakeUploader()
+            val outcomes = mutableListOf<Pair<CoverageDescriptorPageTicket, Boolean>>()
+            val coordinator = CoveragePointUploadCoordinator(2, uploader, onUploadPageSettled = { ticket, successful -> outcomes += ticket to successful })
+            val pending = CoverageDescriptorPageTicket(1)
+            coordinator.submitPage(page(1f), RendererUploadPageOrigin.ORDINARY, pending)
+            if (cancelWithSnapshot) coordinator.submit(snapshot(2, 2f)) else coordinator.destroy()
+            assertEquals(listOf(pending to false), outcomes)
+        }
+        for (destroyBetweenCallbacks in listOf(false, true)) {
+            val uploader = FakeUploader()
+            val sequencer = CoverageDescriptorPageSequencer()
+            val descriptor = pointReceiptDescriptor(1)
+            val outcomes = mutableListOf<Pair<CoverageDescriptorPageTicket, Boolean>>()
+            val coordinator = CoveragePointUploadCoordinator(2, uploader,
+                onUploadPageSettled = { ticket, successful -> outcomes += ticket to successful; sequencer.finishUpload(ticket, successful) })
+            sequencer.replace(descriptor)
+            val page = checkNotNull(sequencer.nextPage())
+            coordinator.submitPage(page.page, RendererUploadPageOrigin.ORDINARY, page.ticket)
+            coordinator.onRendererFrame()
+            if (destroyBetweenCallbacks) uploader.completeNext()
+            coordinator.destroy()
+            assertTrue(outcomes.isEmpty())
+            assertTrue(sequencer.hasInFlightPage)
+            assertFalse(CoveragePointMeshResources.descriptorUploadReady(sequencer, coordinator, descriptor, indexUploadPending = false, destroyed = false))
+            uploader.completeAll()
+            assertEquals(listOf(page.ticket to false), outcomes)
+            assertFalse(sequencer.isSuccessfullyComplete(descriptor))
+        }
+    }
+
+    @Test
+    fun `multi page point descriptor cannot complete from later successes after an earlier failed page`() {
+        val uploader = FakeUploader()
+        val sequencer = CoverageDescriptorPageSequencer()
+        val coordinator = CoveragePointUploadCoordinator(1_025, uploader,
+            onUploadPageSettled = sequencer::finishUpload)
+        val failed = pointReceiptDescriptor(1_025)
+        sequencer.replace(failed)
+        val rejected = checkNotNull(sequencer.nextPage())
+        uploader.rejection = "colors"
+        coordinator.submitPage(rejected.page, RendererUploadPageOrigin.ORDINARY, rejected.ticket)
+        assertThrows(IllegalStateException::class.java) { coordinator.onRendererFrame() }
+        uploader.completeAll()
+        assertFalse(sequencer.isSuccessfullyComplete(failed))
+        assertTrue(sequencer.nextPage() == null)
+        uploader.rejection = null
+        coordinator.submitPage(page(2f), RendererUploadPageOrigin.ORDINARY, CoverageDescriptorPageTicket(99))
+        coordinator.onRendererFrame()
+        uploader.completeAll()
+        assertTrue(coordinator.isIdleAndSuccessful())
+        assertFalse(CoveragePointMeshResources.descriptorUploadReady(sequencer, coordinator, failed, indexUploadPending = false, destroyed = false))
+        val descriptor = pointReceiptDescriptor(1_025)
+        sequencer.replace(descriptor)
+        repeat(3) { index ->
+            val page = checkNotNull(sequencer.nextPage())
+            coordinator.submitPage(page.page, RendererUploadPageOrigin.ORDINARY, page.ticket)
+            coordinator.onRendererFrame()
+            uploader.completeAll()
+            assertEquals(index == 2, CoveragePointMeshResources.descriptorUploadReady(sequencer, coordinator, descriptor, indexUploadPending = false, destroyed = false))
+        }
+        val empty = pointReceiptDescriptor(0)
+        sequencer.replace(empty)
+        assertTrue(sequencer.nextPage() == null)
+        assertFalse(CoveragePointMeshResources.descriptorUploadReady(sequencer, coordinator, empty, indexUploadPending = true, destroyed = false))
+        assertTrue(CoveragePointMeshResources.descriptorUploadReady(sequencer, coordinator, empty, indexUploadPending = false, destroyed = false))
+    }
+
 }
 
 private class FakeUploader : CoveragePointVertexUploader {
@@ -860,3 +989,23 @@ private fun partialSnapshot(
                 reset = false,
             ),
     )
+
+private fun pointReceiptDescriptor(count: Int): BoundedCoveragePresentation {
+    val qualifier = CoverageRowsQualifier(1, 1, 1, 1, 1, 1)
+    val style = CoverageRendererStyleRowV1().encode()
+    return PresentationDescriptor.create(
+        qualifier = qualifier, mode = CoveragePresentationMode.SEMANTIC_CENTROIDS, enabled = true,
+        capacity = CoveragePresentationMode.SEMANTIC_CENTROIDS.presentationCapacity,
+        sourceCapacity = count, sourceCount = count, palette = CoverageRendererPalette.COVERAGE, paletteEpoch = 1,
+        selectedSurfaceIds = LongArray(count) { it + 1L }, selectedSourceSlots = IntArray(count) { it },
+        styleRows = ByteArray(count * COVERAGE_RENDERER_STYLE_ROW_BYTES) { style[it % style.size] }, update = null,
+        pageReader = { expected, start, maximum ->
+            if (expected != qualifier || start >= count) null else {
+                val rows = minOf(maximum, count - start)
+                CoveragePresentationPage(startSlot = start, totalCount = count,
+                    surfaceIds = LongArray(rows) { start + it + 1L }, positions = FloatArray(rows * 3),
+                    colors = IntArray(rows), styleRows = ByteArray(rows * COVERAGE_RENDERER_STYLE_ROW_BYTES))
+            }
+        },
+    )
+}

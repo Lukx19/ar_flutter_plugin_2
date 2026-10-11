@@ -56,8 +56,24 @@ internal interface CoverageVoxelMeshResources {
 
     fun onRendererFrame()
 
+    /** Controls the node/layer gate without discarding candidate upload state. */
+    fun setDisplayVisible(visible: Boolean) = Unit
+
+    /** True only after every descriptor page and required index upload drained successfully. */
+    fun isWholeDescriptorUploadComplete(descriptor: BoundedCoveragePresentation): Boolean = false
+
+    /** Drops completed source aliases after the compact GPU receipt is latched. */
+    fun releaseCompletedDescriptorSource() = Unit
+
     /** Invoked only after both native buffer-consumption callbacks release a page. */
     fun setOnUploadPageReleased(listener: () -> Unit)
+
+    /** Invoked once every submitted GPU/page/index callback has actually drained. */
+    fun setOnResourceDrained(listener: () -> Unit) = Unit
+
+    /** True only after [destroy] has completed all asynchronous resource work. */
+    val resourceDrainComplete: Boolean
+        get() = true
 
     fun destroy()
 }

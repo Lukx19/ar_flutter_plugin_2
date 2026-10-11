@@ -17,12 +17,195 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.locks.ReentrantLock
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class VisibilitySurfaceStreamChannelTest {
+    @Test
+    fun `alternating sparse publication consumes actual Dart packets through stream state and selection`() {
+        val input = System.getenv("CAPTURE3D_SPARSE_STYLE_HOST_INPUT")
+        org.junit.Assume.assumeTrue(input != null)
+        val document = kotlinx.serialization.json.Json.parseToJsonElement(java.io.File(input!!).readText())
+            as kotlinx.serialization.json.JsonObject
+        fun field(objectValue: kotlinx.serialization.json.JsonObject, name: String) =
+            (objectValue.getValue(name) as kotlinx.serialization.json.JsonPrimitive).content
+        val groupBytes = ByteArray(16) { field(document, "captureGroupHex").substring(it * 2, it * 2 + 2).toInt(16).toByte() }
+        val ownership = com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityObservationOwnership(
+            sessionId = "01".repeat(16), sessionGeneration = 1,
+            captureGroupId = field(document, "captureGroupHex"), groupGeneration = 4, coverageEpoch = 1,
+            arSessionIdentity = "03".repeat(16), viewInstanceId = "04".repeat(16), viewGeneration = 1,
+            nativeStreamToken = "05".repeat(16), workerBindingToken = "06".repeat(16), bindingGeneration = 1,
+            lifecycleSequence = 1, operationGeneration = 1,
+            groupFrame = com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityGroupFrame.copyOf(
+                com.uhg0.ar_flutter_plugin_2.visibilitygrid.identityVisibilityGridTransform(),
+                com.uhg0.ar_flutter_plugin_2.visibilitygrid.identityVisibilityGridTransform(), 100_000, 6732))
+        val workloads = document.getValue("workloads") as kotlinx.serialization.json.JsonObject
+        val samples = mutableListOf<String>()
+        var comparisonIds: LongArray? = null
+        var comparisonStyles: ByteArray? = null
+        var comparisonColors: IntArray? = null
+        val runs = document.getValue("runs") as kotlinx.serialization.json.JsonArray
+        for (item in runs) {
+            val run = item as kotlinx.serialization.json.JsonObject
+            val workload = field(run, "workload")
+            val specification = workloads.getValue(workload) as kotlinx.serialization.json.JsonObject
+            val nearRows = field(specification, "nearRows").toInt()
+            val nearYOffset = field(specification, "nearYOffset").toInt()
+            val baseRows = java.util.Base64.getDecoder().decode(field(specification, "baseStyleRowsBase64"))
+            val state = com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityGridRendererState(6732, retainWorldPositions = false)
+            val geometry = List(6732) { index ->
+                val x = if (index < nearRows) index % 30 - 15 else 100 + index % 100
+                val y = if (index < nearRows) index / 30 + nearYOffset else 100 + index / 100
+                com.uhg0.ar_flutter_plugin_2.visibilitygrid.CanonicalRenderRow(index + 1L,
+                    com.uhg0.ar_flutter_plugin_2.visibilitygrid.packVisibilityGridKey(x, y, -30), 0, 200, 0)
+            }
+            state.startCanonicalGroup(com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityGridGroupConfig(
+                groupId = ownership.captureGroupId, groupGeneration = 4, sessionGeneration = 1,
+                voxelSizeMeters = .1, capacity = 6732,
+                groupFromWorldGl = com.uhg0.ar_flutter_plugin_2.visibilitygrid.identityVisibilityGridTransform()),
+                1, geometry, ownership, 1, 1)
+            val baseTarget = (0 until 6732).firstOrNull { (baseRows[it * 16 + 1].toInt() ushr 6) and 3 == 1 }
+            assertTrue(state.applyStyleCut(com.uhg0.ar_flutter_plugin_2.visibilitygrid.QualifiedRendererStyleCut(
+                ownership, 1, 1, 1, 1, 1, 1, 1, 1, true, LongArray(6732) { it + 1L }, baseRows,
+                baseTarget?.let { it + 1L }, baseTarget?.let { baseRows[it * 16 + 4].toInt() and 255 }))
+                is com.uhg0.ar_flutter_plugin_2.visibilitygrid.RendererStyleCutResult.Applied)
+            val messenger = TestMessenger(146)
+            var applyNs = 0L
+            var selectionNs = 0L
+            var selected: com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot? = null
+            fun apply(cut: RendererStyleCutPayloadV1): RendererStyleCommandApplyResultV1 {
+                val clock = System.nanoTime()
+                val result = state.applyStyleCut(com.uhg0.ar_flutter_plugin_2.visibilitygrid.QualifiedRendererStyleCut(
+                    ownership, cut.transactionId, cut.geometryRevision, cut.lineageRevision,
+                    cut.semanticRevision, cut.coverageRevision, cut.styleRevision, cut.residencyRevision,
+                    cut.targetRevision, cut.reset, cut.surfaceIds, cut.styleRows,
+                    cut.targetSurfaceId, cut.targetDirectionIndex, cut.sparseContext))
+                applyNs += System.nanoTime() - clock
+                require(result is com.uhg0.ar_flutter_plugin_2.visibilitygrid.RendererStyleCutResult.Applied)
+                val selectionClock = System.nanoTime()
+                assertTrue(state.withCommittedRows(com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRowsQualifier(1, 4, 0, 1, 1, 2)) { rows ->
+                    selected = com.uhg0.ar_flutter_plugin_2.sceneview.CoveragePresentationSelector(4096).select(rows, forceReset = true)
+                })
+                selectionNs += System.nanoTime() - selectionClock
+                return RendererStyleCommandApplyResultV1(cut.styleRevision)
+            }
+            val binding = VisibilitySurfaceStreamChannel(messenger, 146,
+                onRendererStyleCut = ::apply, admitSparseRendererStyle = { true }, onSparseRendererStyleCut = ::apply)
+            binding.setCommittedBaseline(1, 1, 1, 1)
+            val packets = run.getValue("packetsBase64") as kotlinx.serialization.json.JsonArray
+            // Export decoding and fixture classification are outside every
+            // measured exchange. The real stream still validates its input.
+            val predecodeStarted = System.nanoTime()
+            val preparedPackets = packets.map { packet ->
+                val bytes = java.util.Base64.getDecoder().decode((packet as kotlinx.serialization.json.JsonPrimitive).content)
+                Pair(bytes, PacketCodec.decodeRequestView(bytes).commandLength == 0)
+            }
+            val predecodeNs = System.nanoTime() - predecodeStarted
+            val replies = mutableListOf<ByteArray>()
+            var nativeNs = 0L
+            var commandNs = 0L
+            var fenceNs = 0L
+            for ((bytes, fence) in preparedPackets) {
+                val started = System.nanoTime()
+                val reply = messenger.exchange(bytes)
+                val elapsed = System.nanoTime() - started
+                nativeNs += elapsed
+                if (fence) fenceNs += elapsed else commandNs += elapsed
+                replies.add(reply)
+            }
+            // Test-side response inspection/parity is also outside timing.
+            val responses = replies.map { PacketCodec.decodeResponse(it) }
+            val errors = responses.map { it.errorId }
+            val styles = ByteArray(6732 * 16)
+            val readable = state.withCommittedRows(com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRowsQualifier(1, 4, 0, 1, 1, 2)) { rows ->
+                for (index in 0 until 6732) rows.copyStyleAt(index, styles, index * 16)
+            }
+            val target = state.currentTargetSurfaceId
+            val virtual = RendererStyleCutPayloadV1(groupBytes, 1, 4, 1, 1, 1, 2, 2, 2, 2, 2,
+                true, LongArray(6732) { it + 1L }, styles, target, state.currentTargetDirectionIndex)
+            val digest = virtual.completeDigest().joinToString("") { "%02x".format(it.toInt() and 255) }
+            val projection = selected
+            val mode = field(run, "mode")
+            val pair = field(run, "pair")
+            samples += "{\"workload\":\"$workload\",\"pair\":$pair,\"mode\":\"$mode\",\"cold\":${field(run, "cold")}," +
+                "\"changedRows\":${field(run, "changedRows")},\"fallback\":${field(run, "fallback")}," +
+                "\"nativeMessengerExchangeUs\":${nativeNs / 1000},\"nativeCommandExchangeUs\":${commandNs / 1000}," +
+                "\"driverPredecodeUs\":${predecodeNs / 1000},\"nativeStateApplyUs\":${applyNs / 1000}," +
+                "\"nativeSelectionUs\":${selectionNs / 1000},\"nativeFinalFenceUs\":${fenceNs / 1000}," +
+                "\"commands\":${preparedPackets.count { !it.second }},\"requestBytes\":${preparedPackets.sumOf { it.first.size }}," +
+                "\"responseErrors\":[${errors.joinToString(",")}],\"readable\":$readable,\"selectedAvailable\":${projection != null}," +
+                "\"exactFinalFenceComplete\":${binding.rendererStyleAcknowledgementComplete}," +
+                "\"virtualDigestParity\":${readable && digest == field(run, "virtualFullDigestHex")}}"
+            // Write before assertions; failed runs remain visible evidence.
+            System.getenv("CAPTURE3D_SPARSE_STYLE_HOST_NATIVE_RESULT")?.let { path -> java.io.File(path).writeText(
+                "{\"scope\":\"Actual messenger exchange walls include serial native stream dispatch/callbacks/final fence; exported packet predecode/classification and response/parity checks are outside timing. Callback/selection times are nested, not added percentiles. No isolated CPU, JNI, physical allocation, mounted renderer or camera claim.\",\"samples\":[" + samples.joinToString(",") + "]}") }
+            assertTrue(errors.all { it == 0 })
+            assertTrue(readable)
+            assertNotNull(projection)
+            assertEquals(field(run, "virtualFullDigestHex"), digest)
+            assertTrue(binding.rendererStyleAcknowledgementComplete)
+            if (mode == "controlBefore") {
+                comparisonIds = projection!!.surfaceIds.copyOf(); comparisonStyles = projection!!.styleRows.copyOf(); comparisonColors = projection!!.colors.copyOf()
+            } else {
+                assertArrayEquals(comparisonIds, projection!!.surfaceIds)
+                assertArrayEquals(comparisonStyles, projection!!.styleRows)
+                assertArrayEquals(comparisonColors, projection!!.colors)
+            }
+            binding.dispose(); state.dispose()
+        }
+        assertEquals(workloads.size * 90, samples.size)
+    }
+
+    @Test
+    fun `sparse zero records advance once replay exact bytes and require separate final fence`() {
+        val messenger = TestMessenger(146)
+        var calls = 0
+        val binding = VisibilitySurfaceStreamChannel(messenger, 146,
+            admitSparseRendererStyle = { true }, onSparseRendererStyleCut = {
+                calls++; RendererStyleCommandApplyResultV1(it.styleRevision)
+            })
+        binding.setCommittedBaseline(0, 0, 0, 1)
+        val command = SparseRendererStyleCommandV1.encode(sparseFixture(ids = longArrayOf()))
+        val packet = styleRequest(1, 146, command, styleRevision = 2)
+        val first = messenger.exchange(packet)
+        assertEquals(2L, PacketCodec.decodeResponse(first).acceptedStyleRevision)
+        assertEquals(1, calls)
+        assertFalse(binding.rendererStyleAcknowledgementComplete)
+        assertArrayEquals(first, messenger.exchange(packet))
+        assertEquals(1, calls)
+        assertFalse(binding.rendererStyleAcknowledgementComplete)
+        val final = PacketCodec.decodeResponse(messenger.exchange(request(2, 146, styleRevision = 2)))
+        assertEquals(2L, final.acceptedStyleRevision)
+        assertTrue(binding.rendererStyleAcknowledgementComplete)
+        assertEquals(1, calls)
+        binding.dispose()
+    }
+
+    @Test
+    fun `sparse unnegotiated and stale exact base fail before callback and sequence mutation`() {
+        for (supported in listOf(false, true)) {
+            val messenger = TestMessenger(147)
+            var calls = 0
+            val binding = VisibilitySurfaceStreamChannel(messenger, 147,
+                admitSparseRendererStyle = { supported }, onSparseRendererStyleCut = {
+                    calls++; RendererStyleCommandApplyResultV1(it.styleRevision)
+                })
+            binding.setCommittedBaseline(0, 0, 0, 1)
+            val command = SparseRendererStyleCommandV1.encode(sparseFixture(base = if (supported) 4 else 1))
+            val response = PacketCodec.decodeResponse(messenger.exchange(styleRequest(1, 147, command,
+                styleRevision = if (supported) 5 else 2)))
+            assertEquals(34, response.errorId)
+            assertEquals(1L, response.nextExpectedRequestSequence)
+            assertEquals(1L, response.acceptedStyleRevision)
+            assertEquals(0, calls)
+            binding.dispose()
+        }
+    }
+
     @Test
     fun `qualified reply views stay immutable through replay later publication and disposal`() {
         val held = mutableListOf<ByteBuffer>()

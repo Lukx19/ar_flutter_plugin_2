@@ -11,6 +11,62 @@ import org.junit.Test
 
 class DepthEvidenceKernelTest {
     @Test
+    fun `texture calibration reconstructs one oblique plane through native camera motion and display rotations`() {
+        val intrinsics = depthIntrinsicsFromTexture(200, 100, 800, 400, 640.0, 512.0, 260.0, 180.0)
+        val groupFromWorld = rotationY180().also { it[12] = 0.35; it[13] = 0.25; it[14] = -0.05 }
+        val worldFromGroup = rotationY180().also { it[12] = 0.35; it[13] = -0.25; it[14] = -0.05 }
+        val group = VisibilityGroupFrame.copyOf(worldFromGroup, groupFromWorld,
+            voxelSizeMicrometres = 100_000, modelCapacity = 100)
+        // Known world plane: z = -1000 - 0.5*x millimetres. Integer pixel/depth
+        // quantization is regenerated from each physical pose, never reused.
+        val planePoints = listOf(65, 97, 33).map { x ->
+            val rayX = (x - intrinsics.cx) / intrinsics.fx
+            val depth = kotlin.math.round(1_000.0 / (1.0 - 0.5 * rayX)).toInt()
+            doubleArrayOf(rayX * depth, 0.0, -depth.toDouble())
+        }
+        fun samples(cameraX: Double, cameraY: Double, cameraZ: Double) = planePoints.map { point ->
+            val depth = kotlin.math.round(cameraZ * 1_000.0 - point[2]).toInt()
+            VisibilityDepthSample(
+                kotlin.math.round(intrinsics.cx + intrinsics.fx * (point[0] - cameraX * 1_000.0) / depth).toInt(),
+                kotlin.math.round(intrinsics.cy - intrinsics.fy * (point[1] - cameraY * 1_000.0) / depth).toInt(),
+                depth, 255,
+            )
+        }
+        fun targets(cameraX: Double, cameraY: Double, cameraZ: Double, displayDegrees: Int? = null): Set<Voxel> {
+            // Native pose composes once with the nonidentity group. The optional
+            // display-oriented transform is a negative control, not production.
+            val native = rotationY180().also {
+                it[12] = 0.35 - cameraX; it[13] = 0.25 + cameraY; it[14] = -0.05 - cameraZ
+            }
+            val transform = if (displayDegrees == null) native else {
+                val angle = Math.toRadians(displayDegrees.toDouble())
+                val display = identity().also {
+                    it[0] = kotlin.math.cos(angle); it[1] = kotlin.math.sin(angle)
+                    it[4] = -kotlin.math.sin(angle); it[5] = kotlin.math.cos(angle)
+                }
+                DoubleArray(16) { index ->
+                    val row = index % 4; val column = index / 4
+                    (0 until 4).sumOf { inner -> native[inner * 4 + row] * display[column * 4 + inner] }
+                }
+            }
+            val input = DepthEvidenceBatch(1L, 1L, group, transform.toList(),
+                VisibilityCameraIntrinsics(200, 100, intrinsics.fx, intrinsics.fy, intrinsics.cx, intrinsics.cy),
+                samples(cameraX, cameraY, cameraZ), 0)
+            val kernel = DepthEvidenceKernel(DepthEvidenceConfiguration(occupiedEvidenceToShow = 1, sampleCapacity = 3, rayVisitCapacity = 128, surfaceCapacity = 16))
+            return try {
+                val result = kernel.prepare(input, FakeCanonicalView()) as DepthEvidenceResult.Accepted
+                assertEquals(3, result.receipt.acceptedSamples)
+                result.changes.filterIsInstance<DepthEvidenceChange.Create>().map { it.target.voxel }.toSet()
+            } finally { kernel.close() }
+        }
+        val expected = setOf(Voxel(3, 2, 9), Voxel(1, 2, 10), Voxel(5, 2, 8))
+        assertEquals(expected, targets(0.0, 0.0, 0.0))
+        assertEquals(expected, targets(0.125, 0.0625, 0.125))
+        for (displayDegrees in listOf(90, 270)) {
+            assertTrue("fixture must detect a second display rotation", expected != targets(0.0, 0.0, 0.0, displayDegrees))
+        }
+    }
+    @Test
     fun `canonical view traversal adapter matches kernel supercover and direct addresses`() {
         val addressed = surface(7, Voxel(0, 0, -1))
         val adapter = CanonicalSurfaceRayViewAdapter(

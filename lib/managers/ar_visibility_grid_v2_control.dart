@@ -132,8 +132,10 @@ final class ARVisibilityRendererControls {
       visible: _rendererBool(map, 'visible'),
       mode: ARCoveragePresentationMode.fromWire(map['mode']),
       palette: ARCoveragePalette.fromWire(map['palette']),
-      expectedGeometryRevision:
-          _rendererNullableInt(map, 'expectedGeometryRevision'),
+      expectedGeometryRevision: _rendererNullableInt(
+        map,
+        'expectedGeometryRevision',
+      ),
       expectedStyleRevision: _rendererNullableInt(map, 'expectedStyleRevision'),
     );
   }
@@ -315,10 +317,7 @@ final class ARVisibilityRendererHitReceipt {
     final requestId = _rendererRequestId(map);
     final hit = _rendererBool(map, 'hit');
     if (!hit) {
-      return ARVisibilityRendererHitReceipt(
-        requestId: requestId,
-        hit: false,
-      );
+      return ARVisibilityRendererHitReceipt(requestId: requestId, hit: false);
     }
     return ARVisibilityRendererHitReceipt(
       requestId: requestId,
@@ -326,8 +325,10 @@ final class ARVisibilityRendererHitReceipt {
       surfaceId: _rendererNonNegativeInt(map, 'surfaceId'),
       semanticLabel: ARCoverageSemanticLabel.fromWire(map['semanticLabel']),
       coverageLabel: ARCoverageLabel.fromWire(map['coverageLabel']),
-      targetDirectionIndex:
-          _rendererDirectionIndex(map, 'targetDirectionIndex'),
+      targetDirectionIndex: _rendererDirectionIndex(
+        map,
+        'targetDirectionIndex',
+      ),
       geometryRevision: _rendererNonNegativeInt(map, 'geometryRevision'),
       styleRevision: _rendererNonNegativeInt(map, 'styleRevision'),
     );
@@ -340,12 +341,18 @@ final class ARVisibilityRendererHitReceipt {
       requestId: requestId,
       hit: false,
       stale: true,
-      expectedGeometryRevision:
-          _rendererNonNegativeInt(map, 'expectedGeometryRevision'),
-      actualGeometryRevision:
-          _rendererNonNegativeInt(map, 'actualGeometryRevision'),
-      expectedStyleRevision:
-          _rendererNonNegativeInt(map, 'expectedStyleRevision'),
+      expectedGeometryRevision: _rendererNonNegativeInt(
+        map,
+        'expectedGeometryRevision',
+      ),
+      actualGeometryRevision: _rendererNonNegativeInt(
+        map,
+        'actualGeometryRevision',
+      ),
+      expectedStyleRevision: _rendererNonNegativeInt(
+        map,
+        'expectedStyleRevision',
+      ),
       actualStyleRevision: _rendererNonNegativeInt(map, 'actualStyleRevision'),
     );
   }
@@ -388,16 +395,13 @@ final class ARVisibilityGridV2RendererTransport {
       throw ArgumentError('Renderer hit request fields are invalid.');
     }
     try {
-      final response = await _invoke(
-        'rendererHitTest',
-        <String, Object?>{
-          'xPx': xPx,
-          'yPx': yPx,
-          'requestId': requestId,
-          'expectedGeometryRevision': expectedGeometryRevision,
-          'expectedStyleRevision': expectedStyleRevision,
-        },
-      );
+      final response = await _invoke('rendererHitTest', <String, Object?>{
+        'xPx': xPx,
+        'yPx': yPx,
+        'requestId': requestId,
+        'expectedGeometryRevision': expectedGeometryRevision,
+        'expectedStyleRevision': expectedStyleRevision,
+      });
       return ARVisibilityRendererHitReceipt.fromMap(response);
     } on PlatformException catch (error) {
       if (error.code != 'VG_RENDERER_STALE') rethrow;
@@ -1334,8 +1338,9 @@ final class ARVisibilityGridV2Control {
   Future<ARVisibilityGridV2Issue98Preparation>
       prepareDebugV2Issue98Handoff() async {
     await _bindingReady;
-    final raw =
-        await _channel.invokeMethod<Object?>('prepareDebugV2Issue98Handoff');
+    final raw = await _channel.invokeMethod<Object?>(
+      'prepareDebugV2Issue98Handoff',
+    );
     return ARVisibilityGridV2Issue98Preparation.fromMap(raw);
   }
 
@@ -1412,7 +1417,8 @@ final class ARVisibilityGridV2Control {
     final response = await _channel.invokeMethod<Object?>(method, request);
     if (response is! Uint8List) {
       throw StateError(
-          'visibility protocol control returned a non-byte response.');
+        'visibility protocol control returned a non-byte response.',
+      );
     }
     return Uint8List.fromList(response);
   }
@@ -1573,8 +1579,10 @@ Map<Object?, Object?> _teardownReceipt(Object? raw) {
     'timeoutSchedulerBalance',
     'ownedResourceBalance',
   ];
-  final hasBalances =
-      <String>[...beforeAfterKeys, ...balanceKeys].any(receipt.containsKey);
+  final hasBalances = <String>[
+    ...beforeAfterKeys,
+    ...balanceKeys,
+  ].any(receipt.containsKey);
   if (hasBalances) {
     int exact(String key, {required bool nonNegative}) {
       final value = receipt[key];
@@ -1603,7 +1611,8 @@ Map<Object?, Object?> _teardownReceipt(Object? raw) {
       final balance = exact('${kind}Balance', nonNegative: false);
       if (balance != after - before) {
         throw StateError(
-            'V2 teardown receipt field ${kind}Balance is incoherent.');
+          'V2 teardown receipt field ${kind}Balance is incoherent.',
+        );
       }
     }
     if (exact('closedResourcesAfter', nonNegative: true) !=
@@ -1747,6 +1756,44 @@ final class ARVisibilityGridV2WorkerBinding {
     _bindingQualifier = qualifier;
   }
 
+  /// Sets the implemented depth preset for one qualified group before START.
+  /// Native rejects unsupported selections and changes to an active group.
+  /// Throws [StateError] for malformed confirmation; propagates platform errors.
+  Future<void> configureDepthSurfaceEstimator(Uint8List selection) async {
+    _ensureOpen();
+    if (selection.length != 49) {
+      throw ArgumentError.value(selection.length, 'selection');
+    }
+    final expectedSelection = Uint8List.fromList(selection);
+    final response = await _controlChannel.invokeMethod<Object?>(
+      'configureDepthSurfaceEstimator',
+      _qualify(expectedSelection),
+    );
+    if (response is! Uint8List ||
+        !_bytesEqual(_authenticate(response), expectedSelection)) {
+      throw StateError('Native did not confirm the depth surface selection.');
+    }
+  }
+
+  /// Selects the debug depth source for one qualified group before START.
+  /// Native rejects unsupported selections and changes to an active group.
+  /// Throws [StateError] for malformed confirmation; propagates platform errors.
+  Future<void> configureDepthSource(Uint8List selection) async {
+    _ensureOpen();
+    if (selection.length != 49) {
+      throw ArgumentError.value(selection.length, 'selection');
+    }
+    final expectedSelection = Uint8List.fromList(selection);
+    final response = await _controlChannel.invokeMethod<Object?>(
+      'configureDepthSource',
+      _qualify(expectedSelection),
+    );
+    if (response is! Uint8List ||
+        !_bytesEqual(_authenticate(response), expectedSelection)) {
+      throw StateError('Native did not confirm the depth source selection.');
+    }
+  }
+
   /// Sends START through the worker-owned control channel.
   /// Throws [StateError] when closed or for a non-byte response, and
   /// propagates [PlatformException] or [MissingPluginException].
@@ -1776,8 +1823,30 @@ final class ARVisibilityGridV2WorkerBinding {
   /// Negotiates optional attributes on this exact existing worker binding.
   Future<bool> rendererAttributesSupported() async {
     final result = await _rendererAttributeCall(
-        'rendererAttributesCapabilities', Uint8List(0));
+      'rendererAttributesCapabilities',
+      Uint8List(0),
+    );
     return result is Map && result['supported'] == true;
+  }
+
+  /// Negotiates the distinct bounded sparse style command on this binding.
+  Future<bool> sparseStylePublicationSupported() async {
+    try {
+      final result = await _rendererAttributeCall(
+        'sparseStylePublicationCapabilities',
+        Uint8List(0),
+      );
+      return result is Map &&
+          result['supported'] == true &&
+          result['version'] == 2 &&
+          result['maximumChangedRows'] == 512;
+    } on MissingPluginException {
+      return false;
+    } on PlatformException catch (error) {
+      if (error.code == 'unimplemented' || error.code == 'unsupported')
+        return false;
+      rethrow;
+    }
   }
 
   /// One optional request, with no ACK/credit meaning. Unknown reply keeps its
@@ -1793,11 +1862,16 @@ final class ARVisibilityGridV2WorkerBinding {
     final qualified = _qualify(bytes);
     _rendererAttributeInvocationReserved = true;
     final invocation = _controlChannel.invokeMethod<Object?>(method, qualified);
-    unawaited(invocation.then<void>((_) {
-      _rendererAttributeInvocationReserved = false;
-    }, onError: (Object _, StackTrace __) {
-      _rendererAttributeInvocationReserved = false;
-    }));
+    unawaited(
+      invocation.then<void>(
+        (_) {
+          _rendererAttributeInvocationReserved = false;
+        },
+        onError: (Object _, StackTrace __) {
+          _rendererAttributeInvocationReserved = false;
+        },
+      ),
+    );
     try {
       final response = await invocation.timeout(const Duration(seconds: 2));
       _ensureOpen();
@@ -1914,10 +1988,7 @@ final class ARVisibilityGridV2WorkerBinding {
   /// times out. Throws [StateError] when closed, native returns no response, or
   /// the response qualifier is absent/stale. Propagates [PlatformException] or
   /// [MissingPluginException] on other channel failures.
-  Future<Uint8List> exchange(
-    Uint8List request, {
-    Duration? timeout,
-  }) {
+  Future<Uint8List> exchange(Uint8List request, {Duration? timeout}) {
     _ensureOpen();
     final operation = _streamChannel.send(
       ByteData.sublistView(_qualify(request)),

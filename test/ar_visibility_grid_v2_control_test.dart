@@ -1,157 +1,323 @@
 import 'dart:async';
+
 import 'package:ar_flutter_plugin_2/managers/ar_visibility_grid_v2_control.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
-  TestWidgetsFlutterBinding.ensureInitialized();
-
-  test('visibility handoff returns a validated immutable typed receipt',
+  test(
+      'worker depth selection confirms the transmitted snapshot after caller mutation',
       () async {
-    const channel = MethodChannel('visibility_grid_v2_control_98');
-    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-        .setMockMethodCallHandler(channel, (call) async {
-      if (call.method == 'prepareDebugV2Issue98Handoff') {
-        return <String, Object>{
-          'correlationId': Uint8List(16),
-          'oldBindingQualifier': Uint8List(32),
-          'staleRequestBytes': Uint8List.fromList(<int>[1, 2, 3]),
-        };
+    for (final contradictsSentSelection in [false, true]) {
+      const control = MethodChannel('visibility_grid_v2_control_198');
+      const stream = BasicMessageChannel<ByteData?>(
+        'visibility_surface_stream_198',
+        BinaryCodec(),
+      );
+      final native = Uint8List.fromList(List<int>.generate(16, (i) => i + 1));
+      final worker = Uint8List.fromList(List<int>.generate(16, (i) => i + 17));
+      final callerSelection = Uint8List(49)..[48] = 4;
+      final originallySelected = Uint8List.fromList(callerSelection);
+      final observed = Completer<Uint8List>();
+      final reply = Completer<Uint8List>();
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(control, (call) async {
+        expect(call.method, 'configureDepthSurfaceEstimator');
+        final sent = Uint8List.fromList(call.arguments! as Uint8List);
+        expect(sent.sublist(0, 16), native);
+        expect(sent.sublist(16, 32), worker);
+        expect(sent.sublist(32), originallySelected);
+        observed.complete(sent);
+        return reply.future;
+      });
+      final binding = ARVisibilityGridV2WorkerBinding.connect(
+        rootIsolateToken: ServicesBinding.rootIsolateToken!,
+        viewId: 198,
+        controlChannel: control,
+        streamChannel: stream,
+      );
+      binding.bindSnapshot({
+        'nativeStreamToken': native,
+        'workerBindingToken': worker,
+      });
+      try {
+        final confirmation = binding.configureDepthSurfaceEstimator(
+          callerSelection,
+        );
+        final sent = await observed.future;
+        callerSelection[48] = 2;
+        final response = Uint8List.fromList(sent);
+        if (contradictsSentSelection)
+          response.setRange(32, 81, callerSelection);
+        reply.complete(response);
+        if (contradictsSentSelection) {
+          await expectLater(confirmation, throwsStateError);
+        } else {
+          await confirmation;
+        }
+        expect(sent.sublist(32), originallySelected);
+        expect(callerSelection[48], 2);
+      } finally {
+        binding.close();
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(control, null);
       }
-      if (call.method != 'finalizeDebugV2Issue98Handoff') return null;
-      return <String, Object>{
-        'oldTransactionId': 0x7fffffffffffffff,
-        'oldRequestSequence': 0x7fffffffffffffff,
-        'terminalResultFlags': 5,
-        'terminalNextExpectedRequestSequence': 0x7fffffffffffffff,
-        'freshTransactionId': 0,
-        'freshRequestSequence': 1,
-        'nextTransactionId': 1,
-        'geometryRevision': 11,
-        'lineageRevision': 12,
-        'captureRevision': 13,
-        'coverageRevision': 14,
-        'acceptedStyleRevision': 15,
-        'regionManifestRevision': 16,
-        'nextSurfaceIdHighWater': 17,
-        'schemaRootRevision': 18,
-        'oldTokenAttemptCount': 1,
-        'oldTokenRejectionCount': 1,
-        'semanticEffectCount': 0,
-        'oldTokenPublicationCount': 0,
-        'rootIsolateSurfaceBytes': 0,
-        'oldClosedResources': 3,
-        'freshActiveResources': 3,
-      };
-    });
-    addTearDown(
-      () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-          .setMockMethodCallHandler(channel, null),
-    );
+    }
+  });
+  test(
+      'worker depth source selection confirms the transmitted snapshot after caller mutation',
+      () async {
+    for (final contradictsSentSelection in [false, true]) {
+      const control = MethodChannel('visibility_grid_v2_control_198');
+      const stream = BasicMessageChannel<ByteData?>(
+        'visibility_surface_stream_198',
+        BinaryCodec(),
+      );
+      final native = Uint8List.fromList(List<int>.generate(16, (i) => i + 1));
+      final worker = Uint8List.fromList(List<int>.generate(16, (i) => i + 17));
+      final callerSelection = Uint8List(49)..[48] = 1;
+      final originallySelected = Uint8List.fromList(callerSelection);
+      final observed = Completer<Uint8List>();
+      final reply = Completer<Uint8List>();
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(control, (call) async {
+        expect(call.method, 'configureDepthSource');
+        final sent = Uint8List.fromList(call.arguments! as Uint8List);
+        expect(sent.sublist(0, 16), native);
+        expect(sent.sublist(16, 32), worker);
+        expect(sent.sublist(32), originallySelected);
+        observed.complete(sent);
+        return reply.future;
+      });
+      final binding = ARVisibilityGridV2WorkerBinding.connect(
+        rootIsolateToken: ServicesBinding.rootIsolateToken!,
+        viewId: 198,
+        controlChannel: control,
+        streamChannel: stream,
+      );
+      binding.bindSnapshot({
+        'nativeStreamToken': native,
+        'workerBindingToken': worker,
+      });
+      try {
+        final confirmation = binding.configureDepthSource(
+          callerSelection,
+        );
+        final sent = await observed.future;
+        callerSelection[48] = 0;
+        final response = Uint8List.fromList(sent);
+        if (contradictsSentSelection) {
+          response.setRange(32, 81, callerSelection);
+        }
+        reply.complete(response);
+        if (contradictsSentSelection) {
+          await expectLater(confirmation, throwsStateError);
+        } else {
+          await confirmation;
+        }
+        expect(sent.sublist(32), originallySelected);
+        expect(callerSelection[48], 0);
+      } finally {
+        binding.close();
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(control, null);
+      }
+    }
+  });
+  test(
+      'worker depth selection carries current tokens and rejects contradictory confirmation',
+      () async {
+    const control = MethodChannel('visibility_grid_v2_control_197');
     const stream = BasicMessageChannel<ByteData?>(
-      'visibility_surface_stream_98',
+      'visibility_surface_stream_197',
       BinaryCodec(),
     );
+    final native = Uint8List.fromList(List<int>.generate(16, (i) => i + 1));
+    final worker = Uint8List.fromList(List<int>.generate(16, (i) => i + 17));
+    final selection = Uint8List(49)..[48] = 4;
+    var contradictory = false;
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-        .setMockMessageHandler(stream.name, (_) async => null);
-    addTearDown(
-      () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-          .setMockMessageHandler(stream.name, null),
-    );
-    final control = ARVisibilityGridV2Control(
-      98,
-      initialBindingSnapshot: <Object?, Object?>{
-        'nativeStreamToken': Uint8List(16),
-        'workerBindingToken': Uint8List(16),
-      },
-    );
-    final preparation = await control.prepareDebugV2Issue98Handoff();
-    await control.submitDebugV2Issue98StaleAttempt(preparation);
-    final receipt = await control.finalizeDebugV2Issue98Handoff(preparation);
-    expect(receipt, isA<ARVisibilityGridV2Issue98HandoffReceipt>());
-    expect(receipt.oldTokenAttemptCount, 1);
-    expect(receipt.oldTokenRejectionCount, 1);
-    expect(receipt.nextTransactionId, 1);
-    expect(receipt.semanticEffectCount, 0);
-    expect(receipt.oldTokenPublicationCount, 0);
-    expect(receipt.rootIsolateSurfaceBytes, 0);
-  });
-
-  test(
-      'connection-owned disposal rejects stale replacement and returns receipt',
-      () async {
-    const channel = MethodChannel('visibility_grid_v2_control_41');
-    final methods = <String>[];
-    Uint8List? disposalQualifier;
-    var currentQualifier = <int>[
-      ...List<int>.generate(16, (i) => i),
-      ...List<int>.generate(16, (i) => i + 16),
-    ];
-    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-        .setMockMethodCallHandler(channel, (call) async {
-      methods.add(call.method);
-      if (call.method == 'disposeBinding') {
-        final qualifier = List<int>.from(call.arguments! as Uint8List);
-        if (!_sameBytes(qualifier, currentQualifier)) {
-          throw PlatformException(code: 'VG_STREAM_BINDING_ABANDONED');
-        }
-        disposalQualifier = Uint8List.fromList(qualifier);
-        return <String, Object>{
-          'closedResources': 3,
-          'disposed': false,
-        };
-      }
-      throw PlatformException(code: 'unsupported');
+        .setMockMethodCallHandler(control, (call) async {
+      expect(call.method, 'configureDepthSurfaceEstimator');
+      final bytes = call.arguments! as Uint8List;
+      expect(bytes.sublist(0, 16), native);
+      expect(bytes.sublist(16, 32), worker);
+      expect(bytes.sublist(32), selection);
+      final reply = Uint8List.fromList(bytes);
+      if (contradictory) reply[80] = 2;
+      return reply;
     });
     addTearDown(
       () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-          .setMockMethodCallHandler(channel, null),
+          .setMockMethodCallHandler(control, null),
     );
-
-    final stale = ARVisibilityGridV2Control(
-      41,
-      initialBindingSnapshot: <Object?, Object?>{
-        'nativeStreamToken':
-            Uint8List.fromList(List<int>.generate(16, (i) => i)),
-        'workerBindingToken': Uint8List.fromList(
-          List<int>.generate(16, (i) => i + 16),
-        ),
-      },
+    final binding = ARVisibilityGridV2WorkerBinding.connect(
+      rootIsolateToken: ServicesBinding.rootIsolateToken!,
+      viewId: 197,
+      controlChannel: control,
+      streamChannel: stream,
     );
-    currentQualifier = <int>[
-      ...List<int>.generate(16, (i) => i + 32),
-      ...List<int>.generate(16, (i) => i + 48),
-    ];
-
+    binding.bindSnapshot({
+      'nativeStreamToken': native,
+      'workerBindingToken': worker,
+    });
+    await binding.configureDepthSurfaceEstimator(selection);
+    contradictory = true;
     await expectLater(
-      stale.dispose(),
-      throwsA(
-        isA<PlatformException>().having(
-          (error) => error.code,
-          'code',
-          'VG_STREAM_BINDING_ABANDONED',
-        ),
-      ),
+      binding.configureDepthSurfaceEstimator(selection),
+      throwsStateError,
     );
-
-    final current = ARVisibilityGridV2Control(
-      41,
-      initialBindingSnapshot: <Object?, Object?>{
-        'nativeStreamToken': Uint8List.fromList(
-          List<int>.generate(16, (i) => i + 32),
-        ),
-        'workerBindingToken': Uint8List.fromList(
-          List<int>.generate(16, (i) => i + 48),
-        ),
-      },
-    );
-    final receipt = await current.dispose();
-
-    expect(methods, <String>['disposeBinding', 'disposeBinding']);
-    expect(disposalQualifier, currentQualifier);
-    expect(receipt['closedResources'], 3);
-    expect(receipt['disposed'], false);
+    binding.close();
   });
+  TestWidgetsFlutterBinding.ensureInitialized();
+
+  test(
+    'visibility handoff returns a validated immutable typed receipt',
+    () async {
+      const channel = MethodChannel('visibility_grid_v2_control_98');
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (call) async {
+        if (call.method == 'prepareDebugV2Issue98Handoff') {
+          return <String, Object>{
+            'correlationId': Uint8List(16),
+            'oldBindingQualifier': Uint8List(32),
+            'staleRequestBytes': Uint8List.fromList(<int>[1, 2, 3]),
+          };
+        }
+        if (call.method != 'finalizeDebugV2Issue98Handoff') return null;
+        return <String, Object>{
+          'oldTransactionId': 0x7fffffffffffffff,
+          'oldRequestSequence': 0x7fffffffffffffff,
+          'terminalResultFlags': 5,
+          'terminalNextExpectedRequestSequence': 0x7fffffffffffffff,
+          'freshTransactionId': 0,
+          'freshRequestSequence': 1,
+          'nextTransactionId': 1,
+          'geometryRevision': 11,
+          'lineageRevision': 12,
+          'captureRevision': 13,
+          'coverageRevision': 14,
+          'acceptedStyleRevision': 15,
+          'regionManifestRevision': 16,
+          'nextSurfaceIdHighWater': 17,
+          'schemaRootRevision': 18,
+          'oldTokenAttemptCount': 1,
+          'oldTokenRejectionCount': 1,
+          'semanticEffectCount': 0,
+          'oldTokenPublicationCount': 0,
+          'rootIsolateSurfaceBytes': 0,
+          'oldClosedResources': 3,
+          'freshActiveResources': 3,
+        };
+      });
+      addTearDown(
+        () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(channel, null),
+      );
+      const stream = BasicMessageChannel<ByteData?>(
+        'visibility_surface_stream_98',
+        BinaryCodec(),
+      );
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMessageHandler(stream.name, (_) async => null);
+      addTearDown(
+        () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMessageHandler(stream.name, null),
+      );
+      final control = ARVisibilityGridV2Control(
+        98,
+        initialBindingSnapshot: <Object?, Object?>{
+          'nativeStreamToken': Uint8List(16),
+          'workerBindingToken': Uint8List(16),
+        },
+      );
+      final preparation = await control.prepareDebugV2Issue98Handoff();
+      await control.submitDebugV2Issue98StaleAttempt(preparation);
+      final receipt = await control.finalizeDebugV2Issue98Handoff(preparation);
+      expect(receipt, isA<ARVisibilityGridV2Issue98HandoffReceipt>());
+      expect(receipt.oldTokenAttemptCount, 1);
+      expect(receipt.oldTokenRejectionCount, 1);
+      expect(receipt.nextTransactionId, 1);
+      expect(receipt.semanticEffectCount, 0);
+      expect(receipt.oldTokenPublicationCount, 0);
+      expect(receipt.rootIsolateSurfaceBytes, 0);
+    },
+  );
+
+  test(
+    'connection-owned disposal rejects stale replacement and returns receipt',
+    () async {
+      const channel = MethodChannel('visibility_grid_v2_control_41');
+      final methods = <String>[];
+      Uint8List? disposalQualifier;
+      var currentQualifier = <int>[
+        ...List<int>.generate(16, (i) => i),
+        ...List<int>.generate(16, (i) => i + 16),
+      ];
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (call) async {
+        methods.add(call.method);
+        if (call.method == 'disposeBinding') {
+          final qualifier = List<int>.from(call.arguments! as Uint8List);
+          if (!_sameBytes(qualifier, currentQualifier)) {
+            throw PlatformException(code: 'VG_STREAM_BINDING_ABANDONED');
+          }
+          disposalQualifier = Uint8List.fromList(qualifier);
+          return <String, Object>{'closedResources': 3, 'disposed': false};
+        }
+        throw PlatformException(code: 'unsupported');
+      });
+      addTearDown(
+        () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(channel, null),
+      );
+
+      final stale = ARVisibilityGridV2Control(
+        41,
+        initialBindingSnapshot: <Object?, Object?>{
+          'nativeStreamToken': Uint8List.fromList(
+            List<int>.generate(16, (i) => i),
+          ),
+          'workerBindingToken': Uint8List.fromList(
+            List<int>.generate(16, (i) => i + 16),
+          ),
+        },
+      );
+      currentQualifier = <int>[
+        ...List<int>.generate(16, (i) => i + 32),
+        ...List<int>.generate(16, (i) => i + 48),
+      ];
+
+      await expectLater(
+        stale.dispose(),
+        throwsA(
+          isA<PlatformException>().having(
+            (error) => error.code,
+            'code',
+            'VG_STREAM_BINDING_ABANDONED',
+          ),
+        ),
+      );
+
+      final current = ARVisibilityGridV2Control(
+        41,
+        initialBindingSnapshot: <Object?, Object?>{
+          'nativeStreamToken': Uint8List.fromList(
+            List<int>.generate(16, (i) => i + 32),
+          ),
+          'workerBindingToken': Uint8List.fromList(
+            List<int>.generate(16, (i) => i + 48),
+          ),
+        },
+      );
+      final receipt = await current.dispose();
+
+      expect(methods, <String>['disposeBinding', 'disposeBinding']);
+      expect(disposalQualifier, currentQualifier);
+      expect(receipt['closedResources'], 3);
+      expect(receipt['disposed'], false);
+    },
+  );
 
   test('concurrent public dispose calls share one native rotation', () async {
     const channel = MethodChannel('visibility_grid_v2_control_43');
@@ -175,9 +341,7 @@ void main() {
       channel: channel,
       initialBindingSnapshot: <Object?, Object?>{
         'nativeStreamToken': Uint8List(16),
-        'workerBindingToken': Uint8List.fromList(
-          List<int>.filled(16, 1),
-        ),
+        'workerBindingToken': Uint8List.fromList(List<int>.filled(16, 1)),
       },
     );
     final first = control.dispose();
@@ -223,9 +387,7 @@ void main() {
       channel: channel,
       initialBindingSnapshot: <Object?, Object?>{
         'nativeStreamToken': Uint8List(16),
-        'workerBindingToken': Uint8List.fromList(
-          List<int>.filled(16, 1),
-        ),
+        'workerBindingToken': Uint8List.fromList(List<int>.filled(16, 1)),
       },
     );
     final first = control.dispose();
@@ -251,93 +413,101 @@ void main() {
     expect(invocationCount, 1);
   });
 
-  test('public receipt query returns bounded commit baseline and qualifier',
-      () async {
-    const channel = MethodChannel('visibility_grid_v2_control_83');
-    final currentQualifier = Uint8List.fromList(
-      List<int>.generate(32, (index) => index + 1),
-    );
-    final oldNative = Uint8List.fromList(List<int>.generate(16, (i) => i + 33));
-    final oldWorker = Uint8List.fromList(List<int>.generate(16, (i) => i + 49));
-    Uint8List? observedCurrentQualifier;
-    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-        .setMockMethodCallHandler(channel, (call) async {
-      expect(call.method, 'queryCommitReceipt');
-      final arguments = Map<Object?, Object?>.from(call.arguments! as Map);
-      observedCurrentQualifier =
-          arguments['currentBindingQualifier'] as Uint8List;
-      return <String, Object?>{
-        'decision': 'commit',
-        'controlRequestId': '0102030405064708890a0b0c0d0e0f10',
-        'sessionId': '1112131415164718991a1b1c1d1e1f20',
-        'captureGroupId': '2122232425264728a92a2b2c2d2e2f30',
-        'sessionGeneration': 3,
-        'groupGeneration': 4,
-        'nativeStreamToken': oldNative,
-        'workerBindingToken': oldWorker,
-        'streamToken': 7,
-        'requestSequence': 2,
-        'transactionId': 1,
-        'targetGeometryRevision': 1,
-        'targetLineageRevision': 1,
-        'rootIsolateSurfaceBytes': 0,
-        'baseline': <String, Object?>{
+  test(
+    'public receipt query returns bounded commit baseline and qualifier',
+    () async {
+      const channel = MethodChannel('visibility_grid_v2_control_83');
+      final currentQualifier = Uint8List.fromList(
+        List<int>.generate(32, (index) => index + 1),
+      );
+      final oldNative = Uint8List.fromList(
+        List<int>.generate(16, (i) => i + 33),
+      );
+      final oldWorker = Uint8List.fromList(
+        List<int>.generate(16, (i) => i + 49),
+      );
+      Uint8List? observedCurrentQualifier;
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (call) async {
+        expect(call.method, 'queryCommitReceipt');
+        final arguments = Map<Object?, Object?>.from(
+          call.arguments! as Map,
+        );
+        observedCurrentQualifier =
+            arguments['currentBindingQualifier'] as Uint8List;
+        return <String, Object?>{
+          'decision': 'commit',
+          'controlRequestId': '0102030405064708890a0b0c0d0e0f10',
+          'sessionId': '1112131415164718991a1b1c1d1e1f20',
+          'captureGroupId': '2122232425264728a92a2b2c2d2e2f30',
+          'sessionGeneration': 3,
+          'groupGeneration': 4,
+          'nativeStreamToken': oldNative,
+          'workerBindingToken': oldWorker,
+          'streamToken': 7,
+          'requestSequence': 2,
           'transactionId': 1,
-          'geometryRevision': 1,
-          'lineageRevision': 1,
-          'styleRevision': 0,
-          'evidenceRevision': 0,
-          'captureRevision': 0,
-          'coverageRevision': 0,
-          'producedStyleRevision': 0,
-          'regionManifestRevision': 0,
-          'schemaRootRevision': 0,
-          'nextSurfaceIdHighWater': 0,
-          'schemaRootHashIdentity': '',
-          'manifestRootHashIdentity': '',
-          'groupFrameConvention': 1,
-          'matrixConvention': 1,
-          'directionConvention': 1,
-          'normalEncoding': 1,
-          'groupFromWorldIdentity': 'identity',
-          'worldFromGroupIdentity': 'identity',
-        },
-      };
-    });
-    addTearDown(
-      () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-          .setMockMethodCallHandler(channel, null),
-    );
+          'targetGeometryRevision': 1,
+          'targetLineageRevision': 1,
+          'rootIsolateSurfaceBytes': 0,
+          'baseline': <String, Object?>{
+            'transactionId': 1,
+            'geometryRevision': 1,
+            'lineageRevision': 1,
+            'styleRevision': 0,
+            'evidenceRevision': 0,
+            'captureRevision': 0,
+            'coverageRevision': 0,
+            'producedStyleRevision': 0,
+            'regionManifestRevision': 0,
+            'schemaRootRevision': 0,
+            'nextSurfaceIdHighWater': 0,
+            'schemaRootHashIdentity': '',
+            'manifestRootHashIdentity': '',
+            'groupFrameConvention': 1,
+            'matrixConvention': 1,
+            'directionConvention': 1,
+            'normalEncoding': 1,
+            'groupFromWorldIdentity': 'identity',
+            'worldFromGroupIdentity': 'identity',
+          },
+        };
+      });
+      addTearDown(
+        () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(channel, null),
+      );
 
-    final control = ARVisibilityGridV2Control(
-      83,
-      channel: channel,
-      initialBindingSnapshot: <Object?, Object?>{
-        'nativeStreamToken': currentQualifier.sublist(0, 16),
-        'workerBindingToken': currentQualifier.sublist(16),
-      },
-    );
-    final receipt = await control.queryCommitReceipt(
-      ARVisibilityGridV2CommitReceiptQuery(
-        controlRequestId: '0102030405064708890a0b0c0d0e0f10',
-        sessionId: '1112131415164718991a1b1c1d1e1f20',
-        captureGroupId: '2122232425264728a92a2b2c2d2e2f30',
-        sessionGeneration: 3,
-        groupGeneration: 4,
-        nativeStreamToken: oldNative,
-        workerBindingToken: oldWorker,
-        streamToken: 7,
-        requestSequence: 2,
-        transactionId: 1,
-        targetGeometryRevision: 1,
-        targetLineageRevision: 1,
-      ),
-    );
-    expect(receipt.committed, isTrue);
-    expect(receipt.baseline.geometryRevision, 1);
-    expect(receipt.rootIsolateSurfaceBytes, 0);
-    expect(observedCurrentQualifier, currentQualifier);
-  });
+      final control = ARVisibilityGridV2Control(
+        83,
+        channel: channel,
+        initialBindingSnapshot: <Object?, Object?>{
+          'nativeStreamToken': currentQualifier.sublist(0, 16),
+          'workerBindingToken': currentQualifier.sublist(16),
+        },
+      );
+      final receipt = await control.queryCommitReceipt(
+        ARVisibilityGridV2CommitReceiptQuery(
+          controlRequestId: '0102030405064708890a0b0c0d0e0f10',
+          sessionId: '1112131415164718991a1b1c1d1e1f20',
+          captureGroupId: '2122232425264728a92a2b2c2d2e2f30',
+          sessionGeneration: 3,
+          groupGeneration: 4,
+          nativeStreamToken: oldNative,
+          workerBindingToken: oldWorker,
+          streamToken: 7,
+          requestSequence: 2,
+          transactionId: 1,
+          targetGeometryRevision: 1,
+          targetLineageRevision: 1,
+        ),
+      );
+      expect(receipt.committed, isTrue);
+      expect(receipt.baseline.geometryRevision, 1);
+      expect(receipt.rootIsolateSurfaceBytes, 0);
+      expect(observedCurrentQualifier, currentQualifier);
+    },
+  );
 
   test('public query rejects malformed identity and bounds before channel', () {
     final token = Uint8List(16);
@@ -542,51 +712,53 @@ void main() {
     },
   );
 
-  test('stalled claim retains callbacks and reuses the exact lease for abandon',
-      () async {
-    const controlChannel = MethodChannel('visibility_grid_v2_control_93');
-    const streamChannel = BasicMessageChannel<ByteData?>(
-      'visibility_surface_stream_93',
-      BinaryCodec(),
-    );
-    final claimReply = Completer<Object?>();
-    Uint8List? claimedLease;
-    Uint8List? abandonedLease;
-    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-        .setMockMethodCallHandler(controlChannel, (call) async {
-      if (call.method == 'claimBindingLease') {
-        claimedLease = Uint8List.fromList(call.arguments! as Uint8List);
-        expect(claimedLease, hasLength(16));
-        return claimReply.future;
-      }
-      if (call.method == 'abandonBinding') {
-        abandonedLease = Uint8List.fromList(call.arguments! as Uint8List);
-        return <String, Object?>{'closedResources': 3};
-      }
-      throw PlatformException(code: 'unsupported');
-    });
-    addTearDown(
-      () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-          .setMockMethodCallHandler(controlChannel, null),
-    );
-    final binding = ARVisibilityGridV2WorkerBinding.connect(
-      rootIsolateToken: ServicesBinding.rootIsolateToken!,
-      viewId: 93,
-      controlChannel: controlChannel,
-      streamChannel: streamChannel,
-    );
-    final capture = binding.captureCleanupAuthority();
-    // Retain the independent cleanup callback before awaiting the claim
-    // response. Native owns the lease before that response is queued.
-    final abandon = binding.abandonAndSnapshot();
-    expect((await abandon)['closedResources'], 3);
-    expect(abandonedLease, orderedEquals(claimedLease!));
-    claimReply.complete(<String, Object?>{
-      'nativeStreamToken': Uint8List(15),
-      'workerBindingToken': Uint8List(16),
-    });
-    await expectLater(capture, throwsStateError);
-  });
+  test(
+    'stalled claim retains callbacks and reuses the exact lease for abandon',
+    () async {
+      const controlChannel = MethodChannel('visibility_grid_v2_control_93');
+      const streamChannel = BasicMessageChannel<ByteData?>(
+        'visibility_surface_stream_93',
+        BinaryCodec(),
+      );
+      final claimReply = Completer<Object?>();
+      Uint8List? claimedLease;
+      Uint8List? abandonedLease;
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(controlChannel, (call) async {
+        if (call.method == 'claimBindingLease') {
+          claimedLease = Uint8List.fromList(call.arguments! as Uint8List);
+          expect(claimedLease, hasLength(16));
+          return claimReply.future;
+        }
+        if (call.method == 'abandonBinding') {
+          abandonedLease = Uint8List.fromList(call.arguments! as Uint8List);
+          return <String, Object?>{'closedResources': 3};
+        }
+        throw PlatformException(code: 'unsupported');
+      });
+      addTearDown(
+        () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(controlChannel, null),
+      );
+      final binding = ARVisibilityGridV2WorkerBinding.connect(
+        rootIsolateToken: ServicesBinding.rootIsolateToken!,
+        viewId: 93,
+        controlChannel: controlChannel,
+        streamChannel: streamChannel,
+      );
+      final capture = binding.captureCleanupAuthority();
+      // Retain the independent cleanup callback before awaiting the claim
+      // response. Native owns the lease before that response is queued.
+      final abandon = binding.abandonAndSnapshot();
+      expect((await abandon)['closedResources'], 3);
+      expect(abandonedLease, orderedEquals(claimedLease!));
+      claimReply.complete(<String, Object?>{
+        'nativeStreamToken': Uint8List(15),
+        'workerBindingToken': Uint8List(16),
+      });
+      await expectLater(capture, throwsStateError);
+    },
+  );
 
   test(
       'native unclaimed rejection is a PlatformException without replacement mutation',
@@ -857,56 +1029,62 @@ void main() {
     await expectLater(binding.disposeAndSnapshot(), throwsStateError);
   });
 
-  test('public byte seam returns authenticated canonical control error bytes',
-      () async {
-    const controlChannel = MethodChannel('visibility_grid_v2_control_95');
-    const streamChannel = BasicMessageChannel<ByteData?>(
-      'visibility_surface_stream_95',
-      BinaryCodec(),
-    );
-    final nativeToken = Uint8List.fromList(List<int>.generate(16, (i) => i));
-    final workerToken =
-        Uint8List.fromList(List<int>.generate(16, (i) => i + 16));
-    final qualifier = Uint8List.fromList(<int>[...nativeToken, ...workerToken]);
-    final canonicalError = Uint8List.fromList(<int>[
-      0x56,
-      0x47,
-      0x44,
-      0x32,
-      ...List<int>.generate(220, (index) => (index * 17) & 0xff),
-    ]);
-    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-        .setMockMethodCallHandler(controlChannel, (call) async {
-      if (call.method == 'claimBindingLease') {
-        return <String, Object?>{
-          'nativeStreamToken': nativeToken,
-          'workerBindingToken': workerToken,
-        };
-      }
-      if (call.method == 'start') {
-        final qualified = call.arguments! as Uint8List;
-        expect(qualified.sublist(0, 32), orderedEquals(qualifier));
-        expect(qualified.sublist(32), orderedEquals(<int>[1, 2, 3]));
-        return Uint8List.fromList(<int>[...qualifier, ...canonicalError]);
-      }
-      throw PlatformException(code: 'unsupported');
-    });
-    addTearDown(
-      () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-          .setMockMethodCallHandler(controlChannel, null),
-    );
-    final binding = ARVisibilityGridV2WorkerBinding.connect(
-      rootIsolateToken: ServicesBinding.rootIsolateToken!,
-      viewId: 95,
-      controlChannel: controlChannel,
-      streamChannel: streamChannel,
-    );
-    await binding.captureCleanupAuthority();
+  test(
+    'public byte seam returns authenticated canonical control error bytes',
+    () async {
+      const controlChannel = MethodChannel('visibility_grid_v2_control_95');
+      const streamChannel = BasicMessageChannel<ByteData?>(
+        'visibility_surface_stream_95',
+        BinaryCodec(),
+      );
+      final nativeToken = Uint8List.fromList(List<int>.generate(16, (i) => i));
+      final workerToken = Uint8List.fromList(
+        List<int>.generate(16, (i) => i + 16),
+      );
+      final qualifier = Uint8List.fromList(<int>[
+        ...nativeToken,
+        ...workerToken,
+      ]);
+      final canonicalError = Uint8List.fromList(<int>[
+        0x56,
+        0x47,
+        0x44,
+        0x32,
+        ...List<int>.generate(220, (index) => (index * 17) & 0xff),
+      ]);
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(controlChannel, (call) async {
+        if (call.method == 'claimBindingLease') {
+          return <String, Object?>{
+            'nativeStreamToken': nativeToken,
+            'workerBindingToken': workerToken,
+          };
+        }
+        if (call.method == 'start') {
+          final qualified = call.arguments! as Uint8List;
+          expect(qualified.sublist(0, 32), orderedEquals(qualifier));
+          expect(qualified.sublist(32), orderedEquals(<int>[1, 2, 3]));
+          return Uint8List.fromList(<int>[...qualifier, ...canonicalError]);
+        }
+        throw PlatformException(code: 'unsupported');
+      });
+      addTearDown(
+        () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(controlChannel, null),
+      );
+      final binding = ARVisibilityGridV2WorkerBinding.connect(
+        rootIsolateToken: ServicesBinding.rootIsolateToken!,
+        viewId: 95,
+        controlChannel: controlChannel,
+        streamChannel: streamChannel,
+      );
+      await binding.captureCleanupAuthority();
 
-    final response = await binding.start(Uint8List.fromList(<int>[1, 2, 3]));
+      final response = await binding.start(Uint8List.fromList(<int>[1, 2, 3]));
 
-    expect(response, orderedEquals(canonicalError));
-  });
+      expect(response, orderedEquals(canonicalError));
+    },
+  );
 
   test(
       'worker stream bounds request before qualification and response before copy',
@@ -917,8 +1095,9 @@ void main() {
       BinaryCodec(),
     );
     final nativeToken = Uint8List.fromList(List<int>.generate(16, (i) => i));
-    final workerToken =
-        Uint8List.fromList(List<int>.generate(16, (i) => i + 16));
+    final workerToken = Uint8List.fromList(
+      List<int>.generate(16, (i) => i + 16),
+    );
     var streamCalls = 0;
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(controlChannel, (call) async {
@@ -933,9 +1112,7 @@ void main() {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockDecodedMessageHandler<ByteData?>(streamChannel, (_) async {
       streamCalls++;
-      return ByteData.sublistView(
-        Uint8List(32 + 64 * 1024 + 1),
-      );
+      return ByteData.sublistView(Uint8List(32 + 64 * 1024 + 1));
     });
     addTearDown(() {
       TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
@@ -952,15 +1129,9 @@ void main() {
     );
     await binding.captureCleanupAuthority();
 
-    expect(
-      () => binding.exchange(Uint8List(16 * 1024 + 1)),
-      throwsRangeError,
-    );
+    expect(() => binding.exchange(Uint8List(16 * 1024 + 1)), throwsRangeError);
     expect(streamCalls, 0);
-    await expectLater(
-      binding.exchange(Uint8List(1)),
-      throwsStateError,
-    );
+    await expectLater(binding.exchange(Uint8List(1)), throwsStateError);
     expect(streamCalls, 1);
   });
 }

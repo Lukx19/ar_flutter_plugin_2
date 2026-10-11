@@ -40,6 +40,144 @@ import org.openjdk.jol.info.GraphLayout
 /** Locks Option A's BINDING-LIFECYCLE-ACK seeded CREATE cut without a Flutter payload seam. */
 class VisibilityGridIntegrationTest {
     @Test
+    fun `binding replacement clears experimental depth selection before companion free baseline START`() {
+        for (cleanupMethod in listOf("disposeBinding", "abandonBinding")) {
+            val directory = Files.createTempDirectory("depth-preset-binding-replacement").toFile()
+            val messenger = MethodTestMessenger()
+            val view = 2175
+            val binding = VisibilityGridV2Binding(messenger, view, CommittedBaselineAuthority(), postToMain = { it() })
+            val integration = VisibilityGridIntegration(binding, binding::currentObservationOwnership, directory,
+                resourcesForGroup = resources(directory, budget(directory)))
+            val channel = MethodChannel(messenger, "visibility_grid_v2_control_$view")
+            fun call(method: String, arguments: Any?): RecordingResult = RecordingResult().also {
+                channel.invokeMethod(method, arguments, it)
+                assertTrue(it.completed.await(2, TimeUnit.SECONDS))
+            }
+            fun claim(lease: ByteArray): ByteArray {
+                val result = call("claimBindingLease", lease)
+                assertEquals(1, result.successCount)
+                val snapshot = result.successValue as Map<*, *>
+                return (snapshot["nativeStreamToken"] as ByteArray) + (snapshot["workerBindingToken"] as ByteArray)
+            }
+            fun startCurrent(qualifier: ByteArray, request: ControlRequest): Stream {
+                val result = call("start", qualifier + ControlCodec.encodeRequest(request))
+                assertEquals("start error=${result.errorCode}:${result.errorMessage}", 1, result.successCount)
+                val response = ControlCodec.decodeResponse(strip(result.successValue as ByteArray, qualifier))
+                assertEquals(0, response.outcome)
+                return Stream(qualifier, response.streamToken)
+            }
+            fun bootstrap(stream: Stream) {
+                exchange(messenger, view, stream, 1, 0, 0, 0)
+                exchange(messenger, view, stream, 2, 0, 0, 0)
+                exchange(messenger, view, stream, 3, 1, 1, 1)
+            }
+            try {
+                val oldLease = ByteArray(16) { (it + 7).toByte() }
+                val oldQualifier = claim(oldLease)
+                val experimental = startRequest()
+                val selection = ByteArray(49).also {
+                    experimental.sessionId.bytes.copyInto(it, 0)
+                    experimental.captureGroupId.bytes.copyInto(it, 16)
+                    ByteBuffer.wrap(it).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                        .putLong(32, experimental.sessionGeneration).putLong(40, experimental.groupGeneration)
+                    it[48] = DepthSurfacePreset.COMPATIBLE_PLANES.wireId.toByte()
+                }
+                assertEquals(1, call("configureDepthSurfaceEstimator", oldQualifier + selection).successCount)
+                bootstrap(startCurrent(oldQualifier, experimental))
+                val experimentalOwnership = requireNotNull(binding.currentObservationOwnership())
+                assertEquals(DepthSurfacePreset.COMPATIBLE_PLANES, experimentalOwnership.groupFrame.depthSurfacePreset)
+                integration.admitDepth(depth(experimentalOwnership, 10))
+                assertEquals(DepthSurfacePreset.COMPATIBLE_PLANES.configuration(), integration.depthEstimatorConfiguration())
+
+                assertEquals(1, call(cleanupMethod, oldLease).successCount)
+                val newQualifier = claim(ByteArray(16) { (it + 31).toByte() })
+                assertFalse(oldQualifier.contentEquals(newQualifier))
+                val stale = call("configureDepthSurfaceEstimator", oldQualifier + selection)
+                assertEquals("VG_PROTOCOL_INVALID", stale.errorCode)
+                assertEquals(null, binding.currentObservationOwnership())
+                val baselineRequest = experimental.copy(
+                    controlRequestId = uuid(80), captureGroupId = uuid(60),
+                    groupGeneration = experimental.groupGeneration + 1,
+                    coverageEpoch = experimental.coverageEpoch + 1,
+                )
+                // The baseline deliberately sends no depth-selection companion.
+                bootstrap(startCurrent(newQualifier, baselineRequest))
+                val baselineOwnership = requireNotNull(binding.currentObservationOwnership())
+                assertEquals(DepthSurfacePreset.VIEW_RAY_WEIGHTED, baselineOwnership.groupFrame.depthSurfacePreset)
+                assertEquals(experimental.groupGeneration + 1, baselineOwnership.groupGeneration)
+                assertFalse(experimentalOwnership.captureGroupId == baselineOwnership.captureGroupId)
+                integration.admitDepth(depth(baselineOwnership, 20))
+                assertEquals(DepthEvidenceConfiguration(), integration.depthEstimatorConfiguration())
+            } finally {
+                integration.close(); binding.dispose(); directory.deleteRecursively()
+            }
+        }
+    }
+
+    @Test
+    fun `qualified depth preset reaches canonical START production dispatcher and immutable group`() {
+        for (preset in DepthSurfacePreset.entries) {
+            val directory = Files.createTempDirectory("depth-preset-dispatch").toFile()
+            val messenger = MethodTestMessenger()
+            val view = 2174
+            val binding = VisibilityGridV2Binding(messenger, view, CommittedBaselineAuthority(), postToMain = { it() })
+            val integration = VisibilityGridIntegration(binding, binding::currentObservationOwnership, directory,
+                resourcesForGroup = resources(directory, budget(directory)))
+            try {
+                val request = startRequest()
+                val snapshot = binding.snapshot()
+                val qualifier = snapshot.nativeStreamToken + snapshot.workerBindingToken
+                fun selection(selected: DepthSurfacePreset) = ByteArray(49).also {
+                    request.sessionId.bytes.copyInto(it, 0)
+                    request.captureGroupId.bytes.copyInto(it, 16)
+                    ByteBuffer.wrap(it).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                        .putLong(32, request.sessionGeneration).putLong(40, request.groupGeneration)
+                    it[48] = selected.wireId.toByte()
+                }
+                val channel = MethodChannel(messenger, "visibility_grid_v2_control_$view")
+                fun configure(bytes: ByteArray): RecordingResult = RecordingResult().also {
+                    channel.invokeMethod("configureDepthSurfaceEstimator", bytes, it)
+                    assertTrue(it.completed.await(2, TimeUnit.SECONDS))
+                }
+                // A stale qualifier cannot stage an estimator on this binding.
+                val foreign = qualifier.copyOf().also { it[0] = (it[0].toInt() xor 1).toByte() }
+                assertEquals("VG_PROTOCOL_INVALID", configure(foreign + selection(preset)).errorCode)
+                if (preset != DepthSurfacePreset.VIEW_RAY_WEIGHTED) {
+                    val wrongGeneration = selection(preset).also {
+                        ByteBuffer.wrap(it).order(java.nio.ByteOrder.LITTLE_ENDIAN).putLong(40, request.groupGeneration + 1)
+                    }
+                    assertEquals(1, configure(qualifier + wrongGeneration).successCount)
+                    val refusedStart = RecordingResult()
+                    channel.invokeMethod("start", qualifier + ControlCodec.encodeRequest(request), refusedStart)
+                    assertTrue(refusedStart.completed.await(2, TimeUnit.SECONDS))
+                    assertEquals("VG_PROTOCOL_INVALID", refusedStart.errorCode)
+                    assertEquals(null, binding.currentObservationOwnership())
+                    val accepted = configure(qualifier + selection(preset))
+                    assertEquals(1, accepted.successCount)
+                    assertArrayEquals(qualifier + selection(preset), accepted.successValue as ByteArray)
+                }
+                val stream = start(binding, messenger, view, request)
+                exchange(messenger, view, stream, 1, 0, 0, 0)
+                exchange(messenger, view, stream, 2, 0, 0, 0)
+                exchange(messenger, view, stream, 3, 1, 1, 1)
+                val ownership = requireNotNull(binding.currentObservationOwnership())
+                assertEquals(preset, ownership.groupFrame.depthSurfacePreset)
+                integration.admitDepth(depth(ownership, 10))
+                assertEquals(preset.configuration(), integration.depthEstimatorConfiguration())
+                if (preset == DepthSurfacePreset.VIEW_RAY_WEIGHTED) {
+                    assertEquals(DepthEvidenceConfiguration(), integration.depthEstimatorConfiguration())
+                }
+                val different = DepthSurfacePreset.entries.first { it != preset }
+                assertEquals("VG_DEPTH_PRESET_REJECTED", configure(qualifier + selection(different)).errorCode)
+                assertEquals(preset, binding.currentObservationOwnership()?.groupFrame?.depthSurfacePreset)
+                assertEquals(preset.configuration(), integration.depthEstimatorConfiguration())
+            } finally {
+                integration.close(); binding.dispose(); directory.deleteRecursively()
+            }
+        }
+    }
+
+    @Test
     fun `selected renderer reservation funds live mapper and pending depth without refusing canonical work`() { proveRendererReservation(true) }
     @Test
     fun `selected renderer reservation counts the durable kernel partition once`() { proveRendererReservation(false) }

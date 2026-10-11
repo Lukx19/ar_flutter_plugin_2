@@ -51,6 +51,14 @@ internal class CoverageShapeUploadOwner(
         return if (completedSelection == mesh.header.selectionGeneration && mesh.available && current(mesh)) mesh else null
     }
 
+    fun releaseCompletedSource(): Boolean {
+        if (busy || latest == null || completedSelection == 0L) return false
+        latest = null
+        active = null
+        completedSelection = 0
+        return true
+    }
+
     fun offer(mesh: PreparedCoverageShapeReference?) {
         if (closed || poisoned) return
         val previous = latest

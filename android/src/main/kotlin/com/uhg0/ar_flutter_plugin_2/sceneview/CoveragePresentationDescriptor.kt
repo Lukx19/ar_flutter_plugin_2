@@ -319,6 +319,8 @@ internal class PresentationDescriptor private constructor(
     }
 
     internal fun ownedStorageBytes(): Long = backing.ownedStorageBytes()
+    /** Identity used to charge aliases once while a successor is frozen. */
+    internal val backingIdentity: Any get() = backing
 
     companion object {
         /** Exact bytes of the immutable bounded backing, excluding borrowed pages. */

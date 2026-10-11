@@ -62,6 +62,8 @@ internal class CoverageDescriptorPageSequencer {
     private var failedDescriptor: BoundedCoveragePresentation? = null
     private val pendingPages = ArrayDeque<PageWork>()
     private var inFlightPage: InFlightPage? = null
+    // Legacy release permits cube delta sequencing, but supplies no GPU success proof.
+    private var uploadProof = UPLOAD_UNPROVEN
     private var nextTicketSerial = 0L
     private val pageDestination = CoveragePresentationPage.allocate(MAX_ROWS_PER_PAGE)
 
@@ -75,11 +77,13 @@ internal class CoverageDescriptorPageSequencer {
         val predecessorComplete = previous != null &&
             previous === completedDescriptor &&
             previous !== failedDescriptor
+        val previousUploadSucceeded = predecessorComplete && uploadProof == DESCRIPTOR_SUCCEEDED
         currentDescriptor = descriptor
         completedDescriptor = null
+        uploadProof = PAGES_SUCCEEDED
         failedDescriptor = null
         pendingPages.clear()
-        if (descriptor == null || !descriptor.enabled) return
+        if (descriptor == null || !descriptor.enabled) { uploadProof = UPLOAD_UNPROVEN; return }
 
         val full = previous == null ||
             !predecessorComplete ||
@@ -108,7 +112,10 @@ internal class CoverageDescriptorPageSequencer {
                 start = end
             }
         }
-        if (ranges.isEmpty()) completedDescriptor = descriptor
+        if (ranges.isEmpty()) {
+            completedDescriptor = descriptor
+            uploadProof = if (descriptor.count == 0 || previousUploadSucceeded) DESCRIPTOR_SUCCEEDED else UPLOAD_UNPROVEN
+        }
     }
 
     /** Clears queued work; an already submitted page still owns its ticket. */
@@ -116,6 +123,7 @@ internal class CoverageDescriptorPageSequencer {
         checkRendererThread()
         currentDescriptor = null
         completedDescriptor = null
+        uploadProof = UPLOAD_UNPROVEN
         failedDescriptor = null
         pendingPages.clear()
     }
@@ -135,6 +143,7 @@ internal class CoverageDescriptorPageSequencer {
             )
             if (!accepted || pageDestination.startSlot + pageDestination.count != work.endSlotExclusive) {
                 failedDescriptor = work.descriptor
+                uploadProof = UPLOAD_UNPROVEN
                 pendingPages.clear()
                 completedDescriptor = null
                 return null
@@ -146,25 +155,56 @@ internal class CoverageDescriptorPageSequencer {
         return null
     }
 
-    /** Releases only the currently owned page represented by [ticket]. */
-    fun release(ticket: CoverageDescriptorPageTicket) {
+    /** Legacy cube drain/delta sequencing; this is never a successful GPU receipt. */
+    fun release(ticket: CoverageDescriptorPageTicket) = settle(ticket, successful = null)
+
+    /** Settles the exact point page only after all its accepted GPU lanes consumed storage. */
+    fun finishUpload(ticket: CoverageDescriptorPageTicket, successful: Boolean) = settle(ticket, successful)
+
+    private fun settle(ticket: CoverageDescriptorPageTicket, successful: Boolean?) {
         checkRendererThread()
         val inFlight = inFlightPage ?: return
         if (ticket !== inFlight.ticket) return
         inFlightPage = null
-        if (currentDescriptor === inFlight.work.descriptor &&
-            failedDescriptor !== inFlight.work.descriptor &&
-            pendingPages.isEmpty()
-        ) {
+        if (currentDescriptor !== inFlight.work.descriptor) return
+        if (successful != true) uploadProof = UPLOAD_UNPROVEN
+        if (successful == false) {
+            failedDescriptor = inFlight.work.descriptor
+            completedDescriptor = null
+            pendingPages.clear()
+            return
+        }
+        if (failedDescriptor !== inFlight.work.descriptor && pendingPages.isEmpty()) {
             completedDescriptor = inFlight.work.descriptor
+            if (uploadProof == PAGES_SUCCEEDED) uploadProof = DESCRIPTOR_SUCCEEDED
         }
     }
+
+    fun isCurrent(descriptor: BoundedCoveragePresentation): Boolean {
+        checkRendererThread()
+        return currentDescriptor === descriptor
+    }
+
+    fun owns(ticket: CoverageDescriptorPageTicket): Boolean {
+        checkRendererThread()
+        return inFlightPage?.ticket === ticket
+    }
+
+    /** Exact descriptor identity includes its immutable selection/control/attribute view. */
+    fun isSuccessfullyComplete(descriptor: BoundedCoveragePresentation): Boolean =
+        isComplete(descriptor) && uploadProof == DESCRIPTOR_SUCCEEDED
 
     val hasInFlightPage: Boolean
         get() {
             checkRendererThread()
             return inFlightPage != null
         }
+
+    fun isComplete(descriptor: BoundedCoveragePresentation): Boolean {
+        checkRendererThread()
+        return currentDescriptor === descriptor && completedDescriptor === descriptor &&
+            failedDescriptor !== descriptor && inFlightPage == null && pendingPages.isEmpty()
+    }
 
     private fun mergeClippedRanges(
         spans: List<CoveragePointSpan>,
@@ -194,6 +234,9 @@ internal class CoverageDescriptorPageSequencer {
     }
 
     internal companion object {
+        private const val UPLOAD_UNPROVEN = 0
+        private const val PAGES_SUCCEEDED = 1
+        private const val DESCRIPTOR_SUCCEEDED = 2
         const val MAX_ROWS_PER_PAGE = 512
     }
 }

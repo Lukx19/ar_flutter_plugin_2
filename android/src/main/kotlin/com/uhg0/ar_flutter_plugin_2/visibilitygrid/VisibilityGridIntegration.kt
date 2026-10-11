@@ -187,7 +187,10 @@ internal class VisibilityGridIntegration(
         { runtime, mutation -> runtime.commitAdjacent(mutation) },
     private val queueCurrent: (VisibilityGridV2Binding, CurrentDeltaSourceV1, CurrentDeltaSelectorV1) -> CurrentDeltaQueueResult =
         { activeBinding, source, selector -> activeBinding.queueCommittedCurrentDelta(source, selector) },
-    private val depthKernelFactory: (VisibilityGroupFrame) -> DepthEvidenceKernel = { DepthEvidenceKernel() },
+    private val depthKernelFactory: (VisibilityGroupFrame) -> DepthEvidenceKernel = { frame ->
+        if (frame.depthSurfacePreset == DepthSurfacePreset.VIEW_RAY_WEIGHTED) DepthEvidenceKernel()
+        else DepthEvidenceKernel(frame.depthSurfacePreset.configuration())
+    },
     private val featureKernelFactory: () -> FeatureFusionKernel = { FeatureFusionKernel() },
     private val beforeAdmission: () -> Unit = {},
     private val afterLifecycleFence: () -> Unit = {},
@@ -201,6 +204,11 @@ internal class VisibilityGridIntegration(
      */
     private val allocationCounter: (() -> Long?)? = null,
 ) : VisibilityObservationMapper {
+    /** Scalar calibration selected by the production group factory; no samples or map rows. */
+    internal fun depthEstimatorConfiguration(): DepthEvidenceConfiguration? = synchronized(lock) {
+        depthKernel?.configuration
+    }
+
     private val lock = Any()
     private val publicationGate = Any()
     @Volatile private var closed = false
@@ -572,6 +580,31 @@ internal class VisibilityGridIntegration(
     // Frame ingress must never wait for canonical ACK/storage/renderer work.
     // Each returned object is immutable and remains valid across later writes.
     override fun snapshot(): VisibilityMappingAdmissionHealth = admissionHealth.get()
+
+    /** Reads immutable publications only; never enters the canonical mutation lock. */
+    internal fun scalarSnapshot(): Map<String, Any?> {
+        val canonical = receipt
+        val admission = admissionHealth.get()
+        val depthStatus = lastDepthAdmissionStatus
+        return mapOf(
+            "admittedDepths" to admission.admittedDepths,
+            "admittedFeatures" to admission.admittedFeatures,
+            "lastDepthAdmissionStatus" to depthStatus,
+            "canonicalStatus" to canonical.status,
+            "canonicalOperation" to canonical.canonicalOperation,
+            "bindingGeneration" to canonical.bindingGeneration,
+            "sessionGeneration" to canonical.sessionGeneration,
+            "groupGeneration" to canonical.groupGeneration,
+            "transactionId" to canonical.transactionId,
+            "geometryRevision" to canonical.geometryRevision,
+            "lineageRevision" to canonical.lineageRevision,
+            "committed" to canonical.committed,
+            "rejected" to canonical.rejected,
+            "fenced" to canonical.fenced,
+            "rendererRows" to canonical.rendererRows,
+            "detailUnavailable" to true,
+        )
+    }
 
     private fun publishAdmissionHealth(
         featureDelta: Long = 0L,
@@ -2534,7 +2567,7 @@ internal class NativeRendererProjection(
         if (closed) return RendererStyleCutResult.Rejected(RendererStyleCutRejection.CLOSED)
         val timingStartedNs = timingSink?.let { System.nanoTime() } ?: 0L
         val timingStartedAllocatedBytes = if (timingStartedNs == 0L) null else artAllocatedBytes()
-        seedEmptyBootstrap(cut)
+        if (cut.sparseContext == null) seedEmptyBootstrap(cut)
         val stateApplyStartedNs = if (timingStartedNs == 0L) 0L else System.nanoTime()
         val stateApplyStartedAllocatedBytes =
             if (timingStartedNs == 0L) null else artAllocatedBytes()
@@ -2551,14 +2584,14 @@ internal class NativeRendererProjection(
         if (result is RendererStyleCutResult.Applied) {
             emitPresentation(
                 checkNotNull(activeRenderConfig),
-                forceReset = cut.reset,
+                forceReset = cut.reset && cut.sparseContext == null,
                 timing = if (timingStartedNs == 0L) {
                     null
                 } else {
                     RendererProjectionTimingCapture(
                         startedNs = timingStartedNs,
                         styleRevision = cut.styleRevision,
-                        requestedRows = cut.surfaceIds.size,
+                        requestedRows = cut.sparseContext?.totalRows ?: cut.surfaceIds.size,
                         startedAllocatedBytes = timingStartedAllocatedBytes,
                         publishTimingScope = publishTimingScope,
                         stateApplyMicros = stateApplyMicros,

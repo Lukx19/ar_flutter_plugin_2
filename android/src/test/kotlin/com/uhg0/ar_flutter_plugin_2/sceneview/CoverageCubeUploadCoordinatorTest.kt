@@ -1,16 +1,159 @@
 package com.uhg0.ar_flutter_plugin_2.sceneview
 
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoveragePointRenderSnapshot
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererPalette
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererStyleRowV1
+import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRowsQualifier
 import com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_STYLE_ROW_BYTES
 import java.nio.ByteBuffer
 import java.nio.FloatBuffer
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class CoverageCubeUploadCoordinatorTest {
+    @Test
+    fun `whole cube readiness requires successful pages and both index callbacks and rejects late states`() {
+        val descriptor = cubeDescriptor()
+        val sequencer = CoverageDescriptorPageSequencer()
+        val uploader = FakeCubeUploader()
+        val events = mutableListOf<String>()
+        var triangleIndexPending = true
+        var outlineIndexPending = true
+        val triangleIndexConsumed = { triangleIndexPending = false }
+        val outlineIndexConsumed = { outlineIndexPending = false }
+        val coordinator = CoverageCubeMeshResources.CoverageCubeUploadCoordinator(
+            capacity = 1,
+            halfSize = 0.5f,
+            uploader = uploader,
+            onUploadPageSettled = { ticket, successful ->
+                events += "settled:$successful"
+                sequencer.finishUpload(ticket, successful)
+            },
+            onUploadPageReleasedWithTicket = { events += "released" },
+        )
+
+        sequencer.replace(descriptor)
+        val submission = checkNotNull(sequencer.nextPage())
+        coordinator.submitPage(
+            submission.page,
+            RendererUploadPageOrigin.RESOURCE_GENERATION_RESET,
+            submission.ticket,
+        )
+        coordinator.onRendererFrame()
+        assertFalse(
+            CoverageCubeMeshResources.descriptorUploadReady(
+                sequencer, coordinator, descriptor,
+                triangleIndexUploadPending = triangleIndexPending,
+                outlineIndexUploadPending = outlineIndexPending,
+                destroyed = false,
+            ),
+        )
+
+        val lateCallbacks = uploader.callbackHistory.toList()
+        uploader.completeAll()
+        assertEquals(listOf("settled:true", "released"), events)
+        triangleIndexConsumed()
+        assertFalse(
+            CoverageCubeMeshResources.descriptorUploadReady(
+                sequencer, coordinator, descriptor,
+                triangleIndexUploadPending = triangleIndexPending,
+                outlineIndexUploadPending = outlineIndexPending,
+                destroyed = false,
+            ),
+        )
+        outlineIndexConsumed()
+        assertTrue(
+            CoverageCubeMeshResources.descriptorUploadReady(
+                sequencer, coordinator, descriptor,
+                triangleIndexUploadPending = triangleIndexPending,
+                outlineIndexUploadPending = outlineIndexPending,
+                destroyed = false,
+            ),
+        )
+        assertFalse(
+            CoverageCubeMeshResources.descriptorUploadReady(
+                sequencer, coordinator, descriptor,
+                triangleIndexUploadPending = triangleIndexPending,
+                outlineIndexUploadPending = true,
+                destroyed = false,
+            ),
+        )
+        lateCallbacks.forEach { it() }
+        assertTrue(
+            CoverageCubeMeshResources.descriptorUploadReady(
+                sequencer, coordinator, descriptor,
+                triangleIndexUploadPending = triangleIndexPending,
+                outlineIndexUploadPending = outlineIndexPending,
+                destroyed = false,
+            ),
+        )
+
+        val failedSequencer = CoverageDescriptorPageSequencer()
+        val failedDescriptor = cubeDescriptor(revision = 2L)
+        failedSequencer.replace(failedDescriptor)
+        val failedSubmission = checkNotNull(failedSequencer.nextPage())
+        val failedCoordinator = CoverageCubeMeshResources.CoverageCubeUploadCoordinator(
+            capacity = 1,
+            halfSize = 0.5f,
+            uploader = FakeCubeUploader(),
+            onUploadPageSettled = { ticket, successful ->
+                failedSequencer.finishUpload(ticket, successful)
+            },
+        )
+        failedCoordinator.submitPage(
+            failedSubmission.page,
+            RendererUploadPageOrigin.RESOURCE_GENERATION_RESET,
+            failedSubmission.ticket,
+        )
+        failedSequencer.finishUpload(failedSubmission.ticket, successful = false)
+        assertFalse(
+            CoverageCubeMeshResources.descriptorUploadReady(
+                failedSequencer, failedCoordinator, failedDescriptor,
+                triangleIndexUploadPending = false,
+                outlineIndexUploadPending = false,
+                destroyed = false,
+            ),
+        )
+        val destroyedSequencer = CoverageDescriptorPageSequencer()
+        val destroyedDescriptor = cubeDescriptor(revision = 3L)
+        destroyedSequencer.replace(destroyedDescriptor)
+        val destroyedSubmission = checkNotNull(destroyedSequencer.nextPage())
+        val destroyedCoordinator = CoverageCubeMeshResources.CoverageCubeUploadCoordinator(
+            capacity = 1,
+            halfSize = 0.5f,
+            uploader = FakeCubeUploader(),
+            onUploadPageSettled = { ticket, successful ->
+                destroyedSequencer.finishUpload(ticket, successful)
+            },
+        )
+        destroyedCoordinator.submitPage(
+            destroyedSubmission.page,
+            RendererUploadPageOrigin.RESOURCE_GENERATION_RESET,
+            destroyedSubmission.ticket,
+        )
+        destroyedCoordinator.destroy()
+        assertFalse(
+            CoverageCubeMeshResources.descriptorUploadReady(
+                destroyedSequencer, destroyedCoordinator, destroyedDescriptor,
+                triangleIndexUploadPending = false,
+                outlineIndexUploadPending = false,
+                destroyed = false,
+            ),
+        )
+        assertFalse(
+            CoverageCubeMeshResources.descriptorUploadReady(
+                sequencer, coordinator, descriptor,
+                triangleIndexUploadPending = false,
+                outlineIndexUploadPending = false,
+                destroyed = true,
+            ),
+        )
+    }
+
     @Test
     fun `cube submission kick requests one later renderer frame`() {
         val uploader = FakeCubeUploader()
@@ -766,6 +909,35 @@ private fun cubePage(value: Float): CoveragePresentationPage = CoveragePresentat
     colors = intArrayOf(0xFF000000.toInt()),
     styleRows = ByteArray(COVERAGE_RENDERER_STYLE_ROW_BYTES),
 )
+
+private fun cubeDescriptor(revision: Long = 1L): BoundedCoveragePresentation {
+    val qualifier = CoverageRowsQualifier(1L, 1L, 1L, revision, revision, revision)
+    val styleRows = CoverageRendererStyleRowV1().encode()
+    return PresentationDescriptor.create(
+        qualifier = qualifier,
+        mode = CoveragePresentationMode.SEMANTIC_CUBES,
+        enabled = true,
+        capacity = CoveragePresentationMode.SEMANTIC_CUBES.presentationCapacity,
+        sourceCapacity = 1,
+        sourceCount = 1,
+        palette = CoverageRendererPalette.COVERAGE,
+        paletteEpoch = 0L,
+        selectedSurfaceIds = longArrayOf(1L),
+        selectedSourceSlots = intArrayOf(0),
+        styleRows = styleRows,
+        update = null,
+        pageReader = { expected, start, maximum ->
+            if (expected != qualifier || start != 0 || maximum < 1) null else CoveragePresentationPage(
+                startSlot = 0,
+                totalCount = 1,
+                surfaceIds = longArrayOf(1L),
+                positions = floatArrayOf(1f, 1f, 1f),
+                colors = intArrayOf(0xFF000000.toInt()),
+                styleRows = styleRows.copyOf(),
+            )
+        },
+    )
+}
 
 private fun cubeSnapshot(
     revision: Long,

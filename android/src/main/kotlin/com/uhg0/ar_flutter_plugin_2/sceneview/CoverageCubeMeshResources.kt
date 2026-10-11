@@ -75,12 +75,13 @@ internal class CoverageCubeMeshResources(
         onDestroyedUploadCallback = {
             telemetry?.recordFencedDestroyedUploadCallback()
         },
-        onUploadPageReleasedWithTicket = { ticket ->
-            descriptorSequencer.release(ticket)
+        onUploadPageSettled = { ticket, successful ->
+            descriptorSequencer.finishUpload(ticket, successful)
         },
         onUploadPageReleased = {
             onUploadPageReleased()
         },
+        onTerminalStateSettled = { finishDestroyIfDrained() },
     )
     private var indexStaging: java.nio.IntBuffer? = null
     private var outlineIndexStaging: java.nio.IntBuffer? = null
@@ -91,7 +92,9 @@ internal class CoverageCubeMeshResources(
     private var currentMaterialForDescriptor: MaterialInstance? = null
     private var currentPointSizeForDescriptor = 0f
     private var destroyed = false
+    private var destroyRequested = false
     @Volatile private var onUploadPageReleased: () -> Unit = {}
+    @Volatile private var onResourceDrained: () -> Unit = {}
 
     init {
         // The two direct index buffers remain live until their independent
@@ -116,6 +119,7 @@ internal class CoverageCubeMeshResources(
         ) {
             indexStaging = null
             allocationLedger?.completeCubeTriangleStartup(telemetryOwner)
+            finishDestroyIfDrained()
         }
 
         val outlineIndices = ByteBuffer
@@ -139,6 +143,7 @@ internal class CoverageCubeMeshResources(
         ) {
             outlineIndexStaging = null
             allocationLedger?.completeCubeOutlineStartup(telemetryOwner)
+            finishDestroyIfDrained()
         }
     }
 
@@ -247,9 +252,27 @@ internal class CoverageCubeMeshResources(
         if (!descriptorSequencer.hasInFlightPage) queueNextDescriptorPage()
     }
 
+    override fun isWholeDescriptorUploadComplete(descriptor: BoundedCoveragePresentation): Boolean =
+        descriptorUploadReady(
+            descriptorSequencer,
+            uploadCoordinator,
+            descriptor,
+            triangleIndexUploadPending = indexStaging != null,
+            outlineIndexUploadPending = outlineIndexStaging != null,
+            destroyed = destroyed,
+        )
+
     override fun setOnUploadPageReleased(listener: () -> Unit) {
         onUploadPageReleased = listener
     }
+
+    override fun setOnResourceDrained(listener: () -> Unit) {
+        onResourceDrained = listener
+        if (destroyed) listener() else finishDestroyIfDrained()
+    }
+
+    override val resourceDrainComplete: Boolean
+        get() = destroyed
 
     private fun setDrawCount(node: Node, voxelCount: Int) {
         val instance = engine.renderableManager.getInstance(node.entity)
@@ -274,19 +297,30 @@ internal class CoverageCubeMeshResources(
     }
 
     override fun destroy() {
-        if (destroyed) return
-        destroyed = true
+        if (destroyRequested) return
+        destroyRequested = true
         onUploadPageReleased = {}
         uploadCoordinator.destroy()
-        indexStaging = null
-        outlineIndexStaging = null
         descriptorSequencer.clear()
         currentNodeForDescriptor = null
         currentMaterialForDescriptor = null
-        allocationLedger?.releaseCubeResources(telemetryOwner)
-        engine.destroyVertexBuffer(vertexBuffer)
-        engine.destroyIndexBuffer(indexBuffer)
-        engine.destroyIndexBuffer(outlineIndexBuffer)
+        finishDestroyIfDrained()
+    }
+
+    private val destructionCompletion = CoverageResourceDrainCompletion(
+        isDrained = { indexStaging == null && outlineIndexStaging == null && uploadCoordinator.isDrained() },
+        complete = {
+            engine.destroyVertexBuffer(vertexBuffer)
+            engine.destroyIndexBuffer(indexBuffer)
+            engine.destroyIndexBuffer(outlineIndexBuffer)
+            destroyed = true
+            allocationLedger?.releaseCubeResources(telemetryOwner)
+            onResourceDrained()
+        },
+    )
+
+    private fun finishDestroyIfDrained() {
+        if (destroyRequested) destructionCompletion.requestDestroy()
     }
 
     internal companion object {
@@ -351,6 +385,24 @@ internal class CoverageCubeMeshResources(
 
         internal fun cubeOutlineIndices(): IntArray =
             CUBE_OUTLINE_INDICES.copyOf()
+
+        /**
+         * Shared whole-cube readiness gate used by the live resource and its
+         * host-path proof. Legacy page drain alone is deliberately insufficient:
+         * the exact descriptor must settle successfully, both index buffers must
+         * be consumed, and the resource must still be alive.
+         */
+        internal fun descriptorUploadReady(
+            descriptorSequencer: CoverageDescriptorPageSequencer,
+            uploadCoordinator: CoverageCubeUploadCoordinator,
+            descriptor: BoundedCoveragePresentation,
+            triangleIndexUploadPending: Boolean,
+            outlineIndexUploadPending: Boolean,
+            destroyed: Boolean,
+        ): Boolean =
+            !destroyed && !triangleIndexUploadPending && !outlineIndexUploadPending &&
+                descriptorSequencer.isSuccessfullyComplete(descriptor) &&
+                uploadCoordinator.isIdleAndSuccessful()
     }
 
     internal class CoverageCubeUploadCoordinator(
@@ -365,8 +417,10 @@ internal class CoverageCubeMeshResources(
         private val onUploadCompleted: (Long) -> Unit = {},
         private val onUploadCompletedAttributed: (Long, RendererUploadPageOrigin) -> Unit = { _, _ -> },
         private val onDestroyedUploadCallback: () -> Unit = {},
+        private val onUploadPageSettled: (CoverageDescriptorPageTicket, Boolean) -> Unit = { _, _ -> },
         private val onUploadPageReleasedWithTicket: (CoverageDescriptorPageTicket) -> Unit = {},
         private val onUploadPageReleased: () -> Unit = {},
+        private val onTerminalStateSettled: () -> Unit = {},
         private val clockNanos: () -> Long = System::nanoTime,
     ) {
         private val positionBuffer = ByteBuffer.allocateDirect(
@@ -414,14 +468,15 @@ internal class CoverageCubeMeshResources(
             ticket: CoverageDescriptorPageTicket? = null,
         ) {
             if (destroyed) {
-                if (ticket != null) onUploadPageReleasedWithTicket(ticket)
+                if (ticket != null) settlePage(ticket, false)
                 return
             }
             val cancelledPage = pendingPages.removeFirstOrNull()
             pendingUploads.clear()
             pendingPages.addLast(PendingPage(page, origin, ticket))
             // Install the replacement before release: its callback may enqueue a newer page.
-            cancelledPage?.ticket?.let(onUploadPageReleasedWithTicket)
+            cancelledPage?.ticket?.let { settlePage(it, false) }
+            if (isDrained()) onTerminalStateSettled()
         }
 
         private fun enqueue(
@@ -446,7 +501,7 @@ internal class CoverageCubeMeshResources(
             }
             pendingUploads.addLast(PendingUpload(normalized, origin))
             if (uploadBusy) pendingRanges.clear()
-            cancelledPage?.ticket?.let(onUploadPageReleasedWithTicket)
+            cancelledPage?.ticket?.let { settlePage(it, false) }
         }
 
         /** Rehydrates a new Filament resource generation from the retained cut. */
@@ -466,21 +521,35 @@ internal class CoverageCubeMeshResources(
             pendingUploads.clear()
             pendingRanges.clear()
             // Submitted direct storage and its page owner survive until consumption.
-            if (!uploadBusy) releaseActivePage()
-            cancelledPage?.ticket?.let(onUploadPageReleasedWithTicket)
+            if (!uploadBusy) releaseActivePage(successful = false)
+            cancelledPage?.ticket?.let { settlePage(it, false) }
+            if (isDrained()) onTerminalStateSettled()
         }
 
-        private fun releaseActivePage() {
+        private fun releaseActivePage(successful: Boolean) {
             activeSnapshot = null
             activePage = null
             val ticket = activePageTicket
             activePageTicket = null
-            if (ticket != null) onUploadPageReleasedWithTicket(ticket)
+            if (ticket != null) settlePage(ticket, successful)
+        }
+
+        private fun settlePage(ticket: CoverageDescriptorPageTicket, successful: Boolean) {
+            onUploadPageSettled(ticket, successful)
+            onUploadPageReleasedWithTicket(ticket)
         }
 
         fun onRendererFrame() {
             drain()
         }
+
+        fun isIdleAndSuccessful(): Boolean =
+            !uploadBusy && pendingUploads.isEmpty() && pendingPages.isEmpty() && pendingRanges.isEmpty() &&
+                !activeUploadFailed && !submissionInProgress
+
+        fun isDrained(): Boolean =
+            !uploadBusy && pendingUploads.isEmpty() && pendingPages.isEmpty() && pendingRanges.isEmpty() &&
+                !submissionInProgress && activePage == null && activeSnapshot == null
 
         private fun drain() {
             if (destroyed || uploadBusy) return
@@ -697,17 +766,20 @@ internal class CoverageCubeMeshResources(
             val origin = activeOrigin
             val elapsedNanos = (clockNanos() - activeUploadStartedNanos).coerceAtLeast(0L)
             uploadBusy = false
-            if (pendingRanges.isEmpty()) {
-                if (completed && !destroyed && activeFullUpload) hasUploadedSnapshot = true
-                activeFullUpload = false
-                releaseActivePage()
+            try {
+                if (pendingRanges.isEmpty()) {
+                    if (completed && !destroyed && activeFullUpload) hasUploadedSnapshot = true
+                    activeFullUpload = false
+                    releaseActivePage(successful = completed && !destroyed)
+                }
+                if (!destroyed && completed) {
+                    onUploadCompleted(elapsedNanos)
+                    if (!destroyed) onUploadCompletedAttributed(elapsedNanos, origin)
+                }
+                if (!destroyed) onUploadPageReleased()
+            } finally {
+                if (isDrained()) onTerminalStateSettled()
             }
-            if (destroyed) return
-            if (completed) {
-                onUploadCompleted(elapsedNanos)
-                if (!destroyed) onUploadCompletedAttributed(elapsedNanos, origin)
-            }
-            if (!destroyed) onUploadPageReleased()
             // A completed callback only releases the page; a renderer frame admits the next one.
         }
 

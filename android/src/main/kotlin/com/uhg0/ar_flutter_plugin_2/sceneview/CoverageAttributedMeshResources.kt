@@ -20,6 +20,7 @@ internal class CoverageAttributedMeshResources(
     private val owner: NativeCoverageRendererOwner,
     private val telemetry: RendererTelemetry,
     private val resourceBudget: CoverageShapeResourceBudget,
+    private var role: CoverageDisplayRole = CoverageDisplayRole.ACTIVE,
 ) : CoverageVoxelMeshResources, CoverageAttributedDrawTarget {
     private val points = CoveragePointMeshResources(engine, capacity, telemetry, "coverage-attributed-points-${token.epoch}")
     private val balls = shape == CoveragePresentationMode.DIRECTIONAL_BALLS
@@ -39,7 +40,12 @@ internal class CoverageAttributedMeshResources(
     private var node: Node? = null
     private var closed = false
     private var destroyed = false
+    private var destroyRequested = false
+    private var pointsDrained = false
     private var drawEnabled = false
+    private var displayVisible = true
+    private var shapeUploadLease: PreparedCoverageShapeReference? = null
+    private var residentPresentation: CoverageDisplayResidencyReceipt? = null
     private var onReleased: () -> Unit = {}
     private val callbackHandler = Handler(Looper.getMainLooper())
     private var submittedTicket = 0L
@@ -69,8 +75,11 @@ internal class CoverageAttributedMeshResources(
     }
     private val uploads = CoverageShapeUploadOwner(
         uploader = pageUploader,
-        current = { mesh -> !closed && owner.acceptsResourceToken(token) &&
-            owner.presentationDescriptor()?.shapes === mesh },
+        current = { mesh -> !closed &&
+            (if (role == CoverageDisplayRole.CANDIDATE) owner.acceptsCandidateResourceToken(token)
+            else owner.acceptsResourceToken(token)) &&
+            (if (role == CoverageDisplayRole.CANDIDATE) owner.candidateDisplayDescriptor()
+            else owner.activeDisplayDescriptor())?.shapes === mesh },
         onCompleted = ::shapeUploadCompleted,
         onPageReleased = { if (closed) finishDestroy() else onReleased() },
     )
@@ -79,6 +88,10 @@ internal class CoverageAttributedMeshResources(
 
     private fun shapeUploadCompleted(mesh: PreparedCoverageShapeReference) {
         owner.recordCompletedShapeUpload(token, mesh, uploads.completionWasReuse)
+        shapeUploadLease?.takeIf { it === mesh }?.let {
+            it.releaseUploadLease()
+            shapeUploadLease = null
+        }
         applyDrawRanges()
     }
 
@@ -92,7 +105,13 @@ internal class CoverageAttributedMeshResources(
 
     fun updateDescriptor(node: Node, descriptor: PresentationDescriptor, material: MaterialInstance, pointSize: Float) {
         this.node = node; this.descriptor = descriptor
+        residentPresentation = null
         drawEnabled = descriptor.enabled
+        if (role == CoverageDisplayRole.CANDIDATE && shapeUploadLease == null) {
+            descriptor.shapes?.takeIf { it.available }?.let {
+                if (it.retainForUpload()) shapeUploadLease = it
+            }
+        }
         points.updateDescriptor(node, descriptor, material, pointSize)
         uploads.offer(descriptor.shapes.takeIf { descriptor.enabled })
         applyDrawRanges()
@@ -102,8 +121,10 @@ internal class CoverageAttributedMeshResources(
         val node = node
         val instance = if (node == null) 0 else engine.renderableManager.getInstance(node.entity)
         val shapeVisible = CoverageAttributedDraw.apply(
-            this, owner, token, descriptor, uploads.completedMesh, !closed && drawEnabled,
-            instance, node?.parent?.isVisible != false,
+            this, owner, token, descriptor, uploads.completedMesh, !closed && drawEnabled && displayVisible,
+            instance, node?.parent?.isVisible != false, role,
+            owner.completedShapeDrawReceipt(token, descriptor),
+            residentPresentation,
         )
         owner.recordShapeDrawState(token, shapeVisible)
     }
@@ -133,24 +154,75 @@ internal class CoverageAttributedMeshResources(
     override fun requireRetainedSnapshotUpload() { points.requireRetainedSnapshotUpload(); uploads.offer(null) }
     override fun onRendererFrame() {
         if (closed) return
-        val current = owner.presentationDescriptor()
-        if (current !== descriptor) {
+        val current = if (role == CoverageDisplayRole.CANDIDATE) owner.candidateDisplayDescriptor()
+        else owner.activeDisplayDescriptor()
+        if (current != null && current !== descriptor) {
             descriptor = current; drawEnabled = current?.enabled == true; uploads.offer(current?.shapes.takeIf { current?.enabled == true })
         }
         points.onRendererFrame(); uploads.onFrame(); applyDrawRanges()
     }
+
+    override fun setDisplayVisible(visible: Boolean) {
+        displayVisible = visible
+        applyDrawRanges()
+    }
+
+    fun promoteToActive() {
+        role = CoverageDisplayRole.ACTIVE
+        descriptor = owner.activeDisplayDescriptor()
+        applyDrawRanges()
+    }
+
+    override fun isWholeDescriptorUploadComplete(descriptor: BoundedCoveragePresentation): Boolean {
+        if (!points.isWholeDescriptorUploadComplete(descriptor)) return false
+        // Attributed preparation is a whole-presentation receipt.  Missing or
+        // stale attributes cannot qualify a successor, and a zero-shape mesh
+        // still needs its selected point-fallback bytes settled before the
+        // candidate may promote.
+        descriptor.shapes ?: return false
+        return owner.completedShapeDrawReceipt(token, descriptor) != null && !uploads.inFlight
+    }
+    override fun releaseCompletedDescriptorSource() {
+        residentPresentation = owner.activeDisplayResidencyReceipt(token)
+        uploads.releaseCompletedSource()
+        points.releaseCompletedDescriptorSource()
+        descriptor = null
+    }
     override fun setOnUploadPageReleased(listener: () -> Unit) { onReleased = listener; points.setOnUploadPageReleased(listener) }
+    override fun setOnResourceDrained(listener: () -> Unit) {
+        onResourceDrained = listener
+        if (destroyed) {
+            listener()
+            return
+        }
+        points.setOnResourceDrained {
+            pointsDrained = true
+            finishDestroy()
+        }
+        finishDestroy()
+    }
+    private var onResourceDrained: () -> Unit = {}
     override fun destroy() {
-        if (closed) return
-        closed = true; onReleased = {}; uploads.close(); points.destroy()
-        owner.recordShapeResourceUnmounted(token)
+        if (destroyRequested) return
+        destroyRequested = true
+        closed = true; onReleased = {}; uploads.close(); shapeUploadLease?.releaseUploadLease(); shapeUploadLease = null
+        points.setOnResourceDrained {
+            pointsDrained = true
+            finishDestroy()
+        }
+        points.destroy()
         descriptor = null; node = null
-        if (!uploads.inFlight) finishDestroy()
+        finishDestroy()
     }
     private fun finishDestroy() {
-        if (destroyed || !closed || uploads.inFlight) return
-        destroyed = true
+        if (destroyed || !destroyRequested || uploads.inFlight || !pointsDrained) return
         engine.destroyVertexBuffer(shapeVertexBuffer); engine.destroyIndexBuffer(shapeIndexBuffer)
+        destroyed = true
         resourceBudget.drained(token)
+        owner.recordShapeResourceUnmounted(token)
+        onResourceDrained()
     }
+
+    override val resourceDrainComplete: Boolean
+        get() = destroyed
 }

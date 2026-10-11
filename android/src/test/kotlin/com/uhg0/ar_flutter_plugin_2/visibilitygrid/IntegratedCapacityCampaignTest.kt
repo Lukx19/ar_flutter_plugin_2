@@ -120,7 +120,7 @@ class IntegratedCapacityCampaignTest {
                         val maximumPendingDepth = PendingDepthRetentionReceipt.maximumModeled()
                         val depthResources = depthKernel.resourceReceipt()
                         val rendererResources = renderer.telemetry.pressureSnapshot()
-                        assertEquals(13_358_756, rendererResources.rendererOwnedBytes)
+                        assertEquals(13_366_948, rendererResources.rendererOwnedBytes)
                         assertTrue(rendererResources.rendererOwnedBytes <= CoverageRendererLimits.ACTIVE_RENDERER_OWNED_LIMIT_BYTES)
                         assertTrue(renderer.peakTransitionBytes <= CoverageRendererLimits.COMBINED_RENDERER_OWNED_LIMIT_BYTES)
                         assertEquals(64L * 1024L, rendererResources.maxUploadBytesPerFrame)

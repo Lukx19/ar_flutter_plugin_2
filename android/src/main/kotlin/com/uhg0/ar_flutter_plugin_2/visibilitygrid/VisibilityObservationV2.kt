@@ -9,6 +9,8 @@ internal class VisibilityGroupFrame private constructor(
     val worldFromGroupGl: List<Double>,
     val voxelSizeMicrometres: Int,
     val modelCapacity: Int,
+    val depthSurfacePreset: DepthSurfacePreset,
+    val depthSourcePreference: DepthSourcePreference?,
 ) {
     init {
         require(groupFromWorldGl.size == 16 && groupFromWorldGl.all(Double::isFinite))
@@ -24,11 +26,15 @@ internal class VisibilityGroupFrame private constructor(
             worldFromGroupGl: DoubleArray,
             voxelSizeMicrometres: Int,
             modelCapacity: Int,
+            depthSurfacePreset: DepthSurfacePreset = DepthSurfacePreset.VIEW_RAY_WEIGHTED,
+            depthSourcePreference: DepthSourcePreference? = null,
         ): VisibilityGroupFrame = VisibilityGroupFrame(
             Collections.unmodifiableList(groupFromWorldGl.copyOf().toList()),
             Collections.unmodifiableList(worldFromGroupGl.copyOf().toList()),
             voxelSizeMicrometres,
             modelCapacity,
+            depthSurfacePreset,
+            depthSourcePreference,
         )
     }
 
@@ -37,13 +43,17 @@ internal class VisibilityGroupFrame private constructor(
             groupFromWorldGl == other.groupFromWorldGl &&
             worldFromGroupGl == other.worldFromGroupGl &&
             voxelSizeMicrometres == other.voxelSizeMicrometres &&
-            modelCapacity == other.modelCapacity
+            modelCapacity == other.modelCapacity &&
+            depthSurfacePreset == other.depthSurfacePreset &&
+            depthSourcePreference == other.depthSourcePreference
 
     override fun hashCode(): Int = listOf(
         groupFromWorldGl,
         worldFromGroupGl,
         voxelSizeMicrometres,
         modelCapacity,
+        depthSurfacePreset,
+        depthSourcePreference,
     ).hashCode()
 
     override fun toString(): String =

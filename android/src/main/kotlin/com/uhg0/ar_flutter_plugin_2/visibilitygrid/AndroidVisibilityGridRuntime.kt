@@ -1,5 +1,7 @@
 package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
+import android.util.Log
+import com.uhg0.ar_flutter_plugin_2.BuildConfig
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
@@ -39,7 +41,7 @@ internal class AndroidVisibilityGridRuntime(
     private val afterLaneResidentPublication: (VisibilityObservationSource) -> Unit = {},
     private val beforeLaneDiscardResidentPublication: (VisibilityObservationSource) -> Unit = {},
     private val debugDepthOfferNanoTime: () -> Long = System::nanoTime,
-) : AutoCloseable {
+) : AutoCloseable, DepthCopyTransientObserver {
     private val lock = Any()
     private var requestedDepthCapability = VisibilityDepthCapability.UNSUPPORTED
     private var requestedCapabilityOwnership: VisibilityObservationOwnership? = null
@@ -77,8 +79,13 @@ internal class AndroidVisibilityGridRuntime(
     private var duplicateEstimateRefusals = 0L
     private var depthConfidencePairRefusals = 0L
     private var invalidImageTimestampRefusals = 0L
+    private val invalidDepthTuple = LongArray(7)
+    private val staleDepthTuple = LongArray(7)
+    private var invalidDepthReason: String? = null
+    private var staleDepthReason: String? = null
     private var latestDepthImageTimestampNs = 0L
     private var latestDepthFrameTimestampNs = 0L
+    private var latestDepthCameraImageTimestampNs = 0L
     private var latestDepthConfidenceTimestampNs = 0L
     private var latestDepthSourceImageWidth = 0
     private var latestDepthSourceImageHeight = 0
@@ -219,10 +226,12 @@ internal class AndroidVisibilityGridRuntime(
         val needsDrain = synchronized(lock) {
             if (closed || ingressDrainFailed) return
             val requestOwnership = ownership()
-            val changed = capability != requestedDepthCapability || requestOwnership != requestedCapabilityOwnership
+            val ownerChanged = requestOwnership != requestedCapabilityOwnership
+            val changed = capability != requestedDepthCapability || ownerChanged
             requestedDepthCapability = capability
             requestedCapabilityOwnership = requestOwnership
             if (changed) ingressDrainGeneration++
+            if (ownerChanged) depthAcquisitionFunding?.debugTransientMask = 0
             if (capability == VisibilityDepthCapability.UNSUPPORTED) {
                 val wasSupported = depthCapability != VisibilityDepthCapability.UNSUPPORTED
                 depthCapability = capability
@@ -425,28 +434,34 @@ internal class AndroidVisibilityGridRuntime(
                 }
                 if (observation.acquisitionMode != DepthAcquisitionMode.PROVIDED) {
                     recordDepthAcquisitionEvidence(observation.frame.sourceTimestampNs, observation.frame.frameTimestampNs,
-                        observation.confidenceTimestampNs, observation.sourceImageWidth, observation.sourceImageHeight,
+                        observation.confidenceTimestampNs, observation.cameraImageTimestampNs, observation.sourceImageWidth, observation.sourceImageHeight,
                         observation.frame.intrinsics.imageWidth, observation.frame.intrinsics.imageHeight, observation.acquisitionMode)
                     if (depthAcquisitionFunding?.let { it.funded && it.matches(observation.ownership) } != true) {
                         droppedDepthObservations++
                         observation.close()
                         return@tryOfferLifecycle false
                     }
-                    if (observation.frame.sourceTimestampNs > observation.frame.frameTimestampNs) {
-                        invalidImageTimestampRefusals++
-                        droppedDepthObservations++
-                        observation.close()
-                        return@tryOfferLifecycle false
-                    }
-                    if (observation.acquisitionMode == DepthAcquisitionMode.AUTOMATIC &&
-                        observation.frame.sourceTimestampNs != observation.frame.frameTimestampNs) {
-                        staleAutomaticRefusals++
+                    depthImageIdentityRefusal(observation.frame.sourceTimestampNs,
+                        observation.cameraImageTimestampNs, observation.frame.frameTimestampNs,
+                        observation.acquisitionMode, observation.rawProjectionQualified,
+                        observation.projectionProvenance,
+                        denseCurrentFrameExperimentForPreference(observation.ownership.groupFrame.depthSourcePreference))?.let { refusal ->
+                        when (refusal) {
+                            DepthAcquisitionRefusal.INVALID_TIMESTAMP -> invalidImageTimestampRefusals++
+                            DepthAcquisitionRefusal.INVALID_PROJECTION -> invalidDepthObservations++
+                            DepthAcquisitionRefusal.STALE_AUTOMATIC -> staleAutomaticRefusals++
+                            DepthAcquisitionRefusal.CONFIDENCE_PAIR -> depthConfidencePairRefusals++
+                        }
                         droppedDepthObservations++
                         observation.close()
                         return@tryOfferLifecycle false
                     }
                 }
                 qualifyDepthEstimate(observation.ownership)
+                if (observation.acquisitionMode == DepthAcquisitionMode.RAW &&
+                    depthLastCopiedTimestampNs > 0L && observation.frame.sourceTimestampNs == depthLastCopiedTimestampNs) {
+                    rawReprojectedAcquisitions++
+                }
                 if (observation.frame.sourceTimestampNs <= depthLastCopiedTimestampNs) {
                     duplicateDepthObservations++
                     if (observation.acquisitionMode != DepthAcquisitionMode.PROVIDED) duplicateEstimateRefusals++
@@ -514,8 +529,19 @@ internal class AndroidVisibilityGridRuntime(
     }
 
     fun recordDepthAcquisitionRefusal(reason: DepthAcquisitionRefusal, metadata: RawDepthFrameMetadata) = synchronized(lock) {
+        when (reason) {
+            DepthAcquisitionRefusal.INVALID_TIMESTAMP, DepthAcquisitionRefusal.INVALID_PROJECTION -> {
+                recordDepthRefusalTuple(invalidDepthTuple, metadata)
+                invalidDepthReason = depthRefusalBound(reason, metadata)
+            }
+            DepthAcquisitionRefusal.STALE_AUTOMATIC -> {
+                recordDepthRefusalTuple(staleDepthTuple, metadata)
+                staleDepthReason = depthRefusalBound(reason, metadata)
+            }
+            DepthAcquisitionRefusal.CONFIDENCE_PAIR -> Unit
+        }
         recordDepthAcquisitionEvidence(metadata.timestampNs, metadata.arFrameTimestampNs,
-            metadata.confidenceTimestampNs, metadata.sourceImageWidth, metadata.sourceImageHeight,
+            metadata.confidenceTimestampNs, metadata.cameraImageTimestampNs, metadata.sourceImageWidth, metadata.sourceImageHeight,
             metadata.width, metadata.height, metadata.acquisitionMode)
         when (reason) {
             DepthAcquisitionRefusal.STALE_AUTOMATIC -> staleAutomaticRefusals++
@@ -525,17 +551,38 @@ internal class AndroidVisibilityGridRuntime(
         }
     }
 
-    private fun recordDepthAcquisitionEvidence(imageTime: Long, frameTime: Long, confidenceTime: Long,
+    private fun recordDepthRefusalTuple(target: LongArray, metadata: RawDepthFrameMetadata) {
+        target[0] = metadata.timestampNs
+        target[1] = metadata.acquisitionFrameBeforeNs
+        target[2] = metadata.acquisitionFrameAfterNs
+        target[3] = metadata.acquisitionAndroidCameraBeforeNs
+        target[4] = metadata.acquisitionAndroidCameraAfterNs
+        target[5] = metadata.acquisitionFrameSequence
+        target[6] = metadata.groupGeneration
+    }
+
+    private fun depthRefusalScalarFields(prefix: String, reason: String?, tuple: LongArray): Map<String, Any?> = mapOf(
+        "${prefix}Reason" to reason,
+        "${prefix}ImageTimestampNs" to if (reason == null) null else tuple[0].toString(),
+        "${prefix}FrameBeforeNs" to if (reason == null) null else tuple[1].toString(),
+        "${prefix}FrameAfterNs" to if (reason == null) null else tuple[2].toString(),
+        "${prefix}AndroidCameraBeforeNs" to if (reason == null) null else tuple[3].toString(),
+        "${prefix}AndroidCameraAfterNs" to if (reason == null) null else tuple[4].toString(),
+        "${prefix}FrameSequence" to if (reason == null) null else tuple[5],
+        "${prefix}GroupGeneration" to if (reason == null) null else tuple[6],
+    )
+
+    private fun recordDepthAcquisitionEvidence(imageTime: Long, frameTime: Long, confidenceTime: Long, cameraImageTime: Long,
         sourceWidth: Int, sourceHeight: Int, depthWidth: Int, depthHeight: Int, mode: DepthAcquisitionMode) {
         latestDepthImageTimestampNs = imageTime
         latestDepthFrameTimestampNs = frameTime
+        latestDepthCameraImageTimestampNs = cameraImageTime
         latestDepthConfidenceTimestampNs = confidenceTime
         latestDepthSourceImageWidth = sourceWidth
         latestDepthSourceImageHeight = sourceHeight
         latestDepthImageWidth = depthWidth
         latestDepthImageHeight = depthHeight
         latestDepthAcquisitionMode = mode
-        if (mode == DepthAcquisitionMode.RAW && imageTime > 0L && imageTime < frameTime) rawReprojectedAcquisitions++
     }
 
     private fun qualifyDepthEstimate(owner: VisibilityObservationOwnership) {
@@ -551,6 +598,50 @@ internal class AndroidVisibilityGridRuntime(
             depthEstimateLifecycleSequence = owner.lifecycleSequence
             depthEstimateOperationGeneration = owner.operationGeneration
         }
+    }
+
+    override fun onPackedDepthTransient(
+        owner: VisibilityObservationOwnership,
+        metadata: RawDepthFrameMetadata,
+        reason: PackedDepthTransientReason,
+        examinedDepthPositive: Int,
+        examinedPairedPositive: Int,
+        selectedCount: Int,
+        sourceRejected: Int,
+    ) {
+        claimDepthCopyTransientDiagnostic(owner, metadata, reason, examinedDepthPositive,
+            examinedPairedPositive, selectedCount, sourceRejected)?.let {
+            Log.d("Capture3DDepthCopy", it)
+        }
+    }
+
+    /** Full existing owner references fence this cold event; no obsolete pose is retained. */
+    internal fun claimDepthCopyTransientDiagnostic(
+        owner: VisibilityObservationOwnership,
+        metadata: RawDepthFrameMetadata,
+        reason: PackedDepthTransientReason,
+        examinedDepthPositive: Int,
+        examinedPairedPositive: Int,
+        selectedCount: Int,
+        sourceRejected: Int,
+        debug: Boolean = BuildConfig.DEBUG,
+    ): String? = synchronized(lock) {
+        if (!debug || closed || paused || ingressDrainFailed ||
+            metadata.acquisitionMode == DepthAcquisitionMode.PROVIDED ||
+            ownership() != owner || requestedCapabilityOwnership != owner) return null
+        val funding = depthAcquisitionFunding?.takeIf { it.funded && it.matches(owner) } ?: return null
+        val bit = 1 shl (metadata.acquisitionMode.ordinal * 3 + reason.ordinal)
+        if (funding.debugTransientMask and bit != 0) return null
+        require(metadata.width in 1..16_384 && metadata.height in 1..16_384)
+        val maximumProbes = Math.multiplyExact(metadata.width, metadata.height)
+        require(examinedDepthPositive in 0..maximumProbes)
+        require(examinedPairedPositive in 0..examinedDepthPositive)
+        require(selectedCount in 0..4_096 && sourceRejected >= 0)
+        funding.debugTransientMask = funding.debugTransientMask or bit
+        "depthCopyTransient source=${metadata.acquisitionMode.name} reason=${reason.name} " +
+            "width=${metadata.width} height=${metadata.height} " +
+            "examinedDepthPositive=$examinedDepthPositive examinedPairedPositive=$examinedPairedPositive " +
+            "selected=$selectedCount sourceRejected=$sourceRejected"
     }
 
     fun recordDepthPreparationReady() = synchronized(lock) {
@@ -741,6 +832,196 @@ internal class AndroidVisibilityGridRuntime(
         }
     }
 
+    /** One sampled, fixed-field receipt. No reservation, acquisition or diagnostic exporter runs. */
+    internal fun scalarSnapshot(expected: VisibilityObservationOwnership?): Map<String, Any?> {
+        val started = System.nanoTime()
+        val admission = mapper.snapshot()
+        val retained = mapper.retainedDepthPayloadBytes()
+        val copy = synchronized(lock) {
+            val funding = depthAcquisitionFunding
+            DepthScalarCopy(
+                depthTransientUnavailable = depthTransientUnavailable,
+                depthFailures = depthFailures,
+                depthPreparationReady = depthPreparationReady,
+                depthPreparationTransient = depthPreparationTransient,
+                depthPreparationRejected = depthPreparationRejected,
+                depthProcessingTransient = depthProcessingTransient,
+                depthProcessingRejected = depthProcessingRejected,
+                depthProcessorBusyDrops = depthProcessorBusyDrops,
+                offeredDepthObservations = offeredDepthObservations,
+                copiedDepthObservations = copiedDepthObservations,
+                admittedDepthObservations = admittedDepthObservations,
+                droppedDepthObservations = droppedDepthObservations,
+                replacedDepthObservations = replacedDepthObservations,
+                invalidDepthObservations = invalidDepthObservations,
+                duplicateDepthObservations = duplicateDepthObservations,
+                freshEstimateAdmissions = freshEstimateAdmissions,
+                staleAutomaticRefusals = staleAutomaticRefusals,
+                rawReprojectedAcquisitions = rawReprojectedAcquisitions,
+                duplicateEstimateRefusals = duplicateEstimateRefusals,
+                depthConfidencePairRefusals = depthConfidencePairRefusals,
+                invalidImageTimestampRefusals = invalidImageTimestampRefusals,
+                invalidDepthTuple = invalidDepthTuple.copyOf(),
+                staleDepthTuple = staleDepthTuple.copyOf(),
+                invalidDepthReason = invalidDepthReason,
+                staleDepthReason = staleDepthReason,
+                latestDepthImageTimestampNs = latestDepthImageTimestampNs,
+                latestDepthFrameTimestampNs = latestDepthFrameTimestampNs,
+                latestDepthCameraImageTimestampNs = latestDepthCameraImageTimestampNs,
+                latestDepthConfidenceTimestampNs = latestDepthConfidenceTimestampNs,
+                acquiredProducerResources = acquiredProducerResources,
+                closedProducerResources = closedProducerResources,
+                peakResidentPayloadBytes = peakResidentPayloadBytes,
+                latestDepthSourceImageWidth = latestDepthSourceImageWidth,
+                latestDepthSourceImageHeight = latestDepthSourceImageHeight,
+                latestDepthImageWidth = latestDepthImageWidth,
+                latestDepthImageHeight = latestDepthImageHeight,
+                maximumDepthSamples = maximumDepthSamples,
+                depthHealth = depthHealth.wireName,
+                depthCapability = depthCapability.wireName,
+                latestDepthAcquisitionMode = latestDepthAcquisitionMode.name,
+                syntheticSource = syntheticSource,
+                runtimePaused = paused,
+                runtimeClosed = closed,
+                ingressDrainFailed = ingressDrainFailed,
+                depthAcquisitionPreparationPending = depthAcquisitionPreparationPending,
+                fundingOwnerMatched = funding?.let { expected != null && it.matches(expected) } == true,
+                fundingState = when { closed || paused -> "closedOrPaused"; depthAcquisitionPreparationPending -> "pending"; funding == null -> "unrequestedOrRetryable"; expected == null || !funding.matches(expected) -> "staleOwner"; funding.funded -> "funded"; else -> "refused" },
+                callbackBudgetDegraded = callbackCopyBudgetDegraded,
+                residentPayloadBytes = featureResidentPayloadBytes + depthResidentPayloadBytes + retained,
+                accountedMapperDepths = accountedMapperDepths,
+            )
+        }
+        val imageAgeUs = if (copy.latestDepthImageTimestampNs > 0L && copy.latestDepthCameraImageTimestampNs > 0L) {
+            Math.subtractExact(copy.latestDepthCameraImageTimestampNs, copy.latestDepthImageTimestampNs) / 1_000L
+        } else null
+        val mapping = (mapper as? VisibilityGridIntegration)?.scalarSnapshot()
+            ?: mapOf("detailUnavailable" to true)
+        return mapOf(
+            "source" to mapOf(
+                "depthHealth" to copy.depthHealth,
+                "depthCapability" to copy.depthCapability,
+                "latestDepthAcquisitionMode" to copy.latestDepthAcquisitionMode,
+                "depthTransientUnavailable" to copy.depthTransientUnavailable,
+                "depthFailures" to copy.depthFailures,
+                "depthPreparationReady" to copy.depthPreparationReady,
+                "depthPreparationTransient" to copy.depthPreparationTransient,
+                "depthPreparationRejected" to copy.depthPreparationRejected,
+                "depthProcessingTransient" to copy.depthProcessingTransient,
+                "depthProcessingRejected" to copy.depthProcessingRejected,
+                "depthProcessorBusyDrops" to copy.depthProcessorBusyDrops,
+                "offeredDepthObservations" to copy.offeredDepthObservations,
+                "copiedDepthObservations" to copy.copiedDepthObservations,
+                "droppedDepthObservations" to copy.droppedDepthObservations,
+                "replacedDepthObservations" to copy.replacedDepthObservations,
+                "invalidDepthObservations" to copy.invalidDepthObservations,
+                "duplicateDepthObservations" to copy.duplicateDepthObservations,
+                "admittedDepthObservations" to Math.addExact(copy.admittedDepthObservations, (admission.admittedDepths - copy.accountedMapperDepths).coerceAtLeast(0L)),
+                "maximumDepthSamples" to copy.maximumDepthSamples,
+                "syntheticSource" to copy.syntheticSource,
+            ),
+            "identity" to mapOf(
+                "freshEstimateAdmissions" to copy.freshEstimateAdmissions,
+                "staleAutomaticRefusals" to copy.staleAutomaticRefusals,
+                "rawReprojectedAcquisitions" to copy.rawReprojectedAcquisitions,
+                "duplicateEstimateRefusals" to copy.duplicateEstimateRefusals,
+                "depthConfidencePairRefusals" to copy.depthConfidencePairRefusals,
+                "invalidImageTimestampRefusals" to copy.invalidImageTimestampRefusals,
+                "latestDepthImageTimestampNs" to copy.latestDepthImageTimestampNs.takeIf { it > 0L }?.toString(),
+                "latestDepthFrameTimestampNs" to copy.latestDepthFrameTimestampNs.takeIf { it > 0L }?.toString(),
+                "latestDepthCameraImageTimestampNs" to copy.latestDepthCameraImageTimestampNs.takeIf { it > 0L }?.toString(),
+                "latestDepthConfidenceTimestampNs" to copy.latestDepthConfidenceTimestampNs.takeIf { it > 0L }?.toString(),
+                "latestDepthSourceImageWidth" to copy.latestDepthSourceImageWidth,
+                "latestDepthSourceImageHeight" to copy.latestDepthSourceImageHeight,
+                "latestDepthImageWidth" to copy.latestDepthImageWidth,
+                "latestDepthImageHeight" to copy.latestDepthImageHeight,
+                "latestFrameMinusImageAgeUs" to null,
+                "latestCameraMinusImageAgeUs" to imageAgeUs?.toString(),
+                "depthTimestampComparability" to "unverified",
+            ).plus(depthRefusalScalarFields("latestInvalidDepth", copy.invalidDepthReason, copy.invalidDepthTuple))
+                .plus(depthRefusalScalarFields("latestStaleDepth", copy.staleDepthReason, copy.staleDepthTuple)),
+            "gates" to mapOf(
+                "fundingState" to copy.fundingState,
+                "fundingOwnerMatched" to copy.fundingOwnerMatched,
+                "depthAcquisitionPreparationPending" to copy.depthAcquisitionPreparationPending,
+                "runtimePaused" to copy.runtimePaused,
+                "runtimeClosed" to copy.runtimeClosed,
+                "ingressDrainFailed" to copy.ingressDrainFailed,
+                "callbackCopyBudgetState" to if (copy.callbackBudgetDegraded) "degraded" else "normal",
+                "sourceSuspended" to null,
+                "processorAvailable" to null,
+                "noveltyEligibility" to null,
+                "rateEligibility" to null,
+            ),
+            "resources" to mapOf(
+                "acquiredProducerResources" to copy.acquiredProducerResources,
+                "closedProducerResources" to copy.closedProducerResources,
+                "resourceBalance" to Math.subtractExact(copy.acquiredProducerResources, copy.closedProducerResources),
+                "residentPayloadBytes" to copy.residentPayloadBytes,
+                "peakResidentPayloadBytes" to copy.peakResidentPayloadBytes,
+                "pendingRetainedDepthBytes" to retained,
+            ),
+            "mapping" to mapping,
+            "sampling" to mapOf(
+                "sourceCapturedStartNs" to started.toString(),
+                "sourceCapturedEndNs" to System.nanoTime().toString(),
+            ),
+        )
+    }
+
+    private data class DepthScalarCopy(
+        val depthTransientUnavailable: Long,
+        val depthFailures: Long,
+        val depthPreparationReady: Long,
+        val depthPreparationTransient: Long,
+        val depthPreparationRejected: Long,
+        val depthProcessingTransient: Long,
+        val depthProcessingRejected: Long,
+        val depthProcessorBusyDrops: Long,
+        val offeredDepthObservations: Long,
+        val copiedDepthObservations: Long,
+        val admittedDepthObservations: Long,
+        val droppedDepthObservations: Long,
+        val replacedDepthObservations: Long,
+        val invalidDepthObservations: Long,
+        val duplicateDepthObservations: Long,
+        val freshEstimateAdmissions: Long,
+        val staleAutomaticRefusals: Long,
+        val rawReprojectedAcquisitions: Long,
+        val duplicateEstimateRefusals: Long,
+        val depthConfidencePairRefusals: Long,
+        val invalidImageTimestampRefusals: Long,
+        val invalidDepthTuple: LongArray,
+        val staleDepthTuple: LongArray,
+        val invalidDepthReason: String?,
+        val staleDepthReason: String?,
+        val latestDepthImageTimestampNs: Long,
+        val latestDepthFrameTimestampNs: Long,
+        val latestDepthCameraImageTimestampNs: Long,
+        val latestDepthConfidenceTimestampNs: Long,
+        val acquiredProducerResources: Long,
+        val closedProducerResources: Long,
+        val peakResidentPayloadBytes: Long,
+        val latestDepthSourceImageWidth: Int,
+        val latestDepthSourceImageHeight: Int,
+        val latestDepthImageWidth: Int,
+        val latestDepthImageHeight: Int,
+        val maximumDepthSamples: Int,
+        val depthHealth: String,
+        val depthCapability: String,
+        val latestDepthAcquisitionMode: String,
+        val syntheticSource: Boolean,
+        val runtimePaused: Boolean,
+        val runtimeClosed: Boolean,
+        val ingressDrainFailed: Boolean,
+        val depthAcquisitionPreparationPending: Boolean,
+        val fundingOwnerMatched: Boolean,
+        val fundingState: String,
+        val callbackBudgetDegraded: Boolean,
+        val residentPayloadBytes: Long,
+        val accountedMapperDepths: Long,
+    )
+
     fun snapshot(): VisibilityObservationHealth {
         // The mapper may release its bounded deferred-depth slot on the ACK
         // executor without a lane callback. Read its lock-free health and
@@ -775,6 +1056,7 @@ internal class AndroidVisibilityGridRuntime(
                 invalidImageTimestampRefusals = invalidImageTimestampRefusals,
                 latestDepthImageTimestampNs = latestDepthImageTimestampNs,
                 latestDepthFrameTimestampNs = latestDepthFrameTimestampNs,
+                latestDepthCameraImageTimestampNs = latestDepthCameraImageTimestampNs,
                 latestDepthConfidenceTimestampNs = latestDepthConfidenceTimestampNs,
                 latestDepthSourceImageWidth = latestDepthSourceImageWidth,
                 latestDepthSourceImageHeight = latestDepthSourceImageHeight,
@@ -1255,6 +1537,7 @@ internal data class VisibilityObservationHealth(
     val invalidImageTimestampRefusals: Long = 0L,
     val latestDepthImageTimestampNs: Long = 0L,
     val latestDepthFrameTimestampNs: Long = 0L,
+    val latestDepthCameraImageTimestampNs: Long = 0L,
     val latestDepthConfidenceTimestampNs: Long = 0L,
     val latestDepthSourceImageWidth: Int = 0,
     val latestDepthSourceImageHeight: Int = 0,
@@ -1298,13 +1581,14 @@ internal data class VisibilityObservationHealth(
         "invalidImageTimestampRefusals" to invalidImageTimestampRefusals,
         "latestDepthImageTimestampNs" to latestDepthImageTimestampNs,
         "latestDepthFrameTimestampNs" to latestDepthFrameTimestampNs,
+        "latestDepthCameraImageTimestampNs" to latestDepthCameraImageTimestampNs,
         "latestDepthConfidenceTimestampNs" to latestDepthConfidenceTimestampNs,
         "latestDepthSourceImageWidth" to latestDepthSourceImageWidth,
         "latestDepthSourceImageHeight" to latestDepthSourceImageHeight,
         "latestDepthImageWidth" to latestDepthImageWidth,
         "latestDepthImageHeight" to latestDepthImageHeight,
         "latestDepthAcquisitionMode" to latestDepthAcquisitionMode.name,
-        "depthCalibrationQualification" to "legacyScaleUnverified",
+        "depthCalibrationQualification" to "textureScaleUnverified",
         "admittedFeatureObservations" to admittedFeatureObservations,
         "admittedDepthObservations" to admittedDepthObservations,
         "invalidFeatureObservations" to invalidFeatureObservations,

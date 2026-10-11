@@ -249,7 +249,12 @@ class CoverageRendererOwnerTest {
     @Test
     fun `low memory pressure fences resources while retaining a recoverable semantic cut`() {
         val owner = NativeCoverageRendererOwner()
-        owner.install(snapshot())
+        val descriptor = descriptorForReceipt(count = 2)
+        owner.installPresentation(descriptor, PointCloudNativeConfig(
+            renderCapacity = descriptor.capacity,
+            voxelRenderMode = VoxelRenderMode.CENTROIDS,
+            rendererGeneration = descriptor.qualifier.rendererGeneration,
+        ))
         val before = owner.status()
 
         assertTrue(owner.markLowMemoryPressure())
@@ -271,7 +276,12 @@ class CoverageRendererOwnerTest {
     @Test
     fun `duplicate resume while replacement is pending keeps one resource token`() {
         val owner = NativeCoverageRendererOwner()
-        owner.install(snapshot())
+        val descriptor = descriptorForReceipt(count = 2)
+        owner.installPresentation(descriptor, PointCloudNativeConfig(
+            renderCapacity = descriptor.capacity,
+            voxelRenderMode = VoxelRenderMode.CENTROIDS,
+            rendererGeneration = descriptor.qualifier.rendererGeneration,
+        ))
         val oldToken = checkNotNull(owner.issueResourceToken())
         assertTrue(owner.markResourceFailure(oldToken))
 
@@ -911,7 +921,12 @@ class CoverageRendererOwnerTest {
     @Test
     fun `late resource callbacks cannot clear a replacement owner lifetime`() {
         val owner = NativeCoverageRendererOwner()
-        owner.install(snapshot(rendererGeneration = 9L))
+        val descriptor = descriptorForReceipt(count = 2, rendererGeneration = 9L)
+        owner.installPresentation(descriptor, PointCloudNativeConfig(
+            renderCapacity = descriptor.capacity,
+            voxelRenderMode = VoxelRenderMode.CENTROIDS,
+            rendererGeneration = descriptor.qualifier.rendererGeneration,
+        ))
 
         val first = checkNotNull(owner.issueResourceToken())
         val replacement = checkNotNull(owner.requestResourceReplacement())
@@ -928,14 +943,221 @@ class CoverageRendererOwnerTest {
         assertTrue(owner.status().resourceAvailable)
     }
 
-    private fun descriptorForReceipt(count: Int): BoundedCoveragePresentation {
-        val qualifier = CoverageRowsQualifier(2L, 3L, 5L, 8L, 4L, 7L)
+    @Test
+    fun `target display receipt uses fixed monotonic hold and fences cleared targets and late candidate promotion`() {
+        var now = 10_000L
+        val config = PointCloudNativeConfig(
+            enabled = true,
+            voxelRenderMode = VoxelRenderMode.CENTROIDS,
+            rendererGeneration = 5L,
+        )
+        val owner = NativeCoverageRendererOwner(clockNanos = { now })
+        owner.installPresentation(
+            descriptorForReceipt(
+                count = 1,
+                geometryRevision = 4L,
+                styleRevision = 7L,
+                targetSurfaceId = 1L,
+                targetDirectionIndex = 2,
+            ),
+            config,
+        )
+        val token = checkNotNull(owner.issueResourceToken())
+        assertTrue(owner.releaseActiveDisplaySource(token))
+        val receipt = checkNotNull(owner.activeDisplayResidencyReceipt(token))
+        val deadline = checkNotNull(receipt.holdUntilNanos)
+        assertEquals(now + 500_000_000L, deadline)
+
+        now += 100L
+        owner.installPresentation(
+            descriptorForReceipt(
+                count = 1,
+                geometryRevision = 5L,
+                styleRevision = 8L,
+                targetSurfaceId = 1L,
+                targetDirectionIndex = 2,
+            ),
+            config,
+        )
+        assertEquals(deadline, checkNotNull(owner.activeDisplayResidencyReceipt(token)).holdUntilNanos)
+        now = deadline - 1L
+        assertTrue(owner.isDisplayResidencyVisible(token))
+        now = deadline
+        assertFalse(owner.isDisplayResidencyVisible(token))
+
+        val candidate = checkNotNull(owner.issueCandidateResourceToken())
+        assertTrue(owner.stageCandidateDisplay(checkNotNull(owner.presentationDescriptor())))
+        val hidden = owner.setControls(
+            CoverageRendererControls(false, CoveragePresentationMode.SEMANTIC_CENTROIDS, CoverageRendererPalette.COVERAGE),
+        )
+        assertTrue(hidden.accepted)
+        assertFalse(owner.candidatePromotionAllowed(candidate))
+        assertFalse(owner.promoteCandidateDisplay(candidate))
+
+        var clearNow = 20_000L
+        val clearedOwner = NativeCoverageRendererOwner(clockNanos = { clearNow })
+        clearedOwner.installPresentation(
+            descriptorForReceipt(
+                count = 1,
+                geometryRevision = 4L,
+                styleRevision = 7L,
+                targetSurfaceId = 1L,
+                targetDirectionIndex = 2,
+            ),
+            config,
+        )
+        val clearedToken = checkNotNull(clearedOwner.issueResourceToken())
+        assertTrue(clearedOwner.releaseActiveDisplaySource(clearedToken))
+        clearNow += 1L
+        clearedOwner.installPresentation(
+            descriptorForReceipt(
+                count = 1,
+                geometryRevision = 5L,
+                styleRevision = 8L,
+                targetSurfaceId = null,
+                targetDirectionIndex = null,
+            ),
+            config,
+        )
+        assertFalse(clearedOwner.isDisplayResidencyVisible(clearedToken))
+    }
+
+    @Test
+    fun `non target current geometry stays visible while older geometry expires once without flood extension`() {
+        var now = 0L
+        val config = PointCloudNativeConfig(enabled = true, voxelRenderMode = VoxelRenderMode.CENTROIDS, rendererGeneration = 5)
+        val owner = NativeCoverageRendererOwner(clockNanos = { now })
+        owner.installPresentation(descriptorForReceipt(1), config)
+        val a = checkNotNull(owner.issueResourceToken())
+        assertTrue(owner.releaseActiveDisplaySource(a))
+        now = 2_000_000_000L
+        assertTrue(owner.isDisplayResidencyVisible(a))
+        assertNull(checkNotNull(owner.activeDisplayResidencyReceipt(a)).holdUntilNanos)
+        owner.installPresentation(descriptorForReceipt(1, geometryRevision = 5, styleRevision = 8), config)
+        val fixed = now + 500_000_000L
+        assertEquals(fixed, checkNotNull(owner.activeDisplayResidencyReceipt(a)).holdUntilNanos)
+        val b = checkNotNull(owner.issueCandidateResourceToken())
+        assertTrue(owner.stageCandidateDisplay(checkNotNull(owner.presentationDescriptor())))
+        now += 10L
+        owner.installPresentation(descriptorForReceipt(1, geometryRevision = 6, styleRevision = 9), config)
+        assertTrue(owner.candidatePromotionAllowed(b))
+        val bDeadline = now + 500_000_000L
+        now += 10L
+        owner.installPresentation(descriptorForReceipt(1, geometryRevision = 7, styleRevision = 10), config)
+        assertEquals(fixed, checkNotNull(owner.activeDisplayResidencyReceipt(a)).holdUntilNanos)
+        now = fixed - 1
+        assertTrue(owner.isDisplayResidencyVisible(a))
+        now = fixed
+        assertFalse(owner.isDisplayResidencyVisible(a))
+        now = bDeadline
+        assertFalse(owner.candidatePromotionAllowed(b))
+        assertFalse(owner.promoteCandidateDisplay(b))
+        assertEquals(a, owner.currentResourceToken())
+    }
+
+    @Test
+    fun `candidate promotion and callback drawing share palette transform group lifecycle and config fences`() {
+        for (change in listOf("palette", "mode", "transform", "group", "binding", "config", "lifecycle")) {
+            var now = 100L
+            val config = PointCloudNativeConfig(enabled = true, voxelRenderMode = VoxelRenderMode.CENTROIDS, rendererGeneration = 5)
+            val owner = NativeCoverageRendererOwner(clockNanos = { now })
+            owner.installPresentation(descriptorForReceipt(1), config)
+            val a = checkNotNull(owner.issueResourceToken())
+            assertTrue(owner.releaseActiveDisplaySource(a))
+            now++
+            owner.installPresentation(descriptorForReceipt(1, geometryRevision = 5, styleRevision = 8), config)
+            val b = checkNotNull(owner.issueCandidateResourceToken())
+            assertTrue(owner.stageCandidateDisplay(checkNotNull(owner.presentationDescriptor())))
+            assertTrue(owner.candidatePromotionAllowed(b))
+            when (change) {
+                "palette" -> owner.setControls(CoverageRendererControls(true, CoveragePresentationMode.SEMANTIC_CENTROIDS, CoverageRendererPalette.UNIFORM))
+                "mode" -> owner.setControls(CoverageRendererControls(true, CoveragePresentationMode.SEMANTIC_CUBES, CoverageRendererPalette.COVERAGE))
+                "lifecycle" -> owner.pause()
+                else -> owner.installPresentation(descriptorForReceipt(1, geometryRevision = 6, styleRevision = 9,
+                    bindingGeneration = if (change == "binding") 3 else 2,
+                    groupGeneration = if (change == "group") 4 else 3,
+                    world = if (change == "transform") DoubleArray(16) { if (it % 5 == 0) 1.0 else 0.0 } else null),
+                    if (change == "config") config.copy(pointSizePx = 7f) else config)
+            }
+            assertFalse(change, owner.candidatePromotionAllowed(b))
+            assertFalse(change, owner.isDisplayResidencyVisible(b))
+            assertFalse(change, owner.promoteCandidateDisplay(b))
+            assertEquals(a, owner.currentResourceToken())
+        }
+    }
+
+    @Test
+    fun `target candidate native receive deadline survives delayed admission and rejects cleared changed and expired targets`() {
+        for (contradiction in listOf("expired", "cleared", "different")) {
+            var now = 100L
+            val config = PointCloudNativeConfig(enabled = true, voxelRenderMode = VoxelRenderMode.CENTROIDS, rendererGeneration = 5)
+            val owner = NativeCoverageRendererOwner(clockNanos = { now })
+            owner.installPresentation(descriptorForReceipt(1), config)
+            val a = checkNotNull(owner.issueResourceToken())
+            assertTrue(owner.releaseActiveDisplaySource(a))
+            now = 1000L
+            owner.installPresentation(descriptorForReceipt(1, geometryRevision = 5, styleRevision = 8,
+                targetSurfaceId = 1, targetDirectionIndex = 2), config)
+            now += 400_000_000L
+            val b = checkNotNull(owner.issueCandidateResourceToken())
+            assertTrue(owner.stageCandidateDisplay(checkNotNull(owner.presentationDescriptor())))
+            assertTrue(owner.candidatePromotionAllowed(b))
+            if (contradiction == "expired") now = 500_001_000L
+            else owner.installPresentation(descriptorForReceipt(1, geometryRevision = 6, styleRevision = 9,
+                targetSurfaceId = if (contradiction == "cleared") null else 2,
+                targetDirectionIndex = if (contradiction == "cleared") null else 3), config)
+            assertFalse(owner.candidatePromotionAllowed(b))
+            assertFalse(owner.isDisplayResidencyVisible(b))
+            assertFalse(owner.promoteCandidateDisplay(b))
+            assertEquals(a, owner.currentResourceToken())
+        }
+    }
+
+    @Test
+    fun `older candidate promotion seals the existing native deadline without restarting its hold`() {
+        var now = 100L
+        val config = PointCloudNativeConfig(enabled = true, voxelRenderMode = VoxelRenderMode.CENTROIDS, rendererGeneration = 5)
+        val owner = NativeCoverageRendererOwner(clockNanos = { now })
+        owner.installPresentation(descriptorForReceipt(1), config)
+        val a = checkNotNull(owner.issueResourceToken())
+        assertTrue(owner.releaseActiveDisplaySource(a))
+        now++
+        owner.installPresentation(descriptorForReceipt(1, geometryRevision = 5, styleRevision = 8), config)
+        val b = checkNotNull(owner.issueCandidateResourceToken())
+        assertTrue(owner.stageCandidateDisplay(checkNotNull(owner.presentationDescriptor())))
+        now = 1000L
+        owner.installPresentation(descriptorForReceipt(1, geometryRevision = 6, styleRevision = 9), config)
+        val deadline = now + 500_000_000L
+        now = deadline - 1
+        assertTrue(owner.promoteCandidateDisplay(b))
+        assertTrue(owner.releaseActiveDisplaySource(b))
+        assertEquals(deadline, checkNotNull(owner.activeDisplayResidencyReceipt(b)).holdUntilNanos)
+        assertTrue(owner.isDisplayResidencyVisible(b))
+        now = deadline
+        assertFalse(owner.isDisplayResidencyVisible(b))
+        owner.installPresentation(descriptorForReceipt(1, geometryRevision = 7, styleRevision = 10), config)
+        assertEquals(deadline, checkNotNull(owner.activeDisplayResidencyReceipt(b)).holdUntilNanos)
+        assertFalse(owner.isDisplayResidencyVisible(b))
+    }
+
+    private fun descriptorForReceipt(
+        count: Int,
+        geometryRevision: Long = 4L,
+        styleRevision: Long = 7L,
+        targetSurfaceId: Long? = null,
+        targetDirectionIndex: Int? = null,
+        bindingGeneration: Long = 2L,
+        groupGeneration: Long = 3L,
+        world: DoubleArray? = null,
+        rendererGeneration: Long = 5L,
+    ): BoundedCoveragePresentation {
+        val qualifier = CoverageRowsQualifier(bindingGeneration, groupGeneration, rendererGeneration, 8L, geometryRevision, styleRevision)
         val surfaceIds = LongArray(count) { it.toLong() + 1L }
         val style = CoverageRendererStyleRowV1().encode()
         val styleRows = ByteArray(count * com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_STYLE_ROW_BYTES) {
             style[it % style.size]
         }
-        return PresentationDescriptor.create(
+        return PresentationDescriptor.createOwned(
             qualifier = qualifier,
             mode = CoveragePresentationMode.SEMANTIC_CENTROIDS,
             enabled = true,
@@ -944,24 +1166,19 @@ class CoverageRendererOwnerTest {
             sourceCount = count,
             palette = CoverageRendererPalette.COVERAGE,
             paletteEpoch = 1L,
+            targetSurfaceId = targetSurfaceId,
+            targetDirectionIndex = targetDirectionIndex,
             selectedSurfaceIds = surfaceIds,
             selectedSourceSlots = IntArray(count) { it },
             styleRows = styleRows,
             update = null,
-            pageReader = { expected, start, maximum ->
-                if (expected != qualifier || start >= count) null else {
-                    val pageCount = minOf(maximum, count - start)
-                    CoveragePresentationPage(
-                        startSlot = start,
-                        totalCount = count,
-                        surfaceIds = surfaceIds.copyOfRange(start, start + pageCount),
-                        positions = FloatArray(pageCount * 3),
-                        colors = IntArray(pageCount),
-                        styleRows = styleRows.copyOfRange(
-                            start * com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_STYLE_ROW_BYTES,
-                            (start + pageCount) * com.uhg0.ar_flutter_plugin_2.pointcloud.COVERAGE_RENDERER_STYLE_ROW_BYTES,
-                        ),
-                    )
+            worldFromGroup = world,
+            workspace = PresentationWorkspace(count),
+            pageReader = PresentationPageReader { expected, start, pageCount, _, page ->
+                if (expected != qualifier || start >= count || start + pageCount > count) false else {
+                    surfaceIds.copyInto(page.surfaceIds, 0, start, start + pageCount)
+                    java.util.Arrays.fill(page.positions, 0, pageCount * 3, 0f)
+                    true
                 }
             },
         )

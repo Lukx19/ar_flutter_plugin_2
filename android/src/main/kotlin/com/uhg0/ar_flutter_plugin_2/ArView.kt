@@ -616,6 +616,9 @@ internal class ArView(
                 "getAnchorPose" -> result.success(
                     anchorRecords[call.argument<String>("anchorId")]?.transform?.matrix,
                 )
+                "getRendererScalarSnapshot" -> result.success(
+                    sceneHost.rendererScalarSnapshot(captureSession.nativeCaptureWorkPendingV2()),
+                )
                 "getRendererPerformanceSnapshot" ->
                     result.success(
                         sceneHost.rendererPerformanceSnapshot(

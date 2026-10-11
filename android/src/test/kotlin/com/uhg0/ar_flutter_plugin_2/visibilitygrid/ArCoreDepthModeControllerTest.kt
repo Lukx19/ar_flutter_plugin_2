@@ -10,7 +10,7 @@ class ArCoreDepthModeControllerTest {
         val controller = ArCoreDepthModeController(rawDepthSupported = true, automaticDepthSupported = true)
         val metadata = RawDepthFrameMetadata(10, 1, 1, true, 4, 3,
             DepthIntrinsics(2.0, 2.0, 1.5, 1.0), identityVisibilityGridTransform(),
-            arFrameTimestampNs = 20, acquisitionMode = DepthAcquisitionMode.AUTOMATIC)
+            arFrameTimestampNs = 20, cameraImageTimestampNs = 20, acquisitionMode = DepthAcquisitionMode.AUTOMATIC)
         repeat(5) {
             assertEquals(Config.DepthMode.AUTOMATIC, controller.recordProbe(
                 DepthAcquisitionResult.Refused(DepthAcquisitionRefusal.STALE_AUTOMATIC, metadata)))

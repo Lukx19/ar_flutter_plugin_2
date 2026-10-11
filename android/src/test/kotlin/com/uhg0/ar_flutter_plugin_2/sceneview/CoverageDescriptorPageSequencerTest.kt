@@ -316,6 +316,89 @@ class CoverageDescriptorPageSequencerTest {
         sequencer.release(shown.ticket)
     }
 
+    @Test
+    fun `successful descriptor receipt requires every page rather than legacy drain`() {
+        val sequencer = CoverageDescriptorPageSequencer()
+        val descriptor = descriptor(count = 1_025)
+        sequencer.replace(descriptor)
+        repeat(3) { index ->
+            val page = checkNotNull(sequencer.nextPage())
+            assertFalse(sequencer.isSuccessfullyComplete(descriptor))
+            sequencer.finishUpload(page.ticket, true)
+            assertEquals(index == 2, sequencer.isSuccessfullyComplete(descriptor))
+        }
+        assertNull(sequencer.nextPage())
+        assertFalse(sequencer.isSuccessfullyComplete(descriptor(count = 1_025)))
+        val legacy = CoverageDescriptorPageSequencer()
+        val cube = descriptor(count = 1)
+        legacy.replace(cube)
+        legacy.release(checkNotNull(legacy.nextPage()).ticket)
+        assertTrue(legacy.isComplete(cube))
+        assertFalse(legacy.isSuccessfullyComplete(cube))
+    }
+
+    @Test
+    fun `failed point page cannot be repaired by drain or a duplicate success callback`() {
+        val sequencer = CoverageDescriptorPageSequencer()
+        val failed = descriptor(count = 600)
+        sequencer.replace(failed)
+        val page = checkNotNull(sequencer.nextPage())
+        sequencer.finishUpload(page.ticket, false)
+        assertFalse(sequencer.hasInFlightPage)
+        assertFalse(sequencer.isComplete(failed))
+        assertFalse(sequencer.isSuccessfullyComplete(failed))
+        assertNull(sequencer.nextPage())
+        sequencer.release(page.ticket)
+        sequencer.finishUpload(page.ticket, true)
+        assertFalse(sequencer.isSuccessfullyComplete(failed))
+        val successor = descriptor(count = 2)
+        sequencer.replace(successor)
+        val reset = checkNotNull(sequencer.nextPage())
+        assertTrue(reset.reset)
+        sequencer.finishUpload(reset.ticket, true)
+        assertTrue(sequencer.isSuccessfullyComplete(successor))
+    }
+
+    @Test
+    fun `stale page success and hidden clear cannot qualify a successor descriptor`() {
+        val sequencer = CoverageDescriptorPageSequencer()
+        val first = descriptor(count = 600)
+        val successor = descriptor(count = 2)
+        sequencer.replace(first)
+        val held = checkNotNull(sequencer.nextPage())
+        sequencer.replace(successor)
+        sequencer.finishUpload(held.ticket, true)
+        assertFalse(sequencer.isSuccessfullyComplete(first))
+        assertFalse(sequencer.isSuccessfullyComplete(successor))
+        val current = checkNotNull(sequencer.nextPage())
+        sequencer.finishUpload(held.ticket, false)
+        assertTrue(sequencer.owns(current.ticket))
+        sequencer.clear()
+        sequencer.finishUpload(current.ticket, true)
+        assertFalse(sequencer.isSuccessfullyComplete(successor))
+    }
+
+    @Test
+    fun `sparse no upload successor inherits only a successful descriptor receipt`() {
+        for (explicitSuccess in listOf(false, true)) {
+            val sequencer = CoverageDescriptorPageSequencer()
+            val predecessor = descriptor(count = 2)
+            sequencer.replace(predecessor)
+            val page = checkNotNull(sequencer.nextPage())
+            if (explicitSuccess) sequencer.finishUpload(page.ticket, true) else sequencer.release(page.ticket)
+            val successor = descriptor(count = 2)
+            sequencer.replace(successor)
+            assertNull(sequencer.nextPage())
+            assertTrue(sequencer.isComplete(successor))
+            assertEquals(explicitSuccess, sequencer.isSuccessfullyComplete(successor))
+        }
+        val unavailable = CoverageDescriptorPageSequencer()
+        val noSource = descriptor(count = 1, pageAvailable = false)
+        unavailable.replace(noSource)
+        assertNull(unavailable.nextPage())
+        assertFalse(unavailable.isSuccessfullyComplete(noSource))
+    }
+
     private fun descriptor(
         count: Int,
         update: CoveragePointRenderUpdate = CoveragePointRenderUpdate(

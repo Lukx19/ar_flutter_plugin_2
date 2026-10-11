@@ -8,6 +8,176 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
 class RendererAttributeHostPathTest {
+    @Test fun `actual host choice keeps missing patch and ball attributes pending after ordinary point completion then admits whole fallback`() {
+        for (balls in listOf(false, true)) {
+            val fixture = Fixture(balls, 3, normalConfidence = 63)
+            val originalToken = fixture.token
+            val initial = checkNotNull(fixture.owner.activeDisplayDescriptor())
+            assertTrue(CoveragePresentationEligibility.wholeUploadComplete(initial, CompletedPoints(initial).complete(initial),
+                attributedResource = false, initial = true))
+            assertTrue(fixture.owner.releaseActiveDisplaySource(originalToken))
+            fixture.preparePending(2)
+            val pending = checkNotNull(fixture.owner.candidateDisplayDescriptor())
+            val points = CompletedPoints(pending)
+            assertTrue(points.complete(pending))
+            assertEquals(CoveragePresentationEligibility.ResourceKind.POINTS,
+                CoveragePresentationEligibility.resourceKind(pending, initial = true))
+            assertEquals(CoveragePresentationEligibility.ResourceKind.PENDING,
+                CoveragePresentationEligibility.resourceKind(pending, initial = false))
+            assertFalse(CoveragePresentationEligibility.wholeUploadComplete(pending,
+                points.complete(pending), attributedResource = false))
+            assertFalse(fixture.attemptPromotion(CoveragePromotionReadiness { points.complete(it) }))
+            assertEquals(originalToken, fixture.owner.currentResourceToken())
+            fixture.publish(2, 1, installCut = false)
+            fixture.uploadUntilComplete()
+            val qualified = checkNotNull(fixture.owner.candidateDisplayDescriptor())
+            assertEquals(CoveragePresentationEligibility.ResourceKind.ATTRIBUTED,
+                CoveragePresentationEligibility.resourceKind(qualified, initial = false))
+            assertEquals(if (balls) 3 else 0, checkNotNull(qualified.shapes).shapeCount)
+            assertEquals(if (balls) 0 else 3, checkNotNull(qualified.shapes).pointCount)
+            assertEquals(originalToken, fixture.owner.currentResourceToken())
+            val wholePoints = CompletedPoints(qualified)
+            fixture.promoteCandidate(CoveragePromotionReadiness { descriptor ->
+                CoveragePresentationEligibility.wholeUploadComplete(descriptor, wholePoints.complete(descriptor),
+                    attributedResource = true) &&
+                    fixture.owner.completedShapeDrawReceipt(checkNotNull(fixture.owner.currentCandidateResourceToken()), descriptor) != null
+            })
+            assertNotEquals(originalToken, fixture.owner.currentResourceToken())
+            fixture.owner.dispose()
+        }
+    }
+
+    @Test fun `sealing initial point fallback preserves logical backing selection and delayed attribute basis for real host upgrade`() {
+        val fixture = Fixture(false, 3)
+        val source = checkNotNull(fixture.owner.presentationDescriptor())
+        val ids = fixture.owner.selectedSurfaceIds()
+        val points = CompletedPoints(source)
+        assertTrue(CoveragePresentationEligibility.wholeUploadComplete(source, points.complete(source),
+            attributedResource = false, initial = true))
+        assertTrue(fixture.owner.releaseActiveDisplaySource(fixture.token))
+        assertNull(fixture.owner.activeDisplayDescriptor())
+        assertSame(source, fixture.owner.presentationDescriptor())
+        assertSame(source.backingIdentity, checkNotNull(fixture.owner.presentationDescriptor()).backingIdentity)
+        assertArrayEquals(ids, fixture.owner.selectedSurfaceIds())
+        assertEquals(3, checkNotNull(checkNotNull(fixture.owner.presentationDescriptor()).toLegacySnapshot()).count)
+        // This is the real select/page/commit exchange; it needs the preserved basis.
+        fixture.publish(1, 2, candidate = true, installCut = false)
+        fixture.uploadUntilComplete()
+        val attributed = checkNotNull(fixture.owner.candidateDisplayDescriptor())
+        assertSame(source.backingIdentity, attributed.backingIdentity)
+        assertTrue(CoveragePresentationEligibility.requiresCandidate(attributed,
+            fixture.owner.activeDisplayDescriptor(), fixture.owner.activeDisplayResidencyReceipt(fixture.token),
+            supportsAttributed = false))
+        val wholePoints = CompletedPoints(attributed)
+        fixture.promoteCandidate(CoveragePromotionReadiness { descriptor ->
+            CoveragePresentationEligibility.wholeUploadComplete(descriptor, wholePoints.complete(descriptor),
+                attributedResource = true) &&
+                fixture.owner.completedShapeDrawReceipt(checkNotNull(fixture.owner.currentCandidateResourceToken()), descriptor) != null
+        })
+        assertArrayEquals(ids, fixture.owner.selectedSurfaceIds())
+        fixture.owner.dispose()
+    }
+
+    /** Real descriptor sequencing/coordinator successful receipt, with synchronous GPU adapter. */
+    private class CompletedPoints(descriptor: PresentationDescriptor) {
+        private val sequencer = CoverageDescriptorPageSequencer()
+        private val coordinator = CoveragePointUploadCoordinator(descriptor.capacity,
+            object : CoveragePointVertexUploader {
+                override fun uploadPositions(buffer: java.nio.FloatBuffer, destOffsetBytes: Int,
+                    elementCount: Int, onConsumed: () -> Unit) { onConsumed() }
+                override fun uploadColors(buffer: ByteBuffer, destOffsetBytes: Int,
+                    byteCount: Int, onConsumed: () -> Unit) { onConsumed() }
+            }, onUploadPageSettled = { ticket, successful -> sequencer.finishUpload(ticket, successful) })
+        init {
+            sequencer.replace(descriptor)
+            while (true) {
+                val page = sequencer.nextPage() ?: break
+                coordinator.submitPage(page.page, RendererUploadPageOrigin.ORDINARY, page.ticket)
+                coordinator.onRendererFrame()
+            }
+        }
+        fun complete(descriptor: PresentationDescriptor): Boolean = CoveragePointMeshResources.descriptorUploadReady(
+            sequencer, coordinator, descriptor, indexUploadPending = false, destroyed = false)
+    }
+
+    @Test fun `prepared successor stays hidden and blocks a third generation until old drain`() {
+        val releases = mutableListOf<String>()
+        val factory = CoverageRendererResourceFactory(
+            admit = { _, _ ->
+                CoverageRendererResourceAdmission(
+                    CoverageRendererTransitionStrategy.COEXIST, 0, 1, 1,
+                )
+            },
+        )
+        val a = CoverageResourceToken(1, 1, CoveragePresentationMode.PLANAR_PATCHES)
+        val b = a.copy(epoch = 2)
+        val c = a.copy(epoch = 3)
+        val first = factory.replacePoint(
+            VoxelRenderMode.CENTROIDS, 4, "a", token = a,
+            create = { _, _, _ -> "a" },
+            release = { releases += it },
+        )
+        assertEquals("a", first)
+        val second = factory.preparePoint(
+            VoxelRenderMode.CENTROIDS, 4, "b", token = b,
+            create = { _, _, _ -> "b" },
+            release = { releases += it },
+        )
+        assertEquals("b", second)
+        assertTrue(releases.isEmpty())
+        assertNull(factory.preparePoint(
+            VoxelRenderMode.CENTROIDS, 4, "c", token = c,
+            create = { _, _, _ -> "c" },
+            release = { releases += it },
+        ))
+        assertTrue(factory.activatePrepared(b))
+        assertTrue(releases.isEmpty())
+        assertNull(factory.preparePoint(
+            VoxelRenderMode.CENTROIDS, 4, "c", token = c,
+            create = { _, _, _ -> "c" },
+            release = { releases += it },
+        ))
+        assertTrue(factory.releaseResource(a))
+        assertEquals(listOf("a"), releases)
+        assertNotNull(factory.preparePoint(
+            VoxelRenderMode.CENTROIDS, 4, "c", token = c,
+            create = { _, _, _ -> "c" },
+            release = { releases += it },
+        ))
+    }
+
+    @Test fun `two physical slots repeat A B C D only after each outgoing drain`() {
+        val disposed = mutableListOf<CoverageResourceToken?>()
+        val factory = CoverageRendererResourceFactory(
+            onDisposed = { disposed += it },
+            admit = { _, _ -> CoverageRendererResourceAdmission(
+                CoverageRendererTransitionStrategy.COEXIST, 1, 1, 2,
+            ) },
+        )
+        val a = CoverageResourceToken(11, 1, CoveragePresentationMode.PLANAR_PATCHES)
+        val b = a.copy(epoch = 12)
+        val c = a.copy(epoch = 13)
+        val d = a.copy(epoch = 14)
+        fun prepared(token: CoverageResourceToken) = factory.preparePoint(
+            VoxelRenderMode.CENTROIDS, 4, "slot", token = token,
+            create = { _, _, _ -> token }, release = {},
+        )
+        assertNotNull(factory.replacePoint(
+            VoxelRenderMode.CENTROIDS, 4, "slot", token = a,
+            create = { _, _, _ -> a }, release = {},
+        ))
+        assertNotNull(prepared(b))
+        assertNull(prepared(c))
+        assertTrue(factory.activatePrepared(b))
+        assertTrue(factory.releaseResource(a))
+        assertNotNull(prepared(c))
+        assertTrue(factory.activatePrepared(c))
+        assertNull(prepared(d))
+        assertTrue(factory.releaseResource(b))
+        assertNotNull(prepared(d))
+        assertEquals(listOf(a, b), disposed)
+    }
+
     @Test fun `native palette and canonical attribute digests match locked portable ABI`() {
         assertArrayEquals(intArrayOf(0xffff4545.toInt(), 0xffffbf3f.toInt(), 0xff44cc66.toInt(), 0xff999999.toInt()),
             intArrayOf(RendererAttributeCodec.ZERO_ARGB, RendererAttributeCodec.ONE_ARGB,
@@ -120,7 +290,16 @@ class RendererAttributeHostPathTest {
             fixture.owner.beginShapeMeasurementWindow()
             var revision = 0L
             repeat(180) { frame ->
-                if (frame % 30 == 0) { revision++; fixture.publish(revision, minOf(2, revision.toInt() - 1)) }
+                if (frame % 30 == 0) {
+                    revision++
+                    val candidate = revision > 1
+                    fixture.publish(revision, minOf(2, revision.toInt() - 1), candidate = candidate)
+                    if (candidate) {
+                        fixture.uploadUntilComplete()
+                        fixture.completePointReceipt()
+                        fixture.promoteCandidate()
+                    }
+                }
                 fixture.uploads.onFrame()
                 val mounted = fixture.uploads.completedMesh != null
                 fixture.owner.recordShapeDrawState(fixture.token, mounted)
@@ -171,9 +350,55 @@ class RendererAttributeHostPathTest {
         val fixture = Fixture(false, 3)
         fixture.publish(1, 2); fixture.uploadUntilComplete()
         fixture.replay(2)
-        assertNull(fixture.owner.presentationDescriptor()?.shapes)
-        assertEquals("rawFeatures", fixture.owner.rendererGeometryStatus()["effectiveMode"])
+        val latest = checkNotNull(fixture.owner.presentationDescriptor())
+        val active = checkNotNull(fixture.owner.activeDisplayDescriptor())
+        assertNull(latest.shapes)
+        assertNotSame(latest, active)
+        assertEquals(2L, fixture.owner.rendererGeometryStatus()["latestPresentationRevision"])
+        assertEquals(1L, fixture.owner.rendererGeometryStatus()["activePresentationRevision"])
+        assertEquals("planarPatches", fixture.owner.rendererGeometryStatus()["effectiveMode"])
+        assertEquals(0L, fixture.owner.rendererGeometryStatus()["candidatePresentationRevision"])
         fixture.owner.dispose()
+    }
+
+    @Test fun `incomplete successor retains completed attributed presentation until qualified promotion`() {
+        val fixture = Fixture(false, 3)
+        fixture.publish(1, 2); fixture.uploadUntilComplete()
+        val predecessor = checkNotNull(fixture.owner.presentationDescriptor())
+        val predecessorShape = checkNotNull(fixture.uploads.completedMesh)
+        val predecessorToken = fixture.token
+        val target = DrawTarget()
+        assertTrue(CoverageAttributedDraw.apply(
+            target, fixture.owner, fixture.token, predecessor, predecessorShape, true,
+        ))
+
+        // An incoming depth/style cut has no committed successor attributes yet.
+        // The coherent whole-presentation contract keeps the old qualified pair
+        // active until the successor pair is complete.
+        fixture.replay(2)
+        assertNotSame(predecessor, fixture.owner.presentationDescriptor())
+        assertSame(predecessor, fixture.owner.activeDisplayDescriptor())
+        assertTrue(CoverageAttributedDraw.apply(
+            target, fixture.owner, fixture.token, predecessor, predecessorShape, true,
+        ))
+
+        // Once the successor is qualified, normal bounded upload/promotion may
+        // replace the old pair atomically.
+        fixture.publish(2, 2, candidate = true); fixture.uploadUntilComplete(); fixture.completePointReceipt()
+        val successor = checkNotNull(fixture.owner.presentationDescriptor())
+        val successorShape = checkNotNull(fixture.uploads.completedMesh)
+        val candidateToken = checkNotNull(fixture.owner.issueCandidateResourceToken())
+        assertSame(successor, fixture.owner.candidateDisplayDescriptor())
+        fixture.promoteCandidate()
+        assertFalse(CoverageAttributedDraw.apply(
+            target, fixture.owner, predecessorToken, predecessor, predecessorShape, true,
+        ))
+        assertNotSame(predecessor, successor)
+        assertNotSame(predecessorShape, successorShape)
+        assertTrue(CoverageAttributedDraw.apply(
+            target, fixture.owner, candidateToken, successor, successorShape, true,
+        ))
+        fixture.uploads.close(); fixture.owner.dispose()
     }
 
     @Test fun `shape replay refuses mismatched ownership revisions selection palette mode and coordinates`() {
@@ -204,6 +429,31 @@ class RendererAttributeHostPathTest {
         fixture.owner.dispose()
     }
 
+    @Test fun `resident shape receipt keeps active ranges after CPU body eviction`() {
+        val fixture = Fixture(false, 3)
+        fixture.publish(1, 2); fixture.uploadUntilComplete()
+        val active = checkNotNull(fixture.owner.activeDisplayDescriptor())
+        val completed = checkNotNull(fixture.uploads.completedMesh)
+        fixture.publish(2, 2)
+        // Equivalent contents may reuse the one funded CPU body.  Evict it
+        // only after the completed GPU receipt is latched and no source page
+        // is borrowed by the uploader.
+        fixture.owner.invalidateRendererAttributes(1)
+        assertFalse(completed.available)
+        assertFalse(completed.copyPage(
+            ByteBuffer.allocate(16), 0, 1, ByteBuffer.allocate(4), 0, 1,
+        ))
+        val receipt = checkNotNull(fixture.owner.completedShapeDrawReceipt(fixture.token, active))
+        val target = DrawTarget()
+        assertTrue(CoverageAttributedDraw.apply(
+            target, fixture.owner, fixture.token, active, null, true,
+            residentReceipt = receipt,
+        ))
+        assertEquals(receipt.indexCount, target.ranges[2])
+        assertEquals(true, fixture.owner.rendererGeometryStatus()["basisAvailable"])
+        fixture.owner.dispose()
+    }
+
     @Test fun `attributed hide masks every primitive through renderer frames and delayed completion`() {
         for (balls in listOf(false, true)) {
             val fixture = Fixture(balls, 3, lowNormalRow = 2, deferUploads = true)
@@ -230,8 +480,9 @@ class RendererAttributeHostPathTest {
                 submittedMesh, false))
             target.assertHidden()
             fixture.owner.setControls(CoverageRendererControls(true, fixture.mode, fixture.palette))
-            fixture.publish(2, 1)
+            fixture.publish(2, 1, candidate = true)
             fixture.uploads.onFrame(); fixture.completeDelayedUpload()
+            fixture.completePointReceipt(); fixture.promoteCandidate()
             val current = fixture.owner.presentationDescriptor() as PresentationDescriptor
             val ready = checkNotNull(fixture.uploads.completedMesh)
             assertTrue(CoverageAttributedDraw.apply(target, fixture.owner, fixture.token, current, ready, true))
@@ -265,10 +516,15 @@ class RendererAttributeHostPathTest {
         target.assertHidden()
         // A prior patch mesh is never interpreted as current ball geometry.
         assertFalse(CoverageAttributedDraw.apply(target, fixture.owner, successor, current, oldMesh, true))
-        assertTrue(target.layerVisible)
-        assertArrayEquals(intArrayOf(0, current.count, 0, 0, 0), target.ranges)
+        target.assertHidden()
+        fixture.publish(2, 2, candidate = true, modeOverride = CoveragePresentationMode.DIRECTIONAL_BALLS)
+        fixture.uploadUntilComplete(); fixture.completePointReceipt(); fixture.promoteCandidate()
+        val promoted = checkNotNull(fixture.owner.presentationDescriptor())
+        val promotedMesh = checkNotNull(fixture.uploads.completedMesh)
+        assertTrue(CoverageAttributedDraw.apply(target, fixture.owner, fixture.token, promoted, promotedMesh, true))
+        assertArrayEquals(intArrayOf(3, 0, promotedMesh.indexCount, promotedMesh.indexCount, 0), target.ranges)
         fixture.owner.dispose()
-        assertFalse(CoverageAttributedDraw.apply(target, fixture.owner, successor, current, oldMesh, true))
+        assertFalse(CoverageAttributedDraw.apply(target, fixture.owner, fixture.token, promoted, promotedMesh, true))
         target.assertHidden()
     }
 
@@ -281,13 +537,49 @@ class RendererAttributeHostPathTest {
         assertFalse(CoverageAttributedDraw.apply(target, fixture.owner, fixture.token, descriptor, ready, true))
         assertTrue(target.layerVisible)
         assertArrayEquals(intArrayOf(3, 0, 0, 0, 3), target.ranges)
-        fixture.publish(2, 2)
-        assertFalse(CoverageAttributedDraw.apply(target, fixture.owner, fixture.token, descriptor, ready, true))
-        target.assertHidden()
+        val predecessorReceipt = checkNotNull(
+            fixture.owner.completedShapeDrawReceipt(fixture.token, descriptor),
+        )
+        assertEquals(0, predecessorReceipt.shapeCount)
+        assertEquals(3, predecessorReceipt.pointCount)
+        assertEquals(0, predecessorReceipt.indexCount)
+        val predecessorToken = fixture.token
+        fixture.publish(2, 2, candidate = true)
+        // The successor is logical authority only; the completed predecessor
+        // remains drawable from its scalar GPU receipt while B uploads.
+        val successorShape = checkNotNull(fixture.owner.candidateDisplayDescriptor()?.shapes)
+        if (!ready.sharesContent(successorShape)) {
+            assertFalse(ready.available)
+            assertFalse(ready.copyPage(
+                ByteBuffer.allocate(16), 0, 1, ByteBuffer.allocate(4), 0, 1,
+            ))
+        }
+        assertFalse(CoverageAttributedDraw.apply(target, fixture.owner, fixture.token, descriptor, ready, true,
+            residentReceipt = predecessorReceipt))
+        assertTrue(target.layerVisible)
+        assertArrayEquals(intArrayOf(3, 0, 0, 0, 3), target.ranges)
         val current = fixture.owner.presentationDescriptor() as PresentationDescriptor
         assertFalse(CoverageAttributedDraw.apply(target, fixture.owner, fixture.token, current, ready, true))
-        assertArrayEquals(intArrayOf(0, 3, 0, 0, 0), target.ranges)
+        target.assertHidden()
         assertFalse(CoverageAttributedDraw.apply(target, fixture.owner, fixture.token, current, ready, false))
+        target.assertHidden()
+        fixture.uploadUntilComplete(); fixture.completePointReceipt(); fixture.promoteCandidate()
+        val promoted = checkNotNull(fixture.owner.presentationDescriptor())
+        val promotedMesh = checkNotNull(fixture.uploads.completedMesh)
+        assertSame(fixture.token, fixture.owner.currentResourceToken())
+        assertNull(fixture.owner.currentCandidateResourceToken())
+        assertNull(fixture.owner.candidateDisplayDescriptor())
+        assertEquals(0, promotedMesh.shapeCount)
+        assertEquals(3, promotedMesh.pointCount)
+        assertEquals(0, promotedMesh.indexCount)
+        assertFalse(CoverageAttributedDraw.apply(target, fixture.owner, fixture.token, promoted, promotedMesh, true))
+        assertTrue(target.layerVisible)
+        assertArrayEquals(intArrayOf(3, 0, 0, 0, 3), target.ranges)
+        assertFalse(CoverageAttributedDraw.apply(
+            target, fixture.owner, predecessorToken, promoted, promotedMesh, true,
+        ))
+        target.assertHidden()
+        assertFalse(CoverageAttributedDraw.apply(target, fixture.owner, fixture.token, promoted, promotedMesh, false))
         target.assertHidden()
         fixture.uploads.close(); fixture.owner.dispose()
     }
@@ -381,8 +673,10 @@ class RendererAttributeHostPathTest {
         assertEquals(token, fixture.owner.currentResourceToken())
         assertEquals(generation, fixture.owner.rendererGeometryStatus()["completedShapeSelectionGeneration"])
         assertEquals(1L, fixture.owner.rendererAttributeSnapshot()["accepted"])
+        val active = checkNotNull(fixture.owner.activeDisplayDescriptor())
+        assertSame(before, active.shapes)
         assertTrue(CoverageAttributedDraw.apply(target, fixture.owner, token,
-            fixture.owner.presentationDescriptor() as PresentationDescriptor, before, true))
+            active, before, true))
         assertTrue(target.layerVisible)
         assertArrayEquals(intArrayOf(3, 0, before.indexCount, before.indexCount, 1), target.ranges)
         fixture.uploads.close(); fixture.owner.dispose()
@@ -392,44 +686,76 @@ class RendererAttributeHostPathTest {
         val palette: CoverageRendererPalette = CoverageRendererPalette.COVERAGE,
         val lowNormalRow: Int = -1, val deferUploads: Boolean = false) {
         val owner = NativeCoverageRendererOwner()
+        private val factory = CoverageRendererResourceFactory(
+            admit = { _, _ -> CoverageRendererResourceAdmission(
+                CoverageRendererTransitionStrategy.COEXIST, 0, 1, 1,
+            ) },
+        )
         var style = header(1)
         val mode = if (balls) CoveragePresentationMode.DIRECTIONAL_BALLS else CoveragePresentationMode.PLANAR_PATCHES
         var token: CoverageResourceToken
+        private var factoryToken: CoverageResourceToken? = null
+        private var uploadToken: CoverageResourceToken? = null
+        private var candidateToken: CoverageResourceToken? = null
+        private var pointReceiptComplete = false
+        private var shapeReceiptComplete = false
         var pages = 0
         var afterPageRead: (() -> Unit)? = null
         private var pendingCompletion: CoverageShapePageCompletion? = null
         private var pendingTicket = 0L
+        private val promotionReadiness = CoveragePromotionReadiness { descriptor ->
+            val candidate = candidateToken
+            candidate != null && pointReceiptComplete && shapeReceiptComplete &&
+                owner.candidateDisplayDescriptor() === descriptor &&
+                owner.completedShapeDrawReceipt(candidate, descriptor) != null
+        }
         val uploads: CoverageShapeUploadOwner = CoverageShapeUploadOwner(CoverageShapePageUploader { _, _, _, _, _, _, ticket, done ->
             pages++
             if (deferUploads) { pendingCompletion = done; pendingTicket = ticket } else done.complete(ticket)
-        }, { owner.presentationDescriptor()?.shapes === it && it.available },
-            { owner.recordCompletedShapeUpload(token, it, uploadsReuse()) }, {})
+        }, { mesh ->
+            val currentToken = uploadToken
+            currentToken != null && owner.acceptsAnyResourceToken(currentToken) &&
+                owner.displayDescriptorFor(currentToken)?.shapes === mesh && mesh.available
+        }, { mesh ->
+            owner.recordCompletedShapeUpload(checkNotNull(uploadToken), mesh, uploadsReuse())
+            shapeReceiptComplete = true
+        }, {})
         private fun uploadsReuse(): Boolean = uploads.completionWasReuse
         init {
             owner.setControls(CoverageRendererControls(true, mode, palette))
             install(1)
             owner.configureRendererAttributes(1, { style }, { true })
             token = checkNotNull(owner.issueResourceToken()); owner.recordShapeResourceCreated(token); owner.markResourceMounted(token)
+            uploadToken = token
+            checkNotNull(factory.replacePoint(
+                VoxelRenderMode.CENTROIDS, rows, "fixture", token = token,
+                create = { _, _, _ -> Any() }, release = {},
+            ))
+            factoryToken = token
         }
         fun reference() = checkNotNull(owner.presentationDescriptor()?.shapes)
         fun bindShapeResource() {
             owner.recordShapeResourceUnmounted(token)
             token = checkNotNull(owner.issueResourceToken())
             owner.recordShapeResourceCreated(token); owner.markResourceMounted(token)
+            uploadToken = token
         }
         private fun header(revision: Long): ByteArray = RendererStyleCutPayloadV1(ByteArray(16) { 7 },
-            1, 1, 1, 1, 1, revision, revision, revision, revision, revision, true,
+            1, 1, revision, 1, 1, revision, revision, revision, revision, revision, true,
             LongArray(rows) { it + 1L }, ByteArray(rows * 16)).canonicalBytes().copyOf(116)
         fun replay(revision: Long) {
             install(revision)
             owner.presentationDescriptor()?.shapes?.let(uploads::offer)
         }
-        private fun install(revision: Long) {
-            owner.installPresentation(candidate(revision), PointCloudNativeConfig(enabled = true,
+        private fun install(revision: Long, modeOverride: CoveragePresentationMode = mode) {
+            owner.installPresentation(candidate(revision, modeOverride = modeOverride), PointCloudNativeConfig(enabled = true,
                 voxelRenderMode = VoxelRenderMode.CENTROIDS, rendererGeneration = 1))
         }
         fun candidate(revision: Long,
-            qualifier: CoverageRowsQualifier = CoverageRowsQualifier(1, 1, 1, 1, 1, revision),
+            qualifier: CoverageRowsQualifier = CoverageRowsQualifier(
+                bindingGeneration = 1, groupGeneration = 1, rendererGeneration = 1,
+                transactionId = revision, geometryRevision = 1, styleRevision = revision,
+            ),
             modeOverride: CoveragePresentationMode = mode,
             paletteOverride: CoverageRendererPalette = palette,
             world: DoubleArray? = DoubleArray(16) { if (it % 5 == 0) 1.0 else 0.0 },
@@ -448,9 +774,30 @@ class RendererAttributeHostPathTest {
                         page.positions[n*3+2] = -2f }; afterPageRead?.invoke(); true },
                 worldFromGroup = world, voxelSizeMeters = cellSize)
         }
-        fun publish(revision: Long, observationClass: Int, expectedCommit: String = "accepted") {
-            style = header(revision); install(revision)
-            val request = RendererAttributeCodec.header(style, 1, 0, if (balls) 2 else 1,
+        private fun prepareCandidate() {
+            val next = checkNotNull(owner.issueCandidateResourceToken())
+            candidateToken = next
+            assertTrue(owner.stageCandidateDisplay(checkNotNull(owner.presentationDescriptor())))
+            checkNotNull(factory.preparePoint(
+                VoxelRenderMode.CENTROIDS, rows, "fixture-candidate", token = next,
+                create = { _, _, _ -> Any() }, release = {},
+            ))
+            owner.recordShapeResourceCreated(next)
+            assertTrue(owner.markCandidateResourceMounted(next))
+            uploadToken = next
+            pointReceiptComplete = false
+            shapeReceiptComplete = false
+        }
+        fun preparePending(revision: Long) { style = header(revision); install(revision); prepareCandidate() }
+        fun attemptPromotion(readiness: CoveragePromotionReadiness): Boolean =
+            CoveragePresentationPromotion.promote(owner, factory, readiness)
+        fun publish(revision: Long, observationClass: Int, expectedCommit: String = "accepted",
+            candidate: Boolean = false, modeOverride: CoveragePresentationMode = mode,
+            installCut: Boolean = true) {
+            style = header(revision); if (installCut) install(revision, modeOverride)
+            if (candidate) prepareCandidate()
+            val request = RendererAttributeCodec.header(style, 1, 0,
+                if (modeOverride == CoveragePresentationMode.DIRECTIONAL_BALLS) 2 else 1,
                 if (palette == CoverageRendererPalette.DIRECTION) 2 else 1, 0)
             val first = owner.exchangeRendererAttributes(request.encode()) as ByteArray
             val selected = RendererAttributeCodec.decode(first).first
@@ -472,11 +819,28 @@ class RendererAttributeHostPathTest {
             assertEquals(expectedCommit, (owner.exchangeRendererAttributes(selected.page(3,0,0,0,0,digest).encode()) as Map<*,*>)["outcome"])
             uploads.offer(reference())
         }
-        fun uploadUntilComplete() { repeat(128) { uploads.onFrame() }; assertNotNull(uploads.completedMesh) }
+        fun uploadUntilComplete() {
+            repeat(128) { uploads.onFrame() }
+            assertNotNull(uploads.completedMesh)
+            shapeReceiptComplete = true
+        }
+        fun completePointReceipt() { pointReceiptComplete = true }
+        fun promoteCandidate(readiness: CoveragePromotionReadiness = promotionReadiness) {
+            val previous = checkNotNull(factoryToken)
+            val next = checkNotNull(candidateToken)
+            assertTrue(CoveragePresentationPromotion.promote(owner, factory, readiness))
+            token = next
+            uploadToken = next
+            candidateToken = null
+            assertTrue(factory.releaseResource(previous))
+            owner.recordShapeResourceUnmounted(previous)
+            factoryToken = next
+        }
         fun completeDelayedUpload() {
             val completion = checkNotNull(pendingCompletion)
             pendingCompletion = null
             completion.complete(pendingTicket)
+            shapeReceiptComplete = true
         }
     }
     private fun ByteArray.hex() = joinToString("") { "%02x".format(it.toInt() and 255) }

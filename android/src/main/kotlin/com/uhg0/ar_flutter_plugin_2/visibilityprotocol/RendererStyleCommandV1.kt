@@ -22,6 +22,7 @@ data class RendererStyleCutPayloadV1(
     val styleRows: ByteArray,
     val targetSurfaceId: Long? = null,
     val targetDirectionIndex: Int? = null,
+    val sparseContext: SparseRendererStyleContextV1? = null,
 ) {
     init {
         require(captureGroupId.size == 16) { "captureGroupId must contain exactly 16 bytes" }

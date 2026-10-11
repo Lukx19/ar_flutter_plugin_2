@@ -1506,14 +1506,14 @@ class VisibilityGridV2BindingTest {
 
     @Test
     fun `snapshot replies capture source health off main before delayed delivery`() {
-        for (method in listOf("bindingSnapshot", "claimBindingLease")) {
+        for (method in listOf("bindingSnapshot", "bindingScalarSnapshot", "claimBindingLease")) {
             assertSnapshotReplySourceHealthRead(method, disposeBeforeDelivery = false)
         }
     }
 
     @Test
     fun `dispose settles materialized snapshot replies once before delayed delivery`() {
-        for (method in listOf("bindingSnapshot", "claimBindingLease")) {
+        for (method in listOf("bindingSnapshot", "bindingScalarSnapshot", "claimBindingLease")) {
             assertSnapshotReplySourceHealthRead(method, disposeBeforeDelivery = true)
         }
     }
@@ -1587,9 +1587,17 @@ class VisibilityGridV2BindingTest {
             if (!disposeBeforeDelivery) {
                 assertEquals(1, result.successCount)
                 val reply = result.successValue as Map<*, *>
-                val health = reply["sourceHealth"] as Map<*, *>
-                assertEquals("configured", health["featureHealth"])
-                assertEquals(false, reply["observationOwnershipReady"])
+                if (method == "bindingScalarSnapshot") {
+                    val source = reply["source"] as Map<*, *>
+                    assertEquals("unsupported", source["depthHealth"])
+                    assertFalse(reply.containsKey("sourceHealth"))
+                    assertFalse(source.containsKey("featureHealth"))
+                    assertEquals(false, (reply["qualifiers"] as Map<*, *>)["observationOwnershipReady"])
+                } else {
+                    val health = reply["sourceHealth"] as Map<*, *>
+                    assertEquals("configured", health["featureHealth"])
+                    assertEquals(false, reply["observationOwnershipReady"])
+                }
             }
         } finally {
             releaseRead.countDown()
@@ -1626,6 +1634,53 @@ class VisibilityGridV2BindingTest {
             val result = RecordingResult()
             MethodChannel(messenger, "visibility_grid_v2_control_1202")
                 .invokeMethod("bindingSnapshot", null, result)
+            assertEquals(0, result.successCount)
+            assertEquals(0, result.errorCount)
+
+            binding.dispose()
+
+            assertTrue(result.completed.await(2, TimeUnit.SECONDS))
+            assertEquals(0, result.successCount)
+            assertEquals(1, result.errorCount)
+            assertEquals("VG_STREAM_BINDING_ABANDONED", result.errorCode)
+
+            release.countDown()
+            assertTrue(executor.awaitTermination(2, TimeUnit.SECONDS))
+            assertEquals(1, result.successCount + result.errorCount)
+        } finally {
+            release.countDown()
+            binding.dispose()
+        }
+    }
+
+    @Test
+    fun `queued scalar snapshot is claimed once when executor shuts down`() {
+        val messenger = MethodTestMessenger()
+        val executor = Executors.newSingleThreadExecutor()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        executor.execute {
+            entered.countDown()
+            try {
+                while (!release.await(10, TimeUnit.MILLISECONDS)) {
+                    // Keep the queued snapshot behind an explicit executor cut.
+                }
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+        }
+        assertTrue(entered.await(2, TimeUnit.SECONDS))
+        val binding = VisibilityGridV2Binding(
+            messenger = messenger,
+            viewId = 1202,
+            CommittedBaselineAuthority = CommittedBaselineAuthority(),
+            executor = executor,
+            postToMain = { task -> task() },
+        )
+        try {
+            val result = RecordingResult()
+            MethodChannel(messenger, "visibility_grid_v2_control_1202")
+                .invokeMethod("bindingScalarSnapshot", null, result)
             assertEquals(0, result.successCount)
             assertEquals(0, result.errorCount)
 

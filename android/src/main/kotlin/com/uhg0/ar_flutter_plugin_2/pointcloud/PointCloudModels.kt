@@ -144,61 +144,13 @@ data class CoverageRendererStyleRowV1(
     }
 
     /** Deterministic ARGB projection used by the current point/cube material. */
-    fun packedColor(): Int {
-        if (cut == CoverageRendererCut.UNAVAILABLE) return 0x00000000
-        if (palette == CoverageRendererPalette.COVERAGE) {
-            when (cut) {
-                CoverageRendererCut.COVERAGE_PENDING -> return 0xffffa000.toInt()
-                CoverageRendererCut.INDETERMINATE_HISTORY -> return 0xff616161.toInt()
-                CoverageRendererCut.UNAVAILABLE -> return 0x00000000
-                CoverageRendererCut.STALE_DISPLAY -> return 0xff8d6e63.toInt()
-                CoverageRendererCut.LOWER_BOUND -> return 0xff5c6bc0.toInt()
-                CoverageRendererCut.EXACT_CURRENT -> Unit
-            }
-        }
-        return when (palette) {
-            CoverageRendererPalette.UNIFORM -> 0xffffffff.toInt()
-            CoverageRendererPalette.COVERAGE -> when (coverage) {
-                CoverageRendererCoverage.UNCOVERED -> 0xffd50000.toInt()
-                CoverageRendererCoverage.PARTIAL -> 0xffffab00.toInt()
-                CoverageRendererCoverage.COMPLETE -> 0xff00c853.toInt()
-            }
-            CoverageRendererPalette.NORMAL -> 0xff42a5f5.toInt()
-            CoverageRendererPalette.OCCUPANCY -> when (semantic) {
-                CoverageRendererSemantic.CONFIRMED -> 0xff1e88e5.toInt()
-                CoverageRendererSemantic.AMBIGUOUS -> 0xfffb8c00.toInt()
-                CoverageRendererSemantic.SUPPRESSED_DEBUG -> 0xff8e24aa.toInt()
-            }
-            CoverageRendererPalette.LINEAGE -> when (lineageCount) {
-                0 -> 0xff78909c.toInt()
-                1 -> 0xff3949ab.toInt()
-                else -> 0xff6a1b9a.toInt()
-            }
-            CoverageRendererPalette.AGE -> when (age) {
-                CoverageRendererAge.FRESH -> 0xff440154.toInt()
-                CoverageRendererAge.RECENT -> 0xff31688e.toInt()
-                CoverageRendererAge.AGING -> 0xff35b779.toInt()
-                CoverageRendererAge.OLD -> 0xfffde725.toInt()
-            }
-            CoverageRendererPalette.SOURCE_HEALTH -> when (sourceHealth) {
-                CoverageRendererSourceHealth.HEALTHY -> 0xff00c853.toInt()
-                CoverageRendererSourceHealth.FEATURE_ONLY -> 0xff039be5.toInt()
-                CoverageRendererSourceHealth.TRANSIENT_UNAVAILABLE -> 0xffffa000.toInt()
-                CoverageRendererSourceHealth.FAILED -> 0xffd50000.toInt()
-                CoverageRendererSourceHealth.UNSUPPORTED -> 0xff757575.toInt()
-            }
-            CoverageRendererPalette.RESIDENCY -> when (residency) {
-                CoverageRendererResidency.ACTIVE_L0 -> 0xff26a69a.toInt()
-                CoverageRendererResidency.WARM_L1 -> 0xffffb300.toInt()
-                CoverageRendererResidency.COLD_L2 -> 0xff78909c.toInt()
-            }
-            CoverageRendererPalette.DIRECTION -> when (directionBin / 8) {
-                0 -> 0xff5c6bc0.toInt()
-                1 -> 0xff29b6f6.toInt()
-                else -> 0xff26a69a.toInt()
-            }
-        }
-    }
+    fun packedColor(): Int = packedColor(age)
+
+    /** Overrides only freshness, retaining the shared cut and palette precedence. */
+    fun packedColor(ageOverride: CoverageRendererAge): Int = projectPackedColor(
+        semantic, coverage, palette, cut, residency, directionBin, lineageCount,
+        ageOverride, sourceHealth,
+    )
 
     companion object {
         /** Full row validation without constructing a DTO, including rows with no glyph. */
@@ -237,44 +189,91 @@ data class CoverageRendererStyleRowV1(
         }
 
         /** Same validated color projection as [packedColor], without a row DTO. */
-        internal fun validatedPackedColor(bytes: ByteArray, offset: Int = 0): Int {
+        internal fun validatedPackedColor(bytes: ByteArray, offset: Int = 0): Int =
+            validatedPackedColor(bytes, offset, -1)
+
+        /** An override of -1 keeps the encoded age; other valid overrides are byte codes 0-3. */
+        internal fun validatedPackedColor(bytes: ByteArray, offset: Int, ageOverride: Int): Int {
             validateEncoded(bytes, offset)
+            require(ageOverride in -1..3)
             val flags = bytes[offset + 1].u8()
             val paletteCut = bytes[offset + 2].u8()
             val glyphAgeHealth = bytes[offset + 3].u8()
-            if (((paletteCut ushr 4) and 7) == CoverageRendererCut.UNAVAILABLE.code) return 0x00000000
-            if ((paletteCut and 15) == CoverageRendererPalette.COVERAGE.code) when ((paletteCut ushr 4) and 7) {
-                1 -> return 0xff8d6e63.toInt()
-                2 -> return 0xff5c6bc0.toInt()
-                3 -> return 0xffffa000.toInt()
-                4 -> return 0xff616161.toInt()
-                5 -> return 0x00000000
+            return projectPackedColor(
+                semanticByCode(flags and 3),
+                coverageByCode((flags ushr 2) and 3),
+                paletteByCode(paletteCut and 15),
+                cutByCode((paletteCut ushr 4) and 7),
+                residencyByCode((flags ushr 4) and 3),
+                bytes[offset + 4].u8(),
+                u16(bytes, offset + 6),
+                ageByCode(if (ageOverride >= 0) ageOverride else ((glyphAgeHealth ushr 2) and 3)),
+                sourceHealthByCode((glyphAgeHealth ushr 4) and 7),
+            )
+        }
+
+        private fun projectPackedColor(
+            semantic: CoverageRendererSemantic,
+            coverage: CoverageRendererCoverage,
+            palette: CoverageRendererPalette,
+            cut: CoverageRendererCut,
+            residency: CoverageRendererResidency,
+            directionBin: Int,
+            lineageCount: Int,
+            age: CoverageRendererAge,
+            sourceHealth: CoverageRendererSourceHealth,
+        ): Int {
+            if (cut == CoverageRendererCut.UNAVAILABLE) return 0x00000000
+            if (palette == CoverageRendererPalette.COVERAGE) {
+                when (cut) {
+                    CoverageRendererCut.COVERAGE_PENDING -> return 0xffffa000.toInt()
+                    CoverageRendererCut.INDETERMINATE_HISTORY -> return 0xff616161.toInt()
+                    CoverageRendererCut.UNAVAILABLE -> return 0x00000000
+                    CoverageRendererCut.STALE_DISPLAY -> return 0xff8d6e63.toInt()
+                    CoverageRendererCut.LOWER_BOUND -> return 0xff5c6bc0.toInt()
+                    CoverageRendererCut.EXACT_CURRENT -> Unit
+                }
             }
-            return when (paletteCut and 15) {
-                0 -> 0xffffffff.toInt()
-                1 -> when ((flags ushr 2) and 3) {
-                    0 -> 0xffd50000.toInt(); 1 -> 0xffffab00.toInt(); else -> 0xff00c853.toInt()
+            return when (palette) {
+                CoverageRendererPalette.UNIFORM -> 0xffffffff.toInt()
+                CoverageRendererPalette.COVERAGE -> when (coverage) {
+                    CoverageRendererCoverage.UNCOVERED -> 0xffd50000.toInt()
+                    CoverageRendererCoverage.PARTIAL -> 0xffffab00.toInt()
+                    CoverageRendererCoverage.COMPLETE -> 0xff00c853.toInt()
                 }
-                2 -> 0xff42a5f5.toInt()
-                3 -> when (flags and 3) {
-                    0 -> 0xff1e88e5.toInt(); 1 -> 0xfffb8c00.toInt(); else -> 0xff8e24aa.toInt()
+                CoverageRendererPalette.NORMAL -> 0xff42a5f5.toInt()
+                CoverageRendererPalette.OCCUPANCY -> when (semantic) {
+                    CoverageRendererSemantic.CONFIRMED -> 0xff1e88e5.toInt()
+                    CoverageRendererSemantic.AMBIGUOUS -> 0xfffb8c00.toInt()
+                    CoverageRendererSemantic.SUPPRESSED_DEBUG -> 0xff8e24aa.toInt()
                 }
-                4 -> when (u16(bytes, offset + 6)) {
-                    0 -> 0xff78909c.toInt(); 1 -> 0xff3949ab.toInt(); else -> 0xff6a1b9a.toInt()
+                CoverageRendererPalette.LINEAGE -> when (lineageCount) {
+                    0 -> 0xff78909c.toInt()
+                    1 -> 0xff3949ab.toInt()
+                    else -> 0xff6a1b9a.toInt()
                 }
-                5 -> when ((glyphAgeHealth ushr 2) and 3) {
-                    0 -> 0xff440154.toInt(); 1 -> 0xff31688e.toInt()
-                    2 -> 0xff35b779.toInt(); else -> 0xfffde725.toInt()
+                CoverageRendererPalette.AGE -> when (age) {
+                    CoverageRendererAge.FRESH -> 0xff440154.toInt()
+                    CoverageRendererAge.RECENT -> 0xff31688e.toInt()
+                    CoverageRendererAge.AGING -> 0xff35b779.toInt()
+                    CoverageRendererAge.OLD -> 0xfffde725.toInt()
                 }
-                6 -> when ((glyphAgeHealth ushr 4) and 7) {
-                    0 -> 0xff00c853.toInt(); 1 -> 0xff039be5.toInt(); 2 -> 0xffffa000.toInt()
-                    3 -> 0xffd50000.toInt(); else -> 0xff757575.toInt()
+                CoverageRendererPalette.SOURCE_HEALTH -> when (sourceHealth) {
+                    CoverageRendererSourceHealth.HEALTHY -> 0xff00c853.toInt()
+                    CoverageRendererSourceHealth.FEATURE_ONLY -> 0xff039be5.toInt()
+                    CoverageRendererSourceHealth.TRANSIENT_UNAVAILABLE -> 0xffffa000.toInt()
+                    CoverageRendererSourceHealth.FAILED -> 0xffd50000.toInt()
+                    CoverageRendererSourceHealth.UNSUPPORTED -> 0xff757575.toInt()
                 }
-                7 -> when ((flags ushr 4) and 3) {
-                    0 -> 0xff26a69a.toInt(); 1 -> 0xffffb300.toInt(); else -> 0xff78909c.toInt()
+                CoverageRendererPalette.RESIDENCY -> when (residency) {
+                    CoverageRendererResidency.ACTIVE_L0 -> 0xff26a69a.toInt()
+                    CoverageRendererResidency.WARM_L1 -> 0xffffb300.toInt()
+                    CoverageRendererResidency.COLD_L2 -> 0xff78909c.toInt()
                 }
-                else -> when (bytes[offset + 4].u8() / 8) {
-                    0 -> 0xff5c6bc0.toInt(); 1 -> 0xff29b6f6.toInt(); else -> 0xff26a69a.toInt()
+                CoverageRendererPalette.DIRECTION -> when (directionBin / 8) {
+                    0 -> 0xff5c6bc0.toInt()
+                    1 -> 0xff29b6f6.toInt()
+                    else -> 0xff26a69a.toInt()
                 }
             }
         }

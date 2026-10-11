@@ -38,6 +38,8 @@ internal class RendererTelemetry {
     private var resourceAcquisitionCount = 0
     private var resourceDisposalCount = 0
     private var resourceFailureCount = 0
+    private var lastResourceFailureStage = "none"
+    private var lastResourceFailureClass = "none"
     private var lastAdmissionStrategy = "none"
     private var lastAdmissionCurrentBytes = 0
     private var lastAdmissionCandidateBytes = 0
@@ -84,6 +86,29 @@ internal class RendererTelemetry {
     fun recordResourceFailure() {
         resourceFailureCount++
     }
+
+    @Synchronized
+    fun recordResourceFailureDetail(stage: String, exceptionClass: String) {
+        lastResourceFailureStage = stage.take(32)
+        lastResourceFailureClass = exceptionClass.take(96)
+    }
+
+    /** Fixed scalar-only projection; no timing windows, arrays, receipts or owner tables. */
+    @Synchronized
+    fun resourceScalarSnapshot(): Map<String, Any?> = mapOf(
+        "resourcesAcquired" to resourceAcquisitionCount,
+        "resourceFailureCount" to resourceFailureCount,
+        "resourceReplacementCount" to resourceReplacementCount,
+        "resourceDisposalCount" to resourceDisposalCount,
+        "lastResourceFailureStage" to lastResourceFailureStage,
+        "lastResourceFailureClass" to lastResourceFailureClass,
+        "lastAdmissionStrategy" to lastAdmissionStrategy,
+        "lastAdmissionCurrentBytes" to lastAdmissionCurrentBytes,
+        "lastAdmissionCandidateBytes" to lastAdmissionCandidateBytes,
+        "lastAdmissionCombinedBytes" to lastAdmissionCombinedBytes,
+        "uploadPageSubmissionCount" to uploadPageSubmissionCount.get(),
+        "completedUploadCount" to completedUploadCount,
+    )
 
     @Synchronized
     fun recordResourceAdmission(admission: CoverageRendererResourceAdmission) {
@@ -423,6 +448,7 @@ private fun CoverageRendererOwnershipReceipt.asMap(): Map<String, Any> = mapOf(
     "pageReaderCapturedMappingBytes" to pageReaderCapturedMappingBytes,
     "stagingBytes" to stagingBytes,
     "meshBytes" to meshBytes,
+    "commonPresentationMetadataBytes" to commonPresentationMetadataBytes,
     "totalBytes" to totalBytes,
     "combinedRendererOwnedLimitBytes" to combinedRendererOwnedLimitBytes,
     "transitionHeadroomBytes" to transitionHeadroomBytes,

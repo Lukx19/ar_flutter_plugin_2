@@ -10,7 +10,13 @@ internal class PreparedCoverageShapeReference internal constructor(
     private val owner: PreparedCoverageShapeOwner,
     private val contentGeneration: Long,
 ) {
+    /** Portable CPU geometry bytes retained by the owner while a candidate is frozen. */
+    internal val portableSourceBytes: Long = 64L +
+        (vertexCount + pointCount) * (3L * Float.SIZE_BYTES + Int.SIZE_BYTES) +
+        indexCount * Int.SIZE_BYTES
     val available: Boolean get() = owner.currentContentGeneration == contentGeneration
+    internal fun retainForUpload(): Boolean = owner.retain(contentGeneration)
+    internal fun releaseUploadLease() { owner.release(contentGeneration) }
     fun sharesContent(other: PreparedCoverageShapeReference): Boolean =
         owner === other.owner && contentGeneration == other.contentGeneration
     fun copyPage(vertices: ByteBuffer, firstVertex: Int, vertexCount: Int,
@@ -33,6 +39,7 @@ internal class PreparedCoverageShapeOwner {
     @Volatile var currentContentGeneration = 0L
         private set
     private var contentSequence = 0L
+    private val uploadLeases = mutableMapOf<Long, Int>()
     var maxBodies = 0
         private set
 
@@ -40,6 +47,10 @@ internal class PreparedCoverageShapeOwner {
         gate.lock()
         try {
             if (building) return false
+            // A candidate is copying this body into its hidden GPU generation.
+            // Refuse a new producer until that bounded lease is released;
+            // otherwise a newer CPU body would silently invalidate held pages.
+            if (uploadLeases.isNotEmpty()) return false
             building = true
             maxBodies = maxOf(maxBodies, (if (body != null) 1 else 0) + 1)
             check(maxBodies <= 2)
@@ -78,7 +89,35 @@ internal class PreparedCoverageShapeOwner {
                 geometry.vertexCount, geometry.indexCount, this, currentContentGeneration)
         } finally { gate.unlock() }
     }
-    fun invalidate() { gate.lock(); try { body = null; currentSelection = 0; currentContentGeneration = 0 } finally { gate.unlock() } }
+    fun invalidate() {
+        gate.lock()
+        try {
+            // A hidden candidate may still be copying this immutable body.
+            // Keep the backing bytes until its upload lease is released;
+            // descriptors alone cannot keep the source alive.
+            if (uploadLeases.isNotEmpty()) return
+            body = null; currentSelection = 0; currentContentGeneration = 0
+        } finally { gate.unlock() }
+    }
+
+    internal fun retain(generation: Long): Boolean {
+        gate.lock()
+        return try {
+            if (currentContentGeneration != generation || body == null) false
+            else {
+                uploadLeases[generation] = (uploadLeases[generation] ?: 0) + 1
+                true
+            }
+        } finally { gate.unlock() }
+    }
+
+    internal fun release(generation: Long) {
+        gate.lock()
+        try {
+            val count = uploadLeases[generation] ?: return
+            if (count == 1) uploadLeases.remove(generation) else uploadLeases[generation] = count - 1
+        } finally { gate.unlock() }
+    }
 
     fun copyPage(selection: Long, vertices: ByteBuffer, firstVertex: Int, vertexCount: Int,
         indices: ByteBuffer, firstIndex: Int, indexCount: Int): Boolean {

@@ -113,6 +113,57 @@ internal data class CoverageResourceToken(
     }
 }
 
+/** Identity of a resource's display role. Logical authority is separate. */
+internal enum class CoverageDisplayRole { ACTIVE, CANDIDATE }
+
+internal data class CoverageShapeDrawReceipt(
+    val selectionGeneration: Long,
+    val total: Int,
+    val vertexCount: Int,
+    val indexCount: Int,
+    val pointCount: Int,
+    val shapeCount: Int,
+)
+
+/** Compact GPU display identity retained after its CPU descriptor is released. */
+internal data class CoverageDisplayResidencyReceipt(
+    val tokenEpoch: Long,
+    val qualifier: CoverageRowsQualifier,
+    val mode: CoveragePresentationMode,
+    val palette: CoveragePalette,
+    val enabled: Boolean,
+    val count: Int,
+    val glyphCount: Int,
+    val shape: CoverageShapeDrawReceipt?,
+    val observationColorsMeaningful: Boolean,
+    val targetSurfaceId: Long? = null,
+    val targetDirectionIndex: Int? = null,
+    val sealedAtNanos: Long = 0L,
+    val holdUntilNanos: Long? = null,
+)
+
+/** Constant-size admission fence; no descriptor/backing or shape body retained. */
+internal class CoveragePresentationValidity(
+    descriptor: BoundedCoveragePresentation,
+    val lifecycleEpoch: Long,
+    admittedAtNanos: Long,
+    val config: PointCloudNativeConfig,
+) {
+    val qualifier = descriptor.qualifier
+    val mode = descriptor.mode
+    val palette = descriptor.palette
+    val paletteEpoch = descriptor.paletteEpoch
+    val targetSurfaceId = descriptor.targetSurfaceId
+    val targetDirectionIndex = descriptor.targetDirectionIndex
+    val worldFromGroup = descriptor.worldFromGroup?.copyOf()
+    val voxelSizeMeters = descriptor.voxelSizeMeters
+    val targetUntilNanos = if (targetSurfaceId != null) admittedAtNanos + 500_000_000L else null
+    private var olderUntilNanos: Long? = null
+    fun markOlder(nowNanos: Long) { if (olderUntilNanos == null) olderUntilNanos = nowNanos + 500_000_000L }
+    fun deadline(): Long? = targetUntilNanos?.let { minOf(it, olderUntilNanos ?: it) } ?: olderUntilNanos
+    fun isUnexpired(nowNanos: Long): Boolean = deadline()?.let { nowNanos < it } ?: true
+}
+
 /** One immutable row in the latest fully committed presentation cut. */
 internal data class VisibilityRendererRow(
     val surfaceId: Long,
@@ -424,7 +475,22 @@ internal class NativeCoverageRendererOwner(
         CoverageWorldToScreenProjection { x, y, _ -> CoverageScreenPoint(x, y, 1f) },
     private val committedRowsBorrower: CoverageCommittedRowsBorrower? = null,
     private val onSelectionChanged: ((changedRows: Int, residentRows: Int) -> Unit)? = null,
+    private val clockNanos: () -> Long = System::nanoTime,
 ) : CoverageRendererOwner {
+    private companion object {
+        const val OLDER_DISPLAY_HOLD_NANOS = 500_000_000L
+        const val HIT_RADIUS_PX = 32.0
+    }
+
+    private fun qualifierAdvanced(current: CoverageRowsQualifier, prior: CoverageRowsQualifier): Boolean {
+        if (current.bindingGeneration != prior.bindingGeneration) return current.bindingGeneration > prior.bindingGeneration
+        if (current.groupGeneration != prior.groupGeneration) return current.groupGeneration > prior.groupGeneration
+        if (current.transactionId != prior.transactionId) return current.transactionId > prior.transactionId
+        if (current.geometryRevision != prior.geometryRevision) return current.geometryRevision > prior.geometryRevision
+        if (current.styleRevision != prior.styleRevision) return current.styleRevision > prior.styleRevision
+        return current.rendererGeneration > prior.rendererGeneration
+    }
+
     private var latest: CoverageRendererCutMetadata? = null
     private var controls = CoverageRendererControls(
         visible = true,
@@ -446,6 +512,16 @@ internal class NativeCoverageRendererOwner(
     private var lastAcceptedQualifier: InstallQualifier? = null
     private var presentationPlan: CoveragePresentationPlan? = null
     private var latestPresentationDescriptor: PresentationDescriptor? = null
+    /** Last whole presentation admitted to the visible GPU role. */
+    private var activeDisplayDescriptor: BoundedCoveragePresentation? = null
+    /** At most one bounded successor may retain a display descriptor. */
+    private var candidateDisplayDescriptor: BoundedCoveragePresentation? = null
+    private var activeDisplayReceipt: CoverageDisplayResidencyReceipt? = null
+    private var activeValidity: CoveragePresentationValidity? = null
+    private var candidateValidity: CoveragePresentationValidity? = null
+    private var latestDisplayConfig: PointCloudNativeConfig? = null
+    private var latestAdmittedAtNanos = 0L
+    private var lifecycleEpoch = 0L
     private val presentationSelector =
         CoveragePresentationSelector(
             CoverageRendererLimits.CENTROID_CAPACITY,
@@ -454,6 +530,7 @@ internal class NativeCoverageRendererOwner(
     private var selectorEpoch: SelectorEpoch? = null
     private var resourceEpoch = 0L
     private var resourceToken: CoverageResourceToken? = null
+    private var candidateResourceToken: CoverageResourceToken? = null
     private var attributeAuthority: (() -> ByteArray?)? = null
     private var attributeBudget: (Long) -> Boolean = { false }
     private var attributeBinding = 0L
@@ -463,6 +540,7 @@ internal class NativeCoverageRendererOwner(
     private var completedShapeSelection = 0L
     private var completedShapeVertices = 0
     private var completedShapeIndices = 0
+    private val shapeResidentReceipts = linkedMapOf<Long, CoverageShapeDrawReceipt>()
     private val shapeResourceTokens = linkedSetOf<CoverageResourceToken>()
     private val shapeUploadMeasurement = CoverageShapeUploadMeasurement()
     private val shapeDrawingToken = java.util.concurrent.atomic.AtomicLong()
@@ -496,13 +574,41 @@ internal class NativeCoverageRendererOwner(
     }
     @Synchronized internal fun recordCompletedShapeUpload(token: CoverageResourceToken, mesh: PreparedCoverageShapeReference,
         reuse: Boolean = false) {
-        if (!acceptsResourceToken(token) || latestPresentationDescriptor?.shapes !== mesh) return
+        val accepted = acceptsResourceToken(token) || acceptsCandidateResourceToken(token)
+        val descriptor = if (acceptsCandidateResourceToken(token)) candidateDisplayDescriptor
+            else activeDisplayDescriptor
+        if (!accepted || descriptor?.shapes !== mesh) return
         completedShapeResource = token.epoch
         completedShapeSelection = mesh.header.selectionGeneration
         completedShapeVertices = mesh.vertexCount
         completedShapeIndices = mesh.indexCount
+        shapeResidentReceipts[token.epoch] = CoverageShapeDrawReceipt(
+            selectionGeneration = mesh.header.selectionGeneration,
+            total = mesh.header.total,
+            vertexCount = mesh.vertexCount,
+            indexCount = mesh.indexCount,
+            pointCount = mesh.pointCount,
+            shapeCount = mesh.shapeCount,
+        )
         shapeUploadMeasurement.completed(System.nanoTime(), token.epoch, mesh.header.selectionGeneration,
             mesh.header.shape, mesh.shapeCount, reuse)
+    }
+    @Synchronized
+    internal fun completedShapeDrawReceipt(
+        token: CoverageResourceToken,
+        descriptor: PresentationDescriptor?,
+    ): CoverageShapeDrawReceipt? {
+        if (!(acceptsResourceToken(token) || acceptsCandidateResourceToken(token))) return null
+        val shape = descriptor?.shapes ?: return null
+        val selection = descriptor.attributes?.selectionGeneration ?: return null
+        return shapeResidentReceipts[token.epoch]?.takeIf {
+            it.selectionGeneration == selection &&
+                it.total == shape.header.total &&
+                it.vertexCount == shape.vertexCount &&
+                it.indexCount == shape.indexCount &&
+                it.pointCount == shape.pointCount &&
+                it.shapeCount == shape.shapeCount
+        }
     }
     internal fun beginShapeMeasurementWindow() { shapeUploadMeasurement.begin(System.nanoTime()) }
     internal fun endShapeMeasurementWindow() { shapeUploadMeasurement.freeze(System::nanoTime) }
@@ -517,6 +623,7 @@ internal class NativeCoverageRendererOwner(
     }
     @Synchronized internal fun recordShapeResourceUnmounted(token: CoverageResourceToken) {
         shapeResourceTokens.remove(token)
+        shapeResidentReceipts.remove(token.epoch)
         shapeDrawingToken.compareAndSet(token.epoch, 0)
         if (completedShapeResource != token.epoch) return
         completedShapeResource = 0; completedShapeSelection = 0
@@ -550,7 +657,14 @@ internal class NativeCoverageRendererOwner(
                 shapeBodies.cancel(); return@synchronized false
             }
             val reference = shapeBodies.commit(mesh, matchingGeneration)
-            latestPresentationDescriptor = descriptor.withAttributes(reference.header, reference)
+            val updated = descriptor.withAttributes(reference.header, reference)
+            latestPresentationDescriptor = updated
+            if (activeDisplayDescriptor?.qualifier == updated.qualifier) {
+                activeDisplayDescriptor = updated
+            }
+            if (candidateDisplayDescriptor?.qualifier == updated.qualifier) {
+                candidateDisplayDescriptor = updated
+            }
             notifyPresentationChanged()
             true
         }
@@ -560,38 +674,62 @@ internal class NativeCoverageRendererOwner(
         val attributeOutcome = attributeOwner.currentOutcome()
         return synchronized(this) {
         val descriptor = latestPresentationDescriptor
-        val geometryMode = controls.mode == CoveragePresentationMode.PLANAR_PATCHES ||
-            controls.mode == CoveragePresentationMode.DIRECTIONAL_BALLS
-        val mesh = descriptor?.shapes
-        val available = geometryMode && mesh != null && mesh.available && mesh.shapeCount > 0 && descriptor.enabled
+        // Latest authority may advance while the active GPU pair is still
+        // mounted.  Once the source aliases are released, the compact receipt
+        // is the only display identity left and must stay authoritative until
+        // the successor is promoted.
+        val display = activeDisplayDescriptor
+        val displayReceipt = resourceToken?.let { activeDisplayResidencyReceipt(it) }
+        val displayVisible = resourceToken?.let { isDisplayResidencyVisible(it) } ?: true
+        val displayMode = display?.mode ?: displayReceipt?.mode ?: controls.mode
+        val geometryMode = displayMode == CoveragePresentationMode.PLANAR_PATCHES ||
+            displayMode == CoveragePresentationMode.DIRECTIONAL_BALLS
+        val mesh = display?.shapes
+        val activeReceipt = resourceToken?.let { shapeResidentReceipts[it.epoch] } ?: displayReceipt?.shape
+        val resident = if (display != null && resourceToken != null) {
+            completedShapeDrawReceipt(resourceToken!!, display) ?: activeReceipt
+        } else activeReceipt
+        val residentAvailable = geometryMode && resident?.shapeCount?.let { it > 0 } == true &&
+            (display?.enabled ?: displayReceipt?.enabled ?: false)
+        val sourceAvailable = geometryMode && mesh != null && mesh.available &&
+            mesh.shapeCount > 0 && display?.enabled == true
+        val available = displayVisible && if (resident != null) residentAvailable else sourceAvailable
         val mounted = resourceMounted && resourceToken in shapeResourceTokens
-        val uploaded = available && mounted && resourceToken?.epoch == completedShapeResource &&
-            descriptor?.attributes?.selectionGeneration == completedShapeSelection
-        val fallback = geometryMode && !uploaded
-        val pointRows = (mesh?.pointCount ?: 0) + if (mesh != null) (descriptor.count - mesh.header.total).coerceAtLeast(0) else 0
-        val outcome = if (uploaded) { if (pointRows > 0) "partial" else "accepted" }
+        val uploaded = available && mounted && resident != null
+        val fallback = controls.mode == CoveragePresentationMode.PLANAR_PATCHES ||
+            controls.mode == CoveragePresentationMode.DIRECTIONAL_BALLS
+        val pointRows = (resident?.pointCount ?: mesh?.pointCount ?: displayReceipt?.shape?.pointCount ?: 0) +
+            if (mesh != null) ((display?.count ?: 0) - (resident?.total ?: mesh.header.total)).coerceAtLeast(0) else 0
+        val outcome = if (!displayVisible && displayReceipt?.targetSurfaceId != null) "targetExpiredOrContradicted"
+            else if (uploaded) { if (pointRows > 0) "partial" else "accepted" }
             else if (available) "receiving"
             else if (!geometryMode) "unavailable" else if (mesh != null && !mesh.available) "staleCut" else attributeOutcome
         mapOf("rendererGeometrySupported" to (attributeAuthority != null),
             "requestedMode" to controls.mode.wireName,
-            "effectiveMode" to (if (fallback) CoveragePresentationMode.RAW_FEATURES else controls.mode).wireName,
+            "latestPresentationRevision" to (descriptor?.qualifier?.transactionId ?: latest?.transactionId ?: 0L),
+            "activePresentationRevision" to (display?.qualifier?.transactionId ?: displayReceipt?.qualifier?.transactionId ?: 0L),
+            "candidatePresentationRevision" to (candidateDisplayDescriptor?.qualifier?.transactionId ?: 0L),
+            "activeDisplayMode" to displayMode.wireName,
+            "effectiveMode" to (if (uploaded) displayMode else if (fallback) CoveragePresentationMode.RAW_FEATURES else controls.mode).wireName,
             "basisAvailable" to available, "basisOutcome" to outcome,
-            "shapeCount" to (mesh?.shapeCount ?: 0), "shapePointFallbackCount" to pointRows,
-            "selectedAttributeRows" to (mesh?.header?.total ?: 0),
+            "shapeCount" to (mesh?.shapeCount ?: displayReceipt?.shape?.shapeCount ?: 0), "shapePointFallbackCount" to pointRows,
+            "selectedAttributeRows" to (mesh?.header?.total ?: displayReceipt?.shape?.total ?: 0),
             "requestedAttributeRows" to attributeOwner.requestedRows,
-            "fundedAttributeRows" to (mesh?.header?.total ?: attributeOwner.fundedRows),
+            "fundedAttributeRows" to (mesh?.header?.total ?: displayReceipt?.shape?.total ?: attributeOwner.fundedRows),
             "rendererAttributeModeledCpuBytes" to attributeOwner.fundedModeledBytes,
-            "shapeVertexCount" to (mesh?.vertexCount ?: 0), "shapeIndexCount" to (mesh?.indexCount ?: 0),
+            "shapeVertexCount" to (mesh?.vertexCount ?: displayReceipt?.shape?.vertexCount ?: 0), "shapeIndexCount" to (mesh?.indexCount ?: displayReceipt?.shape?.indexCount ?: 0),
             "currentShapeResourceGeneration" to (resourceToken?.epoch ?: 0),
-            "currentShapeSelectionGeneration" to (descriptor?.attributes?.selectionGeneration ?: 0),
-            "completedShapeUploadGeneration" to completedShapeResource,
-            "completedShapeSelectionGeneration" to completedShapeSelection,
-            "completedShapeVertexCount" to completedShapeVertices,
-            "completedShapeIndexCount" to completedShapeIndices,
+            "currentShapeSelectionGeneration" to (display?.attributes?.selectionGeneration ?: displayReceipt?.shape?.selectionGeneration ?: 0),
+            "completedShapeUploadGeneration" to (activeReceipt?.let { resourceToken?.epoch } ?: 0L),
+            "completedShapeSelectionGeneration" to (activeReceipt?.selectionGeneration ?: 0L),
+            "completedShapeVertexCount" to (activeReceipt?.vertexCount ?: 0),
+            "completedShapeIndexCount" to (activeReceipt?.indexCount ?: 0),
             "currentShapeResourceMounted" to (geometryMode && mounted && !disposed),
-            "rendererObservationColorsMeaningful" to (uploaded && controls.mode == CoveragePresentationMode.DIRECTIONAL_BALLS &&
-                controls.palette != CoveragePalette.UNIFORM && descriptor?.attributes?.color == RendererAttributeCodec.OBSERVATIONS),
-            "approximateCellCenterPatches" to (controls.mode == CoveragePresentationMode.PLANAR_PATCHES))
+            "rendererObservationColorsMeaningful" to (uploaded && displayMode == CoveragePresentationMode.DIRECTIONAL_BALLS &&
+                controls.palette != CoveragePalette.UNIFORM &&
+                (display?.attributes?.color == RendererAttributeCodec.OBSERVATIONS ||
+                    displayReceipt?.observationColorsMeaningful == true)),
+            "approximateCellCenterPatches" to (displayMode == CoveragePresentationMode.PLANAR_PATCHES))
         }
     }
 
@@ -846,6 +984,21 @@ internal class NativeCoverageRendererOwner(
         )
         lastAcceptedQualifier = qualifier
         latestPresentationDescriptor = presentation
+        latestDisplayConfig = config
+        val now = clockNanos()
+        if (previous == null || previous.qualifier != presentation.qualifier ||
+            previous.paletteEpoch != presentation.paletteEpoch) latestAdmittedAtNanos = now
+        activeValidity?.let {
+            if (qualifierAdvanced(presentation.qualifier, it.qualifier)) {
+                it.markOlder(now)
+                activeDisplayReceipt = activeDisplayReceipt?.copy(holdUntilNanos = it.deadline())
+            }
+        }
+        candidateValidity?.let { if (qualifierAdvanced(presentation.qualifier, it.qualifier)) it.markOlder(now) }
+        if (activeDisplayDescriptor == null && activeDisplayReceipt == null && candidateDisplayDescriptor == null) {
+            activeDisplayDescriptor = presentation
+            activeValidity = CoveragePresentationValidity(presentation, lifecycleEpoch, now, config)
+        }
         presentationPlan = null
         return RendererInstallReceipt(
             installed = !unavailable && resourceMounted,
@@ -920,7 +1073,18 @@ internal class NativeCoverageRendererOwner(
             paletteRevision++
         }
         this.controls = controls
-        if (modeChanged) { resourceToken = null; currentShapeTokenEpoch = 0 }
+        latestDisplayConfig = latestDisplayConfig?.copy(enabled = controls.visible,
+            voxelRenderMode = controls.mode.toVoxelRenderMode())
+        if (modeChanged) {
+            // A mode change invalidates the frozen candidate's resource mode;
+            // ordinary newer canonical cuts leave it intact until promotion.
+            candidateResourceToken = null
+            candidateDisplayDescriptor = null
+            candidateValidity = null
+        }
+        // A mode change prepares a candidate; keep the completed active token
+        // valid until an atomic promotion fences its old binding.
+        if (modeChanged) { currentShapeTokenEpoch = resourceToken?.epoch ?: 0L }
         controlsConfigured = true
         recomputePresentationPlan(
             explicitResync = modeChanged,
@@ -1046,6 +1210,7 @@ internal class NativeCoverageRendererOwner(
             if (disposed) return
             resetPresentationSelector()
             lifecyclePaused = true
+            lifecycleEpoch++
             unavailable = true
             recoveryPending = true
             recoveryRequestOutstanding = false
@@ -1138,11 +1303,26 @@ internal class NativeCoverageRendererOwner(
         val existing = resourceToken
         if (existing != null &&
             existing.sourceRendererGeneration == current.rendererGeneration &&
-            existing.mode == controls.mode
+            (existing.mode == controls.mode || candidateResourceToken != null)
         ) {
             return existing
         }
         return createResourceToken(current.rendererGeneration, controls.mode)
+    }
+
+    /** Issues a second, bounded identity without replacing the active token. */
+    @Synchronized
+    fun issueCandidateResourceToken(): CoverageResourceToken? {
+        val current = latest ?: return null
+        if (disposed) return null
+        val existing = candidateResourceToken
+        if (existing != null && existing.sourceRendererGeneration == current.rendererGeneration &&
+            existing.mode == controls.mode
+        ) return existing
+        if (candidateResourceToken != null) return null
+        return CoverageResourceToken(++resourceEpoch, current.rendererGeneration, controls.mode).also {
+            candidateResourceToken = it
+        }
     }
 
     /** Forces a new owner lifetime without changing the semantic source cut. */
@@ -1150,6 +1330,13 @@ internal class NativeCoverageRendererOwner(
     fun requestResourceReplacement(): CoverageResourceToken? {
         val current = latest ?: return null
         if (disposed) return null
+        latestPresentationDescriptor?.let { descriptor ->
+            activeDisplayDescriptor = descriptor
+            activeDisplayReceipt = null
+            latestDisplayConfig?.let { config ->
+                activeValidity = CoveragePresentationValidity(descriptor, lifecycleEpoch, latestAdmittedAtNanos, config)
+            }
+        }
         return createResourceToken(current.rendererGeneration, controls.mode)
     }
 
@@ -1157,9 +1344,92 @@ internal class NativeCoverageRendererOwner(
     fun currentResourceToken(): CoverageResourceToken? = resourceToken
 
     @Synchronized
+    fun currentCandidateResourceToken(): CoverageResourceToken? = candidateResourceToken
+
+    @Synchronized
     fun acceptsResourceToken(token: CoverageResourceToken): Boolean =
-        !disposed && resourceToken == token && latest?.rendererGeneration == token.sourceRendererGeneration &&
-            controls.mode == token.mode
+        !disposed && resourceToken == token &&
+            (activeDisplayDescriptor != null || activeDisplayReceipt?.tokenEpoch == token.epoch)
+
+    @Synchronized
+    fun acceptsCandidateResourceToken(token: CoverageResourceToken): Boolean =
+        !disposed && candidateResourceToken == token && controls.mode == token.mode
+
+    /** Candidate B remains qualified by its frozen descriptor while C/D advance. */
+    @Synchronized
+    fun candidatePromotionAllowed(token: CoverageResourceToken): Boolean =
+        acceptsCandidateResourceToken(token) &&
+            candidateDisplayDescriptor != null && validityAllows(candidateValidity)
+
+    /** One renderer-turn timestamp keeps factory and owner commits indivisible at expiry. */
+    @Synchronized
+    internal fun candidatePromotionQualificationTime(token: CoverageResourceToken): Long? {
+        val now = clockNanos()
+        return now.takeIf { acceptsCandidateResourceToken(token) && candidateDisplayDescriptor != null &&
+            validityAllows(candidateValidity, now) }
+    }
+
+    private fun validityAllows(validity: CoveragePresentationValidity?, nowNanos: Long = clockNanos()): Boolean {
+        if (validity == null) return !disposed && !lifecyclePaused && !unavailable && controls.visible
+        if (disposed || lifecyclePaused || unavailable || !controls.visible || validity.lifecycleEpoch != lifecycleEpoch ||
+            validity.mode != controls.mode || validity.palette != controls.palette ||
+            validity.paletteEpoch != paletteRevision || !validity.isUnexpired(nowNanos)) return false
+        val current = latestPresentationDescriptor ?: return false
+        val config = latestDisplayConfig ?: return false
+        return current.qualifier.bindingGeneration == validity.qualifier.bindingGeneration &&
+            current.qualifier.groupGeneration == validity.qualifier.groupGeneration &&
+            current.qualifier.rendererGeneration == validity.qualifier.rendererGeneration &&
+            current.worldFromGroup.contentEquals(validity.worldFromGroup) &&
+            current.voxelSizeMeters == validity.voxelSizeMeters &&
+            (validity.targetSurfaceId == null || current.targetSurfaceId == validity.targetSurfaceId &&
+                current.targetDirectionIndex == validity.targetDirectionIndex) &&
+            config.renderCapacity == validity.config.renderCapacity &&
+            config.pointSizePx == validity.config.pointSizePx &&
+            config.voxelRenderMode == validity.config.voxelRenderMode &&
+            config.voxelSizeMeters == validity.config.voxelSizeMeters &&
+            config.cubeSizeFactor == validity.config.cubeSizeFactor &&
+            config.rendererGeneration == validity.config.rendererGeneration
+    }
+
+    /** A compact receipt is independent of CPU descriptor availability. */
+    @Synchronized
+    fun isDisplayResidencyVisible(token: CoverageResourceToken): Boolean {
+        if (resourceToken == token) return validityAllows(activeValidity) &&
+            (activeDisplayReceipt?.enabled ?: activeDisplayDescriptor?.enabled ?: true)
+        if (candidateResourceToken == token) return validityAllows(candidateValidity)
+        return false
+    }
+
+    /** Resolves a token's role at use time; slots never capture a permanent role. */
+    @Synchronized
+    fun displayRoleFor(token: CoverageResourceToken?): CoverageDisplayRole? = when {
+        token == null || disposed -> null
+        resourceToken == token -> CoverageDisplayRole.ACTIVE
+        candidateResourceToken == token -> CoverageDisplayRole.CANDIDATE
+        else -> null
+    }
+
+    @Synchronized
+    fun displayDescriptorFor(token: CoverageResourceToken?): BoundedCoveragePresentation? = when {
+        token == null || disposed -> null
+        resourceToken == token -> activeDisplayDescriptor
+        candidateResourceToken == token -> candidateDisplayDescriptor
+        else -> null
+    }
+
+    @Synchronized
+    fun acceptsAnyResourceToken(token: CoverageResourceToken): Boolean =
+        acceptsResourceToken(token) || acceptsCandidateResourceToken(token)
+
+    @Synchronized
+    fun markAnyResourceMounted(token: CoverageResourceToken): Boolean =
+        if (candidateResourceToken == token) markCandidateResourceMounted(token)
+        else markResourceMounted(token)
+
+    @Synchronized
+    fun markAnyResourceFailure(token: CoverageResourceToken): Boolean =
+        if (candidateResourceToken == token) markCandidateResourceFailure(token)
+        else markResourceFailure(token)
 
     @Synchronized
     fun markResourceMounted(token: CoverageResourceToken): Boolean {
@@ -1172,6 +1442,10 @@ internal class NativeCoverageRendererOwner(
         onResourceLifecycleChanged(token, true)
         return true
     }
+
+    @Synchronized
+    fun markCandidateResourceMounted(token: CoverageResourceToken): Boolean =
+        acceptsCandidateResourceToken(token)
 
     /**
      * Fences only renderer resources under OS low-memory pressure. The latest
@@ -1220,6 +1494,16 @@ internal class NativeCoverageRendererOwner(
     }
 
     @Synchronized
+    fun markCandidateResourceFailure(token: CoverageResourceToken): Boolean {
+        if (!acceptsCandidateResourceToken(token)) return false
+        candidateResourceToken = null
+        candidateDisplayDescriptor = null
+        candidateValidity = null
+        onResourceLifecycleChanged(token, false)
+        return true
+    }
+
+    @Synchronized
     fun markUploadFailure(rendererGeneration: Long): Boolean =
         markResourceFailure(rendererGeneration)
 
@@ -1242,6 +1526,21 @@ internal class NativeCoverageRendererOwner(
         onResourceLifecycleChanged(token, false)
         return true
     }
+
+    @Synchronized
+    fun markCandidateResourceReleased(token: CoverageResourceToken): Boolean {
+        if (candidateResourceToken != token) return false
+        candidateResourceToken = null
+        candidateDisplayDescriptor = null
+        candidateValidity = null
+        onResourceLifecycleChanged(token, false)
+        return true
+    }
+
+    @Synchronized
+    fun markAnyResourceReleased(token: CoverageResourceToken): Boolean =
+        if (candidateResourceToken == token) markCandidateResourceReleased(token)
+        else markResourceReleased(token)
 
     /** Restores the still-mounted lifetime after a coexistence allocation fails. */
     @Synchronized
@@ -1308,6 +1607,85 @@ internal class NativeCoverageRendererOwner(
     @Synchronized
     fun presentationDescriptor(): BoundedCoveragePresentation? = latestPresentationDescriptor
 
+    /** Descriptor currently eligible for visible drawing, if any. */
+    @Synchronized
+    fun activeDisplayDescriptor(): BoundedCoveragePresentation? = activeDisplayDescriptor
+
+    /** Frozen logical successor retained for the candidate resource role. */
+    @Synchronized
+    fun candidateDisplayDescriptor(): BoundedCoveragePresentation? = candidateDisplayDescriptor
+
+    @Synchronized
+    fun stageCandidateDisplay(descriptor: BoundedCoveragePresentation): Boolean {
+        if (disposed || candidateResourceToken == null) return false
+        if (candidateDisplayDescriptor != null && candidateDisplayDescriptor !== descriptor) return false
+        candidateDisplayDescriptor = descriptor
+        if (candidateValidity == null) {
+            val config = latestDisplayConfig ?: return false
+            candidateValidity = CoveragePresentationValidity(descriptor, lifecycleEpoch, latestAdmittedAtNanos, config)
+        }
+        return true
+    }
+
+    @Synchronized
+    fun promoteCandidateDisplay(token: CoverageResourceToken, qualificationNanos: Long? = null): Boolean {
+        if (!acceptsCandidateResourceToken(token) || candidateDisplayDescriptor == null ||
+            !validityAllows(candidateValidity, qualificationNanos ?: clockNanos())) return false
+        val candidate = candidateDisplayDescriptor ?: return false
+        activeDisplayDescriptor = candidate
+        activeDisplayReceipt = null
+        activeValidity = candidateValidity
+        resourceToken = token
+        // The token changes role in place. Slot bindings resolve the new role
+        // dynamically, so promotion does not remount or retain a candidate
+        // alias that would block the next bounded successor.
+        candidateResourceToken = null
+        candidateDisplayDescriptor = null
+        candidateValidity = null
+        currentShapeTokenEpoch = token.epoch
+        return true
+    }
+
+    @Synchronized
+    fun releaseActiveDisplaySource(token: CoverageResourceToken): Boolean {
+        if (resourceToken != token) return false
+        val descriptor = activeDisplayDescriptor ?: return activeDisplayReceipt?.tokenEpoch == token.epoch
+        val shape = shapeResidentReceipts.remove(token.epoch)
+        val sealedAt = clockNanos()
+        activeDisplayReceipt = CoverageDisplayResidencyReceipt(
+            tokenEpoch = token.epoch,
+            qualifier = descriptor.qualifier,
+            mode = descriptor.mode,
+            palette = descriptor.palette,
+            enabled = descriptor.enabled,
+            count = descriptor.count,
+            glyphCount = descriptor.glyphCount,
+            shape = shape,
+            observationColorsMeaningful = descriptor.mode == CoveragePresentationMode.DIRECTIONAL_BALLS &&
+                descriptor.palette != CoveragePalette.UNIFORM &&
+                descriptor.attributes?.color == RendererAttributeCodec.OBSERVATIONS,
+            targetSurfaceId = descriptor.targetSurfaceId,
+            targetDirectionIndex = descriptor.targetDirectionIndex,
+            sealedAtNanos = sealedAt,
+            holdUntilNanos = activeValidity?.deadline(),
+        )
+        activeDisplayDescriptor = null
+        // The logical latest owner funds this same backing once and must keep
+        // selection/export/attribute basis available after display alias release.
+        return true
+    }
+
+    @Synchronized
+    fun activeDisplayResidencyReceipt(token: CoverageResourceToken): CoverageDisplayResidencyReceipt? =
+        activeDisplayReceipt?.takeIf { it.tokenEpoch == token.epoch }
+
+    @Synchronized
+    fun cancelCandidateDisplay() {
+        candidateResourceToken = null
+        candidateDisplayDescriptor = null
+        candidateValidity = null
+    }
+
     /** Compact selected identity receipt; source values remain in canonical state. */
     @Synchronized
     fun selectedSurfaceIds(): LongArray {
@@ -1330,6 +1708,15 @@ internal class NativeCoverageRendererOwner(
         latestPresentationDescriptor = null
         resetPresentationSelector()
         resourceToken = null
+        candidateResourceToken = null
+        activeDisplayDescriptor = null
+        activeDisplayReceipt = null
+        candidateDisplayDescriptor = null
+        activeValidity = null
+        candidateValidity = null
+        latestDisplayConfig = null
+        shapeResidentReceipts.clear()
+        shapeResourceTokens.clear()
         currentShapeTokenEpoch = 0
         lowMemoryPressure = false
     }
@@ -1362,6 +1749,10 @@ internal class NativeCoverageRendererOwner(
             lowMemoryPressure = lowMemoryPressure,
         )
     }
+
+    /** Draw gate for callbacks that may arrive after a visibility command. */
+    @Synchronized
+    fun displayRequestedVisible(): Boolean = !disposed && controls.visible
 
     private fun selectedRows(): List<VisibilityRendererRow> {
         if (latestPresentationDescriptor != null) return emptyList()
@@ -1590,7 +1981,4 @@ internal class NativeCoverageRendererOwner(
         return token
     }
 
-    private companion object {
-        const val HIT_RADIUS_PX = 32.0
-    }
 }

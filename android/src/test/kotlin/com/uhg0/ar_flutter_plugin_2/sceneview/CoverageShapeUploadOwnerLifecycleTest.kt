@@ -6,6 +6,18 @@ import org.junit.Test
 import java.nio.ByteBuffer
 
 class CoverageShapeUploadOwnerLifecycleTest {
+    @Test fun `candidate shape lease refuses a newer body until held source upload completes`() {
+        val source = PreparedCoverageShapeOwner()
+        val held = publish(source, selection = 1)
+        assertTrue(held.retainForUpload())
+        assertFalse(source.begin())
+        held.releaseUploadLease()
+        val successor = publish(source, selection = 2, balls = true)
+        assertFalse(held.available)
+        assertTrue(successor.available)
+        assertEquals(2, source.maxBodies)
+    }
+
     @Test fun `partial index submission failure retains accepted vertex page through successor and close until real drain`() {
         val source = PreparedCoverageShapeOwner()
         val first = publish(source, selection = 1)

@@ -1,5 +1,8 @@
 package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
+import java.io.File
+import java.math.BigInteger
+import java.security.MessageDigest
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
@@ -7,13 +10,408 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicBoolean
+import com.google.ar.core.Config
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.boolean
+import kotlinx.serialization.json.long
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class AndroidVisibilityGridRuntimeTest {
+    @Test
+    fun `repeated calibration unavailability retains coherent depth and later valid automatic input admits`() {
+        val cut = AtomicReference(ownership())
+        val lastCoherent = AtomicLong(0L)
+        val runtime = runtime(cut, object : VisibilityObservationMapper {
+            private val admittedDepths = AtomicLong(0L)
+            override fun admitFeature(observation: VisibilityFeatureObservation) = Unit
+            override fun admitDepth(observation: VisibilityDepthObservation) {
+                try {
+                    lastCoherent.set(observation.frame.sourceTimestampNs)
+                    admittedDepths.incrementAndGet()
+                } finally { observation.close() }
+            }
+            override fun snapshot() = VisibilityMappingAdmissionHealth.empty().copy(admittedDepths = admittedDepths.get())
+            override fun prepareDepthAcquisition(qualifier: DepthAcquisitionFunding,
+                complete: (DepthAcquisitionPreparationResult) -> Unit) = complete(DepthAcquisitionPreparationResult.FUNDED)
+        })
+        val pool = DepthSamplesLeasePool(capacity = 12)
+        try {
+            runtime.setDepthCapability(VisibilityDepthCapability.AUTOMATIC)
+            runtime.prepareDepthAcquisition(cut.get())
+            assertTrue(runtime.prepareDepthAcquisition(cut.get()))
+            fun prepare(timestamp: Long, valid: Boolean): Pair<PreparedRawDepthResult, CalibrationDepthImage> {
+                val depth = CalibrationDepthImage(timestamp, 1_000)
+                return prepareRawDepthFrame(calibrationAcquirer(depth, null),
+                    { width, height -> calibratedMetadata(timestamp, width, height, valid) }) to depth
+            }
+            fun admitValid(timestamp: Long) {
+                val (prepared, depth) = prepare(timestamp, true)
+                val frame = (prepared as PreparedRawDepthResult.Ready).frame
+                val packed = frame.processPacked(pool, SampleLeaseGeneration.from(cut.get())) as PackedDepthAcquisitionResult.Observation
+                val observation = VisibilityDepthCopyResult.PackedObservation(packed.metadata, packed.lease,
+                    cut.get(), VisibilityDepthCapability.AUTOMATIC, timestamp, timestamp).toObservation()
+                assertTrue(runtime.offerDepth(observation))
+                await { lastCoherent.get() == timestamp && pool.leasedCount() == 0 && runtime.snapshot().residentPayloadBytes == 0L }
+                assertEquals(1, depth.closes)
+            }
+            admitValid(1L)
+            repeat(8) { index ->
+                val (prepared, depth) = prepare(index + 2L, false)
+                assertEquals(PreparedRawDepthResult.TransientUnavailable, prepared)
+                runtime.recordDepthTransientUnavailable()
+                assertEquals(1, depth.closes)
+                assertEquals(0, depth.reads)
+                assertEquals(0, pool.leasedCount())
+                assertEquals(0, runtime.snapshot().residentPayloadBytes)
+                assertEquals(1L, lastCoherent.get())
+            }
+            assertEquals(0L, runtime.snapshot().depthFailures)
+            assertEquals(8L, runtime.snapshot().depthTransientUnavailable)
+            assertFalse(runtime.snapshot().depthHealth == VisibilitySourceHealth.FAILED)
+            assertEquals("textureScaleUnverified", runtime.snapshotWireMap()["depthCalibrationQualification"])
+            admitValid(10L)
+            assertEquals(2L, runtime.snapshot().admittedDepthObservations)
+            assertEquals(VisibilitySourceHealth.HEALTHY, runtime.snapshot().depthHealth)
+        } finally { runtime.close(); pool.close() }
+    }
+
+    @Test
+    fun `prepared dense and raw empty packed copies notify typed transient observer and release resources`() {
+        for (preference in DepthSourcePreference.entries) {
+            val base = ownership()
+            val owner = base.copy(
+                groupFrame = VisibilityGroupFrame.copyOf(
+                    base.groupFrame.groupFromWorldGl.toDoubleArray(),
+                    base.groupFrame.worldFromGroupGl.toDoubleArray(),
+                    base.groupFrame.voxelSizeMicrometres,
+                    base.groupFrame.modelCapacity,
+                    base.groupFrame.depthSurfacePreset,
+                    preference,
+                ),
+            )
+            val mode = depthAcquisitionModeForSession(
+                Config.DepthMode.AUTOMATIC,
+                rawDepthCandidateForPreference(owner.groupFrame.depthSourcePreference, debug = true,
+                    qualificationFallback = true),
+            )
+            val timestamp = if (preference == DepthSourcePreference.DENSE) 101L else 102L
+            val dense = CalibrationDepthImage(timestamp, 0)
+            val raw = CalibrationDepthImage(timestamp, 0)
+            val confidence = CalibrationDepthImage(timestamp, 0)
+            val calls = mutableListOf<String>()
+            val acquirer = selectedDepthAcquirer(
+                mode,
+                acquireDense = { calls += "dense"; dense },
+                acquireRaw = { calls += "raw"; raw },
+                acquireRawConfidence = { calls += "confidence"; confidence },
+            )
+            var acquired = 0
+            var closed = 0
+            val prepared = prepareRawDepthFrame(
+                acquirer,
+                { width, height -> calibratedMetadata(timestamp, width, height).copy(acquisitionMode = mode,
+                    acquisitionFrameBeforeNs = timestamp, acquisitionAndroidCameraBeforeNs = timestamp) },
+                onResourceAcquired = { acquired++ },
+                onResourceClosed = { closed++ },
+            )
+            val frame = (prepared as PreparedRawDepthResult.Ready).frame
+            var callbackOwner: VisibilityObservationOwnership? = null
+            var callbackMetadata: RawDepthFrameMetadata? = null
+            var callbackReason: PackedDepthTransientReason? = null
+            var examinedDepth = -1
+            var examinedPaired = -1
+            var selected = -1
+            var rejected = -1
+            val observer = DepthCopyTransientObserver { callback, metadata, reason,
+                depthPositive, pairedPositive, selectedCount, sourceRejected ->
+                callbackOwner = callback
+                callbackMetadata = metadata
+                callbackReason = reason
+                examinedDepth = depthPositive
+                examinedPaired = pairedPositive
+                selected = selectedCount
+                rejected = sourceRejected
+            }
+            val adapter = ArCoreVisibilityObservationAdapter({}, {})
+            try {
+                val result = adapter.finishDepthPacked(
+                    PreparedVisibilityDepthFrame(frame, owner, VisibilityDepthCapability.AUTOMATIC, 1L, timestamp),
+                    observer,
+                )
+                assertEquals(VisibilityDepthCopyResult.TransientUnavailable, result)
+                assertEquals(
+                    if (mode == DepthAcquisitionMode.RAW) listOf("raw", "confidence") else listOf("dense"),
+                    calls,
+                )
+                assertEquals(owner, callbackOwner)
+                assertEquals(mode, callbackMetadata!!.acquisitionMode)
+                assertEquals(4, callbackMetadata!!.width)
+                assertEquals(3, callbackMetadata!!.height)
+                assertEquals(PackedDepthTransientReason.ZERO_SELECTED_SAMPLES, callbackReason)
+                assertEquals(0, examinedDepth)
+                assertEquals(0, examinedPaired)
+                assertEquals(0, selected)
+                assertEquals(12, rejected)
+                assertEquals(if (mode == DepthAcquisitionMode.RAW) 2 else 1, acquired)
+                assertEquals(acquired, closed)
+                assertEquals(if (mode == DepthAcquisitionMode.AUTOMATIC) 1 else 0, dense.closes)
+                if (mode == DepthAcquisitionMode.RAW) {
+                    assertEquals(1, raw.closes)
+                    assertEquals(1, confidence.closes)
+                } else {
+                    assertEquals(0, raw.closes)
+                    assertEquals(0, confidence.closes)
+                }
+                assertEquals(0, adapter.packedLeaseReceipts().getValue("depth").outstanding)
+            } finally {
+                adapter.closePackedPools()
+            }
+        }
+    }
+
+    @Test
+    fun `funded owner transient diagnostics suppress duplicates and reset on full identity changes`() {
+        val owner = ownership().copy(
+            groupFrame = VisibilityGroupFrame.copyOf(
+                identityVisibilityGridTransform(), identityVisibilityGridTransform(), 1_000, 100_000,
+                depthSourcePreference = DepthSourcePreference.DENSE,
+            ),
+        )
+        val cut = AtomicReference(owner)
+        val preparations = AtomicLong()
+        val runtime = runtime(cut, mapper = object : VisibilityObservationMapper {
+            override fun admitFeature(observation: VisibilityFeatureObservation) = Unit
+            override fun admitDepth(observation: VisibilityDepthObservation) = Unit
+            override fun snapshot() = VisibilityMappingAdmissionHealth.empty()
+            override fun prepareDepthAcquisition(
+                qualifier: DepthAcquisitionFunding,
+                complete: (DepthAcquisitionPreparationResult) -> Unit,
+            ) {
+                preparations.incrementAndGet()
+                complete(DepthAcquisitionPreparationResult.FUNDED)
+            }
+        })
+        fun metadata(mode: DepthAcquisitionMode) = calibratedMetadata(201L, 4, 3).copy(acquisitionMode = mode)
+        fun finishEmpty(current: VisibilityObservationOwnership, timestamp: Long) {
+            runtime.setDepthCapability(VisibilityDepthCapability.AUTOMATIC)
+            assertTrue(runtime.prepareDepthAcquisition(current))
+            val mode = depthAcquisitionModeForSession(
+                Config.DepthMode.AUTOMATIC,
+                rawDepthCandidateForPreference(current.groupFrame.depthSourcePreference, debug = true,
+                    qualificationFallback = true),
+            )
+            val image = CalibrationDepthImage(timestamp, 0)
+            val prepared = prepareRawDepthFrame(
+                selectedDepthAcquirer(mode, { image }, { image }, { error("dense source has no confidence") }),
+                { width, height -> calibratedMetadata(timestamp, width, height).copy(acquisitionMode = mode,
+                    acquisitionFrameBeforeNs = timestamp, acquisitionAndroidCameraBeforeNs = timestamp) },
+            ) as PreparedRawDepthResult.Ready
+            val adapter = ArCoreVisibilityObservationAdapter({}, {})
+            try {
+                assertEquals(
+                    VisibilityDepthCopyResult.TransientUnavailable,
+                    adapter.finishDepthPacked(
+                        PreparedVisibilityDepthFrame(
+                            prepared.frame, current, VisibilityDepthCapability.AUTOMATIC, timestamp, timestamp,
+                        ),
+                        runtime,
+                    ),
+                )
+            } finally {
+                adapter.closePackedPools()
+            }
+        }
+        try {
+            runtime.setDepthCapability(VisibilityDepthCapability.AUTOMATIC)
+            assertFalse(runtime.prepareDepthAcquisition(owner))
+            assertTrue(runtime.prepareDepthAcquisition(owner))
+            assertTrue(runtime.prepareDepthAcquisition(owner))
+            assertEquals(1L, preparations.get())
+            finishEmpty(owner, 201L)
+            finishEmpty(owner, 202L)
+            val automaticZero = metadata(DepthAcquisitionMode.AUTOMATIC)
+            assertNull(runtime.claimDepthCopyTransientDiagnostic(
+                owner, automaticZero, PackedDepthTransientReason.ZERO_SELECTED_SAMPLES, 0, 0, 0, 12,
+            ))
+            val calibration = runtime.claimDepthCopyTransientDiagnostic(
+                owner, automaticZero, PackedDepthTransientReason.CALIBRATION_UNAVAILABLE, 0, 0, 0, 0,
+            )
+            assertTrue(calibration != null && calibration.length <= 512)
+            assertNull(runtime.claimDepthCopyTransientDiagnostic(
+                owner, automaticZero, PackedDepthTransientReason.CALIBRATION_UNAVAILABLE, 0, 0, 0, 0,
+            ))
+            val notYet = runtime.claimDepthCopyTransientDiagnostic(
+                owner, automaticZero, PackedDepthTransientReason.NOT_YET_AVAILABLE,
+                0, 0, 0, 0,
+            )
+            assertTrue(notYet != null && notYet.length <= 512)
+            assertNull(runtime.claimDepthCopyTransientDiagnostic(
+                owner, automaticZero, PackedDepthTransientReason.NOT_YET_AVAILABLE,
+                0, 0, 0, 0,
+            ))
+            listOf(owner.sessionId, owner.captureGroupId, owner.nativeStreamToken, owner.workerBindingToken,
+                "pose", "uri").forEach { secret ->
+                assertFalse(calibration!!.contains(secret))
+                assertFalse(notYet!!.contains(secret))
+            }
+            val sameGenerations = owner.copy(sessionId = "0d".repeat(16), nativeStreamToken = "0e".repeat(16))
+            cut.set(sameGenerations)
+            runtime.setDepthCapability(VisibilityDepthCapability.AUTOMATIC)
+            assertTrue(runtime.prepareDepthAcquisition(sameGenerations))
+            assertEquals(1L, preparations.get())
+            assertNull(runtime.claimDepthCopyTransientDiagnostic(
+                owner, automaticZero, PackedDepthTransientReason.ZERO_SELECTED_SAMPLES, 0, 0, 0, 12,
+            ))
+            assertTrue(runtime.claimDepthCopyTransientDiagnostic(
+                sameGenerations, automaticZero, PackedDepthTransientReason.ZERO_SELECTED_SAMPLES, 0, 0, 0, 12,
+            ) != null)
+            assertNull(runtime.claimDepthCopyTransientDiagnostic(
+                sameGenerations, automaticZero, PackedDepthTransientReason.ZERO_SELECTED_SAMPLES, 0, 0, 0, 12,
+            ))
+            val replacement = owner.copy(
+                sessionId = "07".repeat(16), sessionGeneration = 2,
+                captureGroupId = "08".repeat(16), groupGeneration = 2, coverageEpoch = 2,
+                arSessionIdentity = "09".repeat(16), viewInstanceId = "0a".repeat(16), viewGeneration = 2,
+                nativeStreamToken = "0b".repeat(16), workerBindingToken = "0c".repeat(16),
+                bindingGeneration = 2, lifecycleSequence = 2, operationGeneration = 2,
+            )
+            cut.set(replacement)
+            runtime.setDepthCapability(VisibilityDepthCapability.AUTOMATIC)
+            assertFalse(runtime.prepareDepthAcquisition(replacement))
+            assertTrue(runtime.prepareDepthAcquisition(replacement))
+            assertEquals(2L, preparations.get())
+            assertNull(runtime.claimDepthCopyTransientDiagnostic(
+                owner, automaticZero, PackedDepthTransientReason.ZERO_SELECTED_SAMPLES, 0, 0, 0, 12,
+            ))
+            assertTrue(runtime.claimDepthCopyTransientDiagnostic(
+                replacement, metadata(DepthAcquisitionMode.AUTOMATIC),
+                PackedDepthTransientReason.ZERO_SELECTED_SAMPLES, 0, 0, 0, 12,
+            ) != null)
+        } finally {
+            runtime.close()
+        }
+    }
+
+    @Test
+    fun `scalar receipt samples funding identity and resources without starting source work`() {
+        val owner = ownership()
+        val completion = AtomicReference<((DepthAcquisitionPreparationResult) -> Unit)?>(null)
+        val preparations = AtomicLong()
+        val mapper = object : VisibilityObservationMapper {
+            override fun admitFeature(observation: VisibilityFeatureObservation) = error("No observations expected")
+            override fun admitDepth(observation: VisibilityDepthObservation) = error("No observations expected")
+            override fun prepareDepthAcquisition(qualifier: DepthAcquisitionFunding,
+                complete: (DepthAcquisitionPreparationResult) -> Unit) {
+                preparations.incrementAndGet()
+                completion.set(complete)
+            }
+        }
+        val runtime = AndroidVisibilityGridRuntime(ownership = { owner }, mapper = mapper)
+        try {
+            runtime.setDepthCapability(VisibilityDepthCapability.AUTOMATIC)
+            fun gates() = runtime.scalarSnapshot(owner)["gates"] as Map<*, *>
+            assertEquals("unrequestedOrRetryable", gates()["fundingState"])
+            assertEquals(0L, preparations.get())
+            assertFalse(runtime.prepareDepthAcquisition(owner))
+            assertEquals("pending", gates()["fundingState"])
+            completion.get()!!.invoke(DepthAcquisitionPreparationResult.FUNDED)
+            assertEquals("funded", gates()["fundingState"])
+            assertEquals(true, gates()["fundingOwnerMatched"])
+            assertEquals("staleOwner", (runtime.scalarSnapshot(owner.copy(sessionGeneration = 2))["gates"] as Map<*, *>)["fundingState"])
+            runtime.recordProducerResourceAcquired()
+            val evidence = RawDepthFrameMetadata(timestampNs = 816664864980761L,
+                groupGeneration = 1, sessionGeneration = 1, tracking = true,
+                intrinsics = DepthIntrinsics(2.0, 2.0, 0.5, 0.5),
+                worldFromCameraGl = identityVisibilityGridTransform(), width = 2, height = 2,
+                arFrameTimestampNs = 816664898314095L, cameraImageTimestampNs = 816664898314095L, acquisitionMode = DepthAcquisitionMode.AUTOMATIC)
+            runtime.recordDepthAcquisitionRefusal(DepthAcquisitionRefusal.STALE_AUTOMATIC, evidence)
+            val receipt = runtime.scalarSnapshot(owner)
+            val identity = receipt["identity"] as Map<*, *>
+            assertEquals(1L, identity["staleAutomaticRefusals"])
+            assertEquals("816664864980761", identity["latestDepthImageTimestampNs"])
+            assertEquals(null, identity["latestFrameMinusImageAgeUs"])
+            assertEquals("33333", identity["latestCameraMinusImageAgeUs"])
+            assertEquals(null, identity["latestDepthConfidenceTimestampNs"])
+            val fixture = compositionFixture()
+            val native = fixture.getValue("native").jsonObject
+            val expectedBinding = native.getValue("binding").jsonObject
+            val expectedIdentity = expectedBinding.getValue("identity").jsonObject
+            val expectedGates = expectedBinding.getValue("gates").jsonObject
+            val expectedResources = expectedBinding.getValue("resources").jsonObject
+            assertEquals(expectedIdentity.string("latestDepthImageTimestampNs"), identity["latestDepthImageTimestampNs"])
+            assertEquals(expectedIdentity.string("latestDepthFrameTimestampNs"), identity["latestDepthFrameTimestampNs"])
+            assertEquals(expectedIdentity.string("latestCameraMinusImageAgeUs"), identity["latestCameraMinusImageAgeUs"])
+            assertEquals(expectedIdentity.long("staleAutomaticRefusals"), identity["staleAutomaticRefusals"])
+            val gates = receipt["gates"] as Map<*, *>
+            assertEquals(expectedGates.string("fundingState"), gates["fundingState"])
+            assertEquals(expectedGates.boolean("fundingOwnerMatched"), gates["fundingOwnerMatched"])
+            assertEquals(expectedGates.string("callbackCopyBudgetState"), gates["callbackCopyBudgetState"])
+            assertEquals(expectedResources.long("resourceBalance"), (receipt["resources"] as Map<*, *>) ["resourceBalance"])
+            val hashInput = listOf(
+                expectedIdentity.string("latestDepthImageTimestampNs"),
+                expectedIdentity.string("latestDepthFrameTimestampNs"),
+                "null",
+                expectedIdentity.string("latestCameraMinusImageAgeUs"),
+                expectedGates.string("callbackCopyBudgetState"),
+                expectedIdentity.long("staleAutomaticRefusals").toString(),
+            ).joinToString("|")
+            assertEquals(fixture.getValue("hashes").jsonObject.string("bindingIdentity"), sha256(hashInput))
+            writeCompositionReceipt("native-runtime.json", receipt, "runtime")
+            assertEquals(1L, (receipt["resources"] as Map<*, *>)["resourceBalance"])
+            assertEquals(1L, preparations.get())
+            runtime.recordProducerResourceClosed()
+            assertEquals(0L, (runtime.scalarSnapshot(owner)["resources"] as Map<*, *>)["resourceBalance"])
+        } finally { runtime.close() }
+    }
+
+
+    @Test
+    fun `invalid acquisition tuple survives a later stale tuple without granting image admission`() {
+        val owner = ownership()
+        val mapper = object : VisibilityObservationMapper {
+            override fun admitFeature(observation: VisibilityFeatureObservation) = error("No observations expected")
+            override fun admitDepth(observation: VisibilityDepthObservation) = error("No observations expected")
+        }
+        val runtime = AndroidVisibilityGridRuntime(ownership = { owner }, mapper = mapper)
+        try {
+            val metadata = RawDepthFrameMetadata(timestampNs = 21, groupGeneration = 1, sessionGeneration = 1,
+                tracking = true, width = 2, height = 2, intrinsics = DepthIntrinsics(2.0, 2.0, 0.5, 0.5),
+                worldFromCameraGl = identityVisibilityGridTransform(), arFrameTimestampNs = 21,
+                cameraImageTimestampNs = 20, acquisitionMode = DepthAcquisitionMode.AUTOMATIC,
+                acquisitionFrameBeforeNs = 21,
+                acquisitionAndroidCameraBeforeNs = 20, acquisitionFrameSequence = 7)
+            runtime.recordDepthAcquisitionRefusal(DepthAcquisitionRefusal.INVALID_TIMESTAMP, metadata)
+            runtime.recordDepthAcquisitionRefusal(DepthAcquisitionRefusal.STALE_AUTOMATIC,
+                metadata.copy(timestampNs = 19, acquisitionFrameSequence = 8))
+            val identity = runtime.scalarSnapshot(owner)["identity"] as Map<*, *>
+            assertEquals("21", identity["latestInvalidDepthImageTimestampNs"])
+            assertEquals("21", identity["latestInvalidDepthFrameBeforeNs"])
+            assertEquals("21", identity["latestInvalidDepthFrameAfterNs"])
+            assertEquals("20", identity["latestInvalidDepthAndroidCameraBeforeNs"])
+            assertEquals("20", identity["latestInvalidDepthAndroidCameraAfterNs"])
+            assertEquals(7L, identity["latestInvalidDepthFrameSequence"])
+            assertEquals(1L, identity["latestInvalidDepthGroupGeneration"])
+            assertEquals("imageAfterAndroidCamera", identity["latestInvalidDepthReason"])
+            assertEquals("19", identity["latestStaleDepthImageTimestampNs"])
+            assertEquals(8L, identity["latestStaleDepthFrameSequence"])
+            assertEquals("automaticImageNotEqualAndroidCamera", identity["latestStaleDepthReason"])
+            assertEquals("unverified", identity["depthTimestampComparability"])
+            assertEquals(0L, runtime.snapshot().admittedDepthObservations)
+            runtime.recordDepthAcquisitionRefusal(DepthAcquisitionRefusal.INVALID_TIMESTAMP,
+                metadata.copy(timestampNs = Long.MIN_VALUE))
+            assertEquals(Long.MIN_VALUE.toString(), (runtime.scalarSnapshot(owner)["identity"] as Map<*, *>)
+                ["latestInvalidDepthImageTimestampNs"])
+        } finally { runtime.close() }
+    }
+
     @Test
     fun `mapper throw is surfaced as bounded failure telemetry`() {
         val cut = AtomicReference(ownership())
@@ -693,7 +1091,7 @@ class AndroidVisibilityGridRuntimeTest {
                 "totalGridHealth", "copiedFeatureObservations", "copiedDepthObservations",
                 "freshEstimateAdmissions", "staleAutomaticRefusals", "rawReprojectedAcquisitions",
                 "duplicateEstimateRefusals", "depthConfidencePairRefusals", "invalidImageTimestampRefusals",
-                "latestDepthImageTimestampNs", "latestDepthFrameTimestampNs", "latestDepthConfidenceTimestampNs",
+                "latestDepthImageTimestampNs", "latestDepthFrameTimestampNs", "latestDepthCameraImageTimestampNs", "latestDepthConfidenceTimestampNs",
                 "latestDepthSourceImageWidth", "latestDepthSourceImageHeight", "latestDepthImageWidth",
                 "latestDepthImageHeight", "latestDepthAcquisitionMode", "depthCalibrationQualification",
                 "admittedFeatureObservations", "admittedDepthObservations", "invalidFeatureObservations",
@@ -713,11 +1111,11 @@ class AndroidVisibilityGridRuntimeTest {
                 "admittedBindingGeneration", "admittedSessionGeneration", "admittedGroupGeneration",
                 "admittedLifecycleSequence", "admittedOperationGeneration", "syntheticSource",
             )
-            assertEquals(78, expectedKeys.size)
+            assertEquals(79, expectedKeys.size)
             // Known host metadata exercises scalar projection, not acquired SDK pixels.
             val evidence = RawDepthFrameMetadata(timestampNs = 100, groupGeneration = 1, sessionGeneration = 1,
                 tracking = true, width = 4, height = 3, intrinsics = DepthIntrinsics(2.0, 2.0, 1.5, 1.0),
-                worldFromCameraGl = identityVisibilityGridTransform(), arFrameTimestampNs = 200,
+                worldFromCameraGl = identityVisibilityGridTransform(), arFrameTimestampNs = 200, cameraImageTimestampNs = 200,
                 confidenceTimestampNs = 90, sourceImageWidth = 8, sourceImageHeight = 6,
                 acquisitionMode = DepthAcquisitionMode.AUTOMATIC)
             runtime.recordDepthAcquisitionRefusal(DepthAcquisitionRefusal.STALE_AUTOMATIC, evidence)
@@ -738,13 +1136,14 @@ class AndroidVisibilityGridRuntimeTest {
                 "invalidImageTimestampRefusals" to 0L,
                 "latestDepthImageTimestampNs" to 100L,
                 "latestDepthFrameTimestampNs" to 200L,
+                "latestDepthCameraImageTimestampNs" to 200L,
                 "latestDepthConfidenceTimestampNs" to 90L,
                 "latestDepthSourceImageWidth" to 8,
                 "latestDepthSourceImageHeight" to 6,
                 "latestDepthImageWidth" to 4,
                 "latestDepthImageHeight" to 3,
                 "latestDepthAcquisitionMode" to "AUTOMATIC",
-                "depthCalibrationQualification" to "legacyScaleUnverified",
+                "depthCalibrationQualification" to "textureScaleUnverified",
             )
             assertEquals(15, expectedAcquisition.size)
             assertEquals(expectedAcquisition, wire.filterKeys { it in expectedAcquisition })
@@ -1482,6 +1881,83 @@ class AndroidVisibilityGridRuntimeTest {
         beforeLaneResidentPublication = beforeLaneResidentPublication,
         afterLaneResidentPublication = afterLaneResidentPublication,
     )
+
+    private fun writeCompositionReceipt(
+        fileName: String,
+        receipt: Map<String, Any?>,
+        fixtureName: String,
+    ) {
+        val encoded = encodeJson(receipt)
+        check(encoded.toByteArray(Charsets.UTF_8).size <= 24 * 1024) { "diagnostic receipt exceeds 24 KiB" }
+        System.getenv("CAPTURE3D_DIAGNOSTIC_COMPOSITION_DIR")?.let { directory ->
+            File(directory, fileName).apply {
+                parentFile?.mkdirs()
+                writeText(encoded)
+            }
+        }
+        if (System.getenv("CAPTURE3D_DIAGNOSTIC_COMPOSITION_RECORD") == "1") return
+        val nativeComplete = compositionFixture()["nativeComplete"]?.jsonObject
+            ?: error("composition fixture lacks nativeComplete in strict mode")
+        val expected = nativeComplete[fixtureName]?.jsonObject
+            ?: error("composition fixture lacks nativeComplete.$fixtureName")
+        val normalized = Json.parseToJsonElement(encodeJson(normalizeRuntimeSampling(receipt))).jsonObject
+        assertEquals(expected, normalized)
+    }
+
+    private fun normalizeRuntimeSampling(receipt: Map<String, Any?>): Map<String, Any?> {
+        val sampling = receipt["sampling"] as? Map<*, *> ?: return receipt
+        val start = sampling["sourceCapturedStartNs"] as? String
+        val end = sampling["sourceCapturedEndNs"] as? String
+        check(start != null && end != null && start.matches(Regex("[1-9][0-9]*")) &&
+            end.matches(Regex("[1-9][0-9]*"))) { "runtime sampling timestamps unavailable" }
+        check(BigInteger(end) >= BigInteger(start)) { "runtime sampling timestamps reversed" }
+        val normalizedSampling = LinkedHashMap<String, Any?>()
+        sampling.forEach { (key, value) -> normalizedSampling[key.toString()] = value }
+        normalizedSampling["sourceCapturedStartNs"] = "1"
+        normalizedSampling["sourceCapturedEndNs"] = "2"
+        return LinkedHashMap<String, Any?>(receipt).also { it["sampling"] = normalizedSampling }
+    }
+
+    private fun encodeJson(value: Any?): String = when (value) {
+        null -> "null"
+        is String -> quoteJson(value)
+        is Boolean -> value.toString()
+        is Number -> value.toString()
+        is Map<*, *> -> value.entries.joinToString(",", "{", "}") { (key, nested) ->
+            require(key is String) { "diagnostic receipt map keys must be strings" }
+            "${quoteJson(key)}:${encodeJson(nested)}"
+        }
+        is Iterable<*> -> error("diagnostic receipt must contain scalar leaves")
+        else -> error("unsupported diagnostic receipt value: ${value::class.java.name}")
+    }
+
+    private fun quoteJson(value: String): String = buildString {
+        append('"')
+        value.forEach { character ->
+            when (character) {
+                '"' -> append("\\\"")
+                '\\' -> append("\\\\")
+                '\b' -> append("\\b")
+                '\u000C' -> append("\\f")
+                '\n' -> append("\\n")
+                '\r' -> append("\\r")
+                '\t' -> append("\\t")
+                else -> if (character.code < 0x20) append("\\u%04x".format(character.code)) else append(character)
+            }
+        }
+        append('"')
+    }
+
+    private fun compositionFixture(): JsonObject = Json.parseToJsonElement(
+        File("../../../scripts/performance/fixtures/live_ar_diagnostics_composition.json").readText()
+    ).jsonObject
+
+    private fun JsonObject.string(key: String): String = getValue(key).jsonPrimitive.content
+    private fun JsonObject.long(key: String): Long = getValue(key).jsonPrimitive.long
+    private fun JsonObject.boolean(key: String): Boolean = getValue(key).jsonPrimitive.boolean
+    private fun sha256(value: String): String = MessageDigest.getInstance("SHA-256")
+        .digest(value.toByteArray())
+        .joinToString("") { "%02x".format(it) }
 
     private fun ownership() = VisibilityObservationOwnership(
         sessionId = "01".repeat(16),

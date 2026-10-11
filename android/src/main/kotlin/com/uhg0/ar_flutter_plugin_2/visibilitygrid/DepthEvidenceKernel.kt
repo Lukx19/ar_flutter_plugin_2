@@ -1,5 +1,6 @@
 package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
+import kotlin.math.abs
 import kotlin.math.PI
 import kotlin.math.atan2
 import kotlin.math.cos
@@ -14,8 +15,10 @@ import kotlin.math.sqrt
  * apply the staged packet only after its canonical transaction succeeds.
  */
 internal class DepthEvidenceKernel(
-    private val configuration: DepthEvidenceConfiguration = DepthEvidenceConfiguration(),
-) : AutoCloseable {
+    internal val configuration: DepthEvidenceConfiguration = DepthEvidenceConfiguration(),
+) : AutoCloseable, DepthCellPlaneScratch, CurrentEstimatePlaneSupportWords {
+    private val estimatesEnabled = configuration.surfaceEstimationMode != DepthSurfaceEstimationMode.DISABLED
+    private val localPlane = if (estimatesEnabled) DepthLocalPlaneEstimator(configuration.sampleCapacity) else null
     private val tableCapacity = configuration.surfaceCapacity
     private val hashCapacity = nextPowerOfTwo((tableCapacity * 2).coerceAtLeast(2))
     private val stageCapacity = minOf(
@@ -23,6 +26,16 @@ internal class DepthEvidenceKernel(
         Math.addExact(configuration.rayVisitCapacity, configuration.sampleCapacity),
     )
     private val stageHashCapacity = nextPowerOfTwo((stageCapacity * 2).coerceAtLeast(2))
+    private val supportCacheCapacity = supportCacheCapacityFor(stageCapacity)
+    private var supportCacheCount = 0
+    private var supportCacheOpen = false
+    private var reuseFullFitAttempts = 0
+    private var reuseFullFitSuccesses = 0
+    private var reuseAttempts = 0
+    private var reuseQualifiedPoints = 0
+    private var reuseRefusals = 0
+    private var reuseWitnessWork = 0
+    private var reuseScratchWork = 0
     private var hashRows = IntArray(hashCapacity) { EMPTY_ROW }
     // A retained evidence row is exactly 32 bytes: voxel key (8), evidence
     // counters/directions/flags (7), source id (4), source voxel key (8),
@@ -38,6 +51,11 @@ internal class DepthEvidenceKernel(
     private var rowPackedNormal = ShortArray(tableCapacity)
     private var rowNormalConfidence = ByteArray(tableCapacity)
     private var rowLineageCount = ShortArray(tableCapacity)
+    // Optional millimetre offsets from addressed cell centre: six bytes per row.
+    // Validity uses the existing flags byte; independent support uses occupancy.
+    private var rowEstimateOffsetX = if (estimatesEnabled) ShortArray(tableCapacity) else null
+    private var rowEstimateOffsetY = if (estimatesEnabled) ShortArray(tableCapacity) else null
+    private var rowEstimateOffsetZ = if (estimatesEnabled) ShortArray(tableCapacity) else null
 
     // One fixed staging table is reused by every prepare. A batch can address
     // at most one endpoint per sample plus one row per ray visit, so staging is
@@ -60,6 +78,9 @@ internal class DepthEvidenceKernel(
     private var stageOccupiedPointX = DoubleArray(stageCapacity)
     private var stageOccupiedPointY = DoubleArray(stageCapacity)
     private var stageOccupiedPointZ = DoubleArray(stageCapacity)
+    // Bit 0: retained fit; bit 1: current-frame fit already incorporated.
+    // Existing representative columns hold the staged temporal position.
+    private var stageEstimateState = if (estimatesEnabled) ByteArray(stageCapacity) else null
     private var stageFreeBin = ByteArray(stageCapacity) { NO_DIRECTION.toByte() }
     private var stageOrder = IntArray(stageCapacity)
     private var stageSortScratch = IntArray(stageCapacity)
@@ -83,6 +104,21 @@ internal class DepthEvidenceKernel(
     // Reused scratch for source IDs retired by the canonical mutation that
     // consumed the pending evidence packet.
     private var stageRetiredSourceIds = IntArray(tableCapacity)
+    // Existing reserve: eight Int fields, two Boolean fields, one config reference and fieldless helper header.
+    private val bulkCellCapacity = if (estimatesEnabled && configuration.planeFitStrategy == DepthPlaneFitStrategy.BULK_CELL_MOMENTS)
+        Integer.highestOneBit(minOf(configuration.sampleCapacity, stageCapacity / 3, (3 * stageCapacity) / 34)) else 0
+    private var bulkCellCount = 0
+    private var bulkQualifiedCells = 0
+    private var bulkCovarianceSolves = 0
+    private var bulkCertificateAttempts = 0
+    private var bulkResidualWork = 0
+    private var bulkScratchWork = 0
+    private var bulkProjectedSamples = 0
+    private var bulkScratchOpen = false
+    private var bulkWholeEstimateUnrefined = false
+    private var stageAssociationWork = 0
+    private var stageAssociatedSamples = 0
+    private var stageIndependentPlaneFits = 0
     private var stageCount = 0
     private var stageRelationCount = 0
     private var stageRelationAdmissionWork = 0
@@ -114,7 +150,7 @@ internal class DepthEvidenceKernel(
     } catch (_: DepthLookupFailure) {
         resetStage()
         refused(DepthEvidenceRefusal.CANONICAL_LOOKUP_FAILED, batch)
-    }
+    } finally { endBulkScratch(); endPlaneSupportReusePhase() }
 
     /**
      * Stages a borrowed depth lease without materializing one object per sample.
@@ -132,7 +168,7 @@ internal class DepthEvidenceKernel(
     } catch (_: DepthLookupFailure) {
         resetStage()
         refused(DepthEvidenceRefusal.CANONICAL_LOOKUP_FAILED, metadata)
-    }
+    } finally { endBulkScratch(); endPlaneSupportReusePhase() }
 
     private fun prepareLocked(
         metadata: DepthEvidenceMetadataView,
@@ -261,6 +297,7 @@ internal class DepthEvidenceKernel(
             ) continue
             rowSourceId[resident] = 0
             rowSourceKey[resident] = rowVoxelKey[resident]
+            rowFlags[resident] = (rowFlags[resident].toInt() and ESTIMATED_FLAG.inv()).toByte()
             rowPackedNormal[resident] = 0
             rowNormalConfidence[resident] = 0
             rowLineageCount[resident] = 0
@@ -327,6 +364,11 @@ internal class DepthEvidenceKernel(
         rowPackedNormal = ShortArray(0)
         rowNormalConfidence = ByteArray(0)
         rowLineageCount = ShortArray(0)
+        rowEstimateOffsetX = null
+        rowEstimateOffsetY = null
+        rowEstimateOffsetZ = null
+        stageEstimateState = null
+        localPlane?.close()
         stageHashRows = IntArray(0)
         stageX = IntArray(0)
         stageY = IntArray(0)
@@ -376,6 +418,15 @@ internal class DepthEvidenceKernel(
         revisionPair: CanonicalRevisionPair,
     ): Staged {
         resetStage()
+        if (estimatesEnabled && configuration.planeFitStrategy == DepthPlaneFitStrategy.BULK_CELL_MOMENTS)
+            prepareBulkPlanes(metadata, samples, cameraGroup)
+        else {
+            localPlane?.index(metadata, samples, configuration)
+            beginPlaneSupportReusePhase()
+        }
+        stageAssociationWork = 0
+        stageAssociatedSamples = 0
+        stageIndependentPlaneFits = 0
         val evidenceIndexWork = if (surfaces.supportsEmptyBlockSkipping) rebuildEvidenceBlocks() else 0
         var acceptedSamples = 0
         var rejectedSamples = metadata.sourceRejectedSamples
@@ -423,8 +474,15 @@ internal class DepthEvidenceKernel(
             }
             val endpoint = transform(metadata.groupFromCameraGl, cameraPoint)
                 ?: throw ArithmeticException("non-finite depth transform")
-            val endpointVoxel = DepthVoxelAddressing.quantize(endpoint, metadata.groupFrame.voxelSizeMicrometres)
+            val measuredVoxel = DepthVoxelAddressing.quantize(endpoint, metadata.groupFrame.voxelSizeMicrometres)
                 ?: return refuseAttempt(DepthEvidenceRefusal.ARITHMETIC_OVERFLOW)
+            val hasLocalPlane = if (estimatesEnabled && configuration.planeFitStrategy == DepthPlaneFitStrategy.BULK_CELL_MOMENTS)
+                projectBulkPoint(measuredVoxel, endpoint)
+            else fitWithCurrentEstimateSupport(metadata, samples, sampleIndex, measuredVoxel)
+            val endpointVoxel = if (hasLocalPlane &&
+                configuration.surfaceEstimationMode == DepthSurfaceEstimationMode.COMPATIBLE_LOCAL_PLANES
+            ) associatedEndpointVoxel(measuredVoxel, metadata.groupFrame) else measuredVoxel
+            if (endpointVoxel != measuredVoxel) stageAssociatedSamples++
             val endpointFound = canonicalAccess {
                 surfaces.findSurfaceAtInto(endpointVoxel.x, endpointVoxel.y, endpointVoxel.z, canonicalScratch)
             }
@@ -449,7 +507,10 @@ internal class DepthEvidenceKernel(
                 endpointPackedNormal, endpointNormalConfidence, endpointLineageCount,
             )
             stageHasOccupied[endpointIndex] = true
-            if (!hadOccupied || comparePoint(endpoint, occupiedPoint(endpointIndex)) < 0) {
+            if (hasLocalPlane) updateSupportDestinationHint(measuredVoxel, endpointIndex)
+            if (hasLocalPlane) updateStagedEstimate(endpointIndex, metadata.groupFrame)
+            if (estimateState(endpointIndex) and ESTIMATE_VALID == 0 &&
+                (!hadOccupied || comparePoint(endpoint, occupiedPoint(endpointIndex)) < 0)) {
                 stageOccupiedPointX[endpointIndex] = endpoint.x
                 stageOccupiedPointY[endpointIndex] = endpoint.y
                 stageOccupiedPointZ[endpointIndex] = endpoint.z
@@ -471,10 +532,10 @@ internal class DepthEvidenceKernel(
                     endpoint,
                     metadata.groupFrame,
                     remaining,
-                    endpointVoxel.x,
-                    endpointVoxel.y,
-                    endpointVoxel.z,
-                    endpointFound,
+                    measuredVoxel.x,
+                    measuredVoxel.y,
+                    measuredVoxel.z,
+                    endpointFound && measuredVoxel == endpointVoxel,
                     endpointId,
                     endpointSourceVoxelX,
                     endpointSourceVoxelY,
@@ -540,6 +601,7 @@ internal class DepthEvidenceKernel(
         var directionVotes = 0
         var conflicts = 0
         for (index in 0 until stageCount) {
+            finalizeStagedPosition(index, metadata.groupFrame)
             if (stageHasOccupied[index]) {
                 val updated = increment(stageOccupiedValue(index))
                 stageOccupied[index] = (updated and 0xff).toByte()
@@ -557,6 +619,8 @@ internal class DepthEvidenceKernel(
             }
             if (stageHasOccupied[index] && stageFreeValue(index) > 0) conflicts = checkedAdd(conflicts, 1)
         }
+        endBulkScratch()
+        endPlaneSupportReusePhase()
         val orderingWork = sortStageOrder()
         val planningWork = planChanges(surfaces)
         val validation = validatePlannedChanges()
@@ -576,7 +640,8 @@ internal class DepthEvidenceKernel(
         val kindCounts = kindCounts(stageChangeKind, stageChangeCount)
         val virtualWork = checkedAdd(
             checkedAdd(orderingWork, checkedAdd(planningWork, checkedAdd(validation.work, projection.work))),
-            checkedAdd(evidenceIndexWork, checkedAdd(stageRelationAdmissionWork, checkedAdd(acceptedSamples, checkedAdd(visits, stageCount)))),
+            checkedAdd(checkedAdd(bulkScratchWork, checkedAdd(checkedAdd(stageAssociationWork, localPlane?.workUnits ?: 0), reuseScratchWork)), checkedAdd(evidenceIndexWork,
+                checkedAdd(stageRelationAdmissionWork, checkedAdd(acceptedSamples, checkedAdd(visits, stageCount))))),
         )
         val receipt = DepthEvidenceReceipt(
             sequence = metadata.sequence,
@@ -628,7 +693,7 @@ internal class DepthEvidenceKernel(
             stageComponent[index] = index
             val sourceId = stageSourceIdValue(index)
             if (stageContradicted[index]) {
-                if (stageOccupiedValue(index) >= configuration.occupiedEvidenceToShow) {
+                if (stageOccupiedValue(index) >= configuration.occupiedEvidenceToShow && hasPublicationPlaneSupport(index)) {
                     stageContradicted[index] = false
                     stageFree[index] = 0
                     stageDirections[index] = 0
@@ -647,7 +712,7 @@ internal class DepthEvidenceKernel(
                 stagePublished[index] = false
                 stageRemoval[index] = true
             } else if (!conflicted && stageOccupiedValue(index) >= configuration.occupiedEvidenceToShow &&
-                !stagePublished[index]
+                !stagePublished[index] && hasPublicationPlaneSupport(index)
             ) {
                 stagePublished[index] = true
                 stagePositive[index] = true
@@ -982,7 +1047,7 @@ internal class DepthEvidenceKernel(
         frame: VisibilityGroupFrame,
         sourceId: SurfaceId?,
     ): CanonicalTarget {
-        val packed = if (stagePackedNormalValue(index) != 0) stagePackedNormalValue(index) else {
+        val packed = if (estimateState(index) and ESTIMATE_VALID != 0 || stagePackedNormalValue(index) != 0) stagePackedNormalValue(index) else {
             val center = center(Voxel(stageX[index], stageY[index], stageZ[index]), frame)
             val direction = cameraPoint?.let {
                 DepthPointMm(cameraGroup.x - it.x, cameraGroup.y - it.y, cameraGroup.z - it.z)
@@ -1171,7 +1236,14 @@ internal class DepthEvidenceKernel(
         rowOccupied[row] = stageOccupied[index]
         rowFree[row] = stageFree[index]
         rowDirections[row] = stageDirections[index]
-        rowFlags[row] = flags(stageContradicted[index], stagePublished[index])
+        rowFlags[row] = (flags(stageContradicted[index], stagePublished[index]).toInt() or
+            (if (estimateState(index) and ESTIMATE_VALID != 0) ESTIMATED_FLAG else 0)).toByte()
+        if (estimateState(index) and ESTIMATE_VALID != 0) {
+            val frame = requireNotNull(pending).frame
+            rowEstimateOffsetX!![row] = estimateOffset(stageOccupiedPointX[index], stageX[index], frame)
+            rowEstimateOffsetY!![row] = estimateOffset(stageOccupiedPointY[index], stageY[index], frame)
+            rowEstimateOffsetZ!![row] = estimateOffset(stageOccupiedPointZ[index], stageZ[index], frame)
+        }
         rowSourceId[row] = stageSourceId[index]
         rowSourceKey[row] = stageSourceKey[index]
         rowPackedNormal[row] = stagePackedNormal[index]
@@ -1235,6 +1307,8 @@ internal class DepthEvidenceKernel(
         stageOccupiedPointX[index] = 0.0
         stageOccupiedPointY[index] = 0.0
         stageOccupiedPointZ[index] = 0.0
+        stageEstimateState?.set(index, 0)
+        stageOrder[index] = 0
         stageFreeBin[index] = NO_DIRECTION.toByte()
         val resident = findRow(x, y, z)
         if (resident != EMPTY_ROW) {
@@ -1248,6 +1322,13 @@ internal class DepthEvidenceKernel(
             stagePackedNormal[index] = rowPackedNormal[resident]
             stageNormalConfidence[index] = rowNormalConfidence[resident]
             stageLineageCount[index] = rowLineageCount[resident]
+            if (rowFlags[resident].toInt() and ESTIMATED_FLAG != 0) {
+                stageEstimateState!![index] = ESTIMATE_VALID.toByte()
+                val frame = requireNotNull(activeFrame)
+                stageOccupiedPointX[index] = centerCoordinate(x, frame) + rowEstimateOffsetX!![resident]
+                stageOccupiedPointY[index] = centerCoordinate(y, frame) + rowEstimateOffsetY!![resident]
+                stageOccupiedPointZ[index] = centerCoordinate(z, frame) + rowEstimateOffsetZ!![resident]
+            }
         }
         var slot = stageHash(packVisibilityGridKey(x, y, z))
         while (stageHashRows[slot] != EMPTY_ROW) slot = (slot + 1) and (stageHashCapacity - 1)
@@ -1292,6 +1373,485 @@ internal class DepthEvidenceKernel(
         if (primary == 0L) return
         stageChangeSource[index] = sourceId.toInt()
     }
+
+    /** Constant-size diagnostic read of one retained estimate; never enumerates the map. */
+    @Synchronized
+    internal fun surfacePositionEstimate(voxel: Voxel): DepthSurfacePositionEstimate? {
+        if (closed || !estimatesEnabled || !voxelInRange(voxel)) return null
+        val row = findRow(voxel)
+        if (row == EMPTY_ROW || rowFlags[row].toInt() and ESTIMATED_FLAG == 0) return null
+        val frame = activeFrame ?: return null
+        val confidence = rowNormalConfidence[row].toInt() and 0xff
+        return DepthSurfacePositionEstimate(
+            centerCoordinate(voxel.x, frame) + rowEstimateOffsetX!![row],
+            centerCoordinate(voxel.y, frame) + rowEstimateOffsetY!![row],
+            centerCoordinate(voxel.z, frame) + rowEstimateOffsetZ!![row],
+            rowPackedNormal[row].toInt() and 0xffff,
+            if (confidence == 255) 4 else confidence / 64,
+        )
+    }
+
+    @Synchronized
+    internal fun surfaceEstimationReceipt(): DepthSurfaceEstimationReceipt = DepthSurfaceEstimationReceipt(
+        configuration.surfaceEstimationMode, localPlane?.fittedSamples ?: 0,
+        stageIndependentPlaneFits, stageAssociatedSamples, localPlane?.workUnits ?: 0, stageAssociationWork,
+        reuseFullFitAttempts, reuseFullFitSuccesses, reuseAttempts, reuseQualifiedPoints, reuseRefusals,
+        reuseWitnessWork, reuseScratchWork,
+    )
+
+    /** Relation scratch ownership ends before sorting; no input is retained. */
+    private fun endBulkScratch() { bulkScratchOpen = false }
+
+    override fun cellWord(index: Int): Int {
+        check(bulkScratchOpen && index in 0 until 3 * stageCapacity)
+        bulkScratchWork++
+        return when { index < stageCapacity -> stageRelationTarget[index]
+            index < 2 * stageCapacity -> stageRelationSource[index - stageCapacity]
+            else -> stageRelationOrder[index - 2 * stageCapacity] }
+    }
+
+    override fun cellWord(index: Int, value: Int) {
+        check(bulkScratchOpen && index in 0 until 3 * stageCapacity)
+        bulkScratchWork++
+        when { index < stageCapacity -> stageRelationTarget[index] = value
+            index < 2 * stageCapacity -> stageRelationSource[index - stageCapacity] = value
+            else -> stageRelationOrder[index - 2 * stageCapacity] = value }
+    }
+
+    override fun cellMoment(cell: Int, component: Int): Double {
+        check(bulkScratchOpen && cell in 0 until bulkCellCount && component in 0..8)
+        bulkScratchWork++
+        val index = cell * 3 + component % 3
+        return when (component / 3) { 0 -> stageOccupiedPointX[index]
+            1 -> stageOccupiedPointY[index]; else -> stageOccupiedPointZ[index] }
+    }
+
+    override fun cellMoment(cell: Int, component: Int, value: Double) {
+        check(bulkScratchOpen && cell in 0 until bulkCellCount && component in 0..8)
+        bulkScratchWork++
+        val index = cell * 3 + component % 3
+        when (component / 3) { 0 -> stageOccupiedPointX[index] = value
+            1 -> stageOccupiedPointY[index] = value; else -> stageOccupiedPointZ[index] = value }
+    }
+
+    private fun bulkBase(cell: Int): Int = 2 * bulkCellCapacity + DepthCellPlaneEstimator.WORDS * cell
+    private fun bulkKey(base: Int): Long = (cellWord(base).toLong() and 0xffffffffL) or (cellWord(base + 1).toLong() shl 32)
+    private fun bulkHash(key: Long): Int {
+        var mixed = key xor (key ushr 33)
+        mixed *= -49064778989728563L; mixed = mixed xor (mixed ushr 33)
+        return mixed.toInt() and (2 * bulkCellCapacity - 1)
+    }
+
+    /** Exact voxel hash, with exhaustion selecting raw evidence for the entire estimate. */
+    private fun bulkFind(key: Long, insert: Boolean): Int {
+        if (!bulkScratchOpen || bulkCellCapacity == 0) return EMPTY_ROW
+        var slot = bulkHash(key)
+        for (probe in 0 until 16) {
+            val cell = cellWord(slot)
+            if (cell == EMPTY_ROW) {
+                if (!insert || bulkCellCount == bulkCellCapacity) return EMPTY_ROW
+                val created = bulkCellCount++
+                val base = bulkBase(created)
+                for (word in 0 until DepthCellPlaneEstimator.WORDS) cellWord(base + word, 0)
+                cellWord(base, key.toInt()); cellWord(base + 1, (key ushr 32).toInt())
+                cellWord(base + DepthCellPlaneEstimator.MIN_DEPTH, Int.MAX_VALUE)
+                cellWord(base + DepthCellPlaneEstimator.MIN_X, Int.MAX_VALUE)
+                cellWord(base + DepthCellPlaneEstimator.MIN_Y, Int.MAX_VALUE)
+                cellWord(base + DepthCellPlaneEstimator.MAX_DEPTH, Int.MIN_VALUE)
+                cellWord(base + DepthCellPlaneEstimator.MAX_X, Int.MIN_VALUE)
+                cellWord(base + DepthCellPlaneEstimator.MAX_Y, Int.MIN_VALUE)
+                for (component in 0..8) cellMoment(created, component, 0.0)
+                cellWord(slot, created)
+                return created
+            }
+            if (bulkKey(bulkBase(cell)) == key) return cell
+            slot = (slot + 1) and (2 * bulkCellCapacity - 1)
+        }
+        return EMPTY_ROW
+    }
+
+    private fun bulkEligible(metadata: DepthEvidenceMetadataView, samples: DepthEvidenceSampleAccess, index: Int): Boolean =
+        samples.xAt(index) in 0 until metadata.intrinsics.imageWidth && samples.yAt(index) in 0 until metadata.intrinsics.imageHeight &&
+            samples.confidenceAt(index) >= configuration.confidenceMinimum && samples.depthMillimetresAt(index) in
+            configuration.minimumDepthMillimetres..configuration.maximumDepthMillimetres
+
+    /** Same scalar transform and floor quantization as the ordinary measured endpoint. */
+    private fun bulkMeasuredKey(metadata: DepthEvidenceMetadataView, samples: DepthEvidenceSampleAccess, index: Int): Long {
+        val plane = requireNotNull(localPlane)
+        if (!plane.loadMeasuredPoint(metadata, samples, index)) throw ArithmeticException("non-finite depth transform")
+        val size = metadata.groupFrame.voxelSizeMicrometres
+        val x = floor(plane.pointX * 1_000.0 / size); val y = floor(plane.pointY * 1_000.0 / size)
+        val z = floor(plane.pointZ * 1_000.0 / size)
+        if (!x.isFinite() || !y.isFinite() || !z.isFinite() || x < VOXEL_COORDINATE_MIN || x > VOXEL_COORDINATE_MAX ||
+            y < VOXEL_COORDINATE_MIN || y > VOXEL_COORDINATE_MAX || z < VOXEL_COORDINATE_MIN || z > VOXEL_COORDINATE_MAX)
+            throw ArithmeticException("depth quantization overflow")
+        return packVisibilityGridKey(x.toInt(), y.toInt(), z.toInt())
+    }
+
+    private fun rejectBulkCell(base: Int) { cellWord(base + DepthCellPlaneEstimator.STATUS, DepthCellPlaneEstimator.REJECTED) }
+    private fun useUnrefinedBulkEstimate() { bulkWholeEstimateUnrefined = true; bulkQualifiedCells = 0; endBulkScratch() }
+
+    /** Whole population first; no evidence row or per-point fit exists in this phase. */
+    private fun prepareBulkPlanes(metadata: DepthEvidenceMetadataView, samples: DepthEvidenceSampleAccess, camera: DepthPointMm) {
+        bulkCellCount = 0; bulkQualifiedCells = 0; bulkCovarianceSolves = 0; bulkCertificateAttempts = 0
+        bulkResidualWork = 0; bulkScratchWork = 0; bulkProjectedSamples = 0
+        bulkWholeEstimateUnrefined = false
+        bulkScratchOpen = bulkCellCapacity > 0
+        val plane = requireNotNull(localPlane)
+        if (!bulkScratchOpen) { useUnrefinedBulkEstimate(); plane.index(metadata, samples, configuration); return }
+        for (slot in 0 until 2 * bulkCellCapacity) cellWord(slot, EMPTY_ROW)
+        if (!plane.indexPixelConflicts(metadata, samples, configuration)) {
+            bulkScratchWork += plane.workUnits; useUnrefinedBulkEstimate(); plane.index(metadata, samples, configuration); return
+        }
+        for (index in 0 until samples.count) {
+            if (!bulkEligible(metadata, samples, index)) continue
+            val cell = bulkFind(bulkMeasuredKey(metadata, samples, index), true)
+            if (cell == EMPTY_ROW) {
+                bulkScratchWork += plane.workUnits; useUnrefinedBulkEstimate(); plane.index(metadata, samples, configuration); return
+            }
+            val base = bulkBase(cell)
+            DepthCellPlaneEstimator.accumulate(this, cell, base, plane.pointX, plane.pointY, plane.pointZ)
+            val depth = samples.depthMillimetresAt(index); val x = samples.xAt(index); val y = samples.yAt(index)
+            cellWord(base + 4, minOf(cellWord(base + 4), depth)); cellWord(base + 5, maxOf(cellWord(base + 5), depth))
+            cellWord(base + 6, minOf(cellWord(base + 6), x)); cellWord(base + 7, maxOf(cellWord(base + 7), x))
+            cellWord(base + 8, minOf(cellWord(base + 8), y)); cellWord(base + 9, maxOf(cellWord(base + 9), y))
+            if (plane.pixelConflicted(samples, index)) rejectBulkCell(base)
+        }
+        bulkScratchWork += plane.workUnits
+        for (cell in 0 until bulkCellCount) {
+            val base = bulkBase(cell)
+            if (cellWord(base + DepthCellPlaneEstimator.STATUS) == DepthCellPlaneEstimator.REJECTED) continue
+            if (cellWord(base + 5) - cellWord(base + 4) > 2 * minOf(30.0, metadata.groupFrame.voxelSizeMicrometres / 1_000.0 * 0.3)) {
+                rejectBulkCell(base); continue
+            }
+            bulkCovarianceSolves++
+            if (!DepthCellPlaneEstimator.solve(this, cell, base, camera.x, camera.y, camera.z)) rejectBulkCell(base)
+        }
+        val radius = minOf(50.0, metadata.groupFrame.voxelSizeMicrometres / 1_000.0)
+        val residualLimit = minOf(12.0, metadata.groupFrame.voxelSizeMicrometres / 1_000.0 * 0.12)
+        for (index in 0 until samples.count) {
+            if (!bulkEligible(metadata, samples, index)) continue
+            val cell = bulkFind(bulkMeasuredKey(metadata, samples, index), false)
+            check(cell != EMPTY_ROW)
+            val base = bulkBase(cell)
+            if (cellWord(base + 2) != DepthCellPlaneEstimator.SOLVED) continue
+            bulkResidualWork++
+            val dx = plane.pointX - DepthCellPlaneEstimator.double(this, base + 16)
+            val dy = plane.pointY - DepthCellPlaneEstimator.double(this, base + 18)
+            val dz = plane.pointZ - DepthCellPlaneEstimator.double(this, base + 20)
+            val residual = abs(dx * DepthCellPlaneEstimator.double(this, base + 22) + dy * DepthCellPlaneEstimator.double(this, base + 24) +
+                dz * DepthCellPlaneEstimator.double(this, base + 26))
+            val distance = dx * dx + dy * dy + dz * dz
+            if (!distance.isFinite() || !residual.isFinite() || residual > residualLimit || distance > radius * radius) {
+                rejectBulkCell(base); continue
+            }
+            DepthCellPlaneEstimator.double(this, base + 14, maxOf(DepthCellPlaneEstimator.double(this, base + 14), residual))
+            val old = cellWord(base + 10)
+            val best = DepthCellPlaneEstimator.double(this, base + 12)
+            if (distance < best || (distance == best && (old < 0 || xBefore(samples, index, old)))) {
+                DepthCellPlaneEstimator.double(this, base + 12, distance); cellWord(base + 10, index)
+            }
+        }
+        plane.index(metadata, samples, configuration)
+        for (cell in 0 until bulkCellCount) {
+            val base = bulkBase(cell)
+            if (cellWord(base + 2) != DepthCellPlaneEstimator.SOLVED) continue
+            val centre = cellWord(base + 10)
+            if (centre < 0) { rejectBulkCell(base); continue }
+            bulkCertificateAttempts++
+            if (!plane.estimate(metadata, samples, centre, configuration, populationResidualFloor = DepthCellPlaneEstimator.double(this, base + 14)) ||
+                plane.normalX * DepthCellPlaneEstimator.double(this, base + 22) + plane.normalY * DepthCellPlaneEstimator.double(this, base + 24) +
+                plane.normalZ * DepthCellPlaneEstimator.double(this, base + 26) < DepthCellPlaneEstimator.ANGULAR_COSINE) {
+                rejectBulkCell(base); continue
+            }
+            // Moments are dead after solving; three slots now hold the raw certificate centre.
+            check(plane.loadMeasuredPoint(metadata, samples, centre))
+            cellMoment(cell, 0, plane.pointX); cellMoment(cell, 1, plane.pointY); cellMoment(cell, 2, plane.pointZ)
+            cellWord(base + 2, DepthCellPlaneEstimator.QUALIFIED)
+        }
+        // Every member must also stay in the original certificate's physical neighborhood.
+        for (index in 0 until samples.count) {
+            if (!bulkEligible(metadata, samples, index)) continue
+            val cell = bulkFind(bulkMeasuredKey(metadata, samples, index), false)
+            check(cell != EMPTY_ROW)
+            val base = bulkBase(cell)
+            if (cellWord(base + 2) != DepthCellPlaneEstimator.QUALIFIED) continue
+            bulkResidualWork++
+            val dx = plane.pointX - cellMoment(cell, 0); val dy = plane.pointY - cellMoment(cell, 1); val dz = plane.pointZ - cellMoment(cell, 2)
+            if (dx * dx + dy * dy + dz * dz > radius * radius ||
+                abs(samples.depthMillimetresAt(index) - samples.depthMillimetresAt(cellWord(base + 10))) >
+                minOf(30.0, metadata.groupFrame.voxelSizeMicrometres / 1_000.0 * 0.3)) rejectBulkCell(base)
+        }
+        for (cell in 0 until bulkCellCount) if (cellWord(bulkBase(cell) + 2) == DepthCellPlaneEstimator.QUALIFIED) bulkQualifiedCells++
+    }
+
+    private fun xBefore(samples: DepthEvidenceSampleAccess, a: Int, b: Int): Boolean = samples.xAt(a) < samples.xAt(b) ||
+        (samples.xAt(a) == samples.xAt(b) && (samples.yAt(a) < samples.yAt(b) ||
+            (samples.yAt(a) == samples.yAt(b) && samples.depthMillimetresAt(a) < samples.depthMillimetresAt(b))))
+
+    private fun projectBulkPoint(measured: Voxel, endpoint: DepthPointMm): Boolean {
+        if (!bulkScratchOpen || bulkWholeEstimateUnrefined) return false
+        val cell = bulkFind(packVisibilityGridKey(measured.x, measured.y, measured.z), false)
+        check(cell != EMPTY_ROW)
+        val base = bulkBase(cell)
+        if (cellWord(base + 2) != DepthCellPlaneEstimator.QUALIFIED) return false
+        val nx = DepthCellPlaneEstimator.double(this, base + 22); val ny = DepthCellPlaneEstimator.double(this, base + 24)
+        val nz = DepthCellPlaneEstimator.double(this, base + 26)
+        val residual = (endpoint.x - DepthCellPlaneEstimator.double(this, base + 16)) * nx +
+            (endpoint.y - DepthCellPlaneEstimator.double(this, base + 18)) * ny + (endpoint.z - DepthCellPlaneEstimator.double(this, base + 20)) * nz
+        requireNotNull(localPlane).setProjection(endpoint.x - residual * nx, endpoint.y - residual * ny, endpoint.z - residual * nz, nx, ny, nz)
+        bulkProjectedSamples++
+        return true
+    }
+
+    @Synchronized internal fun bulkPlaneReceipt(): DepthBulkPlaneReceipt = DepthBulkPlaneReceipt(
+        configuration.planeFitStrategy, bulkCellCapacity, bulkCellCount, bulkQualifiedCells, bulkCellCount - bulkQualifiedCells,
+        bulkCovarianceSolves, bulkCertificateAttempts, bulkResidualWork, bulkScratchWork, bulkProjectedSamples, bulkWholeEstimateUnrefined)
+
+    internal fun bulkScratchWordForTest(index: Int): Int = cellWord(index)
+    internal fun bulkHashForTest(key: Long): Int = bulkHash(key)
+    @Synchronized internal fun currentProjectedPointForTest(): DepthPointMm = requireNotNull(localPlane).let {
+        DepthPointMm(it.pointX, it.pointY, it.pointZ)
+    }
+
+    private fun beginPlaneSupportReusePhase() {
+        supportCacheCount = 0
+        reuseFullFitAttempts = 0; reuseFullFitSuccesses = 0
+        reuseAttempts = 0; reuseQualifiedPoints = 0; reuseRefusals = 0
+        reuseWitnessWork = 0; reuseScratchWork = 0
+        supportCacheOpen = supportCacheCapacity > 0
+        if (supportCacheOpen) for (index in 0 until supportCacheCapacity * 2) writePlaneSupportWord(index, EMPTY_ROW)
+    }
+
+    private fun endPlaneSupportReusePhase() {
+        supportCacheOpen = false
+        supportCacheCount = 0
+    }
+
+    override fun readPlaneSupportWord(index: Int): Int {
+        check(supportCacheOpen) { "current-estimate support scratch is no longer owned by ingestion" }
+        require(index in 0 until supportCacheCapacity * 66)
+        reuseScratchWork++
+        return when {
+            index < stageCapacity -> stageRelationTarget[index]
+            index < stageCapacity * 2 -> stageRelationSource[index - stageCapacity]
+            else -> stageRelationOrder[index - stageCapacity * 2]
+        }
+    }
+
+    override fun writePlaneSupportWord(index: Int, value: Int) {
+        check(supportCacheOpen) { "current-estimate support scratch is no longer owned by ingestion" }
+        require(index in 0 until supportCacheCapacity * 66)
+        reuseScratchWork++
+        when {
+            index < stageCapacity -> stageRelationTarget[index] = value
+            index < stageCapacity * 2 -> stageRelationSource[index - stageCapacity] = value
+            else -> stageRelationOrder[index - stageCapacity * 2] = value
+        }
+    }
+
+    private fun supportCertificateBase(entry: Int): Int = supportCacheCapacity * 2 + entry * 64
+
+    private fun findSupportCertificate(key: Long): Int {
+        check(supportCacheOpen)
+        val mask = supportCacheCapacity * 2 - 1
+        var slot = mixedHash(key) and mask
+        repeat(minOf(16, supportCacheCapacity * 2)) {
+            val entry = readPlaneSupportWord(slot)
+            if (entry == EMPTY_ROW) return EMPTY_ROW
+            check(entry in 0 until supportCacheCount)
+            val base = supportCertificateBase(entry)
+            val cached = (readPlaneSupportWord(base).toLong() and 0xffff_ffffL) or
+                (readPlaneSupportWord(base + 1).toLong() shl 32)
+            if (cached == key) return entry
+            slot = (slot + 1) and mask
+        }
+        return EMPTY_ROW
+    }
+
+    private fun canInsertSupportCertificate(key: Long): Boolean {
+        if (supportCacheCount >= supportCacheCapacity) return false
+        val mask = supportCacheCapacity * 2 - 1
+        var slot = mixedHash(key) and mask
+        repeat(minOf(16, supportCacheCapacity * 2)) {
+            if (readPlaneSupportWord(slot) == EMPTY_ROW) return true
+            slot = (slot + 1) and mask
+        }
+        return false
+    }
+
+    private fun publishSupportCertificate(key: Long, entry: Int) {
+        val base = supportCertificateBase(entry)
+        writePlaneSupportWord(base, key.toInt()); writePlaneSupportWord(base + 1, (key ushr 32).toInt())
+        writePlaneSupportWord(base + 2, EMPTY_ROW)
+        if (entry < supportCacheCount) return
+        check(entry == supportCacheCount)
+        val mask = supportCacheCapacity * 2 - 1
+        var slot = mixedHash(key) and mask
+        repeat(minOf(16, supportCacheCapacity * 2)) {
+            if (readPlaneSupportWord(slot) == EMPTY_ROW) {
+                writePlaneSupportWord(slot, entry)
+                supportCacheCount++
+                return
+            }
+            slot = (slot + 1) and mask
+        }
+        error("admitted support-certificate slot disappeared during synchronous ingestion")
+    }
+
+    internal fun currentEstimateSupportCapacityForTest(): Int = supportCacheCapacity
+
+    internal fun currentEstimateSupportHashForTest(measured: Voxel): Int {
+        require(supportCacheCapacity > 0)
+        return mixedHash(packVisibilityGridKey(measured.x, measured.y, measured.z)) and (supportCacheCapacity * 2 - 1)
+    }
+
+    internal fun currentEstimateDestinationHintForTest(measured: Voxel): Int {
+        check(supportCacheOpen)
+        val entry = findSupportCertificate(packVisibilityGridKey(measured.x, measured.y, measured.z))
+        return if (entry == EMPTY_ROW) EMPTY_ROW else readPlaneSupportWord(supportCertificateBase(entry) + 2)
+    }
+
+    private fun fitWithCurrentEstimateSupport(metadata: DepthEvidenceMetadataView, samples: DepthEvidenceSampleAccess,
+        index: Int, measured: Voxel): Boolean {
+        val plane = localPlane ?: return false
+        val key = packVisibilityGridKey(measured.x, measured.y, measured.z)
+        val entry = if (supportCacheOpen) findSupportCertificate(key) else EMPTY_ROW
+        if (entry != EMPTY_ROW) {
+            reuseAttempts++
+            val witnessBefore = plane.workUnits
+            val qualified = plane.tryReuse(metadata, samples, index, configuration, this, supportCertificateBase(entry))
+            reuseWitnessWork += plane.workUnits - witnessBefore
+            if (qualified) { reuseQualifiedPoints++; return true }
+            reuseRefusals++
+        }
+        val writeEntry = if (!supportCacheOpen) EMPTY_ROW else if (entry != EMPTY_ROW) entry
+            else if (canInsertSupportCertificate(key)) supportCacheCount else EMPTY_ROW
+        reuseFullFitAttempts++
+        val qualified = plane.estimate(metadata, samples, index, configuration,
+            if (writeEntry != EMPTY_ROW) this else null,
+            if (writeEntry != EMPTY_ROW) supportCertificateBase(writeEntry) else 0)
+        if (qualified) {
+            reuseFullFitSuccesses++
+            if (writeEntry != EMPTY_ROW) publishSupportCertificate(key, writeEntry)
+        }
+        return qualified
+    }
+
+    private fun updateSupportDestinationHint(measured: Voxel, destination: Int) {
+        if (!supportCacheOpen) return
+        val entry = findSupportCertificate(packVisibilityGridKey(measured.x, measured.y, measured.z))
+        if (entry != EMPTY_ROW) writePlaneSupportWord(supportCertificateBase(entry) + 2, destination)
+    }
+
+    private fun supportCacheCapacityFor(availableStageRows: Int): Int {
+        if (!estimatesEnabled || (!configuration.reuseCurrentEstimatePlaneSupport &&
+            configuration.planeFitStrategy != DepthPlaneFitStrategy.REUSABLE_SAMPLE_SUPPORT)) return 0
+        var capacity = 0
+        var candidate = 1
+        while (candidate <= 2048 && candidate * 66 <= availableStageRows * 3) {
+            capacity = candidate; candidate *= 2
+        }
+        return capacity
+    }
+
+    private fun hasPublicationPlaneSupport(index: Int): Boolean =
+        estimateState(index) and ESTIMATE_VALID == 0 || stageNormalConfidenceValue(index) >=
+            minOf(255, configuration.occupiedEvidenceToShow * 64)
+
+    private fun estimateState(index: Int): Int = stageEstimateState?.get(index)?.toInt() ?: 0
+
+    /** Bounded 27-cell association; never enumerates canonical surfaces or erases a neighbor. */
+    private fun associatedEndpointVoxel(measured: Voxel, frame: VisibilityGroupFrame): Voxel {
+        val plane = requireNotNull(localPlane)
+        val size = frame.voxelSizeMicrometres / 1_000.0
+        val residualGate = minOf(30.0, size * 0.3)
+        val tangentGate = minOf(35.0, size * 0.35)
+        var selected = measured
+        var bestDistance = Double.POSITIVE_INFINITY
+        for (dx in -1..1) for (dy in -1..1) for (dz in -1..1) {
+            stageAssociationWork++
+            val x = measured.x + dx; val y = measured.y + dy; val z = measured.z + dz
+            if (!voxelInRange(x, y, z)) continue
+            val cellDistance = sqrt((dx * dx + dy * dy + dz * dz).toDouble())
+            if (cellDistance > 0.0 && kotlin.math.abs(dx * plane.normalX + dy * plane.normalY +
+                    dz * plane.normalZ) < cellDistance * 0.5) continue
+            val row = findRow(x, y, z)
+            if (row == EMPTY_ROW || (rowOccupied[row].toInt() and 0xff) == 0 ||
+                rowFlags[row].toInt() and ESTIMATED_FLAG == 0 ||
+                rowFlags[row].toInt() and CONTRADICTED_FLAG != 0 ||
+                normalAgreement(rowPackedNormal[row].toInt() and 0xffff, plane) < NORMAL_AGREEMENT_COSINE) continue
+            val px = plane.pointX - (centerCoordinate(x, frame) + rowEstimateOffsetX!![row])
+            val py = plane.pointY - (centerCoordinate(y, frame) + rowEstimateOffsetY!![row])
+            val pz = plane.pointZ - (centerCoordinate(z, frame) + rowEstimateOffsetZ!![row])
+            val residual = px * plane.normalX + py * plane.normalY + pz * plane.normalZ
+            val distance = px * px + py * py + pz * pz
+            if (kotlin.math.abs(residual) > residualGate || distance - residual * residual > tangentGate * tangentGate) continue
+            if (distance < bestDistance) { selected = Voxel(x, y, z); bestDistance = distance }
+        }
+        return selected
+    }
+
+    /** One local fit per independent estimate updates the bounded temporal mean. */
+    private fun updateStagedEstimate(index: Int, frame: VisibilityGroupFrame) {
+        val alreadyObserved = estimateState(index) and ESTIMATE_OBSERVED != 0
+        val plane = requireNotNull(localPlane)
+        val valid = estimateState(index) and ESTIMATE_VALID != 0
+        val size = frame.voxelSizeMicrometres / 1_000.0
+        if (valid) {
+            val dx = plane.pointX - stageOccupiedPointX[index]
+            val dy = plane.pointY - stageOccupiedPointY[index]
+            val dz = plane.pointZ - stageOccupiedPointZ[index]
+            if (normalAgreement(stagePackedNormalValue(index), plane) < NORMAL_AGREEMENT_COSINE ||
+                kotlin.math.abs(dx * plane.normalX + dy * plane.normalY + dz * plane.normalZ) > minOf(30.0, size * 0.3)) return
+        }
+        // stageOrder is unused until sorting; it counts coherent samples in
+        // this acquired estimate without reserving another stage-sized array.
+        val weight = if (alreadyObserved) stageOrder[index] else 0
+        val x = (stageOccupiedPointX[index] * weight + plane.pointX) / (weight + 1)
+        val y = (stageOccupiedPointY[index] * weight + plane.pointY) / (weight + 1)
+        val z = (stageOccupiedPointZ[index] * weight + plane.pointZ) / (weight + 1)
+        if (kotlin.math.abs(x - centerCoordinate(stageX[index], frame)) > Short.MAX_VALUE ||
+            kotlin.math.abs(y - centerCoordinate(stageY[index], frame)) > Short.MAX_VALUE ||
+            kotlin.math.abs(z - centerCoordinate(stageZ[index], frame)) > Short.MAX_VALUE) return
+        stageOccupiedPointX[index] = x; stageOccupiedPointY[index] = y; stageOccupiedPointZ[index] = z
+        stageOrder[index] = weight + 1
+        if (!alreadyObserved) {
+            stagePackedNormal[index] = encodeNormal(DepthPointMm(plane.normalX, plane.normalY, plane.normalZ)).toShort()
+            stageNormalConfidence[index] = (if (valid) stageNormalConfidenceValue(index) + 64 else 64).coerceAtMost(255).toByte()
+            stageIndependentPlaneFits++
+        }
+        stageEstimateState!![index] = (ESTIMATE_VALID or ESTIMATE_OBSERVED).toByte()
+    }
+
+    private fun finalizeStagedPosition(index: Int, frame: VisibilityGroupFrame) {
+        if (estimateState(index) and ESTIMATE_OBSERVED == 0) return
+        val row = findRow(stageX[index], stageY[index], stageZ[index])
+        if (row == EMPTY_ROW || rowFlags[row].toInt() and ESTIMATED_FLAG == 0) return
+        val weight = minOf(3, (rowNormalConfidence[row].toInt() and 0xff) / 64)
+        val oldX = centerCoordinate(stageX[index], frame) + rowEstimateOffsetX!![row]
+        val oldY = centerCoordinate(stageY[index], frame) + rowEstimateOffsetY!![row]
+        val oldZ = centerCoordinate(stageZ[index], frame) + rowEstimateOffsetZ!![row]
+        stageOccupiedPointX[index] = (oldX * weight + stageOccupiedPointX[index]) / (weight + 1)
+        stageOccupiedPointY[index] = (oldY * weight + stageOccupiedPointY[index]) / (weight + 1)
+        stageOccupiedPointZ[index] = (oldZ * weight + stageOccupiedPointZ[index]) / (weight + 1)
+    }
+
+    private fun normalAgreement(packed: Int, plane: DepthLocalPlaneEstimator): Double {
+        var x = (packed ushr 8).toByte().toInt() / 127.0
+        var y = packed.toByte().toInt() / 127.0
+        val z = 1.0 - kotlin.math.abs(x) - kotlin.math.abs(y)
+        if (z < 0.0) {
+            val oldX = x
+            x = (1.0 - kotlin.math.abs(y)) * if (oldX < 0.0) -1.0 else 1.0
+            y = (1.0 - kotlin.math.abs(oldX)) * if (y < 0.0) -1.0 else 1.0
+        }
+        val length = sqrt(x * x + y * y + z * z)
+        return (x * plane.normalX + y * plane.normalY + z * plane.normalZ) / length
+    }
+
+    private fun estimateOffset(point: Double, cell: Int, frame: VisibilityGroupFrame): Short =
+        kotlin.math.round(point - centerCoordinate(cell, frame)).toInt().toShort()
 
     private fun occupiedPoint(index: Int): DepthPointMm = DepthPointMm(
         stageOccupiedPointX[index], stageOccupiedPointY[index], stageOccupiedPointZ[index],
@@ -1505,6 +2065,8 @@ internal class DepthEvidenceKernel(
     }
 
     private fun resetStage() {
+        endBulkScratch()
+        endPlaneSupportReusePhase()
         java.util.Arrays.fill(stageHashRows, EMPTY_ROW)
         java.util.Arrays.fill(stageFreeBin, NO_DIRECTION.toByte())
         java.util.Arrays.fill(stageHasOccupied, false)
@@ -1692,7 +2254,7 @@ internal class DepthEvidenceKernel(
 
     private fun checkedAdd(left: Int, right: Int): Int = Math.addExact(left, right)
 
-    private fun checkedBytes(rows: Int): Int = Math.multiplyExact(rows, EVIDENCE_BYTES)
+    private fun checkedBytes(rows: Int): Int = Math.multiplyExact(rows, EVIDENCE_BYTES + if (estimatesEnabled) 6 else 0)
 
     private inline fun <T> canonicalAccess(access: () -> T): T = try {
         access()
@@ -1726,7 +2288,8 @@ internal class DepthEvidenceKernel(
         stageChangeSource, stageChangeTarget, stageChangeComponent,
         stageKindCounts,
         stageRetiredSourceIds,
-    )
+    ) + listOfNotNull(rowEstimateOffsetX, rowEstimateOffsetY, rowEstimateOffsetZ, stageEstimateState) +
+        (localPlane?.primitiveArraysForAccounting() ?: emptyList())
 
     private fun fixedPrimitiveBytes(): Int = Math.toIntExact(
         primitiveArraysForAccounting().sumOf(::modeledArrayBytes),
@@ -1747,7 +2310,7 @@ internal class DepthEvidenceKernel(
 
     private fun modeledMaximumSemanticStateBytes(): Int = Math.addExact(
         fixedPrimitiveBytes(),
-        MAXIMUM_ACCEPTED_OUTPUT_RESERVE_BYTES,
+        MAXIMUM_ACCEPTED_OUTPUT_RESERVE_BYTES + if (estimatesEnabled) LOCAL_ESTIMATOR_SCALAR_RESERVE_BYTES else 0,
     )
 
     private fun stageFreeBinValue(index: Int): Int = stageFreeBin[index].toInt()
@@ -1863,6 +2426,9 @@ internal class DepthEvidenceKernel(
     private companion object {
         const val EMPTY_ROW = -1
         const val EVIDENCE_BYTES = 32
+        // Combined local helper, configuration and mutually exclusive reuse/bulk scalar fields.
+        // Conservative portable 16-byte header/8-byte alignment model; array scratch is shared.
+        const val LOCAL_ESTIMATOR_SCALAR_RESERVE_BYTES = 384
         const val SEMANTIC_STATE_BUDGET_BYTES = 16 * 1024 * 1024
         // Conservative modeled ownership under the same 16-byte header and
         // 8-byte alignment convention as the fixed-array ledger. The packet
@@ -1893,6 +2459,10 @@ internal class DepthEvidenceKernel(
         const val NO_DIRECTION = -1
         const val CONTRADICTED_FLAG = 1
         const val PUBLISHED_FLAG = 2
+        const val ESTIMATED_FLAG = 4
+        const val ESTIMATE_VALID = 1
+        const val ESTIMATE_OBSERVED = 2
+        const val NORMAL_AGREEMENT_COSINE = 0.984807753012208
         const val CHANGE_CREATE = 1
         const val CHANGE_REFINE = 2
         const val CHANGE_RELOCATE = 3
