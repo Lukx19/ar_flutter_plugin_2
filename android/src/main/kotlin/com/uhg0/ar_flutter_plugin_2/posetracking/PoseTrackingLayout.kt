@@ -16,7 +16,7 @@ internal object PoseTrackingLayout {
     const val CHANNEL = "capture3d/visibility_grid/pose_tracking"
 
     /** Ingest kind of an anchor pose update. */
-    const val ANCHOR_POSE_UPDATE_KIND = 7
+    const val ANCHOR_POSE_UPDATE_KIND = IngestMessageLayout.KIND_ANCHOR_POSE_UPDATE
 }
 
 /** Anchor kinds of update and creation records. */

@@ -12,8 +12,10 @@ abstract final class IngestKind {
   static const int markerDetections = 5;
   static const int sessionEvent = 6;
 
-  /// Reserved for the anchor pose update of pose stability (plan 2.14).
-  static const int reservedAnchorPoses = 7;
+  /// Anchor pose update of pose stability (plan 2.14): ingest header plus
+  /// the anchor pose payload. Travels on the pose tracking channel, not
+  /// through the ingest pull, so it is never part of a pull kind mask.
+  static const int anchorPoseUpdate = 7;
 
   /// Marker tie points of one saved photo, after its durable commit:
   /// payload is the 64 B `C3TB` batch header and 64 B native tie point

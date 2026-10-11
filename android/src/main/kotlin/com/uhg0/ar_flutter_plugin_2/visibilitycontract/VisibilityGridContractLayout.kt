@@ -54,8 +54,12 @@ internal object IngestMessageLayout {
     const val KIND_MARKER_DETECTIONS = 5
     const val KIND_SESSION_EVENT = 6
 
-    /** Reserved for the anchor pose update of pose stability (plan 2.14). */
-    const val KIND_RESERVED_ANCHOR_POSES = 7
+    /**
+     * Anchor pose update of pose stability (plan 2.14). Travels on the
+     * pose tracking channel, not through the ingest pull handler, so it is
+     * never part of a pull kind mask.
+     */
+    const val KIND_ANCHOR_POSE_UPDATE = 7
 
     /**
      * Marker tie points of one saved photo (grid integration amendment):
