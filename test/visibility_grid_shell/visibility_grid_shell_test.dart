@@ -91,8 +91,12 @@ void main() {
       return ByteData.sublistView(idle);
     });
     final client = VisibilityGridIngestPullClient(messenger);
-    final reply = await client.pull();
+    // The golden is the kinds 1-6 request; the default also accepts kind 8.
+    final reply = await client.pull(0x7e);
     expect(request, orderedEquals(_golden('ingest_pull_request.bin')));
+    await client.pull();
+    expect(request![6], 0x7e);
+    expect(request![7], 1 << (IngestKind.photoTiePoints - 8));
     final view = IngestMessageView()..attach(reply);
     expect(view.validate(reply.lengthInBytes), ContractStatus.ok);
     expect(view.kind, IngestKind.idle);

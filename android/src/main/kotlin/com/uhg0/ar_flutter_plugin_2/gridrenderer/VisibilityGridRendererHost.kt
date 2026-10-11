@@ -17,6 +17,7 @@ import android.view.ViewGroup
 import com.google.ar.core.Frame
 import com.google.ar.core.TrackingState
 import com.uhg0.ar_flutter_plugin_2.visibilitycontract.VisibilityGridRendererHostSeam
+import com.uhg0.ar_flutter_plugin_2.gridrenderer.markers.MarkerOutlineOverlay
 import com.uhg0.ar_flutter_plugin_2.gridrenderer.quest.QuestLineOverlay
 import java.nio.ByteBuffer
 import java.util.concurrent.CopyOnWriteArrayList
@@ -73,6 +74,9 @@ internal class VisibilityGridRendererHost(
 
     /** Guided-capture quests; drawn only after their first overlay message. */
     val questOverlay = QuestLineOverlay().also { core.lineOverlays.addIfAbsent(it) }
+
+    /** Marker outlines (C3MO from the grid isolate marker stage) on the same line overlay hook. */
+    val markerOverlay = MarkerOutlineOverlay().also { core.lineOverlays.addIfAbsent(it) }
 
     /** [scene] is the SceneView host view; the overlay is added to its parent above it. [engine] is unused by the GLES path. */
     override fun attach(engine: Any, scene: Any) {

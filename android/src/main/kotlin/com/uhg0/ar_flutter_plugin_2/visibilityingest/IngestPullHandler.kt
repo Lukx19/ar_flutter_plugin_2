@@ -21,8 +21,8 @@ internal interface IngestMessageSink {
     /**
      * Offers `message[0, length)` (little-endian; the copy resets its position
      * and limit). Kinds 1, 2, 3 and 5 keep only the freshest
-     * unsent message (a replaced one counts as dropped); kinds 4 and 6 are
-     * queued in order. Returns false when the message was refused (malformed,
+     * unsent message (a replaced one counts as dropped); kinds 4, 6 and 8
+     * are queued in order. Returns false when the message was refused (malformed,
      * oversized or a full queue); the refusal is counted.
      */
     fun offer(message: ByteBuffer, length: Int): Boolean
@@ -55,7 +55,13 @@ internal class IngestPullHandler(
         const val SESSION_QUEUE = 64
         const val PHOTO_MESSAGE_BYTES = IngestMessageLayout.HEADER_BYTES + 128
         const val SESSION_MESSAGE_BYTES = IngestMessageLayout.HEADER_BYTES + IngestMessageLayout.SESSION_EVENT_BYTES
-        private const val KINDS = 7
+
+        /** Photo tie point batches waiting (one per saved photo; detection takes about 80 ms each). */
+        const val TIE_POINT_QUEUE = 8
+
+        /** Header, `C3TB` batch header and up to 128 native tie point records of 64 B. */
+        const val TIE_POINT_MESSAGE_BYTES = IngestMessageLayout.HEADER_BYTES + 64 + 128 * 64
+        private const val KINDS = 9
 
         /** Delivery order of the freshest-only kinds. */
         private val LATEST_ORDER = intArrayOf(
@@ -75,13 +81,16 @@ internal class IngestPullHandler(
     private val latestLength = IntArray(KINDS)
     private val latestFresh = BooleanArray(KINDS)
 
-    // In-order queues (kinds 4, 6).
+    // In-order queues (kinds 4, 6, 8).
     private val photoRing = Array(PHOTO_QUEUE) { direct(PHOTO_MESSAGE_BYTES) }
     private var photoHead = 0
     private var photoCount = 0
     private val sessionRing = Array(SESSION_QUEUE) { direct(SESSION_MESSAGE_BYTES) }
     private var sessionHead = 0
     private var sessionCount = 0
+    private val tieRing = Array(TIE_POINT_QUEUE) { direct(TIE_POINT_MESSAGE_BYTES) }
+    private var tieHead = 0
+    private var tieCount = 0
 
     private val replies = arrayOf(direct(IngestMessageLayout.MAX_MESSAGE_BYTES), direct(IngestMessageLayout.MAX_MESSAGE_BYTES))
     private var lastReply = 1
@@ -132,6 +141,13 @@ internal class IngestPullHandler(
                     copy(message, length, slot)
                     stampSequenceLocked(slot, kind)
                     sessionCount++
+                }
+                IngestMessageLayout.KIND_PHOTO_TIE_POINTS -> {
+                    if (length > TIE_POINT_MESSAGE_BYTES || tieCount == TIE_POINT_QUEUE) return overflowLocked(kind)
+                    val slot = tieRing[(tieHead + tieCount) % TIE_POINT_QUEUE]
+                    copy(message, length, slot)
+                    stampSequenceLocked(slot, kind)
+                    tieCount++
                 }
                 IngestMessageLayout.KIND_DEPTH_IMAGE, IngestMessageLayout.KIND_POINT_CLOUD,
                 IngestMessageLayout.KIND_AGGREGATED_VOXELS, IngestMessageLayout.KIND_MARKER_DETECTIONS -> {
@@ -225,6 +241,7 @@ internal class IngestPullHandler(
             for (kind in LATEST_ORDER) latestFresh[kind] = false
             photoCount = 0
             sessionCount = 0
+            tieCount = 0
         }
     }
 
@@ -244,7 +261,7 @@ internal class IngestPullHandler(
         val b = message.order(ByteOrder.LITTLE_ENDIAN)
         val at = b.position()
         if (b.getInt(at) != IngestMessageLayout.PULL_REQUEST_MAGIC || b.getShort(at + 4).toInt() != 1) return -1
-        return b.get(at + 6).toInt() and 0xff
+        return b.getShort(at + IngestMessageLayout.PULL_REQUEST_MASK).toInt() and 0xffff
     }
 
     private fun deliverPendingLocked() {
@@ -260,6 +277,13 @@ internal class IngestPullHandler(
             photoHead = (photoHead + 1) % PHOTO_QUEUE
             photoCount--
             replyLocked(reply, slot, IngestMessageWriter.messageBytes(slot), IngestMessageLayout.KIND_PHOTO_SAVED)
+            return true
+        }
+        if (tieCount > 0 && accepts(mask, IngestMessageLayout.KIND_PHOTO_TIE_POINTS)) {
+            val slot = tieRing[tieHead]
+            tieHead = (tieHead + 1) % TIE_POINT_QUEUE
+            tieCount--
+            replyLocked(reply, slot, IngestMessageWriter.messageBytes(slot), IngestMessageLayout.KIND_PHOTO_TIE_POINTS)
             return true
         }
         if (sessionCount > 0 && accepts(mask, IngestMessageLayout.KIND_SESSION_EVENT)) {

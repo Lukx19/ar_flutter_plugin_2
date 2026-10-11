@@ -54,6 +54,16 @@ internal object IngestMessageLayout {
     const val KIND_MARKER_DETECTIONS = 5
     const val KIND_SESSION_EVENT = 6
 
+    /** Reserved for the anchor pose update of pose stability (plan 2.14). */
+    const val KIND_RESERVED_ANCHOR_POSES = 7
+
+    /**
+     * Marker tie points of one saved photo (grid integration amendment):
+     * payload is the 64 B `C3TB` batch header and 64 B native tie point
+     * records; queued in order, never replaced by a fresher message.
+     */
+    const val KIND_PHOTO_TIE_POINTS = 8
+
     const val SOURCE_DEPTH = 1
     const val SOURCE_POINTS = 2
     const val SOURCE_LIDAR_CLASS = 4
@@ -85,6 +95,9 @@ internal object IngestMessageLayout {
 
     val PULL_REQUEST_MAGIC = contractMagic("C3VP")
     const val PULL_REQUEST_BYTES = 8
+
+    /** u16 accepted kind mask (bit k accepts kind k); byte 7 was reserved zero before kind 8. */
+    const val PULL_REQUEST_MASK = 6
 }
 
 internal object PhotoSavedLayout {

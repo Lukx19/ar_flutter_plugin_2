@@ -158,6 +158,28 @@ void main() {
     expect(view.acceptedKindMask, 0x7e);
   });
 
+  test('pull request carries kind 8 in the high mask byte; an 8-bit mask '
+      'reads as before', () {
+    final bytes = Uint8List(IngestPullRequestView.bytes);
+    final view = IngestPullRequestView()..attach(ByteData.sublistView(bytes));
+    view.write(0x17e);
+    expect(bytes[6], 0x7e);
+    expect(bytes[7], 0x01);
+    expect(view.acceptedKindMask & (1 << IngestKind.photoTiePoints), isNonZero);
+    view.write(0x7e);
+    expect(bytes[7], 0);
+  });
+
+  test('a photo tie point message (kind 8) validates', () {
+    final bytes = Uint8List(IngestHeaderLayout.bytes + 64);
+    final h = IngestMessageView()..attach(ByteData.sublistView(bytes));
+    h
+      ..begin(IngestKind.photoTiePoints)
+      ..payloadBytes = 64;
+    expect(h.validate(bytes.length), ContractStatus.ok);
+    expect(h.kind, 8);
+  });
+
   test('one view decodes many messages without reattaching buffers', () {
     final view = IngestMessageView();
     for (final build in ingestGoldens.values) {

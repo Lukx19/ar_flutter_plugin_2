@@ -79,8 +79,11 @@ internal object VisibilityGridShellRegistry {
             markers = GridMarkerShellTaps.create(
                 ingestSink = { ingestSink },
                 shell = { shell },
+                clock = elapsedRealtime,
             )?.also { taps ->
                 if (taps.frameTap !in extraTaps) extraTaps += taps.frameTap
+                photoListeners = photoListeners + taps.photoListener
+                created.durablePhotoListeners = photoListeners
             }
             idleTimer = Thread({
                 val pull = created.pull
@@ -105,6 +108,7 @@ internal object VisibilityGridShellRegistry {
         messenger?.let(GridRendererChannels::unregister)
         markers?.let { taps ->
             extraTaps -= taps.frameTap
+            photoListeners = photoListeners.filter { it !== taps.photoListener }.toTypedArray()
             taps.close()
         }
         markers = null
