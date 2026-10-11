@@ -1495,7 +1495,7 @@ class NativeCaptureAdapterV2Test {
             )
             val lifecycle = executor.submit {
                 adapter.onLifecycle(
-                    CaptureLifecycleEvent.BACKGROUNDED,
+                    CaptureLifecycleEvent.VIEW_REPLACED,
                     request.accepted.identity.lifecycleCut,
                 )
             }
@@ -1514,6 +1514,111 @@ class NativeCaptureAdapterV2Test {
             val recoveredAdapter = NativeCaptureAdapterV2(store, recoveredCamera)
             assertEquals(durableTerminal, recoveredAdapter.admit(request))
             assertTrue(recoveredCamera.requests.isEmpty())
+        } finally {
+            store.commitRelease?.countDown()
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `a pause publishes the terminal a store commit reaches while the pause transfer queries it`() {
+        val store = FakeStore().apply {
+            commitEntered = CountDownLatch(1)
+            commitRelease = CountDownLatch(1)
+            serializeCommitAndQuery = true
+        }
+        val camera = FakeExposure()
+        val events = java.util.Collections.synchronizedList(mutableListOf<NativeCaptureEventV2>())
+        val adapter = NativeCaptureAdapterV2(store, camera, events = events::add)
+        val request = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG))
+        adapter.admit(request)
+        val executor = Executors.newFixedThreadPool(2)
+        try {
+            val commit = executor.submit {
+                camera.components(camera.requests.single().first, request, listOf(CaptureComponentKind.JPEG))
+            }
+            assertTrue(store.commitEntered!!.await(5, TimeUnit.SECONDS))
+            val pause = executor.submit {
+                adapter.onLifecycle(CaptureLifecycleEvent.BACKGROUNDED, request.accepted.identity.lifecycleCut)
+            }
+            assertThrows(TimeoutException::class.java) { pause.get(100, TimeUnit.MILLISECONDS) }
+            store.commitRelease!!.countDown()
+            commit.get(5, TimeUnit.SECONDS)
+            pause.get(5, TimeUnit.SECONDS)
+            val committed = events.filter { it.kind == NativeCaptureEventKindV2.COMMITTED }
+            assertEquals(listOf(request.accepted.identity.attemptId), committed.map { it.attemptId })
+            assertEquals(1L, adapter.snapshot().committed)
+            assertEquals(0, adapter.snapshot().running)
+        } finally {
+            store.commitRelease?.countDown()
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `a store commit that completes after a pause transfer is still published once`() {
+        val store = FakeStore().apply {
+            commitEntered = CountDownLatch(1)
+            commitRelease = CountDownLatch(1)
+        }
+        val camera = FakeExposure()
+        val events = java.util.Collections.synchronizedList(mutableListOf<NativeCaptureEventV2>())
+        val adapter = NativeCaptureAdapterV2(store, camera, events = events::add)
+        val request = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG))
+        adapter.admit(request)
+        val executor = Executors.newFixedThreadPool(2)
+        try {
+            val commit = executor.submit {
+                camera.components(camera.requests.single().first, request, listOf(CaptureComponentKind.JPEG))
+            }
+            assertTrue(store.commitEntered!!.await(5, TimeUnit.SECONDS))
+            // The transfer query finds no terminal yet: the attempt leaves the owner as recovering.
+            executor.submit {
+                adapter.onLifecycle(CaptureLifecycleEvent.BACKGROUNDED, request.accepted.identity.lifecycleCut)
+            }.get(5, TimeUnit.SECONDS)
+            assertTrue(events.any { it.kind == NativeCaptureEventKindV2.RECOVERING })
+            assertTrue(events.none { it.kind == NativeCaptureEventKindV2.COMMITTED })
+            store.commitRelease!!.countDown()
+            commit.get(5, TimeUnit.SECONDS)
+            val committed = events.filter { it.kind == NativeCaptureEventKindV2.COMMITTED }
+            assertEquals(listOf(request.accepted.identity.attemptId), committed.map { it.attemptId })
+            assertEquals(CaptureTerminalKind.COMMITTED_PICTURE, committed.single().verifiedTerminal?.kind)
+        } finally {
+            store.commitRelease?.countDown()
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `a pause waits for an exposed attempt to commit before cutting and is bounded`() {
+        val store = FakeStore().apply {
+            commitEntered = CountDownLatch(1)
+            commitRelease = CountDownLatch(1)
+        }
+        val camera = FakeExposure()
+        val events = java.util.Collections.synchronizedList(mutableListOf<NativeCaptureEventV2>())
+        val adapter = NativeCaptureAdapterV2(store, camera, events = events::add)
+        val request = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG))
+        adapter.admit(request)
+        val executor = Executors.newFixedThreadPool(2)
+        try {
+            assertFalse("an unfinished exposed attempt bounds the wait", adapter.awaitExposedAttemptsSettled(50))
+            val commit = executor.submit {
+                camera.components(camera.requests.single().first, request, listOf(CaptureComponentKind.JPEG))
+            }
+            assertTrue(store.commitEntered!!.await(5, TimeUnit.SECONDS))
+            val pause = executor.submit(java.util.concurrent.Callable {
+                val settled = adapter.awaitExposedAttemptsSettled(5_000)
+                adapter.onLifecycle(CaptureLifecycleEvent.BACKGROUNDED)
+                settled
+            })
+            assertThrows(TimeoutException::class.java) { pause.get(100, TimeUnit.MILLISECONDS) }
+            store.commitRelease!!.countDown()
+            commit.get(5, TimeUnit.SECONDS)
+            assertTrue(pause.get(5, TimeUnit.SECONDS))
+            assertTrue("no recovery transfer", events.none { it.kind == NativeCaptureEventKindV2.RECOVERING })
+            assertEquals(1, events.count { it.kind == NativeCaptureEventKindV2.COMMITTED })
+            assertEquals(0L, adapter.snapshot().unknownQueries)
         } finally {
             store.commitRelease?.countDown()
             executor.shutdownNow()

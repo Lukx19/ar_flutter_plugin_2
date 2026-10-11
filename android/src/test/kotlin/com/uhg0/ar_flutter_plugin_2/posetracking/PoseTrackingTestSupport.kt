@@ -68,6 +68,7 @@ internal class KeyframeRequest(
     val subject: Long = 0L,
     val captureNs: Long = 0L,
     val tq: FloatArray = identityPose(),
+    val flags: Int = 0,
 )
 
 internal fun identityPose(x: Float = 0f, y: Float = 0f, z: Float = 0f): FloatArray =
@@ -99,7 +100,7 @@ internal fun poseQuery(
     requests.forEachIndexed { i, r ->
         val o = PoseQueryLayout.HEADER_BYTES + i * PoseQueryLayout.REQUEST_BYTES
         b.putInt(o + PoseQueryLayout.REQUEST_ANCHOR_ID_OFFSET, r.anchorId)
-        b.putInt(o + 4, 0)
+        b.putInt(o + PoseQueryLayout.REQUEST_FLAGS_OFFSET, r.flags)
         b.putLong(o + PoseQueryLayout.REQUEST_SUBJECT_OFFSET, r.subject)
         b.putLong(o + PoseQueryLayout.REQUEST_CAPTURE_NS_OFFSET, r.captureNs)
         for (k in 0 until 7) b.putFloat(o + PoseQueryLayout.REQUEST_POSE_OFFSET + 4 * k, r.tq[k])

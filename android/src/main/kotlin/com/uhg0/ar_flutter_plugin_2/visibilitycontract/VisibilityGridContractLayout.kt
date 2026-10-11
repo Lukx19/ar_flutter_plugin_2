@@ -97,6 +97,21 @@ internal object IngestMessageLayout {
     const val SESSION_RECORDING_STARTED = 4
     const val SESSION_RECORDING_STOPPED = 5
 
+    /**
+     * ARCore tracking may have been reset (additive amendment): the world
+     * frame of earlier samples can differ from later ones. Value: low byte
+     * one of the `TRACKING_RESET_` causes, bits 8 and up a cause detail
+     * (failure reason code, or the anchor jump in millimetres).
+     */
+    const val SESSION_TRACKING_RESET = 6
+
+    /** The AR session resumed after a pause (additive amendment). Value: frame gap in nanoseconds. */
+    const val SESSION_AR_RESUMED = 7
+
+    const val TRACKING_RESET_AR_RESUMED = 1
+    const val TRACKING_RESET_TRACKING_FAILURE = 2
+    const val TRACKING_RESET_ANCHOR_JUMP = 3
+
     val PULL_REQUEST_MAGIC = contractMagic("C3VP")
     const val PULL_REQUEST_BYTES = 8
 

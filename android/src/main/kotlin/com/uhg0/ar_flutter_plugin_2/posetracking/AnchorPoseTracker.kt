@@ -47,6 +47,11 @@ internal interface AnchorFrame {
     fun updatedAnchor(index: Int): Any
 }
 
+/** Receives the largest anchor jump of one AR frame (AR thread, outside the tracker lock). */
+internal fun interface AnchorJumpListener {
+    fun onAnchorJump(frameNs: Long, jumpMillimetres: Int)
+}
+
 /**
  * Open-addressing (linear probing) index from an int key to a table slot,
  * without boxing. Keys need not be unique (anchor hash codes); callers walk
@@ -208,6 +213,13 @@ internal class AnchorPoseTracker(
         const val UPDATE_MOVE_M = 0.001
         const val UPDATE_TURN_DEG = 0.05
 
+        /**
+         * A tracking anchor that moves more than 5 cm within one frame was
+         * moved by an ARCore map correction (loop closure, map merge or a
+         * motion tracking reset); [jumpListener] is told once per frame.
+         */
+        const val JUMP_MOVE_M = 0.05
+
         /** A pose is stable (for detach by limit) while it stays within 5 mm and 0.2 degrees. */
         const val STABLE_MOVE_M = 0.005
         const val STABLE_TURN_DEG = 0.2
@@ -341,6 +353,12 @@ internal class AnchorPoseTracker(
 
     val lock = Any()
 
+    /** Told of anchor jumps ([JUMP_MOVE_M]); set before tracking starts. */
+    @Volatile var jumpListener: AnchorJumpListener? = null
+
+    private val previousTq = FloatArray(POSE)
+    private var frameJumpM = 0.0
+
     /** True while tracking is active or detaches are pending; the frame path returns after reading it when false. */
     @Volatile var armed = false
         private set
@@ -426,6 +444,7 @@ internal class AnchorPoseTracker(
     private var tableGrowth = 0
     private var deactivations = 0L
     private var sessionReplacements = 0L
+    private var anchorJumps = 0L
 
     /** Growths of every table, queue and index since construction. */
     val growthEvents: Int
@@ -437,6 +456,8 @@ internal class AnchorPoseTracker(
     fun onFrame(session: Any, frame: AnchorFrame) {
         if (!armed) return
         val start = readTimer.nowNs()
+        var jumpM = 0.0
+        var jumpFrameNs = 0L
         synchronized(lock) {
             if (session !== lastSession) {
                 if (lastSession != null && (count > 0 || pendingDetachCount > 0)) {
@@ -468,10 +489,15 @@ internal class AnchorPoseTracker(
                     // Detach long-stable anchors until the lowered limit holds or none qualifies.
                 }
             }
+            frameJumpM = 0.0
             readUpdatedLocked(frame, ts)
+            jumpM = frameJumpM
+            jumpFrameNs = ts
+            if (jumpM > 0.0) anchorJumps++
             val spent = readTimer.nowNs() - start
             if (spent > maxReadNs) maxReadNs = spent
         }
+        if (jumpM > 0.0) jumpListener?.onAnchorJump(jumpFrameNs, (jumpM * 1000.0).toInt())
     }
 
     private fun processRequestsLocked(session: Any, ts: Long) {
@@ -543,6 +569,8 @@ internal class AnchorPoseTracker(
         var bestCreated = Long.MAX_VALUE
         for (s in 0 until count) {
             if (final[s] || anchors[s] == null) continue
+            // Submap anchors carry the grid's map segments; they are never detached by the limit.
+            if (kinds[s].toInt() == AnchorKind.SUBMAP) continue
             if (ts - stableSinceNs[s] < stableNs) continue
             if (createdNs[s] < bestCreated) {
                 bestCreated = createdNs[s]
@@ -578,8 +606,17 @@ internal class AnchorPoseTracker(
             if (s < 0) continue
             val o = s * POSE
             val state = backend.tracking(a)
+            System.arraycopy(current, o, previousTq, 0, POSE)
+            val wasTracking = tracking[s].toInt() == AnchorTracking.TRACKING
             backend.readPose(a, current, o)
             tracking[s] = state.toByte()
+            if (wasTracking && state == AnchorTracking.TRACKING) {
+                val dx = (current[o] - previousTq[0]).toDouble()
+                val dy = (current[o + 1] - previousTq[1]).toDouble()
+                val dz = (current[o + 2] - previousTq[2]).toDouble()
+                val d = sqrt(dx * dx + dy * dy + dz * dz)
+                if (d > JUMP_MOVE_M && d > frameJumpM) frameJumpM = d
+            }
             if (!dirty[s] && (state != sentTracking[s].toInt() ||
                     moved(current, o, sent, o, UPDATE_MOVE_M, UPDATE_TURN_D2))
             ) {
@@ -657,13 +694,15 @@ internal class AnchorPoseTracker(
                 val o = at + PoseQueryLayout.HEADER_BYTES + i * PoseQueryLayout.REQUEST_BYTES
                 for (k in 0 until POSE) requestTq[k] = q.getFloat(o + PoseQueryLayout.REQUEST_POSE_OFFSET + 4 * k)
                 val id = q.getInt(o + PoseQueryLayout.REQUEST_ANCHOR_ID_OFFSET)
+                val requestFlags = q.getInt(o + PoseQueryLayout.REQUEST_FLAGS_OFFSET)
+                val kind = if (requestFlags and PoseQueryLayout.REQUEST_FLAG_SUBMAP != 0) AnchorKind.SUBMAP else AnchorKind.KEYFRAME
                 val subject = q.getLong(o + PoseQueryLayout.REQUEST_SUBJECT_OFFSET)
                 val capture = q.getLong(o + PoseQueryLayout.REQUEST_CAPTURE_NS_OFFSET)
                 if (active) {
-                    enqueueLocked(id, AnchorKind.KEYFRAME, subject, capture, requestTq, -1)
+                    enqueueLocked(id, kind, subject, capture, requestTq, -1)
                 } else {
                     notTracking++
-                    pushResultLocked(id, AnchorKind.KEYFRAME, AnchorCreation.NOT_TRACKING, subject, capture, frameNs)
+                    pushResultLocked(id, kind, AnchorCreation.NOT_TRACKING, subject, capture, frameNs)
                 }
             }
             armed = !closed && (active || pendingDetachCount > 0)
@@ -981,6 +1020,7 @@ internal class AnchorPoseTracker(
             "growthEvents" to (tableGrowth + idIndex.growthEvents + handleIndex.growthEvents),
             "deactivations" to deactivations,
             "sessionReplacements" to sessionReplacements,
+            "anchorJumps" to anchorJumps,
             "pendingCreations" to reqCount,
             "pendingResults" to resCount,
             "dirtyAnchors" to dirtyCount,

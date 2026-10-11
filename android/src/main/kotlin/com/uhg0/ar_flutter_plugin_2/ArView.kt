@@ -440,6 +440,7 @@ internal class ArView(
         VisibilityGridShellRegistry.attachView(
             this,
             sceneHost::visibilityGridDepthMode,
+            reapplyDepthMode = { root.post { if (!disposed) sceneHost.reapplyVisibilityGridDepthMode() } },
         ) { runCatching { captureSession.getCameraIntrinsics() }.getOrNull() }
     }
 
@@ -745,6 +746,8 @@ internal class ArView(
                             if (!sessionPausedByFlutter) {
                                 depthPauseGate.resumed()
                                 captureSession.onSessionResumed()
+                                // Grid ingest: resume and tracking reset session events, depth re-application.
+                                VisibilityGridShellRegistry.onArSessionResumed()
                             }
                         }
                     }

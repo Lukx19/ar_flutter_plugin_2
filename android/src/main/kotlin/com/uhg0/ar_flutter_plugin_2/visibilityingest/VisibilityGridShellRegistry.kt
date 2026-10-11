@@ -10,6 +10,7 @@ import com.google.ar.core.Frame
 import com.uhg0.ar_flutter_plugin_2.BuildConfig
 import com.uhg0.ar_flutter_plugin_2.gridrenderer.GridRendererChannels
 import com.uhg0.ar_flutter_plugin_2.markerdetection.GridMarkerShellTaps
+import com.uhg0.ar_flutter_plugin_2.posetracking.AnchorJumpListener
 import com.uhg0.ar_flutter_plugin_2.posetracking.AnchorPoseUpdateProducer
 import com.uhg0.ar_flutter_plugin_2.visibilitycontract.VisibilityGridChannels
 import com.uhg0.ar_flutter_plugin_2.visibilitycontract.VisibilityGridFrameTap
@@ -97,7 +98,11 @@ internal object VisibilityGridShellRegistry {
                 photoListenerSwitch = { listener, add ->
                     if (add) addDurablePhotoListener(listener) else removeDurablePhotoListener(listener)
                 },
-            ).also { it.bind(messenger) }
+            ).also {
+                it.bind(messenger)
+                // Anchor jumps (ARCore map corrections) reach the grid as tracking reset session events.
+                it.tracker.jumpListener = AnchorJumpListener { frameNs, mm -> shell?.onAnchorJump(frameNs, mm) }
+            }
             markers = GridMarkerShellTaps.create(
                 ingestSink = { ingestSink },
                 shell = { shell },
@@ -244,11 +249,26 @@ internal object VisibilityGridShellRegistry {
     /** The running shell, for marker detection settings and diagnostics. */
     val activeShell: VisibilityGridIngestShell? get() = shell
 
-    /** Binds the AR view's depth mode and still camera intrinsics; the last attached view wins. */
-    fun attachView(owner: Any, depthMode: () -> Config.DepthMode, stillCameraIntrinsics: () -> Map<String, Any>?) {
+    /** Seam called by `ArView` after its AR session resumed (any thread); inert unless the shell was started. */
+    fun onArSessionResumed() {
+        shell?.onArSessionResumed()
+    }
+
+    /**
+     * Binds the AR view's depth mode, its depth mode re-application (posted to
+     * the view's thread by the view) and still camera intrinsics; the last
+     * attached view wins.
+     */
+    fun attachView(
+        owner: Any,
+        depthMode: () -> Config.DepthMode,
+        reapplyDepthMode: () -> Unit = {},
+        stillCameraIntrinsics: () -> Map<String, Any>?,
+    ) {
         synchronized(lock) {
             viewOwner = owner
             viewDepthMode = depthMode
+            viewReapplyDepth = reapplyDepthMode
             viewStillCamera = StillCameraModelSource { out -> StillCameraModel.fromMap(stillCameraIntrinsics(), out) }
             applyViewLocked()
         }
@@ -259,6 +279,7 @@ internal object VisibilityGridShellRegistry {
             if (viewOwner !== owner) return
             viewOwner = null
             viewDepthMode = DISABLED_DEPTH
+            viewReapplyDepth = NO_REAPPLY
             viewStillCamera = StillCameraModelSource.NONE
             applyViewLocked()
         }
@@ -266,11 +287,14 @@ internal object VisibilityGridShellRegistry {
 
     private val DISABLED_DEPTH: () -> Config.DepthMode = { Config.DepthMode.DISABLED }
     private var viewDepthMode: () -> Config.DepthMode = DISABLED_DEPTH
+    private val NO_REAPPLY: () -> Unit = {}
+    private var viewReapplyDepth: () -> Unit = NO_REAPPLY
     private var viewStillCamera: StillCameraModelSource = StillCameraModelSource.NONE
 
     private fun applyViewLocked() {
         shell?.let {
             it.depthMode = viewDepthMode
+            it.depthReapply = viewReapplyDepth
             it.stillCamera = viewStillCamera
         }
     }

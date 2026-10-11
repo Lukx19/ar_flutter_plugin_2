@@ -2,6 +2,7 @@ package com.uhg0.ar_flutter_plugin_2.visibilityingest
 
 import com.google.ar.core.Config
 import com.google.ar.core.Frame
+import com.google.ar.core.TrackingFailureReason
 import com.google.ar.core.TrackingState
 import com.google.ar.core.exceptions.NotYetAvailableException
 import java.nio.ByteBuffer
@@ -22,6 +23,9 @@ internal interface IngestFrameSource {
 
     /** One of [IngestTrackingState]. */
     val trackingState: Int
+
+    /** ARCore `TrackingFailureReason` ordinal (0 none, 1 bad state, 2 light, 3 motion, 4 features, 5 camera). */
+    val trackingFailureReason: Int get() = 0
 
     /** Writes the sensor-oriented camera pose as tx, ty, tz, qx, qy, qz, qw. */
     fun readPose(out: FloatArray)
@@ -96,6 +100,16 @@ internal class ArCoreIngestFrame : IngestFrameSource {
             TrackingState.TRACKING -> IngestTrackingState.TRACKING
             TrackingState.PAUSED -> IngestTrackingState.PAUSED
             else -> IngestTrackingState.STOPPED
+        }
+    override val trackingFailureReason: Int
+        get() = when (current.camera.trackingFailureReason) {
+            TrackingFailureReason.NONE, null -> 0
+            TrackingFailureReason.BAD_STATE -> 1
+            TrackingFailureReason.INSUFFICIENT_LIGHT -> 2
+            TrackingFailureReason.EXCESSIVE_MOTION -> 3
+            TrackingFailureReason.INSUFFICIENT_FEATURES -> 4
+            TrackingFailureReason.CAMERA_UNAVAILABLE -> 5
+            else -> 0
         }
 
     override fun readPose(out: FloatArray) {

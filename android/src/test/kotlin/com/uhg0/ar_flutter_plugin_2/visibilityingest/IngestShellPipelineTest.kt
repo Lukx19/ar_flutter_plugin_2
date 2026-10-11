@@ -37,7 +37,7 @@ class IngestShellPipelineTest {
 
     private fun frameAt(ns: Long) {
         frame.timestampNs = ns
-        frame.androidCameraTimestampNs = ns
+        frame.androidCameraTimestampNs = ns - SENSOR_CLOCK_BEHIND_NS
         shell.process(frame, SESSION)
     }
 
@@ -83,6 +83,8 @@ class IngestShellPipelineTest {
     @Test
     fun `point cloud drops non-finite and far points and equals the points golden`() {
         start(ShellControlLayout.FLAG_POINT_CLOUD, IngestShellConfig.DEPTH_POINTS_ONLY)
+        // The golden predates the confidence gate and carries a 0.25 point.
+        shell.pointProducer.minConfidence = 0f
         primeSequence(IngestMessageLayout.KIND_POINT_CLOUD, "ingest_points.bin")
         warmFrames()
         val nan = Float.NaN
@@ -107,6 +109,64 @@ class IngestShellPipelineTest {
         assertEquals(3L, p.pointsSent)
         assertEquals(3L, p.nonFiniteDropped)
         assertEquals(1L, p.farDropped)
+    }
+
+    @Test
+    fun `point cloud drops low-confidence points and points closer than 20 cm or farther than 4 m from the camera and keeps ids`() {
+        start(ShellControlLayout.FLAG_POINT_CLOUD, IngestShellConfig.DEPTH_POINTS_ONLY)
+        warmFrames()
+        // Camera at (0.5, 1.25, -2).
+        frame.points = FloatBuffer.wrap(floatArrayOf(
+            0.5f, 1.25f, -3f, 0.9f, // 1 m: kept
+            0.5f, 1.25f, -3f, 0.05f, // confidence 0.05: dropped
+            0.5f, 1.25f, -3f, 0f, // confidence 0: dropped
+            0.5f, 1.25f, -2.1f, 0.9f, // 0.1 m: too near
+            0.5f, 1.25f, -52f, 0.9f, // 50 m: too far
+            0.5f, 1.25f, -5.5f, 0.3f, // 3.5 m, confidence at the gate: kept
+        ))
+        frame.ids = IntBuffer.wrap(intArrayOf(11, 12, 13, 14, 15, 16))
+        frame.cloudNs = 1_000_000_000L
+        clock.now = 2_000_000_000L
+        frameAt(1_170_000_000L)
+        shell.pull.onPull(pullRequest(1 shl IngestMessageLayout.KIND_POINT_CLOUD), reply)
+        val b = checkNotNull(reply.last)
+        assertEquals(IngestMessageLayout.KIND_POINT_CLOUD, b.get(IngestMessageLayout.KIND).toInt())
+        val p = IngestMessageLayout.HEADER_BYTES
+        assertEquals(2, b.getInt(p))
+        assertEquals(11, b.getInt(p + IngestMessageLayout.POINT_COUNT_BYTES))
+        assertEquals(16, b.getInt(p + IngestMessageLayout.POINT_COUNT_BYTES + IngestMessageLayout.POINT_BYTES))
+        val producer = shell.pointProducer
+        assertEquals(2L, producer.pointsSent)
+        assertEquals(2L, producer.lowConfidenceDropped)
+        assertEquals(2L, producer.rangeDropped)
+    }
+
+    @Test
+    fun `automatic depth is checked on the frame clock while the sensor clock is 5 s behind`() {
+        start(0, IngestShellConfig.DEPTH_AUTOMATIC)
+        shell.depthMode = { Config.DepthMode.AUTOMATIC }
+        warmFrames()
+        frame.goldenDepth()
+        frame.confidence = null
+        frame.depthImageNs = 1_170_000_000L
+        clock.now = 2_000_000_000L
+        frameAt(1_170_000_000L)
+        val depth = shell.depthProducer
+        assertEquals(0L, depth.identityRefused)
+        assertEquals(1L, depth.published)
+        // An older image of the same clock is counted, not refused.
+        clock.now += 300 * ms
+        frame.depthImageNs = 1_190_000_000L
+        frameAt(1_203_000_000L)
+        assertEquals(0L, depth.identityRefused)
+        assertEquals(1L, depth.identityStaleAutomatic)
+        assertEquals(2L, depth.published)
+        // An image newer than its frame is refused.
+        clock.now += 300 * ms
+        frame.depthImageNs = 1_300_000_000L
+        frameAt(1_236_000_000L)
+        assertEquals(1L, depth.identityRefused)
+        assertEquals(2L, depth.published)
     }
 
     @Test
@@ -162,12 +222,30 @@ class IngestShellPipelineTest {
         shell.depthMode = { Config.DepthMode.AUTOMATIC }
         frameAt(100 * ms)
         frame.trackingState = IngestTrackingState.PAUSED
+        frame.trackingFailureReason = EXCESSIVE_MOTION
         frameAt(133 * ms)
         frame.trackingState = IngestTrackingState.TRACKING
+        frame.trackingFailureReason = 0
         frameAt(166 * ms)
         shell.depthMode = { Config.DepthMode.DISABLED }
         frameAt(200 * ms)
         shell.process(frame.apply { timestampNs = 233 * ms }, OTHER_SESSION)
+        val events = drainSessionEvents()
+        assertEquals(
+            listOf(
+                IngestMessageLayout.SESSION_TRACKING_LOST to IngestTrackingState.PAUSED.toLong(),
+                IngestMessageLayout.SESSION_TRACKING_REGAINED to 0L,
+                IngestMessageLayout.SESSION_TRACKING_RESET to
+                    (IngestMessageLayout.TRACKING_RESET_TRACKING_FAILURE.toLong() or (EXCESSIVE_MOTION.toLong() shl 8)),
+                IngestMessageLayout.SESSION_DEPTH_MODE_CHANGED to IngestFrameSource.DEPTH_MODE_DISABLED.toLong(),
+                IngestMessageLayout.SESSION_AR_RESTARTED to 4L,
+            ),
+            events,
+        )
+        assertEquals(4, shell.groupEpoch)
+    }
+
+    private fun drainSessionEvents(): List<Pair<Int, Long>> {
         val events = mutableListOf<Pair<Int, Long>>()
         while (true) {
             reply.last = null
@@ -176,16 +254,95 @@ class IngestShellPipelineTest {
             if (b.get(IngestMessageLayout.KIND).toInt() != IngestMessageLayout.KIND_SESSION_EVENT) break
             events += (b.get(IngestMessageLayout.HEADER_BYTES).toInt() to b.getLong(IngestMessageLayout.HEADER_BYTES + 8))
         }
+        return events
+    }
+
+    @Test
+    fun `an AR session resume and an anchor jump emit tracking reset events within the same group epoch`() {
+        start(0, IngestShellConfig.DEPTH_AUTOMATIC)
+        shell.depthMode = { Config.DepthMode.AUTOMATIC }
+        var reapplied = 0
+        shell.depthReapply = { reapplied++ }
+        frameAt(100 * ms)
+        frameAt(133 * ms)
+        shell.onArSessionResumed()
+        frameAt(2_133 * ms)
+        shell.onAnchorJump(2_133 * ms, 120)
         assertEquals(
             listOf(
-                IngestMessageLayout.SESSION_TRACKING_LOST to IngestTrackingState.PAUSED.toLong(),
-                IngestMessageLayout.SESSION_TRACKING_REGAINED to 0L,
-                IngestMessageLayout.SESSION_DEPTH_MODE_CHANGED to IngestFrameSource.DEPTH_MODE_DISABLED.toLong(),
-                IngestMessageLayout.SESSION_AR_RESTARTED to 4L,
+                IngestMessageLayout.SESSION_AR_RESUMED to 2_000 * ms,
+                IngestMessageLayout.SESSION_TRACKING_RESET to IngestMessageLayout.TRACKING_RESET_AR_RESUMED.toLong(),
+                IngestMessageLayout.SESSION_TRACKING_RESET to
+                    (IngestMessageLayout.TRACKING_RESET_ANCHOR_JUMP.toLong() or (120L shl 8)),
             ),
-            events,
+            drainSessionEvents(),
         )
-        assertEquals(4, shell.groupEpoch)
+        assertEquals(3, shell.groupEpoch)
+        assertEquals(1, reapplied)
+        assertEquals(2L, shell.trackingResets)
+    }
+
+    @Test
+    fun `depth acquisition continues after two AR session resumes`() {
+        start(0, IngestShellConfig.DEPTH_AUTOMATIC)
+        shell.depthMode = { Config.DepthMode.AUTOMATIC }
+        // Fake ARCore after a shared camera resume: depth stays "not yet available"
+        // until the depth mode is applied to the session again.
+        shell.depthReapply = { frame.depthResult = IngestFrameSource.DEPTH_OK }
+        frame.goldenDepth()
+        frame.confidence = null
+        var t = 1_000 * ms
+        fun run(frames: Int) {
+            repeat(frames) {
+                t += 33 * ms
+                clock.now = t
+                frame.depthImageNs = t
+                frameAt(t)
+            }
+        }
+        val depth = shell.depthProducer
+        run(30)
+        assertTrue(depth.acquired > 0)
+        repeat(2) { resume ->
+            val before = depth.acquired
+            val published = depth.published
+            frame.depthResult = IngestFrameSource.DEPTH_NOT_YET_AVAILABLE
+            t += 2_000 * ms
+            shell.onArSessionResumed()
+            run(30)
+            assertTrue("acquisition continues after resume ${resume + 1}", depth.acquired > before)
+            assertTrue("publication continues after resume ${resume + 1}", depth.published > published)
+        }
+        assertEquals(2L, shell.depthReapplyRequests)
+    }
+
+    @Test
+    fun `depth that stops for 3 s while tracking asks for the depth mode at most every 5 s`() {
+        start(0, IngestShellConfig.DEPTH_AUTOMATIC)
+        shell.depthMode = { Config.DepthMode.AUTOMATIC }
+        var reapplied = 0
+        shell.depthReapply = { reapplied++ }
+        frame.goldenDepth()
+        frame.confidence = null
+        var t = 1_000 * ms
+        fun run(frames: Int) {
+            repeat(frames) {
+                t += 100 * ms
+                clock.now = t
+                frame.depthImageNs = t
+                frameAt(t)
+            }
+        }
+        run(10)
+        frame.depthResult = IngestFrameSource.DEPTH_NOT_YET_AVAILABLE
+        run(29)
+        assertEquals("2.9 s without depth", 0, reapplied)
+        run(2)
+        assertEquals(1, reapplied)
+        run(45)
+        assertEquals("not again within 5 s", 1, reapplied)
+        run(5)
+        assertEquals("one more after the 5 s interval", 2, reapplied)
     }
 
     @Test
@@ -242,7 +399,7 @@ class IngestShellPipelineTest {
                 frame.depthImageNs = t - 170 * ms
                 frame.cloudNs = t + 66 * ms
                 frame.timestampNs = t
-                frame.androidCameraTimestampNs = t
+                frame.androidCameraTimestampNs = t - SENSOR_CLOCK_BEHIND_NS
                 shell.process(frame, SESSION)
                 pull.clear()
                 shell.pull.onPull(pull, reply)
@@ -292,5 +449,6 @@ class IngestShellPipelineTest {
         const val STEADY_WINDOW_FRAMES = 500
         val SESSION = Any()
         val OTHER_SESSION = Any()
+        const val EXCESSIVE_MOTION = 3
     }
 }

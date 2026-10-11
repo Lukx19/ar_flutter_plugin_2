@@ -100,6 +100,25 @@ internal class VisibilityGridIngestShell(
 
     @Volatile var frameFailures = 0L; private set
     @Volatile var restarts = 0L; private set
+    @Volatile var resumes = 0L; private set
+    @Volatile var trackingResets = 0L; private set
+    @Volatile var depthReapplyRequests = 0L; private set
+
+    /**
+     * Asks the AR view to re-apply the session's depth mode; the view posts
+     * it to its own thread. Requested after every AR session resume and when
+     * depth that was acquired before stops for [DEPTH_STALL_NS] while
+     * tracking (ARCore keeps answering "not yet available" after a shared
+     * camera resume).
+     */
+    @Volatile var depthReapply: () -> Unit = {}
+
+    // Set by [onArSessionResumed] on any thread, handled by the next frame.
+    @Volatile private var resumePending = false
+    private var lossFailureReason = 0
+    private var watchedAcquired = 0L
+    private var depthProgressNs = Long.MIN_VALUE
+    private var lastDepthReapplyNs = Long.MIN_VALUE
 
     fun start(config: IngestShellConfig) {
         this.config = config
@@ -140,6 +159,32 @@ internal class VisibilityGridIngestShell(
     }
 
     @Volatile private var lastFrameNsSnapshot = 0L
+
+    /**
+     * The AR session resumed after a pause (any thread). The next frame
+     * emits [IngestMessageLayout.SESSION_AR_RESUMED] and a tracking reset
+     * (ARCore may restart its motion tracking across a pause), drops the pose
+     * history and staged samples of before the pause and asks for the depth
+     * mode to be re-applied.
+     */
+    fun onArSessionResumed() {
+        if (started) resumePending = true
+    }
+
+    /**
+     * AR thread: an anchor moved by [jumpMillimetres] within one frame while
+     * tracking (an ARCore map correction). Emits a tracking reset so the grid
+     * can start a new submap.
+     */
+    fun onAnchorJump(frameNs: Long, jumpMillimetres: Int) {
+        if (!started) return
+        trackingResets++
+        sessionEvents.emit(
+            IngestMessageLayout.SESSION_TRACKING_RESET,
+            IngestMessageLayout.TRACKING_RESET_ANCHOR_JUMP.toLong() or (jumpMillimetres.toLong() shl 8),
+            frameNs, session.trackingState, epochForEvents,
+        )
+    }
 
     /** Seam: one call per AR frame. */
     override fun onFrame(frame: Frame) {
@@ -194,6 +239,17 @@ internal class VisibilityGridIngestShell(
         }
         if (sessionIdentity != null) lastSession = sessionIdentity
         epochForEvents = session.groupEpoch
+        if (resumePending) {
+            resumePending = false
+            val gapNs = if (lastFrameNs == Long.MIN_VALUE) 0L else ts - lastFrameNs
+            resetPoseState()
+            resumes++
+            trackingResets++
+            sessionEvents.emit(IngestMessageLayout.SESSION_AR_RESUMED, gapNs, ts, source.trackingState, session.groupEpoch)
+            sessionEvents.emit(IngestMessageLayout.SESSION_TRACKING_RESET,
+                IngestMessageLayout.TRACKING_RESET_AR_RESUMED.toLong(), ts, source.trackingState, session.groupEpoch)
+            requestDepthReapply(clock.nowNs())
+        }
         photoEmitter.recordEpochStart(source.androidCameraTimestampNs, session.groupEpoch)
         lastFrameNs = ts
         lastFrameNsSnapshot = ts
@@ -202,11 +258,24 @@ internal class VisibilityGridIngestShell(
         session.trackingState = tracking
         if (tracking != lastTracking) {
             if (lastTracking == IngestTrackingState.TRACKING) {
+                lossFailureReason = source.trackingFailureReason
                 sessionEvents.emit(IngestMessageLayout.SESSION_TRACKING_LOST, tracking.toLong(), ts, tracking, session.groupEpoch)
             } else if (tracking == IngestTrackingState.TRACKING && lastTracking != -1) {
                 sessionEvents.emit(IngestMessageLayout.SESSION_TRACKING_REGAINED, 0L, ts, tracking, session.groupEpoch)
+                // ARCore may have reset its motion tracking during the loss: poses of before
+                // the loss are not interpolated with poses after it.
+                resetPoseState()
+                trackingResets++
+                sessionEvents.emit(IngestMessageLayout.SESSION_TRACKING_RESET,
+                    IngestMessageLayout.TRACKING_RESET_TRACKING_FAILURE.toLong() or (lossFailureReason.toLong() shl 8),
+                    ts, tracking, session.groupEpoch)
+                lossFailureReason = 0
             }
             lastTracking = tracking
+        }
+        if (tracking != IngestTrackingState.TRACKING) {
+            val reason = source.trackingFailureReason
+            if (reason != 0) lossFailureReason = reason
         }
 
         val cfg = config
@@ -234,11 +303,37 @@ internal class VisibilityGridIngestShell(
         depth.publishStaged(true)
         points.publishStaged(true)
         depth.onFrame(source, mode)
+        if (mode != IngestFrameSource.DEPTH_MODE_DISABLED) watchDepthStall()
         val wantPoints = mode == IngestFrameSource.DEPTH_MODE_DISABLED ||
             (cfg != null && cfg.flags and ShellControlLayout.FLAG_POINT_CLOUD != 0)
-        if (wantPoints) points.onFrame(source)
+        if (wantPoints) points.onFrame(source, tq)
         depth.publishStaged(false)
         points.publishStaged(false)
+    }
+
+    /** Depth that was acquired before and has not been acquired for [DEPTH_STALL_NS] of tracking frames is re-applied. */
+    private fun watchDepthStall() {
+        val now = clock.nowNs()
+        val acquired = depth.acquired
+        if (acquired != watchedAcquired || depthProgressNs == Long.MIN_VALUE) {
+            watchedAcquired = acquired
+            depthProgressNs = now
+            return
+        }
+        if (acquired == 0L || now - depthProgressNs < DEPTH_STALL_NS) return
+        if (lastDepthReapplyNs != Long.MIN_VALUE && now - lastDepthReapplyNs < DEPTH_REAPPLY_INTERVAL_NS) return
+        requestDepthReapply(now)
+    }
+
+    private fun requestDepthReapply(now: Long) {
+        lastDepthReapplyNs = now
+        depthProgressNs = now
+        depthReapplyRequests++
+        try {
+            depthReapply()
+        } catch (_: RuntimeException) {
+            frameFailures++
+        }
     }
 
     private var lastTelemetryNs = Long.MIN_VALUE
@@ -297,13 +392,13 @@ internal class VisibilityGridIngestShell(
         if (depth.identityRefused > loggedIdentityRefused) {
             loggedIdentityRefused = NativeSessionLogEmitter.reportGrowth(
                 "DEPTH_REFUSED", "identity", depth.identityRefused, loggedIdentityRefused,
-                "Depth images refused by the camera image identity check",
+                "Depth images refused by the frame clock identity check",
             )
         }
         if (depth.identityStaleAutomatic > loggedStaleAutomatic) {
             loggedStaleAutomatic = NativeSessionLogEmitter.reportGrowth(
                 "DEPTH_REFUSED", "staleAutomatic", depth.identityStaleAutomatic, loggedStaleAutomatic,
-                "Depth images older than their camera image (STALE_AUTOMATIC, counted only)",
+                "Depth images older than their frame (STALE_AUTOMATIC, counted only)",
             )
         }
         if (frameFailures > loggedFrameFailures) {
@@ -323,6 +418,7 @@ internal class VisibilityGridIngestShell(
                 "staleDropped=${depth.staleDropped} identityRefused=${depth.identityRefused} " +
                 "staleAutomatic=${depth.identityStaleAutomatic} notYetAvailable=${depth.notYetAvailable} " +
                 "failures=${depth.failures} acquired=${depth.acquired} lastImageAgeMs=$ageMs " +
+                "reapplied=$depthReapplyRequests resumes=$resumes trackingResets=$trackingResets " +
                 "mode=$lastDepthMode tracking=$tracking epoch=${session.groupEpoch}",
         )
     }
@@ -333,6 +429,14 @@ internal class VisibilityGridIngestShell(
         depth.reset()
         points.reset()
         lastFrameNs = Long.MIN_VALUE
+    }
+
+    /** Tracking reset within the same AR session: frame poses and staged samples of before it are dropped. */
+    private fun resetPoseState() {
+        session.history.clear()
+        depth.reset()
+        points.reset()
+        depthProgressNs = Long.MIN_VALUE
     }
 
     fun close() {
@@ -346,6 +450,9 @@ internal class VisibilityGridIngestShell(
         "started" to started,
         "groupEpoch" to session.groupEpoch,
         "restarts" to restarts,
+        "resumes" to resumes,
+        "trackingResets" to trackingResets,
+        "depthReapplyRequests" to depthReapplyRequests,
         "frameFailures" to frameFailures,
         "pull" to pull.snapshot(),
         "depth" to mapOf(
@@ -357,7 +464,8 @@ internal class VisibilityGridIngestShell(
         "points" to mapOf(
             "clouds" to points.clouds, "published" to points.published, "pointsIn" to points.pointsIn,
             "pointsSent" to points.pointsSent, "nonFiniteDropped" to points.nonFiniteDropped,
-            "farDropped" to points.farDropped, "idCountMismatch" to points.idCountMismatch,
+            "farDropped" to points.farDropped,
+            "lowConfidenceDropped" to points.lowConfidenceDropped, "rangeDropped" to points.rangeDropped, "idCountMismatch" to points.idCountMismatch,
             "deferred" to points.deferred, "poseMissing" to points.poseMissing,
         ),
         "photos" to mapOf(
@@ -374,3 +482,5 @@ internal class VisibilityGridIngestShell(
 }
 
 private const val TELEMETRY_INTERVAL_NS = 1_000_000_000L
+private const val DEPTH_STALL_NS = 3_000_000_000L
+private const val DEPTH_REAPPLY_INTERVAL_NS = 5_000_000_000L

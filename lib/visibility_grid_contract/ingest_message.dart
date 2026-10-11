@@ -64,6 +64,24 @@ abstract final class SessionEventKind {
   static const int depthModeChanged = 3;
   static const int recordingStarted = 4;
   static const int recordingStopped = 5;
+
+  /// ARCore tracking may have been reset: earlier samples can sit in a
+  /// different world frame. Value: low byte a [TrackingResetCause], bits 8
+  /// and up a cause detail (failure reason code or anchor jump in mm).
+  static const int trackingReset = 6;
+
+  /// The AR session resumed after a pause. Value: frame gap in nanoseconds.
+  static const int arSessionResumed = 7;
+}
+
+/// Cause byte of a [SessionEventKind.trackingReset] value.
+abstract final class TrackingResetCause {
+  static const int arSessionResumed = 1;
+  static const int trackingFailure = 2;
+  static const int anchorJump = 3;
+
+  static int cause(int value) => value & 0xff;
+  static int detail(int value) => value >> 8;
 }
 
 /// Byte layout of the 160 B ingest message header. Offsets are normative and

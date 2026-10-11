@@ -21,20 +21,24 @@ internal class IngestSessionState {
 /**
  * Kind 1 depth image producer (contract 2.4). On the AR thread, at most every
  * [ACQUIRE_INTERVAL_NS] (the app's existing depth throttle), it acquires the
- * ARCore depth image of the session's depth mode, applies the merged
- * acquisition identity check ([depthImageIdentityRefusal]: positive image,
- * camera and frame clocks), drops images more than 500 ms older than their
- * frame (ARCore hands out its last image under load, measured up to 21 s) and
- * repeats of the last image, copies u16 millimetres and raw confidence into
- * an owned staging buffer and scales the texture intrinsics to the depth size
- * like `depthIntrinsicsFromTexture`. The message carries the pose matched at
- * the depth image timestamp; an image newer than the newest pose waits for
- * the frame that covers it.
+ * ARCore depth image of the session's depth mode, applies the acquisition
+ * identity check ([depthIdentityRefusal]), drops images more than 500 ms
+ * older than their frame (ARCore hands out its last image under load,
+ * measured up to 21 s) and repeats of the last image, copies u16 millimetres
+ * and raw confidence into an owned staging buffer and scales the texture
+ * intrinsics to the depth size like `depthIntrinsicsFromTexture`. The message
+ * carries the pose matched at the depth image timestamp; an image newer than
+ * the newest pose waits for the frame that covers it.
  *
- * The AUTOMATIC "image equals current camera image" rule of the legacy
- * observation path is counted ([identityStaleAutomatic]) but not applied:
- * the grid fuses with the pose at the image timestamp instead of the frame
- * pose, which is what that rule protected.
+ * Clocks: the depth image timestamp is on the `Frame.getTimestamp` clock,
+ * `Frame.getAndroidCameraTimestamp` is the Camera2 sensor clock (a different
+ * base, behind on the SM-X700). Identity is therefore checked against the
+ * frame timestamp only; the sensor timestamp is used for photo pose matching
+ * and never compared with a depth image.
+ *
+ * An AUTOMATIC image older than its frame is counted
+ * ([identityStaleAutomatic]) but not refused: the grid fuses with the pose at
+ * the image timestamp instead of the frame pose.
  */
 internal class DepthIngestProducer(
     private val session: IngestSessionState,
@@ -56,7 +60,6 @@ internal class DepthIngestProducer(
 
     // Per-acquisition inputs for the sink callback.
     private var frameNs = 0L
-    private var cameraNs = 0L
     private var acquireNs = 0L
     private var mode = IngestFrameSource.DEPTH_MODE_DISABLED
 
@@ -99,7 +102,6 @@ internal class DepthIngestProducer(
         }
         frameNs = frame.timestampNs
         latestFrameNs = frameNs
-        cameraNs = frame.androidCameraTimestampNs
         acquireNs = now
         mode = depthMode
         when (frame.acquireDepth(depthMode, this)) {
@@ -124,11 +126,7 @@ internal class DepthIngestProducer(
         confidencePixelStride: Int,
     ) {
         latestImageNs = imageTimestampNs
-        val acquisitionMode = if (mode == IngestFrameSource.DEPTH_MODE_RAW) DepthAcquisitionMode.RAW else DepthAcquisitionMode.AUTOMATIC
-        val refusal = depthImageIdentityRefusal(
-            imageTimestampNs, cameraNs, frameNs, acquisitionMode,
-            rawProjectionQualified = true, denseCurrentFrameExperimentEnabled = false,
-        )
+        val refusal = depthIdentityRefusal(imageTimestampNs, frameNs, mode)
         if (refusal == DepthAcquisitionRefusal.STALE_AUTOMATIC) {
             identityStaleAutomatic++
         } else if (refusal != null) {
@@ -215,6 +213,24 @@ internal class DepthIngestProducer(
         staged = false
         if (sink.offer(staging, IngestMessageWriter.messageBytes(staging))) published++
     }
+}
+
+/**
+ * Identity check of an ingest depth image on the frame clock only: RAW keeps
+ * the shared rule ([depthImageIdentityRefusal], frame clock); AUTOMATIC
+ * refuses a non-positive image or frame time and an image newer than its
+ * frame, and reports an older image as [DepthAcquisitionRefusal.STALE_AUTOMATIC]
+ * (counted, not refused).
+ */
+internal fun depthIdentityRefusal(imageNs: Long, frameNs: Long, mode: Int): DepthAcquisitionRefusal? {
+    if (mode == IngestFrameSource.DEPTH_MODE_RAW) {
+        return depthImageIdentityRefusal(
+            imageNs, 0L, frameNs, DepthAcquisitionMode.RAW,
+            rawProjectionQualified = true, denseCurrentFrameExperimentEnabled = false,
+        )
+    }
+    if (imageNs <= 0L || frameNs <= 0L || imageNs > frameNs) return DepthAcquisitionRefusal.INVALID_TIMESTAMP
+    return if (imageNs != frameNs) DepthAcquisitionRefusal.STALE_AUTOMATIC else null
 }
 
 internal fun gapUs(errorNs: Long): Int {

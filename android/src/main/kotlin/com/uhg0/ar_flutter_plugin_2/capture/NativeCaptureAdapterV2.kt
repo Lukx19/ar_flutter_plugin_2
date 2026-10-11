@@ -544,6 +544,9 @@ internal class NativeCaptureSerialOwnerV2(
         worker.awaitTermination(timeout, unit)
 }
 
+/** Bound of the pause wait for exposed attempts (below the app's 10 s drain). */
+private const val PAUSE_SETTLE_MS = 5_000L
+
 /** Per-view native owner. #102 may supply intent, but not this binding or its lifecycle. */
 internal class NativeCaptureBindingV2(
     context: Context,
@@ -636,8 +639,15 @@ internal class NativeCaptureBindingV2(
     fun onLifecycle(event: CaptureLifecycleEvent) {
         adapterForLifecycleOrNull()?.onLifecycle(event)
     }
+    /**
+     * Pause: attempts that requested exposure get [PAUSE_SETTLE_MS] to reach
+     * their terminal (published normally) before the rest are cut; a store
+     * commit that still completes after the cut is published as well.
+     */
     fun onPause() {
-        adapterForLifecycleOrNull()?.onLifecycle(CaptureLifecycleEvent.BACKGROUNDED)
+        val active = adapterForLifecycleOrNull() ?: return
+        active.awaitExposedAttemptsSettled(PAUSE_SETTLE_MS)
+        active.onLifecycle(CaptureLifecycleEvent.BACKGROUNDED)
     }
     fun onViewReplacement() {
         adapterForLifecycleOrNull()?.onLifecycle(CaptureLifecycleEvent.VIEW_REPLACED)
@@ -904,9 +914,12 @@ internal class NativeCaptureAdapterV2(
         var tenSecondPresented: Boolean = false,
         var terminalClaimed: Boolean = false,
         var exposureTimestampNs: Long = 0L,
+        /** Store terminal that arrived while a pause transfer was querying the store. */
+        var pauseTerminal: CaptureReceipt? = null,
     )
     private val lock = ReentrantLock(true)
     private val storeIdle = lock.newCondition()
+    private val attemptSettled = lock.newCondition()
     private val submissionIdle = lock.newCondition()
     private val admissionLock = ReentrantLock(true)
     private val scheduler = CaptureFinalizerScheduler()
@@ -1035,7 +1048,7 @@ internal class NativeCaptureAdapterV2(
                     CaptureLifecycleEvent.ROUTE_LEFT -> lifecycleTransferLocked(value, "route-left")
                     CaptureLifecycleEvent.VIEW_REPLACED -> lifecycleTransferLocked(value, "view-replaced")
                     CaptureLifecycleEvent.AR_SESSION_REPLACED -> lifecycleTransferLocked(value, "ar-session-replaced")
-                    CaptureLifecycleEvent.BACKGROUNDED -> lifecycleTransferLocked(value, "backgrounded")
+                    CaptureLifecycleEvent.BACKGROUNDED -> lifecycleTransferLocked(value, PAUSE_LIFECYCLE_REASON)
                     CaptureLifecycleEvent.PROCESS_RESTARTED -> lifecycleTransferLocked(value, "process-restarted")
                 }
             }
@@ -1142,6 +1155,7 @@ internal class NativeCaptureAdapterV2(
             safety.release(value.qualifier)
             work.remove(value.request.accepted.identity)
             scheduler.release(value.request.accepted.identity)
+            attemptSettled.signalAll()
         }
         closing = false
     }
@@ -1336,11 +1350,18 @@ internal class NativeCaptureAdapterV2(
             endStoreOperationLocked()
         }
         if (work[value.request.accepted.identity] !== value) {
+            // Transferred by a pause while the store committed: the view stays, so the
+            // durable terminal is still published (and retained for replay).
+            if (value.pendingLifecycleReason == PAUSE_LIFECYCLE_REASON && receipt?.terminal != null) {
+                publishTerminalAfterPauseTransferLocked(value, checkNotNull(receipt))
+            }
             propagatedStoreFailure?.let { throw it }
             return
         }
         val cutReason = value.pendingLifecycleReason
         when {
+            cutReason == PAUSE_LIFECYCLE_REASON && value.lifecycleTransferInProgress && receipt?.terminal != null ->
+                value.pauseTerminal = receipt
             cutReason != null && value.lifecycleTransferInProgress -> Unit
             cutReason != null -> transferUnknownLocked(value, "$cutReason-transfer")
             closing -> transferUnknownLocked(value, "shutdown-transfer")
@@ -1441,12 +1462,19 @@ internal class NativeCaptureAdapterV2(
         counters.unknownQuery(value.request.accepted.identity)
         // A lifecycle owner cut transfers authority to durable recovery even
         // if a concurrent store handoff has just reached a terminal. Projecting
-        // that terminal on the closing view would publish after the cut.
-        storeCallLocked { store.queryReceipt(value.request.accepted.identity) }
+        // that terminal on the closing view would publish after the cut. A
+        // pause (backgrounded) keeps the view: its terminal is published.
+        val receipt = storeCallLocked { store.queryReceipt(value.request.accepted.identity) }
+            ?.takeIf { it.terminal != null } ?: value.pauseTerminal
         if (work[value.request.accepted.identity] !== value) return
+        if (value.pendingLifecycleReason == PAUSE_LIFECYCLE_REASON && receipt?.terminal != null) {
+            finishLocked(value, receipt)
+            return
+        }
         safety.release(value.qualifier)
         work.remove(value.request.accepted.identity)
         scheduler.release(value.request.accepted.identity)
+        attemptSettled.signalAll()
         externalCallLocked { exposure.cancelExposure(value.qualifier) }
         } finally {
             value.lifecycleTransferInProgress = false
@@ -1475,6 +1503,7 @@ internal class NativeCaptureAdapterV2(
         }
         work.remove(identity)
         scheduler.release(identity)
+        attemptSettled.signalAll()
         value?.let { safety.release(it.qualifier) }
         value?.let { externalCallLocked { exposure.cancelExposure(it.qualifier) } }
         if (value != null) {
@@ -1483,6 +1512,13 @@ internal class NativeCaptureAdapterV2(
                 if (terminal.kind == CaptureTerminalKind.COMMITTED_PICTURE) counters.committed() else counters.abandoned()
             }
         }
+        emitTerminalLocked(value, receipt, recoveryContext)
+        if (!lifecycleDrain) scheduler.running?.let { next -> work[next.identity]?.let(::startLocked) }
+    }
+
+    private fun emitTerminalLocked(value: Work?, receipt: CaptureReceipt, recoveryContext: NativeCaptureRecoveryContextV2?) {
+        val identity = receipt.identity
+        val terminal = checkNotNull(receipt.terminal)
         emitLocked(
             NativeCaptureEventV2(
                 if (terminal.kind == CaptureTerminalKind.COMMITTED_PICTURE) {
@@ -1510,7 +1546,39 @@ internal class NativeCaptureAdapterV2(
                 else value.request.exposureTimestampNanoseconds
             externalCallLocked { runCatching { durableTerminalTap.onDurableTerminal(value.request, terminal, exposureNs) } }
         }
-        if (!lifecycleDrain) scheduler.running?.let { next -> work[next.identity]?.let(::startLocked) }
+    }
+
+    /**
+     * A pause transferred [value] to recovery while its store commit was still
+     * running, and the commit reached the terminal of [receipt]. The view was
+     * only paused, so the terminal is published once (the app settles the
+     * attempt and the recovery replay retains it) instead of only after a
+     * restart.
+     */
+    private fun publishTerminalAfterPauseTransferLocked(value: Work, receipt: CaptureReceipt) {
+        if (value.terminalClaimed) return
+        value.terminalClaimed = true
+        if (value.exposureCounted) {
+            if (receipt.terminal?.kind == CaptureTerminalKind.COMMITTED_PICTURE) counters.committed() else counters.abandoned()
+        }
+        emitTerminalLocked(value, receipt, value.request.recoveryContext)
+    }
+
+    /**
+     * Waits up to [timeoutMs] until every attempt that had requested exposure
+     * when called reached a terminal or left this owner, so a pause cuts only
+     * attempts the camera or store did not finish in time. Attempts still
+     * waiting for funding are not waited for (the pause abandons them before
+     * exposure). Returns whether all of them settled.
+     */
+    fun awaitExposedAttemptsSettled(timeoutMs: Long): Boolean = lock.withLock {
+        val exposed = work.values.filter { it.exposureRequested }
+        var remaining = TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+        while (exposed.any { work[it.request.accepted.identity] === it }) {
+            if (remaining <= 0L) return@withLock false
+            remaining = attemptSettled.awaitNanos(remaining)
+        }
+        true
     }
 
     private fun countExposureLocked(value: Work) {
@@ -1575,6 +1643,7 @@ internal class NativeCaptureAdapterV2(
     private companion object {
         const val AUTOMATIC_STALL_MS = 10_000L
         const val TERMINAL_FENCE_MS = 30_000L
+        const val PAUSE_LIFECYCLE_REASON = "backgrounded"
     }
 }
 
