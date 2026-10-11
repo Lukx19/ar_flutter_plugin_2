@@ -83,6 +83,7 @@ internal class ArView(
     id: Int,
     initialSessionFeatures: Set<Session.Feature> = emptySet(),
     requestedRearCameraId: String? = null,
+    private val retainAssessedOriginals: Boolean = false,
     CommittedBaselineAuthority: CommittedBaselineAuthority,
 ) : PlatformView {
     private val root = FrameLayout(context)
@@ -301,6 +302,7 @@ internal class ArView(
             scope.launch { captureChannel.invokeMethod("onCaptureFinalized", value) }
         },
         captureSafetySignalV2 = captureSafetySignalV2,
+        retainAssessedOriginals = retainAssessedOriginals,
     )
 
     private val visibilitySmallSceneDebugChannel = VisibilitySmallSceneDebugChannel(

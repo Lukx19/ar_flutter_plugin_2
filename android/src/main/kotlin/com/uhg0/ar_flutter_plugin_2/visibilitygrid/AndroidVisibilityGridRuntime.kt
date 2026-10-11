@@ -521,6 +521,7 @@ internal class AndroidVisibilityGridRuntime(
             DepthAcquisitionRefusal.STALE_AUTOMATIC -> staleAutomaticRefusals++
             DepthAcquisitionRefusal.CONFIDENCE_PAIR -> depthConfidencePairRefusals++
             DepthAcquisitionRefusal.INVALID_TIMESTAMP -> invalidImageTimestampRefusals++
+            DepthAcquisitionRefusal.INVALID_PROJECTION -> invalidDepthObservations++
         }
     }
 

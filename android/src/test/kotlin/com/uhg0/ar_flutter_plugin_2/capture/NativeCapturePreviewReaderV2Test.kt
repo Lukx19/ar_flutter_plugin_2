@@ -41,6 +41,7 @@ class NativeCapturePreviewReaderV2Test {
                 writeBytes(image)
             }
 
+            writeReceipt(session, manifestId, captureId, requestHash, 1, image.size)
             val target = File(root, "preview.jpg")
             val thumbnail = image.copyOf(16)
             val reader = NativeCapturePreviewReaderV2(root,
@@ -149,6 +150,7 @@ class NativeCapturePreviewReaderV2Test {
         repeat(6) { index ->
             val content = "schema=5\nrevision=${index + 1}\nrequest=${"d".repeat(64)}\nprevious=$previous\nsecondPrevious=$secondPrevious\ncomponent=JPEG:${bytes.size}:$component\n"
             val hash = sha256(content.toByteArray())
+            writeReceipt(session, hash, capture, "d".repeat(64), index + 1L, bytes.size)
             File(session, "objects/$hash.root").apply { parentFile!!.mkdirs(); writeText(content) }
             if (index == 0) first = hash
             secondPrevious = previous; previous = hash
@@ -196,6 +198,75 @@ class NativeCapturePreviewReaderV2Test {
             },
             write = { buffer, offset, count -> output.write(buffer, offset, count) },
         ).also { assertArrayEquals(bytes, output.toByteArray()) }
+    }
+
+    @Test fun retainedReviewPreviewRequiresMatchingReceiptAndNeverPromotesQuality() {
+        val folder = Files.createTempDirectory("retained-preview").toFile()
+        try {
+            AdmittedJpegStoreFixture(folder, CaptureLane.MANUAL).use { fixture ->
+                fixture.store.acceptCaptureBeforeExposure(fixture.request, requireRecoveryIdentity = true)
+                var receipt: CaptureReceipt? = null
+                DirectStoreDispatch(fixture.components(), { acquired ->
+                    receipt = fixture.store.commitStreamedFinalizedAssessed(fixture.template,
+                        acquired.exposureTimestampNanoseconds, acquired.streams, requireNotNull(acquired.qualityAssessment))
+                }, { throw AssertionError(it) }, { PreviewBlurQuality(58.6645, 516, 387) }, retainAssessedOriginals = true).run()
+                val committed = requireNotNull(receipt); val terminal = requireNotNull(committed.terminal)
+                val manifest = requireNotNull(terminal.manifestId); val capture = requireNotNull(terminal.captureId)
+                var writes = 0
+                val reader = NativeCapturePreviewReaderV2(fixture.storeRoot, { _, target, _, _ ->
+                    writes++; target.writeBytes(byteArrayOf(1, 2, 3)); true
+                }, { _, _ -> false })
+                val target = File(folder, "preview.jpg")
+                assertTrue(reader.materializeJpegPreview(manifest, capture, target))
+                assertEquals(1, writes)
+                assertEquals(CaptureQualityDispositionV1.REVIEW_REQUIRED, fixture.store.queryReceipt(committed.identity)?.terminal?.qualityAssessment?.disposition)
+                fixture.assertOriginal(committed)
+                val receiptFile = fixture.storeRoot.walkTopDown().single { it.name == "receipt.properties" }
+                val originalReceipt = receiptFile.readText()
+                receiptFile.writeText(originalReceipt.replace("captureId=${terminal.captureId}", "captureId=${"a".repeat(64)}"))
+                assertFalse(reader.materializeJpegPreview(manifest, capture, target))
+                receiptFile.writeText(originalReceipt.replace("qualityDisposition=reviewRequired", "qualityDisposition=policyPassed"))
+                assertFalse(reader.materializeJpegPreview(manifest, capture, target))
+                receiptFile.writeText(originalReceipt)
+                assertTrue(reader.materializeJpegPreview(manifest, capture, target))
+            }
+        } finally { folder.deleteRecursively() }
+    }
+
+    @Test fun assessedSelectedRootKeepsOlderLegacyPreviewReadable() {
+        val folder = Files.createTempDirectory("mixed-preview").toFile()
+        try {
+            val fixture = committedChain(folder)
+            val session = File(folder, "sessions/session")
+            val previous = File(session, "root-A.ptr").readLines()[1]
+            val previousRoot = File(session, "objects/$previous.root").readLines()
+            val secondPrevious = previousRoot.single { it.startsWith("previous=") }.substringAfter('=')
+            val request = "d".repeat(64)
+            val assessment = CaptureQualityAssessmentV1(policyVersion = "jpegLaplacianVarianceV1:threshold110",
+                disposition = CaptureQualityDispositionV1.REVIEW_REQUIRED, reason = CaptureQualityReasonV1.BELOW_THRESHOLD,
+                score = 58.6645, threshold = 110.0, sampleWidth = 516, sampleHeight = 387)
+            val qualityFields = assessment.rootFields().entries.joinToString("\n", postfix = "\n") { "${it.key}=${it.value}" }
+            val assessmentHash = CaptureQualityAssessmentV1.boundHash(request, assessment)
+            val content = "schema=6\nrevision=7\nrequest=$request\nprevious=$previous\nsecondPrevious=$secondPrevious\n" +
+                "component=JPEG:${fixture.third.size}:${sha256(fixture.third)}\nexposureTimestampNanoseconds=1\n" +
+                "qualityAssessmentHash=$assessmentHash\n$qualityFields"
+            val manifest = sha256(content.toByteArray())
+            File(session, "objects/$manifest.root").writeText(content)
+            writeReceipt(session, manifest, fixture.second, request, 7, fixture.third.size)
+            File(session, "attempts/$manifest/receipt.properties").appendText("qualityAssessmentHash=$assessmentHash\n$qualityFields")
+            File(session, "root-A.ptr").writeText("7\n$manifest\n${"e".repeat(64)}\n")
+            val reader = NativeCapturePreviewReaderV2(folder, { _, target, _, _ -> target.writeBytes(byteArrayOf(1)); true }, { _, _ -> false })
+            assertTrue(reader.materializeJpegPreview(fixture.first, fixture.second, File(folder, "old-preview.jpg")))
+            assertTrue(reader.materializeJpegPreview(manifest, fixture.second, File(folder, "review-preview.jpg")))
+        } finally { folder.deleteRecursively() }
+    }
+
+    private fun writeReceipt(session: File, manifest: String, capture: String, request: String, revision: Long, size: Int) {
+        File(session, "attempts/$manifest/receipt.properties").apply {
+            parentFile!!.mkdirs()
+            writeText("kind=COMMITTED_PICTURE\nrootHash=$manifest\ncaptureId=$capture\nrequestHash=$request\nrevision=$revision\n" +
+                "jpegSizeBytes=$size\nreceiptHash=${sha256("$request|$manifest".toByteArray())}\n")
+        }
     }
 
     private fun sha256(bytes: ByteArray): String =

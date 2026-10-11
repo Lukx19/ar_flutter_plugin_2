@@ -20,8 +20,12 @@ import kotlin.concurrent.withLock
  * directly from Camera2 to the V2 store and are never materialized as a ready
  * picture, a legacy cache entry, or a platform-channel value.
  */
+internal class AssessedReplayUnavailableV2 : UnsupportedOperationException("Assessed replay is unavailable")
+
 internal interface NativeCaptureStorePortV2 {
     fun replayFenceBeforeExposure(request: CaptureCommitRequest): CaptureReceipt?
+    fun replayAssessedFenceBeforeExposure(request: CaptureCommitRequest): CaptureReceipt? =
+        throw AssessedReplayUnavailableV2()
     fun acceptBeforeExposure(request: CaptureCommitRequest): CaptureReceipt
     fun commitStreamed(request: CaptureCommitRequest, streams: List<CaptureComponentStreamV2>): CaptureReceipt
     fun commitStreamed(
@@ -29,12 +33,17 @@ internal interface NativeCaptureStorePortV2 {
         exposureTimestampNanoseconds: Long,
         streams: List<CaptureComponentStreamV2>,
     ): CaptureReceipt = commitStreamed(request, streams)
+    fun commitStreamedAssessed(
+        request: CaptureCommitRequest, exposureTimestampNanoseconds: Long,
+        streams: List<CaptureComponentStreamV2>, qualityAssessment: CaptureQualityAssessmentV1,
+    ): CaptureReceipt = throw UnsupportedOperationException("Assessed durable commit is unavailable")
     fun queryReceipt(identity: CaptureAttemptIdentity): CaptureReceipt?
     fun rebaseSameAttempt(request: CaptureCommitRequest): CaptureReceipt
     fun abandon(request: CaptureCommitRequest, terminal: CaptureTerminal): CaptureReceipt
 }
 internal class DurableNativeCaptureStorePortV2(
     private val store: DurableSessionStoreV2,
+    private val retainAssessedOriginals: Boolean = false,
 ) : NativeCaptureStorePortV2 {
     private fun template(request: CaptureCommitRequest) = CapturePostOutputTemplateV2(
         request.accepted,
@@ -46,7 +55,21 @@ internal class DurableNativeCaptureStorePortV2(
     override fun replayFenceBeforeExposure(request: CaptureCommitRequest) =
         if (request.components.isEmpty()) store.replayTemplateFenceBeforeExposure(template(request))
         else store.replayFenceBeforeExposure(request)
-    override fun acceptBeforeExposure(request: CaptureCommitRequest) = store.acceptCaptureBeforeExposure(request)
+    override fun replayAssessedFenceBeforeExposure(request: CaptureCommitRequest) =
+        if (request.components.isEmpty()) store.replayAssessedTemplateFenceBeforeExposure(template(request))
+        else store.replayFenceBeforeExposure(request)
+    override fun acceptBeforeExposure(request: CaptureCommitRequest) =
+        store.acceptCaptureBeforeExposure(request, requireRecoveryIdentity = retainAssessedOriginals)
+    override fun commitStreamedAssessed(
+        request: CaptureCommitRequest, exposureTimestampNanoseconds: Long,
+        streams: List<CaptureComponentStreamV2>, qualityAssessment: CaptureQualityAssessmentV1,
+    ): CaptureReceipt = if (request.components.isEmpty()) {
+        store.commitStreamedFinalizedAssessed(template(request), exposureTimestampNanoseconds, streams, qualityAssessment)
+    } else {
+        store.commitStreamedAssessed(CaptureCommitRequest(request.accepted, request.components,
+            exposureTimestampNanoseconds, request.poseRecordHash, request.cameraModelHash,
+            request.validationRecordHash, request.ledgerRecordHash, request.recoveryContext, qualityAssessment), streams)
+    }
     override fun commitStreamed(request: CaptureCommitRequest, streams: List<CaptureComponentStreamV2>) =
         commitStreamed(request, request.exposureTimestampNanoseconds, streams)
     override fun commitStreamed(
@@ -88,6 +111,7 @@ internal data class SharedCameraComponentSetV2(
     val qualifier: CaptureAttemptQualifierV2,
     val streams: List<CaptureComponentStreamV2>,
     val exposureTimestampNanoseconds: Long = 0L,
+    val qualityAssessment: CaptureQualityAssessmentV1? = null,
 )
 
 internal enum class NativeCaptureEventKindV2 { ACCEPTED, FINALIZING, RECOVERING, RECOVERY_FAILED, READY, COMMITTED, ABANDONED, HEALTH }
@@ -104,9 +128,29 @@ internal data class NativeCaptureEventV2(
     val reason: String? = null,
     val resources: CaptureResourceSnapshotV2? = null,
     val recoveryContext: NativeCaptureRecoveryContextV2? = null,
+    val qualityAssessment: CaptureQualityAssessmentV1? = null,
+    val qualityAssessmentHash: String? = null,
+    val verifiedTerminal: CaptureTerminal? = null,
 )
 
+/** Both live and recovered assessed events use the contract encoder and verified receipt authority. */
+internal fun encodeNativeCaptureEventV2(value: NativeCaptureEventV2): Map<String, Any?> {
+    if (value.qualityAssessment == null && value.qualityAssessmentHash == null) {
+        require(value.verifiedTerminal?.qualityAssessment == null) { "Assessed terminal cannot use legacy encoding" }
+        return NativeCaptureWireV2.event(value)
+    }
+    val terminal = requireNotNull(value.verifiedTerminal) { "Assessed event has no verified durable terminal" }
+    require(value.qualityAssessment != null && value.qualityAssessment == terminal.qualityAssessment &&
+        value.qualityAssessmentHash == terminal.qualityAssessmentHash)
+    val context = requireNotNull(value.recoveryContext)
+    require(context.sessionId == terminal.identity.lifecycleCut.sessionId &&
+        context.groupId == terminal.identity.lifecycleCut.groupId &&
+        context.groupGeneration == terminal.identity.lifecycleCut.groupGeneration)
+    return NativeCaptureWireV2.assessedCommittedEvent(value, terminal)
+}
+
 internal interface SharedCameraExposureCallbackV2 {
+    val retainAssessedOriginals: Boolean get() = false
     fun onComponents(components: SharedCameraComponentSetV2)
     fun onFailure(qualifier: CaptureAttemptQualifierV2, reason: String)
 }
@@ -121,6 +165,14 @@ internal interface SharedCameraExposurePortV2 {
         required: Set<CaptureComponentKind>,
         callback: SharedCameraExposureCallbackV2,
     ): Boolean
+
+    /** Supplies the already funded workspace without extending the platform wire. */
+    fun requestExposure(
+        qualifier: CaptureAttemptQualifierV2,
+        required: Set<CaptureComponentKind>,
+        callback: SharedCameraExposureCallbackV2,
+        maximumWorkingBytes: Long,
+    ): Boolean = requestExposure(qualifier, required, callback)
 
     fun cancelExposure(qualifier: CaptureAttemptQualifierV2)
 }
@@ -139,9 +191,15 @@ internal class SharedCameraManagerExposurePortV2(
         SharedCameraExposureCallbackV2,
     ) -> Boolean,
     private val cancel: (CaptureAttemptQualifierV2) -> Unit,
+    private val fundedRequest: ((CaptureAttemptQualifierV2, Set<CaptureComponentKind>,
+        SharedCameraExposureCallbackV2, Long) -> Boolean)? = null,
 ) : SharedCameraExposurePortV2 {
     override fun requestExposure(qualifier: CaptureAttemptQualifierV2, required: Set<CaptureComponentKind>, callback: SharedCameraExposureCallbackV2) =
         request(qualifier, required, callback)
+    override fun requestExposure(qualifier: CaptureAttemptQualifierV2, required: Set<CaptureComponentKind>,
+        callback: SharedCameraExposureCallbackV2, maximumWorkingBytes: Long): Boolean =
+        fundedRequest?.invoke(qualifier, required, callback, maximumWorkingBytes)
+            ?: requestExposure(qualifier, required, callback)
     override fun cancelExposure(qualifier: CaptureAttemptQualifierV2) = cancel(qualifier)
 }
 
@@ -161,13 +219,17 @@ internal class NativeCaptureRecoveryDispatcherV2(
 
     init {
         executor.execute {
-            val recovered = runCatching { recover(::isActive) }
+            val recovered = runCatching { recover(::isActive).map { projection ->
+                projection.toNativeEvent().also { event ->
+                    if (event.qualityAssessment != null || event.qualityAssessmentHash != null) encodeNativeCaptureEventV2(event)
+                }
+            } }
             synchronized(lock) {
                 if (state == State.CLOSED) return@execute
                 recovered.fold(
                     onSuccess = { projections ->
                         state = State.READY
-                        projections.map { it.toNativeEvent() }.forEach(::emitAndRetainLocked)
+                        projections.forEach(::emitAndRetainLocked)
                         if (projections.isEmpty()) events(readyEvent())
                     },
                     onFailure = {
@@ -226,10 +288,24 @@ internal class NativeCaptureRecoveryDispatcherV2(
     }
 
     private fun emitAndRetainLocked(event: NativeCaptureEventV2) {
+        if (event.qualityAssessment != null || event.qualityAssessmentHash != null) encodeNativeCaptureEventV2(event)
         when {
             event.kind == NativeCaptureEventKindV2.RECOVERY_FAILED -> replay["recovery-failed"] = event
             event.kind == NativeCaptureEventKindV2.COMMITTED || event.kind == NativeCaptureEventKindV2.ABANDONED || event.kind == NativeCaptureEventKindV2.RECOVERING -> {
                 val key = requireNotNull(event.attemptId)
+                val existing = replay[key]
+                if (existing != null && existing.kind in setOf(NativeCaptureEventKindV2.COMMITTED, NativeCaptureEventKindV2.ABANDONED) &&
+                    event.kind in setOf(NativeCaptureEventKindV2.COMMITTED, NativeCaptureEventKindV2.ABANDONED) &&
+                    listOf(existing.kind, existing.captureId, existing.captureRevision, existing.manifestId,
+                        existing.jpegSizeBytes, existing.dngSizeBytes, existing.recoveryContext,
+                        existing.qualityAssessment, existing.qualityAssessmentHash,
+                        existing.reason.takeIf { existing.kind == NativeCaptureEventKindV2.ABANDONED }) !=
+                    listOf(event.kind, event.captureId, event.captureRevision, event.manifestId,
+                        event.jpegSizeBytes, event.dngSizeBytes, event.recoveryContext,
+                        event.qualityAssessment, event.qualityAssessmentHash,
+                        event.reason.takeIf { event.kind == NativeCaptureEventKindV2.ABANDONED })) {
+                    throw DurableStoreConflictV2("Changed durable terminal conflicts with replay identity")
+                }
                 replay[key] = event
                 while (replay.size > 2) replay.remove(replay.keys.first())
             }
@@ -266,6 +342,9 @@ internal class NativeCaptureRecoveryDispatcherV2(
         dngSizeBytes = dngSizeBytes,
         reason = reason,
         recoveryContext = recoveryContext,
+        qualityAssessment = qualityAssessment,
+        qualityAssessmentHash = qualityAssessmentHash,
+        verifiedTerminal = verifiedTerminal,
     )
 
     private companion object {
@@ -469,6 +548,7 @@ internal class NativeCaptureBindingV2(
     private val safety: CaptureSafetySignalV2,
     private val nowMs: () -> Long = System::currentTimeMillis,
     private val events: (NativeCaptureEventV2) -> Unit = {},
+    private val retainAssessedOriginals: Boolean = false,
 ) : AutoCloseable {
     private val appContext = context.applicationContext
     private val lock = Any()
@@ -500,6 +580,10 @@ internal class NativeCaptureBindingV2(
             val manager = synchronized(lock) { sharedCamera }
             manager?.cancelAttemptQualifiedExposureV2(qualifier)
         },
+        fundedRequest = { qualifier, required, callback, maximumWorkingBytes ->
+            val manager = synchronized(lock) { if (closed) null else sharedCamera }
+            manager?.requestAttemptQualifiedExposureV2(qualifier, required, callback, maximumWorkingBytes) ?: false
+        },
     )
     private val recoveryDelegate = lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
         // Acquire the root inside the binding gate, before recovery can escape
@@ -513,7 +597,8 @@ internal class NativeCaptureBindingV2(
     private val recovery by recoveryDelegate
     private val adapterDelegate = lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
         NativeCaptureAdapterV2(
-            DurableNativeCaptureStorePortV2(store), bridge, safety, nowMs, recovery::emitLive,
+            DurableNativeCaptureStorePortV2(store, retainAssessedOriginals), bridge, safety, nowMs, recovery::emitLive,
+            retainAssessedOriginals,
         )
     }
     private val adapter by adapterDelegate
@@ -768,6 +853,10 @@ internal class CaptureSafetySignalV2 : VisibilityCaptureSafePredicate {
     fun invalidateLifecycleForViewPause() = invalidateAll()
     fun invalidateAll() = synchronized(lock) { ownerLive = false; durableAccepted = false; binding = null }
 
+    fun isCaptureSafeFor(qualifier: CaptureAttemptQualifierV2): Boolean = synchronized(lock) {
+        binding == qualifier && ownerLive && durableAccepted
+    }
+
     override fun isCaptureSafe(): Boolean = synchronized(lock) {
         // A safety proof is an exact V2 owner/store/cut binding, never a Dart policy flag.
         binding != null && durableAccepted && ownerLive
@@ -785,6 +874,7 @@ internal class NativeCaptureAdapterV2(
     private val safety: CaptureSafetySignalV2 = CaptureSafetySignalV2(),
     private val nowMs: () -> Long = System::currentTimeMillis,
     private val events: (NativeCaptureEventV2) -> Unit = {},
+    private val retainAssessedOriginals: Boolean = false,
 ) : AutoCloseable {
     private fun captureLatencyLog(stage: String, attemptId: String) {
         Log.i(
@@ -827,6 +917,17 @@ internal class NativeCaptureAdapterV2(
     private var automaticLifecycleGeneration = 0L
     private var nextExposureGeneration = 0L
 
+    private fun replayFenceForAdmission(request: CaptureCommitRequest): CaptureReceipt? = try {
+        // Read capability is independent of the producer mode: an assessed
+        // terminal already on disk must replay after an OFF restart.
+        store.replayAssessedFenceBeforeExposure(request)
+    } catch (error: AssessedReplayUnavailableV2) {
+        // Keep direct legacy/fake store entrypoints usable; real durable ports
+        // implement the disposition-aware lookup and preserve conflicts.
+        if (retainAssessedOriginals) throw error
+        store.replayFenceBeforeExposure(request)
+    }
+
     fun admit(request: CaptureCommitRequest): CaptureReceipt = admissionLock.withLock { lock.withLock {
         captureLatencyLog("native_admit_start", request.accepted.identity.attemptId)
         check(!closed && !closing) { "NativeCaptureAdapterV2 is closed" }
@@ -845,7 +946,9 @@ internal class NativeCaptureAdapterV2(
         check(work.values.none { it.request.accepted.lane == accepted.lane }) {
             "lane-capacity-${accepted.lane.name.lowercase()}"
         }
-        storeCallLocked { store.replayFenceBeforeExposure(request) }?.let { replay ->
+        storeCallLocked {
+            replayFenceForAdmission(request)
+        }?.let { replay ->
             if (replay.terminal != null) return@withLock replay
             // A durable accepted identity from a prior owner is outcome-unknown.
             // Fence it metadata-only; never infer that a second shutter is safe.
@@ -1053,7 +1156,7 @@ internal class NativeCaptureAdapterV2(
             captureLatencyLog("native_camera_request_start", value.request.accepted.identity.attemptId)
             try {
                 requested = externalCallLocked {
-                    exposure.requestExposure(value.qualifier, value.request.accepted.profile.requiredComponents, callback)
+                    exposure.requestExposure(value.qualifier, value.request.accepted.profile.requiredComponents, callback, value.request.accepted.profile.maximumWorkingBytes)
                 }
             } catch (error: Exception) {
                 if (error is java.util.concurrent.CancellationException) {
@@ -1122,6 +1225,7 @@ internal class NativeCaptureAdapterV2(
     }
 
     private val callback = object : SharedCameraExposureCallbackV2 {
+        override val retainAssessedOriginals: Boolean get() = this@NativeCaptureAdapterV2.retainAssessedOriginals
         override fun onComponents(components: SharedCameraComponentSetV2) = lock.withLock {
             val value = work[components.qualifier.identity]
             if (
@@ -1182,6 +1286,11 @@ internal class NativeCaptureAdapterV2(
             abandonLocked(value.request, "malformed-component-set")
             return
         }
+        if (retainAssessedOriginals != (components.qualityAssessment != null)) {
+            closeStreams(components.streams)
+            abandonLocked(value.request, "quality-assessment-gate-mismatch")
+            return
+        }
         beginStoreOperationLocked()
         emitLocked(NativeCaptureEventV2(NativeCaptureEventKindV2.FINALIZING, value.request.accepted.identity.attemptId))
         if (
@@ -1201,10 +1310,11 @@ internal class NativeCaptureAdapterV2(
         value.inFlightStoreComponents = components
         try {
             receipt = externalCallLocked {
-                store.commitStreamed(
-                    value.request,
-                    components.exposureTimestampNanoseconds,
-                    components.streams,
+                if (retainAssessedOriginals) store.commitStreamedAssessed(
+                    value.request, components.exposureTimestampNanoseconds, components.streams,
+                    requireNotNull(components.qualityAssessment),
+                ) else store.commitStreamed(
+                    value.request, components.exposureTimestampNanoseconds, components.streams,
                 )
             }
         } catch (error: Exception) {
@@ -1383,6 +1493,9 @@ internal class NativeCaptureAdapterV2(
                 dngSizeBytes = terminal.dngSizeBytes,
                 reason = terminal.reason,
                 recoveryContext = recoveryContext,
+                qualityAssessment = terminal.qualityAssessment,
+                qualityAssessmentHash = terminal.qualityAssessmentHash,
+                verifiedTerminal = terminal,
             ),
         )
         emitLocked(NativeCaptureEventV2(NativeCaptureEventKindV2.HEALTH, resources = snapshot()))

@@ -204,7 +204,9 @@ class ARSessionManager {
 
       // Initialize capture manager if config provided
       if (captureConfig != null) {
-        _captureManager = ARCaptureManager(this, captureConfig, buildContext);
+        // Reader capability survives the default-off producer experiment.
+        _captureManager = ARCaptureManager(this, captureConfig, buildContext,
+            allowAssessedQuality: true);
         if (debug) {
           print("ARSessionManager initialized with capture capabilities");
         }
@@ -308,7 +310,8 @@ class ARSessionManager {
         }
 
         _captureManager =
-            ARCaptureManager(this, _arConfig!.captureConfig!, buildContext);
+            ARCaptureManager(this, _arConfig!.captureConfig!, buildContext,
+                allowAssessedQuality: true);
 
         if (debug) {
           print('Capture manager initialized successfully');

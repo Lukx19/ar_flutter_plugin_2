@@ -37,9 +37,12 @@ data class DepthObservation(
     val worldFromCameraGl: DoubleArray,
     val imageOrientation: DepthImageOrientation = DepthImageOrientation.LANDSCAPE_RIGHT,
     val confidenceTimestampNs: Long = 0L,
+    val cameraImageTimestampNs: Long = 0L,
     val sourceImageWidth: Int = width,
     val sourceImageHeight: Int = height,
     val acquisitionMode: DepthAcquisitionMode = DepthAcquisitionMode.PROVIDED,
+    /** Positive only when this producer froze the current projection after paired acquisition. */
+    val projectionFrameTimestampNs: Long = 0L,
 ) {
     init {
         require(timestampNs >= 0)

@@ -21,6 +21,7 @@ class ArViewFactory(
         val creationParams = args as? Map<*, *>
         val enableHighResCapture =
             creationParams?.get("enableHighResCapture") as? Boolean ?: false
+        val retainAssessedOriginals = selectRetainAssessedOriginals(creationParams)
         val requestedRearCameraId = creationParams?.get("rearCameraId") as? String
         val initialSessionFeatures =
             if (enableHighResCapture) setOf(Session.Feature.SHARED_CAMERA) else emptySet()
@@ -33,7 +34,13 @@ class ArViewFactory(
             id = viewId,
             initialSessionFeatures = initialSessionFeatures,
             requestedRearCameraId = requestedRearCameraId,
+            retainAssessedOriginals = retainAssessedOriginals,
             CommittedBaselineAuthority = CommittedBaselineAuthority,
         )
     }
 }
+
+internal fun selectRetainAssessedOriginals(
+    creationParams: Map<*, *>?,
+    isDebugBuild: Boolean = BuildConfig.DEBUG,
+): Boolean = isDebugBuild && creationParams?.get("retainAssessedOriginals") == true

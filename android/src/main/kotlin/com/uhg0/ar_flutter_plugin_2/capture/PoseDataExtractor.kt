@@ -2,6 +2,7 @@ package com.uhg0.ar_flutter_plugin_2.capture
 
 import com.google.ar.core.Frame
 import com.google.ar.core.TrackingState
+import com.uhg0.ar_flutter_plugin_2.BuildConfig
 import kotlin.math.abs
 import kotlin.math.acos
 import kotlin.math.cos
@@ -24,6 +25,9 @@ class PoseDataExtractor(private val capacity: Int = 120) {
         val poseSource: String = "liveAnchor",
         val fixtureBindingGeneration: Long? = null,
         val fixtureGroupGeneration: Long? = null,
+        // Same-frame Android image identity; zero/negative values are unavailable.
+        // Distinct image intervals qualify motion; raw timestamps still align exposures.
+        val androidCameraTimestampNs: Long = 0L,
     )
 
     data class CaptureTiming(
@@ -50,8 +54,19 @@ class PoseDataExtractor(private val capacity: Int = 120) {
 
     private val lock = Object()
     private val poses = PoseHistory(capacity)
+    // Ingress order is authoritative for motion; raw sorting cannot hide a break.
+    private val motionPoses = PoseHistory(capacity)
+    private val frameIngress = PoseSlot()
+    private val previousIngress = PoseSlot()
+    private val motionImage = PoseSlot()
+    private var hasMotionIngress = false
+    private var motionObservedWatermarkNs = 0L
+    private var motionImageWatermarkNs = 0L
+    private var motionFreshnessObservedNs: Long? = null
+    private var motionIngressGate: ExposureMotionGate? = null
     private val wireTransform = FloatArray(16)
     private val wireQuaternion = FloatArray(4)
+    private var debugTimestampReadMismatchCount = 0L
     private var debugFixtureAnchor: CachedPose? = null
     private var debugFixtureOffsetX = 0.0f
     private var debugFixtureSource = LIVE_ANCHOR_POSE_SOURCE
@@ -81,19 +96,25 @@ class PoseDataExtractor(private val capacity: Int = 120) {
     }
 
     fun onFrame(frame: Frame) {
+        // Sample both source clocks once from this frame, before a history-lock wait.
+        val cameraTimestampNs = frame.timestamp
+        val androidCameraTimestampNs = frame.androidCameraTimestamp
+        val observedTimestampNs = System.nanoTime()
         val camera = frame.camera
         val pose = camera.pose
-        val trackingState = when (camera.trackingState) {
+        val cameraTrackingState = camera.trackingState
+        val trackingState = when (cameraTrackingState) {
             TrackingState.TRACKING -> "tracking"
             TrackingState.PAUSED -> "paused"
             TrackingState.STOPPED -> "stopped"
         }
 
         synchronized(lock) {
-            val slot = poses.insert(frame.timestamp) ?: return
-            slot.timestampNs = frame.timestamp
+            val slot = frameIngress
+            slot.timestampNs = cameraTimestampNs
+            slot.androidCameraTimestampNs = androidCameraTimestampNs
             slot.systemTimestampMs = System.currentTimeMillis()
-            slot.observedTimestampNs = System.nanoTime()
+            slot.observedTimestampNs = observedTimestampNs
             val anchor = debugFixtureAnchor
             if (anchor == null) {
                 slot.position[0] = pose.tx()
@@ -101,7 +122,7 @@ class PoseDataExtractor(private val capacity: Int = 120) {
                 slot.position[2] = pose.tz()
                 pose.getRotationQuaternion(slot.rotation, 0)
                 pose.toMatrix(slot.transform, 0)
-                slot.isTracking = camera.trackingState == TrackingState.TRACKING
+                slot.isTracking = cameraTrackingState == TrackingState.TRACKING
                 slot.confidence = if (slot.isTracking) 1f else 0f
                 slot.trackingState = trackingState
                 slot.poseSource = LIVE_ANCHOR_POSE_SOURCE
@@ -120,6 +141,8 @@ class PoseDataExtractor(private val capacity: Int = 120) {
                 slot.bindingGeneration = debugFixtureBindingGeneration
                 slot.groupGeneration = debugFixtureGroupGeneration
             }
+            ingestMotionLocked(slot)
+            poses.insert(cameraTimestampNs)?.copyFrom(slot)
             lock.notifyAll()
         }
     }
@@ -155,12 +178,330 @@ class PoseDataExtractor(private val capacity: Int = 120) {
 
     fun addSample(pose: CachedPose) {
         synchronized(lock) {
-            poses.insert(pose.timestampNs)?.set(pose)
+            frameIngress.set(pose)
+            ingestMotionLocked(frameIngress)
+            poses.insert(pose.timestampNs)?.copyFrom(frameIngress)
             lock.notifyAll()
         }
     }
 
+    private fun resetMotionLocked() {
+        motionPoses.clear()
+        hasMotionIngress = false
+        motionObservedWatermarkNs = 0L
+        motionImageWatermarkNs = 0L
+        motionFreshnessObservedNs = null
+        motionIngressGate = null
+    }
+
+    private fun sameMotionOwner(a: PoseSlot, b: PoseSlot): Boolean =
+        a.poseSource == b.poseSource && a.bindingGeneration == b.bindingGeneration &&
+            a.groupGeneration == b.groupGeneration && a.trackingState == b.trackingState
+
+    private fun ingestMotionLocked(input: PoseSlot) {
+        val imageNs = input.androidCameraTimestampNs
+        val latest = motionPoses.lastSlot()
+        val sameImageRevision = motionImageWatermarkNs > 0L && imageNs == motionImageWatermarkNs &&
+            (!input.position.contentEquals(motionImage.position) || !input.rotation.contentEquals(motionImage.rotation))
+        val failure = when {
+            hasMotionIngress && input.observedTimestampNs <= motionObservedWatermarkNs -> ExposureMotionGate.INVALID_GAP
+            !input.isTracking -> ExposureMotionGate.NOT_TRACKING
+            !input.position.all { it.isFinite() } || !input.rotation.all { it.isFinite() } -> ExposureMotionGate.INVALID_POSE
+            input.rotation.sumOf { it.toDouble() * it.toDouble() } <= 0.0 -> ExposureMotionGate.INVALID_QUATERNION
+            imageNs <= 0L || imageNs < motionImageWatermarkNs -> ExposureMotionGate.INVALID_GAP
+            hasMotionIngress && motionIngressGate == null && !sameMotionOwner(previousIngress, input) -> ExposureMotionGate.INVALID_GAP
+            sameImageRevision -> ExposureMotionGate.INVALID_POSE
+            latest != null && motionIngressGate == null &&
+                (input.observedTimestampNs - latest.observedTimestampNs > 750_000_000L ||
+                    imageNs - motionImageWatermarkNs > 1_000_000_000L) -> ExposureMotionGate.INVALID_GAP
+            else -> null
+        }
+        if (failure != null) {
+            // Retain only the interrupting pair for a truthful bounded diagnostic.
+            motionPoses.clear()
+            if (hasMotionIngress) motionPoses.append().copyFrom(if (sameImageRevision) motionImage else previousIngress)
+            motionPoses.append().copyFrom(input)
+            motionIngressGate = failure
+        } else if (imageNs > motionImageWatermarkNs) {
+            // First distinct image after a break seeds a new dwell; it cannot
+            // inherit approval from the segment retained for diagnostics.
+            if (motionIngressGate != null) motionPoses.clear()
+            motionPoses.append().copyFrom(input)
+            motionIngressGate = null
+            motionFreshnessObservedNs = input.observedTimestampNs
+        }
+        // A repeated identity never updates the original image pose or its
+        // observation time, including repeated revisions after invalidation.
+        if (imageNs > motionImageWatermarkNs) {
+            motionImageWatermarkNs = imageNs
+            motionImage.copyFrom(input)
+        }
+        if (!hasMotionIngress || input.observedTimestampNs > motionObservedWatermarkNs) {
+            motionObservedWatermarkNs = input.observedTimestampNs
+        }
+        previousIngress.copyFrom(input)
+        hasMotionIngress = true
+    }
+
     fun latest(): CachedPose? = synchronized(lock) { poses.lastOrNull() }
+
+    internal enum class ExposureMotionGate {
+        APPROVED, NO_POSE, STALE, NOT_TRACKING, OLDER_NOT_TRACKING,
+        INVALID_GAP, INVALID_POSE, INVALID_QUATERNION, MOVING_TOO_FAST, INSUFFICIENT_DWELL,
+    }
+
+    /** Scalar sample identity; no pose arrays escape in a shutter receipt. */
+    internal data class ExposureMotionSampleIdentity(
+        val cameraTimestampNs: Long,
+        val observedTimestampNs: Long,
+        val isTracking: Boolean,
+        val trackingState: String,
+        val poseSource: String,
+        val fixtureBindingGeneration: Long?,
+        val fixtureGroupGeneration: Long?,
+        val androidCameraTimestampNs: Long,
+    )
+
+    internal data class ExposureMotionPairDiagnostic(
+        // Zero is the latest adjacent pair; larger indices are older pairs.
+        val pairIndex: Int,
+        val cameraGapNs: Long,
+        val observedGapNs: Long,
+        val translationDeltaMeters: Double?,
+        val angularDeltaDegrees: Double?,
+        val older: ExposureMotionSampleIdentity,
+        val newer: ExposureMotionSampleIdentity,
+    )
+
+    /** One scalar-only receipt from the final shutter decision, never a frame log. */
+    internal data class ExposureMotionDiagnostic(
+        val gate: ExposureMotionGate,
+        val decisionNs: Long,
+        val ageMs: Double?,
+        val historySpanMs: Double,
+        val stableDwellMs: Double,
+        val pairCount: Int,
+        val latestTranslationSpeedMps: Double?,
+        val latestAngularSpeedDegreesPerSecond: Double?,
+        val medianTranslationSpeedMps: Double?,
+        val medianAngularSpeedDegreesPerSecond: Double?,
+        val maximumTranslationSpeedMps: Double?,
+        val maximumAngularSpeedDegreesPerSecond: Double?,
+        val firstRefusingPair: ExposureMotionPairDiagnostic?,
+        // Omitted when the first refusing pair already carries this maximum.
+        val maximumAngularPair: ExposureMotionPairDiagnostic?,
+        val minimumPositiveCameraGapNs: Long?,
+        val duplicatePairCount: Int,
+        val timestampReadMismatchCount: Long,
+    )
+
+    // Called only when a bounded debug decision listener is installed. History
+    // stays under the same lock as the Boolean decision; no pose leaves this owner.
+    private fun exposureMotionDiagnostic(gate: ExposureMotionGate, nowNs: Long): ExposureMotionDiagnostic {
+        val poses = motionPoses
+        val latest = poses.lastOrNull()
+        val translations = mutableListOf<Double>()
+        val rotations = mutableListOf<Double>()
+        var latestTranslation: Double? = null
+        var latestRotation: Double? = null
+        var historySpan = 0L
+        var stableDwell = 0L
+        var stablePrefix = true
+        var firstRefusingPairIndex: Int? = null
+        var maximumAngularPairIndex: Int? = null
+        var maximumAngularSpeed: Double? = null
+        var minimumPositiveCameraGap: Long? = null
+        var duplicatePairCount = 0
+        var decidingPrefix = gate == ExposureMotionGate.OLDER_NOT_TRACKING ||
+            gate == ExposureMotionGate.INVALID_GAP || gate == ExposureMotionGate.INVALID_POSE ||
+            gate == ExposureMotionGate.INVALID_QUATERNION || gate == ExposureMotionGate.MOVING_TOO_FAST
+        if (latest != null) {
+            var newer: CachedPose = latest
+            for (index in poses.size - 2 downTo 0) {
+                val older = poses[index]
+                val pairIndex = poses.size - 2 - index
+                val gap = newer.androidCameraTimestampNs - older.androidCameraTimestampNs
+                val cameraGap = newer.timestampNs - older.timestampNs
+                if (gap == 0L) duplicatePairCount++
+                if (cameraGap > 0L && (minimumPositiveCameraGap == null || cameraGap < minimumPositiveCameraGap)) {
+                    minimumPositiveCameraGap = cameraGap
+                }
+                historySpan = (latest.observedTimestampNs - older.observedTimestampNs).coerceAtLeast(0L)
+                val finitePose = newer.position.all { it.isFinite() } && older.position.all { it.isFinite() } &&
+                    newer.rotationQuaternion.all { it.isFinite() } && older.rotationQuaternion.all { it.isFinite() }
+                var translation: Double? = null
+                var rotation: Double? = null
+                var olderNorm = 0.0
+                var newerNorm = 0.0
+                var rawTranslationSpeed = 0.0
+                var rawAngularSpeed = 0.0
+                if (gap in 1L..1_000_000_000L && finitePose) {
+                    val seconds = gap / 1e9
+                    var distanceSquared = 0.0
+                    for (axis in 0..2) {
+                        val delta = (newer.position[axis] - older.position[axis]).toDouble()
+                        distanceSquared += delta * delta
+                    }
+                    rawTranslationSpeed = sqrt(distanceSquared) / seconds
+                    translation = rawTranslationSpeed.takeIf { it.isFinite() }
+                    var dot = 0.0
+                    for (axis in 0..3) {
+                        val a = older.rotationQuaternion[axis].toDouble()
+                        val b = newer.rotationQuaternion[axis].toDouble()
+                        dot += a * b; olderNorm += a * a; newerNorm += b * b
+                    }
+                    if (olderNorm > 0.0 && newerNorm > 0.0) {
+                        val cosine = abs(dot / sqrt(olderNorm * newerNorm)).coerceIn(0.0, 1.0)
+                        rawAngularSpeed = 2 * acos(cosine) * 180 / Math.PI / seconds
+                        rotation = rawAngularSpeed.takeIf { it.isFinite() }
+                    }
+                }
+                // Mirror the existing gate's refusal order only to identify its
+                // first determining pair. This receipt never supplies its verdict.
+                if (decidingPrefix) {
+                    val pairGate = when {
+                        !older.isTracking -> ExposureMotionGate.OLDER_NOT_TRACKING
+                        gap !in 1L..1_000_000_000L || older.androidCameraTimestampNs <= 0L -> ExposureMotionGate.INVALID_GAP
+                        !finitePose -> ExposureMotionGate.INVALID_POSE
+                        olderNorm <= 0.0 || newerNorm <= 0.0 -> ExposureMotionGate.INVALID_QUATERNION
+                        rawTranslationSpeed > 0.25 || rawAngularSpeed > 15.0 -> ExposureMotionGate.MOVING_TOO_FAST
+                        else -> null
+                    }
+                    if (pairGate != null) {
+                        if (pairGate == gate) firstRefusingPairIndex = pairIndex
+                        decidingPrefix = false
+                    } else if (historySpan >= 400_000_000L) decidingPrefix = false
+                }
+                if (index == poses.size - 2) { latestTranslation = translation; latestRotation = rotation }
+                translation?.let(translations::add); rotation?.let(rotations::add)
+                if (rotation != null && (maximumAngularSpeed == null || rotation > maximumAngularSpeed)) {
+                    maximumAngularSpeed = rotation
+                    maximumAngularPairIndex = pairIndex
+                }
+                if (stablePrefix && latest.isTracking && newer.isTracking && older.isTracking &&
+                    translation != null && rotation != null && translation <= 0.25 && rotation <= 15.0) {
+                    stableDwell = historySpan
+                } else stablePrefix = false
+                if (historySpan >= 400_000_000L) break
+                newer = older
+            }
+        }
+        // Ingress failures can precede pair velocity (for example a pose
+        // revision of the same image or an owner change). Report that exact pair.
+        if (motionIngressGate != null && poses.size >= 2) firstRefusingPairIndex = 0
+        if (motionIngressGate != null) stableDwell = 0L
+        fun median(values: List<Double>): Double? {
+            if (values.isEmpty()) return null
+            val sorted = values.sorted(); val middle = sorted.size / 2
+            return if (sorted.size % 2 == 1) sorted[middle] else (sorted[middle - 1] + sorted[middle]) / 2
+        }
+        fun identity(pose: CachedPose) = ExposureMotionSampleIdentity(
+            pose.timestampNs, pose.observedTimestampNs, pose.isTracking, pose.trackingState,
+            pose.poseSource, pose.fixtureBindingGeneration, pose.fixtureGroupGeneration,
+            pose.androidCameraTimestampNs,
+        )
+        fun pairDiagnostic(pairIndex: Int): ExposureMotionPairDiagnostic {
+            val newer = poses[poses.size - 1 - pairIndex]
+            val older = poses[poses.size - 2 - pairIndex]
+            var distance: Double? = null
+            var angle: Double? = null
+            if (newer.position.all { it.isFinite() } && older.position.all { it.isFinite() }) {
+                var distanceSquared = 0.0
+                for (axis in 0..2) {
+                    val delta = (newer.position[axis] - older.position[axis]).toDouble()
+                    distanceSquared += delta * delta
+                }
+                distance = sqrt(distanceSquared).takeIf { it.isFinite() }
+            }
+            if (newer.rotationQuaternion.all { it.isFinite() } && older.rotationQuaternion.all { it.isFinite() }) {
+                var dot = 0.0; var olderNorm = 0.0; var newerNorm = 0.0
+                for (axis in 0..3) {
+                    val a = older.rotationQuaternion[axis].toDouble()
+                    val b = newer.rotationQuaternion[axis].toDouble()
+                    dot += a * b; olderNorm += a * a; newerNorm += b * b
+                }
+                if (olderNorm > 0.0 && newerNorm > 0.0) {
+                    val cosine = abs(dot / sqrt(olderNorm * newerNorm)).coerceIn(0.0, 1.0)
+                    angle = (2 * acos(cosine) * 180 / Math.PI).takeIf { it.isFinite() }
+                }
+            }
+            return ExposureMotionPairDiagnostic(pairIndex, newer.timestampNs - older.timestampNs,
+                newer.observedTimestampNs - older.observedTimestampNs, distance, angle, identity(older), identity(newer))
+        }
+        return ExposureMotionDiagnostic(gate, nowNs, motionFreshnessObservedNs?.let { (nowNs - it) / 1e6 },
+            historySpan / 1e6, stableDwell / 1e6, translations.size, latestTranslation, latestRotation,
+            median(translations), median(rotations), translations.maxOrNull(), rotations.maxOrNull(),
+            firstRefusingPairIndex?.let(::pairDiagnostic),
+            maximumAngularPairIndex?.takeIf { it != firstRefusingPairIndex }?.let(::pairDiagnostic),
+            minimumPositiveCameraGap, duplicatePairCount, debugTimestampReadMismatchCount)
+    }
+
+    /** Non-blocking shutter check over existing authoritative observed poses.
+     * Limits match AutomaticCapturePolicyConfig: 0.25 m/s, 15 deg/s,
+     * 400 ms stable dwell, 750 ms freshness and a one-second maximum gap.
+     */
+    internal fun isExposureMotionStable(
+        nowNs: Long = System.nanoTime(),
+        onDecision: ((ExposureMotionDiagnostic) -> Unit)? = null,
+    ): Boolean {
+        if (onDecision == null) {
+            return synchronized(lock) { exposureMotionGateLocked(nowNs) == ExposureMotionGate.APPROVED }
+        }
+        val diagnostic = synchronized(lock) {
+            exposureMotionDiagnostic(exposureMotionGateLocked(nowNs), nowNs)
+        }
+        // Formatting, logging and service callbacks must never compete with onFrame's pose lock.
+        onDecision(diagnostic)
+        return diagnostic.gate == ExposureMotionGate.APPROVED
+    }
+
+    private fun exposureMotionGateLocked(nowNs: Long): ExposureMotionGate {
+        if (!hasMotionIngress) return ExposureMotionGate.NO_POSE
+        motionIngressGate?.let { return it }
+        val poses = motionPoses
+        val latest = poses.lastOrNull() ?: return ExposureMotionGate.NO_POSE
+        val age = nowNs - latest.observedTimestampNs
+        if (age !in 0L..750_000_000L) return ExposureMotionGate.STALE
+        if (!latest.isTracking) return ExposureMotionGate.NOT_TRACKING
+        var newer = latest
+        for (index in poses.size - 2 downTo 0) {
+            val older = poses[index]
+            val gap = newer.androidCameraTimestampNs - older.androidCameraTimestampNs
+            if (!older.isTracking) return ExposureMotionGate.OLDER_NOT_TRACKING
+            if (gap !in 1L..1_000_000_000L || older.androidCameraTimestampNs <= 0L) return ExposureMotionGate.INVALID_GAP
+            if (!newer.position.all { it.isFinite() } || !older.position.all { it.isFinite() } ||
+                !newer.rotationQuaternion.all { it.isFinite() } || !older.rotationQuaternion.all { it.isFinite() }) {
+                return ExposureMotionGate.INVALID_POSE
+            }
+            val seconds = gap / 1e9
+            var distanceSquared = 0.0
+            var dot = 0.0
+            var olderNorm = 0.0
+            var newerNorm = 0.0
+            for (axis in 0..2) {
+                val delta = (newer.position[axis] - older.position[axis]).toDouble()
+                distanceSquared += delta * delta
+            }
+            for (axis in 0..3) {
+                val a = older.rotationQuaternion[axis].toDouble()
+                val b = newer.rotationQuaternion[axis].toDouble()
+                dot += a * b
+                olderNorm += a * a
+                newerNorm += b * b
+            }
+            if (olderNorm <= 0.0 || newerNorm <= 0.0) return ExposureMotionGate.INVALID_QUATERNION
+            val cosine = kotlin.math.abs(dot / kotlin.math.sqrt(olderNorm * newerNorm)).coerceIn(0.0, 1.0)
+            val angularSpeed = 2 * kotlin.math.acos(cosine) * 180 / Math.PI / seconds
+            if (kotlin.math.sqrt(distanceSquared) / seconds > 0.25 || angularSpeed > 15.0) {
+                return ExposureMotionGate.MOVING_TOO_FAST
+            }
+            if (latest.observedTimestampNs - older.observedTimestampNs >= 400_000_000L) {
+                return ExposureMotionGate.APPROVED
+            }
+            newer = older
+        }
+        return ExposureMotionGate.INSUFFICIENT_DWELL
+    }
 
     /** New immutable wire owner; history and conversion scratch never escape the lock. */
     internal fun latestPacked(sequence: Long): ByteArray? = synchronized(lock) {
@@ -199,6 +540,7 @@ class PoseDataExtractor(private val capacity: Int = 120) {
     internal fun beginDebugFixture(): Boolean = synchronized(lock) {
         if (debugFixtureAnchor != null) return@synchronized true
         val anchor = poses.lastTrackingSlot()?.snapshot() ?: return@synchronized false
+        resetMotionLocked()
         debugFixtureAnchor = anchor
         debugFixtureOffsetX = 0.0f
         debugFixtureSource = LIVE_ANCHOR_POSE_SOURCE
@@ -253,6 +595,7 @@ class PoseDataExtractor(private val capacity: Int = 120) {
             fixtureBindingGeneration = bindingGeneration,
             fixtureGroupGeneration = groupGeneration,
         )
+        resetMotionLocked()
         poses.insert(synthetic.timestampNs)?.set(synthetic)
         debugFixtureAnchor = synthetic
         debugFixtureOffsetX = 0.0f
@@ -285,6 +628,7 @@ class PoseDataExtractor(private val capacity: Int = 120) {
             timestampNs = now, observedTimestampNs = now,
             systemTimestampMs = System.currentTimeMillis(),
         )
+        resetMotionLocked()
         debugFixtureAnchor = next
         debugFixtureOffsetX = 0.0f
         poses.insert(now)?.set(next)
@@ -293,11 +637,13 @@ class PoseDataExtractor(private val capacity: Int = 120) {
 
     internal fun setDebugFixtureManualView() = synchronized(lock) {
         check(debugFixtureAnchor != null) { "synthetic pose fixture is not active" }
+        resetMotionLocked()
         debugFixtureOffsetX = 0.24f
     }
 
     internal fun setDebugFixtureAutomaticRevisit() = synchronized(lock) {
         check(debugFixtureAnchor != null) { "synthetic pose fixture is not active" }
+        resetMotionLocked()
         debugFixtureOffsetX = 0.0f
     }
 
@@ -310,6 +656,7 @@ class PoseDataExtractor(private val capacity: Int = 120) {
 
     internal fun clearDebugFixture() {
         synchronized(lock) {
+            resetMotionLocked()
             debugFixtureAnchor = null
             debugFixtureOffsetX = 0.0f
             debugFixtureSource = LIVE_ANCHOR_POSE_SOURCE
@@ -844,6 +1191,13 @@ class PoseDataExtractor(private val capacity: Int = 120) {
             for (index in 0 until size) if (slots[index].isTracking) tracked.add(slots[index])
             return tracked
         }
+        fun append(): PoseSlot {
+            if (size < slots.size) return slots[size++]
+            val freed = slots[0]
+            for (index in 1 until size) slots[index - 1] = slots[index]
+            slots[size - 1] = freed
+            return freed
+        }
         fun insert(timestamp: Long): PoseSlot? {
             var index = 0
             while (index < size && slots[index].timestampNs <= timestamp) index++
@@ -867,6 +1221,10 @@ class PoseDataExtractor(private val capacity: Int = 120) {
         }
         override fun set(index: Int, element: CachedPose): CachedPose =
             get(index).also { slots[index].set(element) }
+        override fun clear() {
+            size = 0
+            tracked.clear()
+        }
         override fun removeAt(index: Int): CachedPose {
             val result = get(index)
             val freed = slots[index]
@@ -882,6 +1240,7 @@ class PoseDataExtractor(private val capacity: Int = 120) {
         val rotationQuaternion: FloatArray get() = rotation
         val transform = FloatArray(16)
         var timestampNs = 0L
+        var androidCameraTimestampNs = 0L
         var systemTimestampMs = 0L
         var observedTimestampNs = 0L
         var isTracking = false
@@ -890,11 +1249,27 @@ class PoseDataExtractor(private val capacity: Int = 120) {
         var poseSource = LIVE_ANCHOR_POSE_SOURCE
         var bindingGeneration: Long? = null
         var groupGeneration: Long? = null
+        fun copyFrom(pose: PoseSlot) {
+            pose.position.copyInto(position)
+            pose.rotation.copyInto(rotation)
+            pose.transform.copyInto(transform)
+            timestampNs = pose.timestampNs
+            androidCameraTimestampNs = pose.androidCameraTimestampNs
+            systemTimestampMs = pose.systemTimestampMs
+            observedTimestampNs = pose.observedTimestampNs
+            isTracking = pose.isTracking
+            confidence = pose.confidence
+            trackingState = pose.trackingState
+            poseSource = pose.poseSource
+            bindingGeneration = pose.bindingGeneration
+            groupGeneration = pose.groupGeneration
+        }
         fun set(pose: CachedPose) {
             pose.position.copyInto(position)
             pose.rotationQuaternion.copyInto(rotation)
             pose.transform.copyInto(transform)
             timestampNs = pose.timestampNs
+            androidCameraTimestampNs = pose.androidCameraTimestampNs
             systemTimestampMs = pose.systemTimestampMs
             observedTimestampNs = pose.observedTimestampNs
             isTracking = pose.isTracking
@@ -906,6 +1281,6 @@ class PoseDataExtractor(private val capacity: Int = 120) {
         }
         fun snapshot() = CachedPose(position.clone(), rotation.clone(), transform.clone(), timestampNs,
             systemTimestampMs, isTracking, confidence, trackingState, observedTimestampNs,
-            poseSource, bindingGeneration, groupGeneration)
+            poseSource, bindingGeneration, groupGeneration, androidCameraTimestampNs)
     }
 }

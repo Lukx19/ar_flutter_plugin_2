@@ -355,6 +355,9 @@ class ARCaptureManager {
   /// Whether native resources are active, closing, retained, or released.
   ARCaptureCloseState get closeState => _closeState;
   ARCaptureConfig get config => _config;
+  /// Enable only after retained-review history and credit isolation are installed.
+  final bool allowAssessedQuality;
+
   CaptureInitializationResult? get initializationResult =>
       _initializationResult;
 
@@ -390,8 +393,9 @@ class ARCaptureManager {
   ARCaptureManager(
     this._sessionManager,
     this._config,
-    BuildContext buildContext,
-  ) {
+    BuildContext buildContext, {
+    this.allowAssessedQuality = false,
+  }) {
     _channel = MethodChannel('arcapture_${_sessionManager.channelId}');
     _channel.setMethodCallHandler(_platformCallHandler);
   }
@@ -596,6 +600,7 @@ class ARCaptureManager {
     }
     final result = ARNativeCaptureAdmissionResultV2.fromMap(
       _deepCastMap(value),
+      allowAssessedQuality: allowAssessedQuality,
     );
     final terminal = result.terminal;
     if (terminal != null) {
@@ -615,7 +620,8 @@ class ARCaptureManager {
         code: 'NATIVE_CAPTURE_V2_HEALTH_MISSING',
       );
     }
-    final event = ARNativeCaptureEventV2.fromMap(_deepCastMap(value));
+    final event = ARNativeCaptureEventV2.fromMap(
+      _deepCastMap(value), allowAssessedQuality: allowAssessedQuality);
     return event.health ??
         (throw const FormatException('Native V2 health payload was missing.'));
   }
@@ -661,7 +667,8 @@ class ARCaptureManager {
     return value.map((item) {
       if (item is! Map)
         throw const FormatException('Recovery replay entries must be maps.');
-      return ARNativeCaptureEventV2.fromMap(_deepCastMap(item));
+      return ARNativeCaptureEventV2.fromMap(
+        _deepCastMap(item), allowAssessedQuality: allowAssessedQuality);
     }).toList(growable: false);
   }
 
@@ -2228,7 +2235,8 @@ class ARCaptureManager {
           break;
         case 'onNativeCaptureV2Event':
           _publishNativeCaptureV2Event(
-            ARNativeCaptureEventV2.fromMap(_deepCastMap(call.arguments)),
+            ARNativeCaptureEventV2.fromMap(
+              _deepCastMap(call.arguments), allowAssessedQuality: allowAssessedQuality),
           );
           break;
         case 'onExposureStateChanged':
@@ -2280,7 +2288,10 @@ class ARCaptureManager {
       'manifestId': event.manifestId,
       'jpegSizeBytes': event.jpegSizeBytes,
       'dngSizeBytes': event.dngSizeBytes,
-      'reason': event.reason,
+      'qualityDisposition': event.qualityDisposition?.name,
+      'qualityAssessmentHash': event.qualityAssessmentHash,
+      'qualityAssessment': event.qualityAssessment?.toMap(),
+      'reason': event.kind == ARNativeCaptureEventKindV2.committed ? null : event.reason,
       'recoveryContext': event.recoveryContext?.toMap(),
     });
     final existing = _nativeCaptureV2TerminalLedger[attemptId];

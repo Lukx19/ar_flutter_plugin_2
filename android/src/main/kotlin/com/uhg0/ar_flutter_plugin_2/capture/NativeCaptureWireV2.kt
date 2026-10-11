@@ -50,6 +50,29 @@ internal object NativeCaptureWireV2 {
         }
     }
 
+    /** Unused opt-in encoder: adapter integration must supply the verified durable terminal. */
+    fun assessedCommittedEvent(value: NativeCaptureEventV2, terminal: CaptureTerminal): Map<String, Any?> {
+        require(value.kind == NativeCaptureEventKindV2.COMMITTED && terminal.kind == CaptureTerminalKind.COMMITTED_PICTURE)
+        require(value.attemptId == terminal.identity.attemptId && value.captureId == terminal.captureId &&
+            value.captureRevision == terminal.captureRevision && value.manifestId == terminal.manifestId &&
+            value.jpegSizeBytes == terminal.jpegSizeBytes && value.dngSizeBytes == terminal.dngSizeBytes)
+        require(value.recoveryContext != null && terminal.jpegSizeBytes != null &&
+            terminal.qualityAssessment != null && terminal.qualityAssessmentHash != null)
+        val assessment = terminal.qualityAssessment
+        return event(value).toMutableMap().apply {
+            put("wireVersion", "native_capture_quality_v1")
+            put("qualityDisposition", assessment.disposition.wireName)
+            put("qualityAssessmentHash", terminal.qualityAssessmentHash)
+            put("qualityAssessment", mapOf(
+                "schemaVersion" to assessment.schemaVersion, "policyVersion" to assessment.policyVersion,
+                "disposition" to assessment.disposition.wireName, "reason" to assessment.reason.wireName,
+                "score" to assessment.score, "threshold" to assessment.threshold,
+                "sampleWidth" to assessment.sampleWidth, "sampleHeight" to assessment.sampleHeight,
+                "unavailableReason" to assessment.unavailableReason?.wireName,
+            ))
+        }
+    }
+
     private fun decodeRecoveryContext(value: Any?): NativeCaptureRecoveryContextV2 {
         val map = value.map("recoveryContext")
         map.exactKeys(setOf("sessionId", "groupId", "groupIndex", "groupGeneration", "trigger", "requestedAtMs", "coverageRevision", "timestampMs", "position", "rotation", "viewMatrix", "projectionMatrix", "groupFromWorld", "worldFromGroup"))

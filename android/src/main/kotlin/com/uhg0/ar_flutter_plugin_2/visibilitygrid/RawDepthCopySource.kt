@@ -41,10 +41,18 @@ data class RawDepthFrameMetadata(
     val imageOrientation: DepthImageOrientation = DepthImageOrientation.LANDSCAPE_RIGHT,
     val arFrameTimestampNs: Long = timestampNs,
     val confidenceTimestampNs: Long = 0L,
+    val cameraImageTimestampNs: Long = 0L,
     val sourceImageWidth: Int = width,
     val sourceImageHeight: Int = height,
     val acquisitionMode: DepthAcquisitionMode = DepthAcquisitionMode.PROVIDED,
-)
+    val acquisitionFrameBeforeNs: Long = 0L,
+    val acquisitionAndroidCameraBeforeNs: Long = 0L,
+    val acquisitionFrameSequence: Long = 0L,
+) {
+    // The existing frozen clocks are read after acquisition; aliases add no retained fields.
+    val acquisitionFrameAfterNs: Long get() = arFrameTimestampNs
+    val acquisitionAndroidCameraAfterNs: Long get() = cameraImageTimestampNs
+}
 
 sealed interface DepthAcquisitionResult {
     data class Observation(val value: DepthObservation) : DepthAcquisitionResult
@@ -66,6 +74,44 @@ internal sealed interface PackedDepthAcquisitionResult {
     data class Refused(val reason: DepthAcquisitionRefusal, val metadata: RawDepthFrameMetadata) : PackedDepthAcquisitionResult
 
     data class Failure(val reason: String) : PackedDepthAcquisitionResult
+}
+
+internal enum class PackedDepthTransientReason {
+    ZERO_SELECTED_SAMPLES, CALIBRATION_UNAVAILABLE, NOT_YET_AVAILABLE,
+}
+
+/** Synchronous borrowed access; never retains the originating owner or metadata. */
+internal fun interface DepthCopyTransientObserver {
+    fun onPackedDepthTransient(
+        owner: VisibilityObservationOwnership,
+        metadata: RawDepthFrameMetadata,
+        reason: PackedDepthTransientReason,
+        examinedDepthPositive: Int,
+        examinedPairedPositive: Int,
+        selectedCount: Int,
+        sourceRejected: Int,
+    )
+}
+
+private fun packedDepthTransient(
+    reason: PackedDepthTransientReason,
+    owner: VisibilityObservationOwnership?,
+    metadata: RawDepthFrameMetadata?,
+    diagnostic: DepthCopyTransientObserver?,
+    examinedDepthPositive: Int = 0,
+    examinedPairedPositive: Int = 0,
+    selectedCount: Int = 0,
+    sourceRejected: Int = 0,
+): PackedDepthAcquisitionResult {
+    if (owner != null && metadata != null && diagnostic != null) {
+        try {
+            diagnostic.onPackedDepthTransient(owner, metadata, reason,
+                examinedDepthPositive, examinedPairedPositive, selectedCount, sourceRejected)
+        } catch (_: RuntimeException) {
+            // Optional diagnostics cannot change an acquisition outcome.
+        }
+    }
+    return PackedDepthAcquisitionResult.TransientUnavailable
 }
 
 class RawDepthCopySource(
@@ -106,6 +152,8 @@ class RawDepthCopySource(
             } else {
                 copyObservation(metadata, depth, confidence)
             }
+        } catch (_: DepthCalibrationUnavailableException) {
+            DepthAcquisitionResult.TransientUnavailable
         } catch (_: DepthNotYetAvailableException) {
             DepthAcquisitionResult.TransientUnavailable
         } catch (error: RuntimeException) {
@@ -134,14 +182,18 @@ class RawDepthCopySource(
         metadataForDimensions: (width: Int, height: Int) -> RawDepthFrameMetadata,
         pool: DepthSamplesLeasePool,
         generation: SampleLeaseGeneration,
+        owner: VisibilityObservationOwnership? = null,
+        diagnostic: DepthCopyTransientObserver? = null,
     ): PackedDepthAcquisitionResult {
         var depth: RawDepthImage? = null
         var confidence: RawDepthImage? = null
         var lease: DepthSamplesLease? = null
+        var diagnosticMetadata: RawDepthFrameMetadata? = null
         return try {
             depth = acquirer.acquireDepth().also { onResourceAcquired() }
             confidence = acquirer.acquireConfidence()?.also { onResourceAcquired() }
             val metadata = acquiredDepthMetadata(metadataForDimensions(depth.width, depth.height), depth, confidence)
+            diagnosticMetadata = metadata
             depthAcquisitionRefusal(metadata, depth, confidence)?.let {
                 return PackedDepthAcquisitionResult.Refused(it, metadata)
             }
@@ -155,17 +207,27 @@ class RawDepthCopySource(
             } else {
                 lease = pool.tryAcquire(generation)
                     ?: return PackedDepthAcquisitionResult.Failure("depth sample pool exhausted")
-                copyPackedObservation(metadata, depth, confidence, lease)
+                val examined = copyPackedObservation(metadata, depth, confidence, lease)
                 if (lease.samples.count == 0) {
+                    val result = packedDepthTransient(
+                        PackedDepthTransientReason.ZERO_SELECTED_SAMPLES, owner, metadata, diagnostic,
+                        (examined ushr 32).toInt(), examined.toInt(),
+                        lease.samples.count, lease.samples.rejectedCount,
+                    )
                     lease.close()
-                    PackedDepthAcquisitionResult.TransientUnavailable
+                    result
                 } else {
                     PackedDepthAcquisitionResult.Observation(metadata, lease)
                 }
             }
+        } catch (_: DepthCalibrationUnavailableException) {
+            lease?.close()
+            packedDepthTransient(PackedDepthTransientReason.CALIBRATION_UNAVAILABLE,
+                owner, diagnosticMetadata, diagnostic)
         } catch (_: DepthNotYetAvailableException) {
             lease?.close()
-            PackedDepthAcquisitionResult.TransientUnavailable
+            packedDepthTransient(PackedDepthTransientReason.NOT_YET_AVAILABLE,
+                owner, diagnosticMetadata, diagnostic)
         } catch (error: RuntimeException) {
             lease?.close()
             PackedDepthAcquisitionResult.Failure(error.message ?: error.javaClass.simpleName)
@@ -353,9 +415,11 @@ class RawDepthCopySource(
                 worldFromCameraGl = metadata.worldFromCameraGl.copyOf(),
                 imageOrientation = metadata.imageOrientation,
                 confidenceTimestampNs = metadata.confidenceTimestampNs,
+                cameraImageTimestampNs = metadata.cameraImageTimestampNs,
                 sourceImageWidth = metadata.sourceImageWidth,
                 sourceImageHeight = metadata.sourceImageHeight,
                 acquisitionMode = metadata.acquisitionMode,
+                projectionFrameTimestampNs = metadata.arFrameTimestampNs,
             ),
         )
     }
@@ -365,17 +429,21 @@ class RawDepthCopySource(
         depth: RawDepthImage,
         confidence: RawDepthImage?,
         lease: DepthSamplesLease,
-    ) {
+    ): Long {
         require(depth.width in 1..16_384 && depth.height in 1..16_384)
         val pixelCount = Math.multiplyExact(depth.width, depth.height)
         lease.clear()
         var rejected = 0
+        var examinedDepthPositive = 0
+        var examinedPairedPositive = 0
         if (pixelCount <= maxCopiedPixels) {
             for (y in 0 until depth.height) {
                 for (x in 0 until depth.width) {
                     val depthMillimetres = depth.unsignedValue(x, y)
                     val confidenceValue = confidence?.unsignedValue(x, y)
                         ?: PREDICTED_DEPTH_CONFIDENCE
+                    if (depthMillimetres > 0) examinedDepthPositive++
+                    if (depthMillimetres > 0 && confidenceValue > 0) examinedPairedPositive++
                     if (depthMillimetres == 0 || confidenceValue == 0 ||
                         isDiscontinuity(depth, x, y, depthMillimetres)
                     ) {
@@ -412,6 +480,8 @@ class RawDepthCopySource(
                             val value = depth.unsignedValue(x, y)
                             val certainty = confidence?.unsignedValue(x, y)
                                 ?: PREDICTED_DEPTH_CONFIDENCE
+                            if (value > 0) examinedDepthPositive++
+                            if (value > 0 && certainty > 0) examinedPairedPositive++
                             if (value == 0 || certainty == 0) {
                                 rejected++
                                 continue
@@ -509,6 +579,8 @@ class RawDepthCopySource(
         lease.reject(rejected)
         // Keep metadata validation in the same place as the immutable path.
         require(metadata.width == depth.width && metadata.height == depth.height)
+        // Existing primary selection probes only; no additional image pass.
+        return (examinedDepthPositive.toLong() shl 32) or examinedPairedPositive.toLong()
     }
 
     private fun stableSamplePacked(

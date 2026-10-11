@@ -124,36 +124,76 @@ data class ParsedCaptureConfig(
  * Defers durable component consumption without leaking Camera2-owned streams
  * when shutdown removes a queued task before its executor can run it.
  */
-private class DirectStoreDispatch(
-    private val components: SharedCameraComponentSetV2,
+internal class DirectStoreDispatch(
+    components: SharedCameraComponentSetV2,
     private val callback: (SharedCameraComponentSetV2) -> Unit,
     private val onFailure: (String) -> Unit,
+    private val analyzeJpeg: (() -> Boolean) -> PreviewBlurQuality,
+    private val onQuality: (PreviewBlurQuality) -> Unit = {},
+    private val retainAssessedOriginals: Boolean = false,
 ) : Runnable {
+    private val components = components.copy(streams = components.streams.map {
+        CaptureComponentStreamV2(it.kind, CloseOnceInputStreamV2(it.input))
+    })
     private val started = AtomicBoolean(false)
+    private val handoffLock = Any()
+    @Volatile private var cancellationReason: String? = null
 
     override fun run() {
         if (!started.compareAndSet(false, true)) return
+        var handedOff = false
         try {
-            // The callback owns stream closure after it claims the set.
-            // Unexpected callback failures still release every stream.
-            callback(components)
+            var unavailable: CaptureQualityUnavailableReasonV1? = null
+            val quality = try { analyzeJpeg { cancellationReason != null } } catch (error: Exception) {
+                if (!retainAssessedOriginals || error is java.util.concurrent.CancellationException || error is InterruptedException) throw error
+                unavailable = CaptureQualityUnavailableReasonV1.ANALYSIS_FAILED
+                null
+            }
+            cancellationReason?.let { closeStreams(); onFailure(it); return }
+            val valid = quality != null && quality.blurScore.isFinite() && quality.blurScore >= 0.0 &&
+                quality.analyzedWidth in 1..4096 && quality.analyzedHeight in 1..4096
+            if (quality != null) onQuality(quality)
+            if (!retainAssessedOriginals && !valid) { closeStreams(); onFailure("QUALITY_ANALYSIS_FAILED"); return }
+            if (!retainAssessedOriginals && requireNotNull(quality).blurScore < JpegBlurAnalyzer.ProductionThreshold) {
+                closeStreams(); onFailure("REJECTED_BLUR"); return
+            }
+            val assessment = if (!retainAssessedOriginals) null else if (!valid) {
+                CaptureQualityAssessmentV1(policyVersion = QUALITY_POLICY_VERSION,
+                    disposition = CaptureQualityDispositionV1.REVIEW_REQUIRED,
+                    reason = CaptureQualityReasonV1.ANALYSIS_UNAVAILABLE,
+                    threshold = JpegBlurAnalyzer.ProductionThreshold,
+                    unavailableReason = unavailable ?: CaptureQualityUnavailableReasonV1.EVIDENCE_MISSING)
+            } else {
+                val measured = requireNotNull(quality)
+                val passed = measured.blurScore >= JpegBlurAnalyzer.ProductionThreshold
+                CaptureQualityAssessmentV1(policyVersion = QUALITY_POLICY_VERSION,
+                    disposition = if (passed) CaptureQualityDispositionV1.POLICY_PASSED else CaptureQualityDispositionV1.REVIEW_REQUIRED,
+                    reason = if (passed) CaptureQualityReasonV1.POLICY_PASSED else CaptureQualityReasonV1.BELOW_THRESHOLD,
+                    score = measured.blurScore, threshold = JpegBlurAnalyzer.ProductionThreshold,
+                    sampleWidth = measured.analyzedWidth, sampleHeight = measured.analyzedHeight)
+            }
+            val mayHandOff = synchronized(handoffLock) {
+                if (cancellationReason != null) false else { handedOff = true; true }
+            }
+            if (!mayHandOff) { closeStreams(); onFailure(requireNotNull(cancellationReason)); return }
+            callback(components.copy(qualityAssessment = assessment))
         } catch (error: Throwable) {
             closeStreams()
-            onFailure("component-dispatch")
+            onFailure(cancellationReason ?: if (handedOff) "component-dispatch" else "QUALITY_ANALYSIS_FAILED")
         }
     }
 
     fun cancel(reason: String) {
-        if (!started.compareAndSet(false, true)) return
-        closeStreams()
-        onFailure(reason)
+        val ownsQueued = synchronized(handoffLock) {
+            if (cancellationReason == null) cancellationReason = reason
+            started.compareAndSet(false, true)
+        }
+        if (!ownsQueued) return
+        closeStreams(); onFailure(reason)
     }
 
-    private fun closeStreams() {
-        components.streams.forEach { stream ->
-            runCatching { stream.input.close() }
-        }
-    }
+    private fun closeStreams() { components.streams.forEach { runCatching { it.input.close() } } }
+    private companion object { const val QUALITY_POLICY_VERSION = "jpegLaplacianVarianceV1:threshold110" }
 }
 
 data class SharedCameraCaptureResult(
@@ -330,6 +370,7 @@ internal class SharedCameraManager(
     private val onCaptureFinalizationFailed: (String, Throwable) -> Unit = { _, _ -> },
     private val resourceCounters: CaptureResourceCounters = CaptureResourceCounters(),
     private val nativeFrameAttribution: NativeFrameAttributionOwner? = null,
+    private val exposureRefusalV2: (CaptureAttemptQualifierV2) -> String? = { "motion-unavailable" },
 ) {
     // Additive V2 hook. V1 ImageCacheManager/correlation ownership is never
     // consulted by this route; a per-view #101 binding installs the Camera2 hook.
@@ -344,8 +385,10 @@ internal class SharedCameraManager(
         qualifier: CaptureAttemptQualifierV2,
         required: Set<CaptureComponentKind>,
         callback: SharedCameraExposureCallbackV2,
+        maximumWorkingBytes: Long = 0L,
     ): Boolean = v2ExposureHook.request(qualifier, required, callback)
-        ?: requestDirectExposureV2(qualifier, required, callback)
+        ?: if (maximumWorkingBytes >= JpegBlurAnalyzer.WorkingMemoryBytes)
+            requestDirectExposureV2(qualifier, required, callback) else false
 
     internal fun cancelAttemptQualifiedExposureV2(qualifier: CaptureAttemptQualifierV2) {
         if (!v2ExposureHook.cancel(qualifier)) cancelDirectExposureV2(qualifier)
@@ -978,6 +1021,12 @@ internal class SharedCameraManager(
             builder.setTag(DirectCaptureTagV2(qualifier))
             captureLatencyLog("camera_request_submit", qualifier.identity.attemptId)
             val request = builder.build()
+            val refusal = exposureRefusalV2(qualifier)
+            if (refusal != null) {
+                pendingDirectCaptureOwner.release(pending)
+                callback.onFailure(qualifier, refusal)
+                return false
+            }
             if (BuildConfig.NATIVE_FRAME_ATTRIBUTION) recordStillSubmission(request)
             activeSession.capture(request, sharedCameraCaptureCallback, captureCallbackHandler)
             captureLatencyLog("camera_request_submitted", qualifier.identity.attemptId)
@@ -1570,10 +1619,21 @@ internal class SharedCameraManager(
                 )
             }
 
-            runtimeCameraController =
-                RuntimeCameraController(requestBuilder) { runtimeState ->
-                    syncRepeatingRequestWithRuntimeSettings(runtimeState)
-                }
+            val availableAfModes = activeCameraCharacteristics?.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)
+            val ordinaryAfMode = ordinaryAutofocusMode(availableAfModes)
+            val regionAfMode = if (availableAfModes?.contains(CaptureRequest.CONTROL_AF_MODE_AUTO) == true)
+                CaptureRequest.CONTROL_AF_MODE_AUTO else ordinaryAfMode
+            runtimeCameraController = RuntimeCameraController(
+                baseRequestBuilder = requestBuilder,
+                onSettingsChanged = { runtimeState -> syncRepeatingRequestWithRuntimeSettings(runtimeState) },
+                ordinaryAfMode = ordinaryAfMode,
+                regionAfMode = regionAfMode,
+                onFocusTrigger = { runtimeState, trigger -> submitRuntimeFocusTrigger(runtimeState, trigger) },
+                supportsAfMetering = (activeCameraCharacteristics?.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF) ?: 0) > 0,
+            ).also { controller ->
+                controller.applyCurrentFocusSettings(requestBuilder)
+                controller.applyCurrentFocusSettings(repeatingBuilder)
+            }
             Log.i("SharedCameraManager", "Camera settings configured")
             return true
         } catch (e: Exception) {
@@ -1669,10 +1729,26 @@ internal class SharedCameraManager(
                 captureCallbackHandler,
             )
             repeatingRequestLifecycle.markRepeatingStarted()
+            runtimeCameraController?.initializeOrdinaryAutofocus()
             Log.i("SharedCameraManager", "Shared-camera repeating request started")
         } catch (e: Exception) {
             startupBarrier.fail("Failed to start shared camera repeating request: ${e.message}")
             Log.e("SharedCameraManager", "Failed to start repeating request", e)
+        }
+    }
+
+    private fun submitRuntimeFocusTrigger(state: RuntimeCameraSettingsState, trigger: Int) {
+        if (!repeatingRequestLifecycle.shouldSubmitRuntimeUpdate()) return
+        val activeSession = captureSession ?: return
+        val builder = previewCaptureRequestBuilder ?: return
+        try {
+            state.applyCurrentFocusSettings(builder)
+            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, trigger)
+            activeSession.capture(builder.build(), sharedCameraCaptureCallback, captureCallbackHandler)
+        } catch (error: Exception) {
+            Log.e("SharedCameraManager", "Unable to submit runtime focus control", error)
+        } finally {
+            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_IDLE)
         }
     }
 
@@ -1812,6 +1888,7 @@ internal class SharedCameraManager(
                                 CaptureComponentStreamV2(CaptureComponentKind.JPEG, jpeg),
                             ),
                             exposureTimestampNanoseconds = image.timestamp,
+                            jpegForAnalysis = image.planes.single().buffer.asReadOnlyBuffer(),
                         )
                 }
                 return
@@ -2362,6 +2439,7 @@ internal class SharedCameraManager(
                 ),
                 exposureTimestampNanoseconds =
                     capture.result.get(CaptureResult.SENSOR_TIMESTAMP) ?: capture.jpeg.timestamp,
+                jpegForAnalysis = capture.jpeg.planes.single().buffer.asReadOnlyBuffer(),
             )
         } catch (error: Throwable) {
             jpeg.close()
@@ -2374,6 +2452,7 @@ internal class SharedCameraManager(
         direct: PendingDirectCaptureV2,
         streams: List<CaptureComponentStreamV2>,
         exposureTimestampNanoseconds: Long,
+        jpegForAnalysis: java.nio.ByteBuffer,
     ) {
         val dispatch = DirectStoreDispatch(
             components = SharedCameraComponentSetV2(
@@ -2382,8 +2461,22 @@ internal class SharedCameraManager(
                 exposureTimestampNanoseconds,
             ),
             callback = direct.callback::onComponents,
+            retainAssessedOriginals = direct.callback.retainAssessedOriginals,
             onFailure = { reason ->
                 runCatching { direct.callback.onFailure(direct.qualifier, reason) }
+            },
+            analyzeJpeg = { cancelled ->
+                JpegBlurAnalyzer.analyzeLaplacianVariance(
+                    { CameraPlaneInputStreamV2(jpegForAnalysis.asReadOnlyBuffer()) {} },
+                    cancelled,
+                )
+            },
+            onQuality = { quality ->
+                Log.i("CaptureJpegQuality",
+                    "attempt=" + direct.qualifier.identity.attemptId +
+                        " algorithm=" + quality.algorithm + " score=" + quality.blurScore +
+                        " threshold=" + JpegBlurAnalyzer.ProductionThreshold +
+                        " sample=" + quality.analyzedWidth + "x" + quality.analyzedHeight)
             },
         )
         synchronized(pendingDirectStoreDispatches) {

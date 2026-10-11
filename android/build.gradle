@@ -167,6 +167,40 @@ apply plugin: 'com.android.library'
 apply plugin: 'kotlin-android'
 apply plugin: 'org.jetbrains.kotlin.plugin.compose'
 
+// Experimental source is build-latched; it never changes ARCore session capability or JPEG capture.
+def rawDepthCandidateProperty = project.findProperty('rawDepthCandidate')?.toString()
+def rawDepthCandidatePrefix = 'CAPTURE3D_RAW_DEPTH_CANDIDATE='
+def rawDepthCandidateValues = encodedDartDefines?.split(',')?.collect { encoded ->
+    try { new String(java.util.Base64.decoder.decode(encoded), java.nio.charset.StandardCharsets.UTF_8) }
+    catch (Exception ignored) { null }
+}?.findAll { it?.startsWith(rawDepthCandidatePrefix) }
+if (rawDepthCandidateValues?.size() > 1) throw new GradleException('Duplicate RAW depth candidate define')
+if (rawDepthCandidateProperty == null && rawDepthCandidateValues?.size() == 1) {
+    rawDepthCandidateProperty = rawDepthCandidateValues[0].substring(rawDepthCandidatePrefix.length())
+}
+def normalizedRawDepthCandidate = rawDepthCandidateProperty?.trim() ?: 'false'
+if (!['true', 'false'].any { it.equalsIgnoreCase(normalizedRawDepthCandidate) }) {
+    throw new GradleException('rawDepthCandidate must be true or false')
+}
+def rawDepthCandidate = normalizedRawDepthCandidate.toBoolean()
+
+// Unqualified current-frame Dense association experiment; native DEBUG builds only.
+def denseCurrentFrameExperimentProperty = project.findProperty('denseCurrentFrameExperiment')?.toString()
+def denseCurrentFrameExperimentPrefix = 'CAPTURE3D_DENSE_CURRENT_FRAME_EXPERIMENT='
+def denseCurrentFrameExperimentValues = encodedDartDefines?.split(',')?.collect { encoded ->
+    try { new String(java.util.Base64.decoder.decode(encoded), java.nio.charset.StandardCharsets.UTF_8) }
+    catch (Exception ignored) { null }
+}?.findAll { it?.startsWith(denseCurrentFrameExperimentPrefix) }
+if (denseCurrentFrameExperimentValues?.size() > 1) throw new GradleException('Duplicate Dense current-frame experiment define')
+if (denseCurrentFrameExperimentProperty == null && denseCurrentFrameExperimentValues?.size() == 1) {
+    denseCurrentFrameExperimentProperty = denseCurrentFrameExperimentValues[0].substring(denseCurrentFrameExperimentPrefix.length())
+}
+def normalizedDenseCurrentFrameExperiment = denseCurrentFrameExperimentProperty == null ? 'false' : denseCurrentFrameExperimentProperty.trim()
+if (!['true', 'false'].any { it.equalsIgnoreCase(normalizedDenseCurrentFrameExperiment) }) {
+    throw new GradleException('denseCurrentFrameExperiment must be true or false')
+}
+def denseCurrentFrameExperiment = normalizedDenseCurrentFrameExperiment.toBoolean()
+
 android {
     compileSdk 37
     ndkVersion "28.2.13676358" // Match the host app native toolchain.
@@ -189,6 +223,8 @@ android {
 
     defaultConfig {
         buildConfigField('boolean', 'NATIVE_FRAME_ATTRIBUTION', nativeFrameAttribution.toString())
+        buildConfigField('boolean', 'RAW_DEPTH_CANDIDATE', rawDepthCandidate.toString())
+        buildConfigField('boolean', 'DENSE_CURRENT_FRAME_EXPERIMENT', denseCurrentFrameExperiment.toString())
         buildConfigField('boolean', 'MATCH_STILL_PREVIEW_FPS', matchStillPreviewFps.toString())
         buildConfigField('boolean', 'VIDEO_SNAPSHOT_JPEG', videoSnapshotJpeg.toString())
         minSdkVersion 28

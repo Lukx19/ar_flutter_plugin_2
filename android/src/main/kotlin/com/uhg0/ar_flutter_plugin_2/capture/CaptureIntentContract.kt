@@ -205,7 +205,92 @@ class CaptureComponentDescriptor(
     override fun hashCode() = listOf(kind, byteLength, sha256, durableObjectId).hashCode()
 }
 
-/** Complete typed input to a future DurableSessionStoreV2 implementation. */
+/** Quality evidence is independent of durable byte ownership and never implies optical certification. */
+enum class CaptureQualityDispositionV1(val wireName: String) {
+    POLICY_PASSED("policyPassed"), REVIEW_REQUIRED("reviewRequired"),
+}
+enum class CaptureQualityReasonV1(val wireName: String) {
+    POLICY_PASSED("policyPassed"), BELOW_THRESHOLD("belowThreshold"), ANALYSIS_UNAVAILABLE("analysisUnavailable"),
+}
+enum class CaptureQualityUnavailableReasonV1(val wireName: String) {
+    DECODE_FAILED("decodeFailed"), ANALYSIS_FAILED("analysisFailed"), EVIDENCE_MISSING("evidenceMissing"),
+}
+
+/** Immutable, bounded, versioned policy result; unavailable evidence cannot construct a passing result. */
+data class CaptureQualityAssessmentV1(
+    val schemaVersion: Int = 1,
+    val policyVersion: String,
+    val disposition: CaptureQualityDispositionV1,
+    val reason: CaptureQualityReasonV1,
+    val score: Double? = null,
+    val threshold: Double? = null,
+    val sampleWidth: Int? = null,
+    val sampleHeight: Int? = null,
+    val unavailableReason: CaptureQualityUnavailableReasonV1? = null,
+) {
+    init {
+        require(schemaVersion == 1)
+        require(policyVersion.length in 1..128 && policyVersion.all {
+            it in 'a'..'z' || it in 'A'..'Z' || it in '0'..'9' || it in "._:-"
+        })
+        require(score == null || (score.isFinite() && score >= 0.0))
+        require(threshold == null || (threshold.isFinite() && threshold > 0.0))
+        require(sampleWidth == null || sampleWidth in 1..4096)
+        require(sampleHeight == null || sampleHeight in 1..4096)
+        require((sampleWidth == null) == (sampleHeight == null))
+        when (reason) {
+            CaptureQualityReasonV1.POLICY_PASSED -> {
+                require(disposition == CaptureQualityDispositionV1.POLICY_PASSED && unavailableReason == null)
+                require(score != null && threshold != null && sampleWidth != null && sampleHeight != null && score >= threshold)
+            }
+            CaptureQualityReasonV1.BELOW_THRESHOLD -> {
+                require(disposition == CaptureQualityDispositionV1.REVIEW_REQUIRED && unavailableReason == null)
+                require(score != null && threshold != null && sampleWidth != null && sampleHeight != null && score < threshold)
+            }
+            CaptureQualityReasonV1.ANALYSIS_UNAVAILABLE -> {
+                require(disposition == CaptureQualityDispositionV1.REVIEW_REQUIRED && unavailableReason != null)
+                require(score == null)
+            }
+        }
+    }
+
+    internal fun rootFields(): Map<String, String> = linkedMapOf(
+        "qualitySchema" to schemaVersion.toString(), "qualityPolicy" to policyVersion,
+        "qualityDisposition" to disposition.wireName, "qualityReason" to reason.wireName,
+        "qualityScore" to (score?.toString() ?: "-"), "qualityThreshold" to (threshold?.toString() ?: "-"),
+        "qualitySampleWidth" to (sampleWidth?.toString() ?: "-"), "qualitySampleHeight" to (sampleHeight?.toString() ?: "-"),
+        "qualityUnavailableReason" to (unavailableReason?.wireName ?: "-"),
+    )
+    internal fun canonicalBytes(): ByteArray = rootFields().entries.joinToString("\n", postfix = "\n") {
+        "${it.key}=${it.value}"
+    }.toByteArray(Charsets.UTF_8)
+
+    companion object {
+        internal val ROOT_KEYS = setOf("qualitySchema", "qualityPolicy", "qualityDisposition", "qualityReason",
+            "qualityScore", "qualityThreshold", "qualitySampleWidth", "qualitySampleHeight", "qualityUnavailableReason")
+        /** Canonical request already binds complete attempt, original descriptors, exposure and assessment. */
+        internal fun boundHash(requestHash: String, assessment: CaptureQualityAssessmentV1): String {
+            require(CaptureRootMetadataReaderV2.isHash(requestHash))
+            return java.security.MessageDigest.getInstance("SHA-256")
+                .digest("capture-quality-assessment-v1|$requestHash\n".toByteArray(Charsets.UTF_8) + assessment.canonicalBytes()).toCaptureHashHex()
+        }
+        internal fun fromRootFields(fields: Map<String, String>): CaptureQualityAssessmentV1? = try {
+            fun optionalDouble(key: String): Double? = fields.getValue(key).let { if (it == "-") null else it.toDouble() }
+            fun optionalInt(key: String): Int? = fields.getValue(key).let { if (it == "-") null else it.toInt() }
+            CaptureQualityAssessmentV1(
+                fields.getValue("qualitySchema").toInt(), fields.getValue("qualityPolicy"),
+                CaptureQualityDispositionV1.entries.single { it.wireName == fields.getValue("qualityDisposition") },
+                CaptureQualityReasonV1.entries.single { it.wireName == fields.getValue("qualityReason") },
+                optionalDouble("qualityScore"), optionalDouble("qualityThreshold"),
+                optionalInt("qualitySampleWidth"), optionalInt("qualitySampleHeight"),
+                fields.getValue("qualityUnavailableReason").let { name -> if (name == "-") null
+                    else CaptureQualityUnavailableReasonV1.entries.single { it.wireName == name } },
+            )
+        } catch (_: IllegalArgumentException) { null } catch (_: NoSuchElementException) { null }
+    }
+}
+
+/** Complete typed input to the durable capture store. */
 class CaptureCommitRequest(
     val accepted: CaptureAcceptedAttempt,
     components: List<CaptureComponentDescriptor>,
@@ -215,6 +300,7 @@ class CaptureCommitRequest(
     validationRecordHash: List<Int>,
     ledgerRecordHash: List<Int>,
     val recoveryContext: NativeCaptureRecoveryContextV2? = null,
+    val qualityAssessment: CaptureQualityAssessmentV1? = null,
 ) {
     val components: List<CaptureComponentDescriptor> = immutableList(components)
     val poseRecordHash = immutableDigest(poseRecordHash, "poseRecordHash")
@@ -224,6 +310,7 @@ class CaptureCommitRequest(
 
     init {
         require(exposureTimestampNanoseconds >= 0)
+        require(qualityAssessment == null || hasCompleteComponentSet)
     }
 
     val hasCompleteComponentSet: Boolean
@@ -232,11 +319,11 @@ class CaptureCommitRequest(
 
     override fun equals(other: Any?) = other is CaptureCommitRequest &&
         listOf(accepted, components, exposureTimestampNanoseconds, poseRecordHash, cameraModelHash,
-            validationRecordHash, ledgerRecordHash) ==
+            validationRecordHash, ledgerRecordHash, qualityAssessment) ==
         listOf(other.accepted, other.components, other.exposureTimestampNanoseconds, other.poseRecordHash,
-            other.cameraModelHash, other.validationRecordHash, other.ledgerRecordHash)
+            other.cameraModelHash, other.validationRecordHash, other.ledgerRecordHash, other.qualityAssessment)
     override fun hashCode() = listOf(accepted, components, exposureTimestampNanoseconds, poseRecordHash,
-        cameraModelHash, validationRecordHash, ledgerRecordHash).hashCode()
+        cameraModelHash, validationRecordHash, ledgerRecordHash, qualityAssessment).hashCode()
 }
 
 /** Scalar product context retained with acceptance; it can never contain image bytes or paths. */
@@ -277,8 +364,13 @@ data class CaptureTerminal(
     val manifestId: String? = null,
     val jpegSizeBytes: Long? = null,
     val dngSizeBytes: Long? = null,
+    val qualityAssessment: CaptureQualityAssessmentV1? = null,
+    val qualityAssessmentHash: String? = null,
 ) {
     init {
+        require((qualityAssessment == null) == (qualityAssessmentHash == null))
+        require(qualityAssessment == null || (kind == CaptureTerminalKind.COMMITTED_PICTURE &&
+            qualityAssessmentHash == CaptureQualityAssessmentV1.boundHash(canonicalTerminalHash, qualityAssessment)))
         require(canonicalTerminalHash.isNotEmpty() && reason.isNotEmpty())
         require(captureRevision == null || captureRevision >= 0)
         require(jpegSizeBytes == null || jpegSizeBytes > 0)

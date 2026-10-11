@@ -1,12 +1,45 @@
 package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
 import android.media.Image
+import com.uhg0.ar_flutter_plugin_2.BuildConfig
 import com.google.ar.core.Config
 import com.google.ar.core.Frame
 import com.google.ar.core.TrackingState
 import com.google.ar.core.exceptions.NotYetAvailableException
 import java.nio.ByteOrder
 import java.util.concurrent.atomic.AtomicBoolean
+
+/** Build-only qualification seam. Default dense; changing source requires a fresh session/build. */
+internal fun depthAcquisitionModeForSession(
+    mode: Config.DepthMode,
+    rawCandidate: Boolean,
+    denseCurrentFrameExperiment: Boolean = false,
+): DepthAcquisitionMode =
+    when (mode) {
+        Config.DepthMode.AUTOMATIC -> when {
+            rawCandidate -> DepthAcquisitionMode.RAW
+            denseCurrentFrameExperiment -> DepthAcquisitionMode.AUTOMATIC_CURRENT_FRAME_EXPERIMENTAL
+            else -> DepthAcquisitionMode.AUTOMATIC
+        }
+        Config.DepthMode.RAW_DEPTH_ONLY -> DepthAcquisitionMode.RAW
+        Config.DepthMode.DISABLED -> throw IllegalArgumentException("depth source is disabled")
+    }
+
+/** The actual SDK route selector, exercised with owned planes by focused tests. */
+internal fun selectedDepthAcquirer(
+    mode: DepthAcquisitionMode,
+    acquireDense: () -> RawDepthImage,
+    acquireRaw: () -> RawDepthImage,
+    acquireRawConfidence: () -> RawDepthImage,
+): PairedRawDepthAcquirer = object : PairedRawDepthAcquirer {
+    override fun acquireDepth(): RawDepthImage = when (mode) {
+        DepthAcquisitionMode.AUTOMATIC, DepthAcquisitionMode.AUTOMATIC_CURRENT_FRAME_EXPERIMENTAL -> acquireDense()
+        DepthAcquisitionMode.RAW -> acquireRaw()
+        DepthAcquisitionMode.PROVIDED -> error("provided pixels have no SDK acquisition route")
+    }
+    override fun acquireConfidence(): RawDepthImage? =
+        if (mode == DepthAcquisitionMode.RAW) acquireRawConfidence() else null
+}
 
 internal sealed interface PreparedRawDepthResult {
     data class Ready(val frame: PreparedRawDepthFrame) : PreparedRawDepthResult
@@ -39,6 +72,8 @@ internal class PreparedRawDepthFrame(
     fun processPacked(
         pool: DepthSamplesLeasePool,
         generation: SampleLeaseGeneration,
+        owner: VisibilityObservationOwnership? = null,
+        diagnostic: DepthCopyTransientObserver? = null,
     ): PackedDepthAcquisitionResult {
         val source = RawDepthCopySource(
             acquirer = object : PairedRawDepthAcquirer {
@@ -48,7 +83,7 @@ internal class PreparedRawDepthFrame(
             maxCopiedPixels = maxCopiedPixels,
         )
         check(processing.compareAndSet(false, true))
-        return source.acquirePacked({ _, _ -> metadata }, pool, generation)
+        return source.acquirePacked({ _, _ -> metadata }, pool, generation, owner, diagnostic)
     }
 
     override fun close() {
@@ -67,7 +102,11 @@ class ArCoreRawDepthSource(
     private val onResourceAcquired: () -> Unit = {},
     private val onResourceClosed: () -> Unit = {},
     private val depthMode: Config.DepthMode = Config.DepthMode.RAW_DEPTH_ONLY,
+    rawCandidate: Boolean = BuildConfig.DEBUG && BuildConfig.RAW_DEPTH_CANDIDATE,
+    denseCurrentFrameExperiment: Boolean = false,
 ) {
+    private val acquisitionMode = depthAcquisitionModeForSession(depthMode, rawCandidate, denseCurrentFrameExperiment)
+
     init {
         require(depthMode == Config.DepthMode.RAW_DEPTH_ONLY ||
             depthMode == Config.DepthMode.AUTOMATIC) {
@@ -80,14 +119,16 @@ class ArCoreRawDepthSource(
         groupGeneration: Long,
         sessionGeneration: Long,
     ): DepthAcquisitionResult {
+        val frameBefore = frame.timestamp
+        val cameraBefore = frame.androidCameraTimestamp
         val source = RawDepthCopySource(
-            acquirer = ArCorePairedRawDepthAcquirer(frame, depthMode),
+            acquirer = ArCorePairedRawDepthAcquirer(frame, acquisitionMode),
             maxCopiedPixels = maxCopiedPixels,
             onResourceAcquired = onResourceAcquired,
             onResourceClosed = onResourceClosed,
         )
         return source.acquire { width, height ->
-            metadata(frame, groupGeneration, sessionGeneration, width, height)
+            metadata(frame, groupGeneration, sessionGeneration, width, height).copy(acquisitionFrameBeforeNs = frameBefore, acquisitionAndroidCameraBeforeNs = cameraBefore)
         }
     }
 
@@ -97,15 +138,17 @@ class ArCoreRawDepthSource(
         ownership: VisibilityObservationOwnership,
         pool: DepthSamplesLeasePool,
     ): PackedDepthAcquisitionResult {
+        val frameBefore = frame.timestamp
+        val cameraBefore = frame.androidCameraTimestamp
         val source = RawDepthCopySource(
-            acquirer = ArCorePairedRawDepthAcquirer(frame, depthMode),
+            acquirer = ArCorePairedRawDepthAcquirer(frame, acquisitionMode),
             maxCopiedPixels = maxCopiedPixels,
             onResourceAcquired = onResourceAcquired,
             onResourceClosed = onResourceClosed,
         )
         return source.acquirePacked(
             metadataForDimensions = { width, height ->
-                metadata(frame, ownership.groupGeneration, ownership.sessionGeneration, width, height)
+                metadata(frame, ownership.groupGeneration, ownership.sessionGeneration, width, height).copy(acquisitionFrameBeforeNs = frameBefore, acquisitionAndroidCameraBeforeNs = cameraBefore)
             },
             pool = pool,
             generation = SampleLeaseGeneration.from(ownership),
@@ -117,47 +160,23 @@ class ArCoreRawDepthSource(
         frame: Frame,
         groupGeneration: Long,
         sessionGeneration: Long,
+        frameSequence: Long = 0L,
     ): PreparedRawDepthResult {
-        val acquirer = ArCorePairedRawDepthAcquirer(frame, depthMode)
-        var depth: RawDepthImage? = null
-        var confidence: RawDepthImage? = null
-        var accepted = false
-        return try {
-            depth = ManagedRawDepthImage(acquirer.acquireDepth(), onResourceClosed)
-            onResourceAcquired()
-            confidence = acquirer.acquireConfidence()?.let {
-                ManagedRawDepthImage(it, onResourceClosed).also { onResourceAcquired() }
-            }
-            val metadata = acquiredDepthMetadata(metadata(
-                frame, groupGeneration, sessionGeneration, depth.width, depth.height,
-            ), depth, confidence)
-            val refusal = depthAcquisitionRefusal(metadata, depth, confidence)
-            if (refusal != null) {
-                PreparedRawDepthResult.Refused(refusal, metadata)
-            } else {
-                accepted = true
-                PreparedRawDepthResult.Ready(
-                    PreparedRawDepthFrame(
-                        metadata,
-                        depth,
-                        confidence,
-                        maxCopiedPixels,
-                    ),
+        val frameBefore = frame.timestamp
+        val cameraBefore = frame.androidCameraTimestamp
+        return prepareRawDepthFrame(
+            acquirer = ArCorePairedRawDepthAcquirer(frame, acquisitionMode),
+            metadataForDimensions = { width, height ->
+                metadata(frame, groupGeneration, sessionGeneration, width, height).copy(
+                    acquisitionFrameBeforeNs = frameBefore,
+                    acquisitionAndroidCameraBeforeNs = cameraBefore,
+                    acquisitionFrameSequence = frameSequence,
                 )
-            }
-        } catch (_: DepthNotYetAvailableException) {
-            PreparedRawDepthResult.TransientUnavailable
-        } catch (error: RuntimeException) {
-            PreparedRawDepthResult.Failure(error.message ?: error.javaClass.simpleName)
-        } finally {
-            if (!accepted) {
-                try {
-                    confidence?.close()
-                } finally {
-                    depth?.close()
-                }
-            }
-        }
+            },
+            maxCopiedPixels = maxCopiedPixels,
+            onResourceAcquired = onResourceAcquired,
+            onResourceClosed = onResourceClosed,
+        )
     }
 
     private fun metadata(
@@ -167,34 +186,74 @@ class ArCoreRawDepthSource(
         depthWidth: Int,
         depthHeight: Int,
     ): RawDepthFrameMetadata {
-        val imageIntrinsics = frame.camera.imageIntrinsics
-        val focal = imageIntrinsics.focalLength
-        val principal = imageIntrinsics.principalPoint
-        val imageDimensions = imageIntrinsics.imageDimensions
-        val scaleX = depthWidth.toDouble() / imageDimensions[0]
-        val scaleY = depthHeight.toDouble() / imageDimensions[1]
+        val camera = frame.camera
+        val textureIntrinsics = camera.textureIntrinsics
         val pose = FloatArray(16)
-        frame.camera.pose.toMatrix(pose, 0)
-        return RawDepthFrameMetadata(
-            timestampNs = frame.timestamp,
+        camera.pose.toMatrix(pose, 0)
+        return freezeTextureDepthMetadata(
+            frameTimestampNs = frame.timestamp,
             groupGeneration = groupGeneration,
             sessionGeneration = sessionGeneration,
-            tracking = frame.camera.trackingState == TrackingState.TRACKING,
-            width = depthWidth,
-            height = depthHeight,
-            intrinsics = DepthIntrinsics(
-                fx = focal[0] * scaleX,
-                fy = focal[1] * scaleY,
-                cx = principal[0] * scaleX,
-                cy = principal[1] * scaleY,
-            ),
-            worldFromCameraGl = DoubleArray(16) { pose[it].toDouble() },
-            imageOrientation = DepthImageOrientation.LANDSCAPE_RIGHT,
-            arFrameTimestampNs = frame.timestamp,
-            sourceImageWidth = imageDimensions[0],
-            sourceImageHeight = imageDimensions[1],
-            acquisitionMode = if (depthMode == Config.DepthMode.AUTOMATIC) DepthAcquisitionMode.AUTOMATIC else DepthAcquisitionMode.RAW,
+            tracking = camera.trackingState == TrackingState.TRACKING,
+            depthWidth = depthWidth,
+            depthHeight = depthHeight,
+            textureDimensions = textureIntrinsics.imageDimensions,
+            textureFocal = textureIntrinsics.focalLength,
+            texturePrincipal = textureIntrinsics.principalPoint,
+            worldFromCameraGl = pose,
+            sourceImageDimensions = camera.imageIntrinsics.imageDimensions,
+            cameraImageTimestampNs = frame.androidCameraTimestamp,
+            acquisitionMode = acquisitionMode,
         )
+    }
+}
+
+/** The current-frame acquisition stack; no acquirer/calibration callback escapes into prepared work. */
+internal fun prepareRawDepthFrame(
+    acquirer: PairedRawDepthAcquirer,
+    metadataForDimensions: (Int, Int) -> RawDepthFrameMetadata,
+    maxCopiedPixels: Int = 4_096,
+    onResourceAcquired: () -> Unit = {},
+    onResourceClosed: () -> Unit = {},
+): PreparedRawDepthResult {
+    var depth: RawDepthImage? = null
+    var confidence: RawDepthImage? = null
+    var accepted = false
+    return try {
+        depth = ManagedRawDepthImage(acquirer.acquireDepth(), onResourceClosed)
+        onResourceAcquired()
+        confidence = acquirer.acquireConfidence()?.let {
+            ManagedRawDepthImage(it, onResourceClosed).also { onResourceAcquired() }
+        }
+        val metadata = acquiredDepthMetadata(metadataForDimensions(depth.width, depth.height), depth, confidence)
+        val refusal = depthAcquisitionRefusal(metadata, depth, confidence)
+        if (refusal != null) {
+            PreparedRawDepthResult.Refused(refusal, metadata)
+        } else {
+            accepted = true
+            PreparedRawDepthResult.Ready(
+                PreparedRawDepthFrame(
+                    metadata,
+                    depth,
+                    confidence,
+                    maxCopiedPixels,
+                ),
+            )
+        }
+    } catch (_: DepthCalibrationUnavailableException) {
+        PreparedRawDepthResult.TransientUnavailable
+    } catch (_: DepthNotYetAvailableException) {
+        PreparedRawDepthResult.TransientUnavailable
+    } catch (error: RuntimeException) {
+        PreparedRawDepthResult.Failure(error.message ?: error.javaClass.simpleName)
+    } finally {
+        if (!accepted) {
+            try {
+                confidence?.close()
+            } finally {
+                depth?.close()
+            }
+        }
     }
 }
 
@@ -216,32 +275,17 @@ private class ManagedRawDepthImage(
 }
 
 private class ArCorePairedRawDepthAcquirer(
-    private val frame: Frame,
-    private val depthMode: Config.DepthMode,
+    frame: Frame,
+    acquisitionMode: DepthAcquisitionMode,
 ) : PairedRawDepthAcquirer {
-    /**
-     * AUTOMATIC is the product path for devices without a depth sensor. It
-     * exposes ARCore's dense predicted depth image, whereas RAW_DEPTH_ONLY
-     * exposes the sparse raw sensor image. The two APIs have different
-     * confidence contracts, so they must not share the acquisition choice.
-     */
-    override fun acquireDepth(): RawDepthImage =
-        acquireImage {
-            when (depthMode) {
-                Config.DepthMode.AUTOMATIC -> frame.acquireDepthImage16Bits()
-                Config.DepthMode.RAW_DEPTH_ONLY -> frame.acquireRawDepthImage16Bits()
-                Config.DepthMode.DISABLED -> error("depth source is disabled")
-            }
-        }
-
-    override fun acquireConfidence(): RawDepthImage? =
-        if (depthMode == Config.DepthMode.RAW_DEPTH_ONLY) {
-            acquireImage { frame.acquireRawDepthConfidenceImage() }
-        } else {
-            // The dense predicted-depth API has no confidence plane. The
-            // bounded selector treats non-zero predicted values as valid.
-            null
-        }
+    private val selected = selectedDepthAcquirer(
+        acquisitionMode,
+        acquireDense = { acquireImage { frame.acquireDepthImage16Bits() } },
+        acquireRaw = { acquireImage { frame.acquireRawDepthImage16Bits() } },
+        acquireRawConfidence = { acquireImage { frame.acquireRawDepthConfidenceImage() } },
+    )
+    override fun acquireDepth(): RawDepthImage = selected.acquireDepth()
+    override fun acquireConfidence(): RawDepthImage? = selected.acquireConfidence()
 
     private fun acquireImage(block: () -> Image): RawDepthImage =
         try {

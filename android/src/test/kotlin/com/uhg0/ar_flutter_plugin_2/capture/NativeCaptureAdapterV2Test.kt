@@ -1,6 +1,7 @@
 package com.uhg0.ar_flutter_plugin_2.capture
 
 import android.content.ContextWrapper
+import com.uhg0.ar_flutter_plugin_2.selectRetainAssessedOriginals
 import java.io.File
 import java.io.InputStream
 import java.util.concurrent.CountDownLatch
@@ -17,6 +18,102 @@ import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class NativeCaptureAdapterV2Test {
+    @Test
+    fun `retained-original creation selector is exact and debug gated`() {
+        assertTrue(selectRetainAssessedOriginals(mapOf("retainAssessedOriginals" to true), isDebugBuild = true))
+        assertFalse(selectRetainAssessedOriginals(mapOf("retainAssessedOriginals" to true), isDebugBuild = false))
+        assertFalse(selectRetainAssessedOriginals(mapOf("retainAssessedOriginals" to "true"), isDebugBuild = true))
+        assertFalse(selectRetainAssessedOriginals(emptyMap<Any, Any>(), isDebugBuild = true))
+    }
+
+    @Test
+    fun `assessed reader failure does not downgrade to legacy replay or camera`() {
+        val store = FakeStore().apply { assessedReplayFailure = UnsupportedOperationException("reader-failed") }
+        val camera = FakeExposure()
+        val adapter = NativeCaptureAdapterV2(store, camera)
+        val request = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG))
+        try {
+            assertThrows(UnsupportedOperationException::class.java) { adapter.admit(request) }
+            assertEquals(1, store.assessedReplayCalls)
+            assertEquals(0, store.legacyReplayCalls)
+            assertTrue(camera.requests.isEmpty())
+        } finally {
+            adapter.close()
+        }
+    }
+
+    @Test
+    fun `motion race at final submission abandons both lanes durably without exposure and fences replay`() {
+        for (lane in listOf(CaptureLane.MANUAL, CaptureLane.AUTOMATIC)) {
+            val root = File.createTempFile("native-motion-refusal", "").also { it.delete(); assertTrue(it.mkdirs()) }
+            val budget = StorageBudgetCoordinatorV2(
+                File(root, "budget"), StorageBudgetPolicyV2(16L * 1024 * 1024, 0),
+                JvmDescriptorFilesystemV2(authoritativeAllocationUnit = { 4_096L }),
+            ) { 16L * 1024 * 1024 }
+            val durable = DurableSessionStoreV2(File(root, "store"), budget, filesystemBackend = JvmDescriptorFilesystemV2())
+            val safety = CaptureSafetySignalV2()
+            val poses = PoseDataExtractor()
+            fun pose(timeNs: Long, x: Float = 0f) = PoseDataExtractor.CachedPose(
+                floatArrayOf(x, 0f, 0f), floatArrayOf(0f, 0f, 0f, 1f), FloatArray(16),
+                timeNs, timeNs / 1_000_000L, true, 1f, "tracking", timeNs,
+                androidCameraTimestampNs = timeNs + 1L,
+            )
+            for (time in 0L..4L) poses.addSample(pose(time * 100_000_000L))
+            assertTrue(poses.isExposureMotionStable(400_000_000L))
+            var requests = 0
+            val events = mutableListOf<NativeCaptureEventV2>()
+            val camera = object : SharedCameraExposurePortV2 {
+                override fun requestExposure(
+                    qualifier: CaptureAttemptQualifierV2,
+                    required: Set<CaptureComponentKind>,
+                    callback: SharedCameraExposureCallbackV2,
+                ): Boolean {
+                    requests++
+                    assertTrue(safety.isCaptureSafeFor(qualifier))
+                    assertFalse(safety.isCaptureSafeFor(CaptureAttemptQualifierV2(
+                        qualifier.identity, qualifier.lifecycleCut, Long.MAX_VALUE,
+                    )))
+                    // Movement begins after acceptance, at the final Camera2 boundary.
+                    poses.addSample(pose(500_000_000L, 1f))
+                    assertFalse(poses.isExposureMotionStable(500_000_000L))
+                    callback.onFailure(qualifier, "motion-skipped")
+                    return false
+                }
+                override fun cancelExposure(qualifier: CaptureAttemptQualifierV2) = Unit
+            }
+            val adapter = NativeCaptureAdapterV2(DurableNativeCaptureStorePortV2(durable), camera, safety, events = events::add)
+            val attempt = request(lane, setOf(CaptureComponentKind.JPEG))
+            try {
+                adapter.admit(attempt)
+                val terminal = checkNotNull(durable.queryReceipt(attempt.accepted.identity))
+                assertTrue(terminal.durable)
+                assertEquals(CaptureAttemptPhase.ABANDONED_ATTEMPT, terminal.phase)
+                assertEquals(CaptureTerminalKind.ABANDONED_ATTEMPT, terminal.terminal?.kind)
+                assertEquals("camera-motion-skipped", terminal.terminal?.reason)
+                assertEquals(0L, adapter.snapshot().exposures)
+                assertEquals(0L, adapter.snapshot().committed)
+                assertEquals(0, adapter.snapshot().running)
+                assertEquals(0, adapter.snapshot().fundedWaiting)
+                assertFalse(safety.isCaptureSafeFor(CaptureAttemptQualifierV2(
+                    attempt.accepted.identity, attempt.accepted.identity.lifecycleCut, 1L,
+                )))
+                assertEquals(1, events.count { it.kind == NativeCaptureEventKindV2.ABANDONED })
+                assertEquals(terminal, adapter.admit(attempt))
+                assertEquals(1, requests)
+                val replayCamera = FakeExposure()
+                val replay = NativeCaptureAdapterV2(DurableNativeCaptureStorePortV2(durable), replayCamera)
+                assertEquals(terminal, replay.admit(attempt))
+                assertTrue(replayCamera.requests.isEmpty())
+                replay.close()
+            } finally {
+                adapter.close()
+                durable.close()
+                budget.close()
+                root.deleteRecursively()
+            }
+        }
+    }
+
     @Test
     fun `close before first use guards every late lazy entry without acquiring root`() {
         val files = java.nio.file.Files.createTempDirectory("capture-v2-close-before-use-").toFile()
@@ -2045,6 +2142,9 @@ class NativeCaptureAdapterV2Test {
         val accepted = mutableListOf<CaptureCommitRequest>()
         val terminals = mutableListOf<CaptureReceipt>()
         val queries = mutableListOf<CaptureAttemptIdentity>()
+        var assessedReplayFailure: Throwable? = null
+        var assessedReplayCalls = 0
+        var legacyReplayCalls = 0
         var failCommitAfterReads: Int? = null
         var commitFailure: Throwable? = null
         var rebaseFailure: Throwable? = null
@@ -2058,7 +2158,13 @@ class NativeCaptureAdapterV2Test {
         var abandonEntered: CountDownLatch? = null
         var abandonRelease: CountDownLatch? = null
         private val firstAbandonBlocked = AtomicBoolean(false)
+        override fun replayAssessedFenceBeforeExposure(request: CaptureCommitRequest): CaptureReceipt? {
+            assessedReplayCalls++
+            assessedReplayFailure?.let { throw it }
+            return replayFenceBeforeExposure(request)
+        }
         override fun replayFenceBeforeExposure(request: CaptureCommitRequest): CaptureReceipt? {
+            legacyReplayCalls++
             terminals.firstOrNull { it.identity == request.accepted.identity }?.let { prior ->
                 if (accepted.first { it.accepted.identity == request.accepted.identity } == request) return prior
                 throw DurableStoreConflictV2("changed terminal replay")

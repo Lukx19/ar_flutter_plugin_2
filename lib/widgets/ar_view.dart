@@ -105,15 +105,17 @@ class AndroidARView implements PlatformARView {
       // creation-time value in sync with the Android view key below so a mode
       // change disposes the entire platform view and starts a new AR session.
       'enableHighResCapture': captureConfig?.enableHighResCapture ?? false,
+      'retainAssessedOriginals': captureConfig?.retainAssessedOriginals ?? false,
       'rearCameraId': rearCameraId,
     };
 
     return PlatformViewLink(
-      key: ValueKey<(bool, String?, bool)>(
+      key: ValueKey<(bool, String?, bool, bool)>(
         (
           captureConfig?.enableHighResCapture ?? false,
           rearCameraId,
           useHybridComposition,
+          captureConfig?.retainAssessedOriginals ?? false,
         ),
       ),
       viewType: viewType,
@@ -166,7 +168,9 @@ class IosARView implements PlatformARView {
     _context = context;
     _arViewCreatedCallback = arViewCreatedCallback;
     _planeDetectionConfig = planeDetectionConfig;
-    _captureConfig = captureConfig;
+    // Assessed-original production is unsupported on iOS. Reader capability is
+    // independent; do not advertise a producer mode this platform cannot honor.
+    _captureConfig = captureConfig?.copyWith(retainAssessedOriginals: false);
     // This is used in the platform side to register the view.
     final String viewType = 'ar_flutter_plugin_2';
     // Pass parameters to the platform side.

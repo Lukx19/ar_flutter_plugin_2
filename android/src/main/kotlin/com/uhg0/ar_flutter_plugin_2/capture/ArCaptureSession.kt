@@ -51,6 +51,7 @@ internal class ArCaptureSession(
     private val onCaptureAccepted: (Map<String, Any?>) -> Unit = {},
     private val onCaptureFinalized: (Map<String, Any?>) -> Unit = {},
     private val captureSafetySignalV2: CaptureSafetySignalV2 = CaptureSafetySignalV2(),
+    private val retainAssessedOriginals: Boolean = false,
     private val isOwnerClosing: () -> Boolean = { false },
 ) {
     companion object {
@@ -64,6 +65,7 @@ internal class ArCaptureSession(
     private val byteCache = CaptureByteCache()
     private val resourceCounters = CaptureResourceCounters()
     private val poseDataExtractor = PoseDataExtractor()
+    private val motionDiagnosticCount = if (BuildConfig.DEBUG) AtomicInteger() else null
     private var sharedCameraManager: SharedCameraManager? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     private val disposed = AtomicBoolean(false)
@@ -119,10 +121,11 @@ internal class ArCaptureSession(
             }
             mainHandler.post {
                 if (!disposed.get()) {
-                    captureChannel.invokeMethod("onNativeCaptureV2Event", NativeCaptureWireV2.event(event))
+                    captureChannel.invokeMethod("onNativeCaptureV2Event", encodeNativeCaptureEventV2(event))
                 }
             }
         },
+        retainAssessedOriginals = retainAssessedOriginals,
     )
     private var sharedImageCacheManager: ImageCacheManager? = null
     private var highResCaptureEnabled = false
@@ -220,6 +223,28 @@ internal class ArCaptureSession(
         }
     }
 
+    private fun formatMotionPairDiagnostic(
+        label: String,
+        pair: PoseDataExtractor.ExposureMotionPairDiagnostic?,
+    ): String {
+        if (pair == null) return "${label}Pair=null"
+        return "${label}PairIndex=${pair.pairIndex} ${label}CameraGapNs=${pair.cameraGapNs} " +
+            (if (label == "refusing") {
+                "olderAndroidCameraTimestampNs=${if (pair.older.androidCameraTimestampNs > 0L) pair.older.androidCameraTimestampNs else "unavailable"} " +
+                    "newerAndroidCameraTimestampNs=${if (pair.newer.androidCameraTimestampNs > 0L) pair.newer.androidCameraTimestampNs else "unavailable"} " +
+                    "imageGapNs=${pair.newer.androidCameraTimestampNs - pair.older.androidCameraTimestampNs} "
+            } else "") +
+            "${label}ObservedGapNs=${pair.observedGapNs} ${label}DeltaM=${pair.translationDeltaMeters} " +
+            "${label}DeltaDeg=${pair.angularDeltaDegrees} " +
+            "${label}OlderCameraNs=${pair.older.cameraTimestampNs} ${label}NewerCameraNs=${pair.newer.cameraTimestampNs} " +
+            "${label}OlderObservedNs=${pair.older.observedTimestampNs} ${label}NewerObservedNs=${pair.newer.observedTimestampNs} " +
+            "${label}OlderTracking=${pair.older.isTracking}/${pair.older.trackingState} " +
+            "${label}NewerTracking=${pair.newer.isTracking}/${pair.newer.trackingState} " +
+            "${label}OlderSource=${pair.older.poseSource} ${label}NewerSource=${pair.newer.poseSource} " +
+            "${label}OlderBinding=${pair.older.fixtureBindingGeneration} ${label}NewerBinding=${pair.newer.fixtureBindingGeneration} " +
+            "${label}OlderGroup=${pair.older.fixtureGroupGeneration} ${label}NewerGroup=${pair.newer.fixtureGroupGeneration}"
+    }
+
     private fun ensureStartupOwnerCurrent() {
         if (disposed.get() || disposeStarted || isOwnerClosing()) {
             throw CaptureSessionException("CAPTURE_DISPOSED", "Capture owner is closing")
@@ -274,6 +299,33 @@ internal class ArCaptureSession(
                     prepareSessionResume = sceneHost::prepareSharedCameraResume,
                     scenePreviewSurface = scenePreviewSurface,
                     configMap = typedConfigMap,
+                    exposureRefusalV2 = { qualifier ->
+                        when {
+                            !captureSafetySignalV2.isCaptureSafeFor(qualifier) -> "lifecycle-cut-before-exposure"
+                            !poseDataExtractor.isExposureMotionStable(onDecision =
+                                if (BuildConfig.DEBUG && motionDiagnosticCount!!.getAndIncrement() < 16) {
+                                    { diagnostic ->
+                                        Log.i("CaptureLatency", "[DEBUG-capture-motion] stage=native_shutter " +
+                                            "attemptId=${qualifier.identity.attemptId} gate=${diagnostic.gate} " +
+                                            "decisionNs=${diagnostic.decisionNs} motionClock=androidCameraTimestamp " +
+                                            "ageMs=${diagnostic.ageMs} dwellMs=${diagnostic.stableDwellMs} " +
+                                            "historyMs=${diagnostic.historySpanMs} pairs=${diagnostic.pairCount} " +
+                                            "latestMps=${diagnostic.latestTranslationSpeedMps} " +
+                                            "latestDegps=${diagnostic.latestAngularSpeedDegreesPerSecond} " +
+                                            "medianMps=${diagnostic.medianTranslationSpeedMps} " +
+                                            "medianDegps=${diagnostic.medianAngularSpeedDegreesPerSecond} " +
+                                            "maxMps=${diagnostic.maximumTranslationSpeedMps} " +
+                                            "maxDegps=${diagnostic.maximumAngularSpeedDegreesPerSecond} " +
+                                            "minPositiveCameraGapNs=${diagnostic.minimumPositiveCameraGapNs} " +
+                                            "duplicatePairs=${diagnostic.duplicatePairCount} " +
+                                            "timestampReadMismatches=${diagnostic.timestampReadMismatchCount} " +
+                                            formatMotionPairDiagnostic("refusing", diagnostic.firstRefusingPair) + " " +
+                                            formatMotionPairDiagnostic("maxAngular", diagnostic.maximumAngularPair))
+                                    }
+                                } else null) -> "motion-skipped"
+                            else -> null
+                        }
+                    },
                     onObservedCaptureStateChanged = {
                         onObservedControlStateChanged(this)
                     },
@@ -865,7 +917,7 @@ internal class ArCaptureSession(
                     "phase" to receipt.phase.name.lowercase(),
                     "durable" to receipt.durable,
                     "terminal" to receipt.terminal?.let { terminal ->
-                        NativeCaptureWireV2.event(
+                        encodeNativeCaptureEventV2(
                             NativeCaptureEventV2(
                                 if (terminal.kind == CaptureTerminalKind.COMMITTED_PICTURE) {
                                     NativeCaptureEventKindV2.COMMITTED
@@ -880,6 +932,9 @@ internal class ArCaptureSession(
                                 dngSizeBytes = terminal.dngSizeBytes,
                                 reason = terminal.reason,
                                 recoveryContext = request.recoveryContext,
+                                qualityAssessment = terminal.qualityAssessment,
+                                qualityAssessmentHash = terminal.qualityAssessmentHash,
+                                verifiedTerminal = terminal,
                             ),
                         )
                     },
@@ -908,7 +963,7 @@ internal class ArCaptureSession(
     fun durableCaptureRevisionV2(): Long = nativeDurableCaptureRevisionV2.get()
 
     fun replayNativeCaptureRecoveryV2(): List<Map<String, Any?>> =
-        nativeCaptureBindingV2.replayRecovery().map(NativeCaptureWireV2::event)
+        nativeCaptureBindingV2.replayRecovery().map(::encodeNativeCaptureEventV2)
 
     fun acknowledgeNativeCaptureTerminalV2(attemptId: String) {
         nativeCaptureBindingV2.acknowledgeTerminal(attemptId)

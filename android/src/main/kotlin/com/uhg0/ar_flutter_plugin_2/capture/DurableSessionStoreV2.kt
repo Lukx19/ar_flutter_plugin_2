@@ -45,6 +45,9 @@ class DurableSessionStoreV2(
         val recoveryContext: NativeCaptureRecoveryContextV2? = null,
         val jpegSizeBytes: Long? = null,
         val dngSizeBytes: Long? = null,
+        val qualityAssessment: CaptureQualityAssessmentV1? = null,
+        val qualityAssessmentHash: String? = null,
+        val verifiedTerminal: CaptureTerminal? = null,
     )
     private val mutex = Any()
     private val files = SafeFilesystemV2(root, faults, filesystemBackend)
@@ -125,8 +128,10 @@ class DurableSessionStoreV2(
                 setProperty("acceptedHash", acceptedHash(attempt)); setProperty("reservationToken", reservation.token)
                 setProperty("reservationBytes", reservation.bytes.toString()); setProperty("attemptId", attempt.identity.attemptId)
                 setProperty("commitId", attempt.identity.commitId); setProperty("session", attempt.identity.lifecycleCut.sessionId)
+                putExactIdentity(attempt.identity)
                 recoveryContext?.let { putRecoveryContext(it) }
             }
+            check(propertiesBytes(data).size <= NativeCaptureReservationBoundsV2.ACCEPTED_RECORD_BYTES) { "Accepted metadata exceeds reserved record bound" }
             faults.at(DurableStoreFaultPointV2.ACCEPTED_RECORD)
             recordRecoveryCandidate(location, requireNotNull(accepted.parentFile))
             writePropertiesExclusive(accepted, data)
@@ -139,11 +144,19 @@ class DurableSessionStoreV2(
      * the complete commit request before a scheduler owner or shutter can be
      * allocated. The frozen public port remains attempt-based for #99 callers.
      */
-    internal fun acceptCaptureBeforeExposure(request: CaptureCommitRequest): CaptureReceipt = synchronized(mutex) {
+    internal fun acceptCaptureBeforeExposure(
+        request: CaptureCommitRequest,
+        requireRecoveryIdentity: Boolean = false,
+    ): CaptureReceipt = synchronized(mutex) {
+        if (requireRecoveryIdentity) {
+            require(request.accepted.reservation.physicalStoreBytes >= NativeCaptureReservationBoundsV2.ACCEPTED_RECORD_BYTES) { "Exact recovery identity requires funded accepted metadata" }
+        }
         val location = location(request.accepted.identity)
         tombstone(location)?.let { throw DurableStoreConflictV2("Session is tombstoned") }
         replayReceiptBeforeExposure(location, request)?.let { return@synchronized it }
-        acceptBeforeExposureInternal(request.accepted, request.recoveryContext)
+        acceptBeforeExposureInternal(request.accepted, request.recoveryContext).also {
+            if (requireRecoveryIdentity) requireExactAcceptedIdentity(location, request.accepted.identity)
+        }
     }
 
     internal fun replayFenceBeforeExposure(request: CaptureCommitRequest): CaptureReceipt? = synchronized(mutex) {
@@ -159,7 +172,17 @@ class DurableSessionStoreV2(
         null
     }
 
-    internal fun replayTemplateFenceBeforeExposure(template: CapturePostOutputTemplateV2): CaptureReceipt? = synchronized(mutex) {
+    internal fun replayTemplateFenceBeforeExposure(template: CapturePostOutputTemplateV2): CaptureReceipt? =
+        replayTemplateFenceBeforeExposureBound(template, allowAssessedQuality = false)
+
+    /** Pre-exposure query carries existing durable evidence; it never verifies newly supplied sensor bytes. */
+    internal fun replayAssessedTemplateFenceBeforeExposure(template: CapturePostOutputTemplateV2): CaptureReceipt? =
+        replayTemplateFenceBeforeExposureBound(template, allowAssessedQuality = true)
+
+    private fun replayTemplateFenceBeforeExposureBound(
+        template: CapturePostOutputTemplateV2,
+        allowAssessedQuality: Boolean,
+    ): CaptureReceipt? = synchronized(mutex) {
         val location = location(template.accepted.identity)
         tombstone(location)?.let { throw DurableStoreConflictV2("Session is tombstoned") }
         val receiptFile = receiptFile(location, template.accepted.identity)
@@ -168,8 +191,15 @@ class DurableSessionStoreV2(
             if (properties.getProperty("templateHash") != templateHash(template)) {
                 throw DurableStoreConflictV2("Changed accepted template conflicts with durable identity")
             }
-            return@synchronized receipt(location, template.accepted.identity)
+            val prior = receipt(location, template.accepted.identity)
                 ?: throw DurableStoreConflictV2("Template receipt is not selected-root authoritative")
+            if (prior.terminal?.qualityAssessment != null && allowAssessedQuality) {
+                requireExactAcceptedIdentity(location, template.accepted.identity)
+            }
+            if (prior.terminal?.qualityAssessment != null && !allowAssessedQuality) {
+                throw DurableStoreConflictV2("Assessed terminal requires disposition-aware replay")
+            }
+            return@synchronized prior
         }
         val accepted = acceptedFile(location, template.accepted.identity)
         if (files.isFile(accepted)) {
@@ -181,16 +211,33 @@ class DurableSessionStoreV2(
     }
 
     /** Streams, hashes and commits the exact descriptor set.  The passed streams close here. */
-    fun commitStreamed(request: CaptureCommitRequest, streams: List<CaptureComponentStreamV2>): CaptureReceipt = synchronized(mutex) {
+    fun commitStreamed(request: CaptureCommitRequest, streams: List<CaptureComponentStreamV2>): CaptureReceipt =
+        commitStreamedBound(request, streams, assessed = false)
+
+    /** Explicit opt-in only; current native callers remain on the legacy entrypoint. */
+    fun commitStreamedAssessed(request: CaptureCommitRequest, streams: List<CaptureComponentStreamV2>): CaptureReceipt =
+        commitStreamedBound(request, streams, assessed = true)
+
+    private fun commitStreamedBound(
+        request: CaptureCommitRequest,
+        streams: List<CaptureComponentStreamV2>,
+        assessed: Boolean,
+    ): CaptureReceipt = synchronized(mutex) {
+        require((request.qualityAssessment != null) == assessed) { "Quality requires the explicit assessed store entrypoint" }
         val location = location(request.accepted.identity)
         tombstone(location)?.let { throw DurableStoreConflictV2("Session is tombstoned") }
         val requestHash = requestHash(request)
         receipt(location, request.accepted.identity)?.let { prior ->
+            if (assessed && streams.isNotEmpty()) {
+                streams.forEach { it.input.close() }
+                throw DurableStoreConflictV2("Assessed descriptor replay accepts no new streams; use finalized assessed replay to verify bytes")
+            }
             if (prior.requestHash == requestHash) return@synchronized prior
             throw DurableStoreConflictV2("Changed replay conflicts with committed durable identity")
         }
         val accepted = readProperties(acceptedFile(location, request.accepted.identity))
         check(accepted.getProperty("acceptedHash") == acceptedHash(request.accepted)) { "Attempt was not durably accepted" }
+        if (assessed) requireExactAcceptedIdentity(location, request.accepted.identity)
         check(request.hasCompleteComponentSet) { "Component descriptors are incomplete" }
         check(streams.map { it.kind }.toSet() == request.accepted.profile.requiredComponents && streams.size == streams.map { it.kind }.toSet().size) {
             "Stream component set is incomplete or duplicated"
@@ -225,7 +272,8 @@ class DurableSessionStoreV2(
             faults.at(DurableStoreFaultPointV2.ROOT_FILE_SYNC)
             val jpegSizeBytes = request.components.single { it.kind == CaptureComponentKind.JPEG }.byteLength
             val dngSizeBytes = request.components.singleOrNull { it.kind == CaptureComponentKind.DNG }?.byteLength
-            val terminal = CaptureTerminal(CaptureTerminalKind.COMMITTED_PICTURE, request.accepted.identity, requestHash, "committed", captureId, revision, rootHash, jpegSizeBytes, dngSizeBytes)
+            val terminal = CaptureTerminal(CaptureTerminalKind.COMMITTED_PICTURE, request.accepted.identity, requestHash, "committed", captureId, revision, rootHash, jpegSizeBytes, dngSizeBytes, request.qualityAssessment,
+                request.qualityAssessment?.let { CaptureQualityAssessmentV1.boundHash(requestHash, it) })
             val committed = CaptureReceipt(request.accepted.identity, CaptureAttemptPhase.COMMITTED_PICTURE, requestHash, receiptHash(requestHash, rootHash), true, terminal)
             // Receipt is durable before, and independently validates, the pointer switch.
             faults.at(DurableStoreFaultPointV2.RECEIPT_WRITE)
@@ -255,18 +303,40 @@ class DurableSessionStoreV2(
         template: CapturePostOutputTemplateV2,
         exposureTimestampNanoseconds: Long,
         streams: List<CaptureComponentStreamV2>,
+    ): CaptureReceipt = commitStreamedFinalizedBound(template, exposureTimestampNanoseconds, streams, null)
+
+    /** Assessment binds after actual descriptors exist. Repeated streams are rehashed, never metadata-only replay. */
+    internal fun commitStreamedFinalizedAssessed(
+        template: CapturePostOutputTemplateV2,
+        exposureTimestampNanoseconds: Long,
+        streams: List<CaptureComponentStreamV2>,
+        qualityAssessment: CaptureQualityAssessmentV1,
+    ): CaptureReceipt = commitStreamedFinalizedBound(template, exposureTimestampNanoseconds, streams, qualityAssessment)
+
+    private fun commitStreamedFinalizedBound(
+        template: CapturePostOutputTemplateV2,
+        exposureTimestampNanoseconds: Long,
+        streams: List<CaptureComponentStreamV2>,
+        qualityAssessment: CaptureQualityAssessmentV1?,
     ): CaptureReceipt = synchronized(mutex) {
         val identity = template.accepted.identity
         val location = location(identity)
         tombstone(location)?.let { throw DurableStoreConflictV2("Session is tombstoned") }
-        receipt(location, identity)?.let { return@synchronized it }
+        val priorReceipt = receipt(location, identity)
+        if (qualityAssessment == null && priorReceipt != null) {
+            if (priorReceipt.terminal?.qualityAssessment != null) {
+                throw DurableStoreConflictV2("Assessed terminal cannot replay through legacy finalization")
+            }
+            return@synchronized priorReceipt
+        }
         val accepted = readProperties(acceptedFile(location, identity))
         check(accepted.getProperty("acceptedHash") == acceptedHash(template.accepted)) { "Attempt was not durably accepted" }
+        if (qualityAssessment != null) requireExactAcceptedIdentity(location, identity)
         check(streams.map { it.kind }.toSet() == template.accepted.profile.requiredComponents && streams.size == streams.map { it.kind }.toSet().size) {
             "Stream component set is incomplete or duplicated"
         }
         val reservation = budget.reservation(accepted.getProperty("reservationToken"))
-            ?: throw IllegalStateException("Accepted attempt has no live reservation")
+        if (priorReceipt == null && reservation == null) throw IllegalStateException("Accepted attempt has no live reservation")
         val staging = path(attemptDirectory(location, identity), "staging")
         files.ensureDirectory(staging)
         var actualBytes = 0L
@@ -274,19 +344,27 @@ class DurableSessionStoreV2(
             val staged = streams.sortedBy { it.kind.ordinal }.map { stream ->
                 val file = path(staging, "${stream.kind.name.lowercase()}.part")
                 faults.at(DurableStoreFaultPointV2.COMPONENT_OPEN)
-                val measured = files.streamExclusive(file, stream.input)
+                val measured = files.streamExclusive(file,
+                    if (qualityAssessment == null) stream.input else boundedAssessmentStream(stream.input,
+                        template.accepted.profile.maximumComponentBytes - actualBytes))
                 faults.at(DurableStoreFaultPointV2.LENGTH_CHECK)
                 actualBytes = Math.addExact(actualBytes, measured.first)
                 val hash = measured.second.map { it.toInt() and 0xff }
                 val descriptor = CaptureComponentDescriptor(stream.kind, measured.first, hash, measured.second.hex())
                 Staged(stream.kind, file, descriptor)
             }
-            check(actualBytes <= reservation.bytes && actualBytes <= template.accepted.profile.maximumComponentBytes) { "Component bytes exceed accepted reservation" }
+            check(actualBytes <= (reservation?.bytes ?: template.accepted.reservation.physicalStoreBytes) && actualBytes <= template.accepted.profile.maximumComponentBytes) { "Component bytes exceed accepted reservation" }
             val request = CaptureCommitRequest(
                 template.accepted, staged.map { it.descriptor }, exposureTimestampNanoseconds,
                 template.poseRecordHash, template.cameraModelHash, template.validationRecordHash, template.ledgerRecordHash,
+                qualityAssessment = qualityAssessment,
             )
             val requestHash = requestHash(request)
+            priorReceipt?.let { prior ->
+                deleteTree(staging, DurableStoreFaultPointV2.DELETE_RECLAIM)
+                if (prior.requestHash == requestHash) return@synchronized prior
+                throw DurableStoreConflictV2("Changed assessment, exposure, template or component conflicts with durable identity")
+            }
             val captureId = safe(identity.attemptId)
             val assets = path(location, "assets", captureId).also(files::ensureDirectory)
             staged.forEach { moveImmutable(it.file, path(assets, "${it.kind.name.lowercase()}.${it.descriptor.sha256.hex()}.blob"), it.descriptor) }
@@ -299,7 +377,8 @@ class DurableSessionStoreV2(
             faults.at(DurableStoreFaultPointV2.ROOT_FILE_SYNC)
             val jpegSizeBytes = request.components.single { it.kind == CaptureComponentKind.JPEG }.byteLength
             val dngSizeBytes = request.components.singleOrNull { it.kind == CaptureComponentKind.DNG }?.byteLength
-            val terminal = CaptureTerminal(CaptureTerminalKind.COMMITTED_PICTURE, identity, requestHash, "committed", captureId, revision, rootHash, jpegSizeBytes, dngSizeBytes)
+            val terminal = CaptureTerminal(CaptureTerminalKind.COMMITTED_PICTURE, identity, requestHash, "committed", captureId, revision, rootHash, jpegSizeBytes, dngSizeBytes, request.qualityAssessment,
+                request.qualityAssessment?.let { CaptureQualityAssessmentV1.boundHash(requestHash, it) })
             val committed = CaptureReceipt(identity, CaptureAttemptPhase.COMMITTED_PICTURE, requestHash, receiptHash(requestHash, rootHash), true, terminal)
             faults.at(DurableStoreFaultPointV2.RECEIPT_WRITE)
             writePropertiesExclusive(
@@ -310,11 +389,13 @@ class DurableSessionStoreV2(
             )
             faults.at(DurableStoreFaultPointV2.RECEIPT_FILE_SYNC)
             publishPointer(location, RootPointer(revision, rootHash, identity.commitId))
-            budget.commit(reservation, actualBytes)
+            budget.commit(requireNotNull(reservation), actualBytes)
             deleteTree(staging, DurableStoreFaultPointV2.DELETE_RECLAIM)
             committed
         } catch (error: Throwable) {
-            if (!files.isFile(receiptFile(location, identity))) deleteTree(staging, DurableStoreFaultPointV2.DELETE_RECLAIM)
+            if (priorReceipt != null || !files.isFile(receiptFile(location, identity))) {
+                deleteTree(staging, DurableStoreFaultPointV2.DELETE_RECLAIM)
+            }
             throw error
         }
     }
@@ -490,16 +571,25 @@ class DurableSessionStoreV2(
                     if (value.getProperty("kind") == CaptureTerminalKind.COMMITTED_PICTURE.name &&
                         value.getProperty("rootHash") in retainedRootHashes(session)
                     ) {
+                        val exactIdentity = acceptedValues.exactIdentity()
+                        val verified = validateCommittedReceipt(session, exactIdentity, value)
+                        val verifiedTerminal = exactIdentity?.let { identity ->
+                            if (safe(identity.lifecycleCut.sessionId) != sessionHash || safe(identity.commitId) != attemptHash) {
+                                throw DurableStoreConflictV2("Recovered exact identity conflicts with durable location")
+                            }
+                            buildCommittedTerminal(identity, value, verified)
+                        }
                         RecoveryProjectionV2(
                             attemptId,
                             CaptureTerminalKind.COMMITTED_PICTURE,
-                            value.getProperty("captureId"),
-                            value.getProperty("revision").toLong(),
+                            verified.captureId,
+                            verified.revision,
                             value.getProperty("rootHash"),
                             "recovered-committed",
                             acceptedValues.recoveryContext(),
-                            terminalComponentSize(session, value, CaptureComponentKind.JPEG),
-                            terminalComponentSize(session, value, CaptureComponentKind.DNG),
+                            verified.jpegSizeBytes,
+                            verified.dngSizeBytes,
+                            verified.qualityAssessment, verified.qualityAssessmentHash, verifiedTerminal,
                         )
                     } else if (value.getProperty("kind") == CaptureTerminalKind.ABANDONED_ATTEMPT.name) {
                         RecoveryProjectionV2(
@@ -518,6 +608,50 @@ class DurableSessionStoreV2(
             writeRecoveryIndex(validEntries)
         }
         result
+    }
+
+    /** Schema-qualified exact identity; only written at new acceptance, never inferred for old records. */
+    private fun Properties.putExactIdentity(identity: CaptureAttemptIdentity) {
+        val bytes = java.io.ByteArrayOutputStream()
+        java.io.DataOutputStream(bytes).use { output ->
+            output.writeUTF(identity.attemptId); output.writeUTF(identity.commitId); output.writeLong(identity.attemptOrdinal)
+            val cut = identity.lifecycleCut
+            output.writeUTF(cut.sessionId); output.writeLong(cut.sessionGeneration)
+            output.writeUTF(cut.groupId); output.writeLong(cut.groupGeneration)
+            output.writeUTF(cut.arSessionId); output.writeUTF(cut.viewId); output.writeLong(cut.viewGeneration)
+            output.writeUTF(cut.bindingToken); output.writeLong(cut.lifecycleSequence); output.writeLong(cut.operationGeneration)
+        }
+        setProperty("acceptedIdentityVersion", "1")
+        setProperty("acceptedIdentity", java.util.Base64.getEncoder().encodeToString(bytes.toByteArray()))
+    }
+
+    private fun Properties.exactIdentity(): CaptureAttemptIdentity? {
+        val version = getProperty("acceptedIdentityVersion")
+        val encoded = getProperty("acceptedIdentity")
+        if (version == null && encoded == null) return null // Explicit legacy branch.
+        try {
+            require(version == "1" && encoded != null && encoded.length <= NativeCaptureReservationBoundsV2.ACCEPTED_RECORD_BYTES)
+            val identity = java.io.DataInputStream(java.util.Base64.getDecoder().decode(encoded).inputStream()).use { input ->
+                val attemptId = input.readUTF(); val commitId = input.readUTF(); val ordinal = input.readLong()
+                val cut = CaptureLifecycleCut(input.readUTF(), input.readLong(), input.readUTF(), input.readLong(),
+                    input.readUTF(), input.readUTF(), input.readLong(), input.readUTF(), input.readLong(), input.readLong())
+                require(input.read() == -1)
+                CaptureAttemptIdentity(attemptId, commitId, ordinal, cut)
+            }
+            require(identity.attemptId == getProperty("attemptId") && identity.commitId == getProperty("commitId") &&
+                identity.lifecycleCut.sessionId == getProperty("session"))
+            return identity
+        } catch (error: Exception) {
+            throw DurableStoreConflictV2("Accepted exact identity is missing, malformed or conflicting")
+        }
+    }
+
+    private fun requireExactAcceptedIdentity(location: File, identity: CaptureAttemptIdentity) {
+        val accepted = readProperties(acceptedFile(location, identity))
+        if (accepted.exactIdentity() != identity) throw DurableStoreConflictV2("Assessed capture requires exact durable identity")
+        val actualBytes = propertiesBytes(accepted).size.toLong()
+        require(actualBytes <= NativeCaptureReservationBoundsV2.ACCEPTED_RECORD_BYTES &&
+            accepted.getProperty("reservationBytes").toLong() >= actualBytes) { "Accepted metadata exceeds funded bytes" }
     }
 
     private fun Properties.putRecoveryContext(value: NativeCaptureRecoveryContextV2) {
@@ -623,15 +757,136 @@ class DurableSessionStoreV2(
     private fun acceptedFile(location: File, identity: CaptureAttemptIdentity) = path(attemptDirectory(location, identity), "accepted.properties")
     private fun receiptFile(location: File, identity: CaptureAttemptIdentity) = path(attemptDirectory(location, identity), "receipt.properties")
     private fun assetDirectory(location: File, identity: CaptureAttemptIdentity) = path(location, "assets", safe(identity.attemptId))
+    private data class VerifiedCommittedReceiptV2(
+        val captureId: String?,
+        val revision: Long?,
+        val jpegSizeBytes: Long?,
+        val dngSizeBytes: Long?,
+        val qualityAssessment: CaptureQualityAssessmentV1?,
+        val qualityAssessmentHash: String?,
+    )
+
     private fun receipt(location: File, identity: CaptureAttemptIdentity): CaptureReceipt? {
         val file = receiptFile(location, identity); if (!files.isFile(file)) return null
         val value = readProperties(file)
         val kind = value.getProperty("kind") ?: return null
         if (kind == CaptureTerminalKind.COMMITTED_PICTURE.name && value.getProperty("rootHash") !in retainedRootHashes(location)) return null
-        val terminal = if (kind == CaptureTerminalKind.COMMITTED_PICTURE.name) CaptureTerminal(CaptureTerminalKind.COMMITTED_PICTURE, identity, value.getProperty("requestHash"), "committed", value.getProperty("captureId"), value.getProperty("revision").toLong(), value.getProperty("rootHash"), terminalComponentSize(location, value, CaptureComponentKind.JPEG), terminalComponentSize(location, value, CaptureComponentKind.DNG))
+        val verified = if (kind == CaptureTerminalKind.COMMITTED_PICTURE.name) validateCommittedReceipt(location, identity, value) else null
+        val terminal = if (kind == CaptureTerminalKind.COMMITTED_PICTURE.name) buildCommittedTerminal(identity, value, requireNotNull(verified))
         else CaptureTerminal(CaptureTerminalKind.ABANDONED_ATTEMPT, identity, value.getProperty("requestHash"), value.getProperty("reason", "abandoned"))
         return CaptureReceipt(identity, if (terminal.kind == CaptureTerminalKind.COMMITTED_PICTURE) CaptureAttemptPhase.COMMITTED_PICTURE else CaptureAttemptPhase.ABANDONED_ATTEMPT, value.getProperty("requestHash"), value.getProperty("receiptHash"), true, terminal)
     }
+
+    private fun buildCommittedTerminal(
+        identity: CaptureAttemptIdentity,
+        receipt: Properties,
+        verified: VerifiedCommittedReceiptV2,
+    ) = CaptureTerminal(
+        CaptureTerminalKind.COMMITTED_PICTURE,
+        identity,
+        receipt.getProperty("requestHash"),
+        "committed",
+        verified.captureId,
+        verified.revision,
+        receipt.getProperty("rootHash"),
+        verified.jpegSizeBytes,
+        verified.dngSizeBytes,
+        verified.qualityAssessment,
+        verified.qualityAssessmentHash,
+    )
+
+    /** Schema-6 receipt, accepted identity and root must agree before authority is constructed. */
+    private fun validateCommittedReceipt(
+        location: File,
+        identity: CaptureAttemptIdentity?,
+        receipt: Properties,
+    ): VerifiedCommittedReceiptV2 {
+        val rootHash = receipt.getProperty("rootHash") ?: throw DurableStoreConflictV2("Committed receipt has no root")
+        val metadata = readRootMetadata(location, rootHash) ?: throw DurableStoreConflictV2("Committed root is invalid")
+        if (metadata.schema == "5") {
+            if (receipt.stringPropertyNames().any { it.startsWith("quality") }) {
+                throw DurableStoreConflictV2("Legacy receipt cannot carry assessed quality")
+            }
+            return VerifiedCommittedReceiptV2(
+                receipt.getProperty("captureId"),
+                receipt.getProperty("revision").toLong(),
+                terminalComponentSize(location, receipt, CaptureComponentKind.JPEG),
+                terminalComponentSize(location, receipt, CaptureComponentKind.DNG),
+                null,
+                null,
+            )
+        }
+        if (metadata.schema != "6") throw DurableStoreConflictV2("Unknown quality root schema")
+        val fields = receipt.stringPropertyNames().associateWith { receipt.getProperty(it) }
+        val assessment = CaptureQualityAssessmentV1.fromRootFields(fields)
+            ?: throw DurableStoreConflictV2("Committed receipt has missing or malformed quality")
+        val assessmentHash = receipt.getProperty("qualityAssessmentHash")
+        val requestHash = receipt.getProperty("requestHash")
+            ?: throw DurableStoreConflictV2("Committed assessed receipt has no request hash")
+        if (assessment != metadata.qualityAssessment || assessmentHash != metadata.qualityAssessmentHash ||
+            requestHash != metadata.request ||
+            receipt.getProperty("receiptHash") != receiptHash(requestHash, rootHash)) {
+            throw DurableStoreConflictV2("Committed receipt conflicts with bound quality root")
+        }
+        val exactIdentity = identity ?: throw DurableStoreConflictV2("Assessed recovery requires durable exact identity")
+        requireExactAcceptedIdentity(location, exactIdentity)
+        val expectedCaptureId = safe(exactIdentity.attemptId)
+        if (receipt.getProperty("captureId") != expectedCaptureId) {
+            throw DurableStoreConflictV2("Assessed receipt capture identity conflicts with accepted attempt")
+        }
+        val revision = receipt.getProperty("revision")?.toLongOrNull()
+        if (revision == null || revision <= 0L || revision != metadata.revision) {
+            throw DurableStoreConflictV2("Assessed receipt revision conflicts with verified root")
+        }
+        fun exactComponentSize(kind: CaptureComponentKind, property: String): Long {
+            val descriptor = metadata.components.singleOrNull { it.kind == kind.name }
+                ?: throw DurableStoreConflictV2("Assessed root has no required ${kind.name} component")
+            val size = receipt.getProperty(property)?.toLongOrNull()
+                ?: throw DurableStoreConflictV2("Assessed receipt has missing or malformed $property")
+            if (size <= 0L || size != descriptor.length) {
+                throw DurableStoreConflictV2("Assessed receipt $property conflicts with verified root")
+            }
+            return size
+        }
+        val jpegSize = exactComponentSize(CaptureComponentKind.JPEG, "jpegSizeBytes")
+        val dngDescriptor = metadata.components.singleOrNull { it.kind == CaptureComponentKind.DNG.name }
+        val dngProperty = receipt.getProperty("dngSizeBytes")
+        val dngSize = if (dngDescriptor == null) {
+            if (dngProperty != null) throw DurableStoreConflictV2("Assessed receipt has unexpected DNG size")
+            null
+        } else {
+            exactComponentSize(CaptureComponentKind.DNG, "dngSizeBytes")
+        }
+        return VerifiedCommittedReceiptV2(
+            expectedCaptureId,
+            revision,
+            jpegSize,
+            dngSize,
+            assessment,
+            requireNotNull(assessmentHash),
+        )
+    }
+
+    /** Hard bound on new assessed stream replay, including a one-byte overflow probe. */
+    private fun boundedAssessmentStream(input: InputStream, maximumBytes: Long): InputStream = object : InputStream() {
+        private var remaining = maximumBytes.also { require(it >= 0L) }
+        override fun read(): Int {
+            val value = input.read()
+            if (value < 0) return value
+            check(remaining > 0L) { "Component bytes exceed assessment replay bound" }
+            remaining--
+            return value
+        }
+        override fun read(bytes: ByteArray, offset: Int, length: Int): Int {
+            if (length == 0) return 0
+            if (remaining == 0L) return read()
+            val received = input.read(bytes, offset, minOf(length.toLong(), remaining).toInt())
+            if (received > 0) remaining -= received.toLong()
+            return received
+        }
+        override fun close() = input.close()
+    }
+
     private fun acceptedReceipt(attempt: CaptureAcceptedAttempt) = CaptureReceipt(attempt.identity, CaptureAttemptPhase.RESERVED_ACCEPTED, acceptedHash(attempt), attempt.acceptedReceiptHash.hex(), true)
     /** Legacy receipts omitted DNG sizes; the retained hash-validated root still records the exact set. */
     private fun terminalComponentSize(location: File, receipt: Properties, kind: CaptureComponentKind): Long? {
@@ -691,13 +946,26 @@ class DurableSessionStoreV2(
             output.writeLong(request.exposureTimestampNanoseconds)
             digest(request.poseRecordHash); digest(request.cameraModelHash)
             digest(request.validationRecordHash); digest(request.ledgerRecordHash)
+            request.qualityAssessment?.let { assessment ->
+                text("capture-quality-assessment-v1")
+                val qualityBytes = assessment.canonicalBytes()
+                output.writeInt(qualityBytes.size); output.write(qualityBytes)
+            }
         }
         return sha256(bytes.toByteArray()).hex()
     }
     private fun reservationOwner(identity: CaptureAttemptIdentity) = "capture:${safe(identity.lifecycleCut.sessionId)}:${safe(identity.commitId)}"
     private fun receiptHash(requestHash: String, rootHash: String) = sha256("$requestHash|$rootHash".toByteArray()).hex()
-    private fun rootRecord(request: CaptureCommitRequest, requestHash: String, revision: Long, staged: List<Staged>, prior: RootPointer?) = buildString { append("schema=5\nrevision=$revision\nrequest=$requestHash\nprevious=${prior?.rootHash ?: "-"}\nsecondPrevious=${prior?.previousHash ?: "-"}\n"); staged.sortedBy { it.kind.ordinal }.forEach { append("component=${it.kind}:${it.descriptor.byteLength}:${it.descriptor.sha256.hex()}\n") } }.toByteArray(StandardCharsets.UTF_8)
-    private fun receiptProperties(receipt: CaptureReceipt, rootHash: String) = Properties().apply { setProperty("kind", receipt.terminal!!.kind.name); setProperty("requestHash", receipt.requestHash); setProperty("receiptHash", receipt.receiptHash); setProperty("rootHash", rootHash); setProperty("reason", receipt.terminal.reason); receipt.terminal.captureId?.let { setProperty("captureId", it) }; receipt.terminal.captureRevision?.let { setProperty("revision", it.toString()) }; receipt.terminal.jpegSizeBytes?.let { setProperty("jpegSizeBytes", it.toString()) }; receipt.terminal.dngSizeBytes?.let { setProperty("dngSizeBytes", it.toString()) } }
+    private fun rootRecord(request: CaptureCommitRequest, requestHash: String, revision: Long, staged: List<Staged>, prior: RootPointer?) = buildString {
+        append("schema=${if (request.qualityAssessment == null) 5 else 6}\nrevision=$revision\nrequest=$requestHash\nprevious=${prior?.rootHash ?: "-"}\nsecondPrevious=${prior?.previousHash ?: "-"}\n")
+        staged.sortedBy { it.kind.ordinal }.forEach { append("component=${it.kind}:${it.descriptor.byteLength}:${it.descriptor.sha256.hex()}\n") }
+        request.qualityAssessment?.let { assessment ->
+            append("exposureTimestampNanoseconds=${request.exposureTimestampNanoseconds}\n")
+            assessment.rootFields().forEach { (key, value) -> append("$key=$value\n") }
+            append("qualityAssessmentHash=${CaptureQualityAssessmentV1.boundHash(requestHash, assessment)}\n")
+        }
+    }.toByteArray(StandardCharsets.UTF_8)
+    private fun receiptProperties(receipt: CaptureReceipt, rootHash: String) = Properties().apply { setProperty("kind", receipt.terminal!!.kind.name); setProperty("requestHash", receipt.requestHash); setProperty("receiptHash", receipt.receiptHash); setProperty("rootHash", rootHash); setProperty("reason", receipt.terminal.reason); receipt.terminal.captureId?.let { setProperty("captureId", it) }; receipt.terminal.captureRevision?.let { setProperty("revision", it.toString()) }; receipt.terminal.jpegSizeBytes?.let { setProperty("jpegSizeBytes", it.toString()) }; receipt.terminal.dngSizeBytes?.let { setProperty("dngSizeBytes", it.toString()) }; receipt.terminal.qualityAssessment?.let { assessment -> assessment.rootFields().forEach { (key, value) -> setProperty(key, value) }; setProperty("qualityAssessmentHash", requireNotNull(receipt.terminal.qualityAssessmentHash)) } }
 
     private fun replayReceiptBeforeExposure(location: File, request: CaptureCommitRequest): CaptureReceipt? {
         val prior = receipt(location, request.accepted.identity) ?: return null
@@ -744,7 +1012,7 @@ class DurableSessionStoreV2(
     private fun validRootHash(location: File, hash: String, revision: Long, depth: Int): Boolean {
         if (depth > 2) return false
         val values = readRootMetadata(location, hash) ?: return false
-        if (values.schema != "5" || values.revision != revision || !CaptureRootMetadataReaderV2.isHash(values.request)) return false
+        if (values.schema !in setOf("5", "6") || values.revision != revision || !CaptureRootMetadataReaderV2.isHash(values.request)) return false
         val previous = values.previous
         val second = values.secondPrevious
         if (depth == 2) return true
@@ -765,7 +1033,8 @@ class DurableSessionStoreV2(
         }
     }
     private fun moveImmutable(from: File, target: File, descriptor: CaptureComponentDescriptor) { if (files.isFile(target)) { val measured = files.digestAndLength(target); check(measured.first == descriptor.byteLength && measured.second.hex() == descriptor.sha256.hex()) { "Immutable asset conflict" }; files.delete(from, DurableStoreFaultPointV2.DELETE_RECLAIM); return }; files.moveAtomic(from, target) }
-    private fun writePropertiesExclusive(file: File, properties: Properties, point: DurableStoreFaultPointV2 = DurableStoreFaultPointV2.ACCEPTED_RECORD) = writeExclusive(file, buildString { properties.stringPropertyNames().sorted().forEach { append(it).append('=').append(properties.getProperty(it)).append('\n') } }.toByteArray(), point)
+    private fun propertiesBytes(properties: Properties) = buildString { properties.stringPropertyNames().sorted().forEach { append(it).append('=').append(properties.getProperty(it)).append('\n') } }.toByteArray()
+    private fun writePropertiesExclusive(file: File, properties: Properties, point: DurableStoreFaultPointV2 = DurableStoreFaultPointV2.ACCEPTED_RECORD) = writeExclusive(file, propertiesBytes(properties), point)
     private fun readProperties(file: File) = Properties().apply { files.readBytes(file).inputStream().use(::load) }
     private fun writeExclusive(file: File, bytes: ByteArray, point: DurableStoreFaultPointV2 = DurableStoreFaultPointV2.ACCEPTED_RECORD) = files.writeExclusive(file, bytes, point)
     private fun writeImmutable(file: File, bytes: ByteArray) {
