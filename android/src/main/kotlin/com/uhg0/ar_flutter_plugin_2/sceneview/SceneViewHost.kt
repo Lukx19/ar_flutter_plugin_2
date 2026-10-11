@@ -3,6 +3,7 @@ package com.uhg0.ar_flutter_plugin_2.sceneview
 import com.uhg0.ar_flutter_plugin_2.diagnostics.NativeFrameAttributionOwner
 import com.uhg0.ar_flutter_plugin_2.diagnostics.NativeFrameSpan
 import com.uhg0.ar_flutter_plugin_2.diagnostics.measureNativeFrame
+import com.uhg0.ar_flutter_plugin_2.gridrenderer.VisibilityGridRendererHost
 
 import android.app.Activity
 import android.content.Context
@@ -171,6 +172,9 @@ internal class SceneViewHost(
     private val frameRef = AtomicReference<Frame?>()
     private val visibilityGridDepthModeCache = VisibilityGridDepthModeCache()
     private val engineRef = AtomicReference<Engine?>()
+    // Instanced grid renderer seam: inert until the grid sends its first
+    // render or display message (CAPTURE3D_GRID_RENDERER=instanced).
+    private val visibilityGridRenderer = VisibilityGridRendererHost()
     private val cameraStreamRef = AtomicReference<ARCameraStream?>()
     private val debugGapTimingEnabled =
         context.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0
@@ -468,6 +472,10 @@ internal class SceneViewHost(
             }
             engineRef.set(engine)
             cameraStreamRef.set(cameraStream)
+            DisposableEffect(engine) {
+                visibilityGridRenderer.attach(engine, view)
+                onDispose { visibilityGridRenderer.detach() }
+            }
             DisposableEffect(engine, cameraStream) {
                 onDispose {
                     cameraStreamRef.compareAndSet(cameraStream, null)
@@ -567,6 +575,7 @@ internal class SceneViewHost(
                             frameCadenceTracker.record(callbackArrivalNs)
                             coverageRendererOwner.recordShapeMeasurementFrame(callbackArrivalNs)
                             cameraFrameCadenceTracker.record(frame.timestamp, callbackArrivalNs)
+                            visibilityGridRenderer.onArFrame(frame)
                         }
                         sessionRef.set(session)
                         frameRef.set(frame)
@@ -1482,6 +1491,7 @@ internal class SceneViewHost(
     fun dispose() {
         bindNativeFrameAttribution(null)
         if (!ownership.onDispose()) return
+        visibilityGridRenderer.detach()
         rendererProvenance("dispose-request")
         disposed = true
         coveragePublications.close()
