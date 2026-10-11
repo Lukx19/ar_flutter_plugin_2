@@ -74,6 +74,7 @@ internal class VisibilityGridRendererHost(
 
     /** Guided-capture quests; drawn only after their first overlay message. */
     val questOverlay = QuestLineOverlay().also { core.lineOverlays.addIfAbsent(it) }
+    val poseFrustumStyle = PoseFrustumStyle().also { core.lineOverlays.addIfAbsent(it) }
 
     /** Marker outlines (C3MO from the grid isolate marker stage) on the same line overlay hook. */
     val markerOverlay = MarkerOutlineOverlay().also { core.lineOverlays.addIfAbsent(it) }

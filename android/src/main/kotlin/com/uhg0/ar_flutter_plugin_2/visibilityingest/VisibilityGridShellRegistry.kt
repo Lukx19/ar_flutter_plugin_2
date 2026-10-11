@@ -8,6 +8,7 @@ import com.google.ar.core.Frame
 import com.uhg0.ar_flutter_plugin_2.BuildConfig
 import com.uhg0.ar_flutter_plugin_2.gridrenderer.GridRendererChannels
 import com.uhg0.ar_flutter_plugin_2.markerdetection.GridMarkerShellTaps
+import com.uhg0.ar_flutter_plugin_2.posetracking.AnchorPoseUpdateProducer
 import com.uhg0.ar_flutter_plugin_2.visibilitycontract.VisibilityGridChannels
 import com.uhg0.ar_flutter_plugin_2.visibilitycontract.VisibilityGridFrameTap
 import io.flutter.plugin.common.BasicMessageChannel
@@ -50,6 +51,9 @@ internal object VisibilityGridShellRegistry {
     private var viewOwner: Any? = null
     private var markers: GridMarkerShellTaps? = null
 
+    // Pose stability: anchor pose tracker (query channel, durable photo listener, frame reads).
+    @Volatile private var poseTracking: AnchorPoseUpdateProducer? = null
+
     private val elapsedRealtime = IngestClock { SystemClock.elapsedRealtimeNanos() }
 
     /** Registers the ingest and control channels of one engine; the latest engine owns the shell. */
@@ -76,6 +80,14 @@ internal object VisibilityGridShellRegistry {
             // Render and display channels of the instanced grid renderer; inert until the
             // grid isolate or the UI isolate sends a message.
             GridRendererChannels.register(messenger)
+            // Pose stability: anchor pose tracking channel, photo anchors and per-frame anchor reads.
+            // The photo listener is added only while tracking is armed (legacy path stays idle).
+            poseTracking = AnchorPoseUpdateProducer(
+                elapsedRealtime,
+                photoListenerSwitch = { listener, add ->
+                    if (add) addDurablePhotoListener(listener) else removeDurablePhotoListener(listener)
+                },
+            ).also { it.bind(messenger) }
             markers = GridMarkerShellTaps.create(
                 ingestSink = { ingestSink },
                 shell = { shell },
@@ -106,6 +118,9 @@ internal object VisibilityGridShellRegistry {
         ingestChannel?.setMessageHandler(null)
         controlChannel?.setMessageHandler(null)
         messenger?.let(GridRendererChannels::unregister)
+        // Pose stability: anchor pose tracking.
+        poseTracking?.close()
+        poseTracking = null
         markers?.let { taps ->
             extraTaps -= taps.frameTap
             photoListeners = photoListeners.filter { it !== taps.photoListener }.toTypedArray()
@@ -171,6 +186,8 @@ internal object VisibilityGridShellRegistry {
             val tap = t[i]
             if (tap === s) s.onFrame(session, frame) else tap.onFrame(frame)
         }
+        // Pose stability: returns after one volatile read while anchor tracking is inactive.
+        poseTracking?.onArFrame(session, frame)
     }
 
     /** Seam called by the native capture adapter for each durable terminal. */
