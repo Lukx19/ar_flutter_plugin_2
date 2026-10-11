@@ -1,5 +1,6 @@
 package com.uhg0.ar_flutter_plugin_2.posetracking
 
+import com.uhg0.ar_flutter_plugin_2.sessionlog.NativeSessionLogEmitter
 import com.google.ar.core.Anchor
 import com.google.ar.core.Frame
 import com.google.ar.core.Pose
@@ -79,16 +80,29 @@ internal class AnchorPoseUpdateProducer(
      * is answered with the 4-byte status [STATUS_QUERY_REFUSED]; a pose reply is
      * always longer than 4 bytes (ingest header first).
      */
+    /** Queries answered with [STATUS_QUERY_REFUSED] (refused or failing tracker). */
+    @Volatile var queriesRefused = 0L
+        private set
+
     fun onQuery(message: ByteBuffer?, reply: BasicMessageChannel.Reply<ByteBuffer>) {
         synchronized(replyLock) {
             val next = 1 - lastReply
             val b = replies[next]
             val length = try {
                 tracker.handleQuery(message, b, sequence)
-            } catch (_: RuntimeException) {
-                -1
+            } catch (e: RuntimeException) {
+                NativeSessionLogEmitter.failure(
+                    "NATIVE_HANDLER_ERROR", "poseTracking/query/${e.javaClass.simpleName}", "Pose tracking query failed",
+                ) { mapOf("channel" to "poseTracking", "method" to "query", "error" to (e.message ?: "")) }
+                -2
             }
             if (length < 0) {
+                queriesRefused++
+                if (length == -1) {
+                    NativeSessionLogEmitter.failure("POSE_REFUSED", "anchorQuery", "Anchor pose query refused") {
+                        mapOf("reason" to "malformedOrClosed", "queriesRefused" to queriesRefused)
+                    }
+                }
                 reply.reply(ChannelStatusReply.of(STATUS_QUERY_REFUSED))
                 return
             }

@@ -1,5 +1,6 @@
 package com.uhg0.ar_flutter_plugin_2.visibilityingest
 
+import com.uhg0.ar_flutter_plugin_2.sessionlog.NativeSessionLogEmitter
 import android.content.Context
 import android.os.Build
 import android.os.SystemClock
@@ -225,6 +226,9 @@ internal object VisibilityGridShellRegistry {
         val failures = ++frameTapFailures
         // Logs the 1st, 2nd, 4th, 8th, ... failure so a persistent fault cannot flood the log.
         if (failures and (failures - 1) == 0L) Log.w(TAG, "grid frame tap failed ($failures)", e)
+        NativeSessionLogEmitter.failure(
+            "NATIVE_HANDLER_ERROR", "gridFrameTap/${e.javaClass.simpleName}", "Grid frame tap failed",
+        ) { mapOf("channel" to "frame", "method" to "gridFrameTap", "frameTapFailures" to failures, "error" to (e.message ?: "")) }
     }
 
     private const val TAG = "VisibilityGridShell"

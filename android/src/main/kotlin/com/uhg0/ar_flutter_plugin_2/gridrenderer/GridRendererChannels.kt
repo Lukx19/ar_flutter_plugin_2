@@ -1,5 +1,6 @@
 package com.uhg0.ar_flutter_plugin_2.gridrenderer
 
+import com.uhg0.ar_flutter_plugin_2.sessionlog.NativeSessionLogEmitter
 import com.uhg0.ar_flutter_plugin_2.channelstatus.ChannelStatusReply
 import com.uhg0.ar_flutter_plugin_2.visibilitycontract.VisibilityGridChannels
 import io.flutter.plugin.common.BinaryMessenger
@@ -29,6 +30,13 @@ internal object GridRendererChannels {
     const val STATUS_NO_RENDERER = 3
     const val STATUS_RENDERER_FAILED = 4
 
+    /** A handler failure for the session log; the caller still replies a status. */
+    private fun handlerFailed(method: String, e: RuntimeException) {
+        NativeSessionLogEmitter.failure(
+            "NATIVE_HANDLER_ERROR", "gridRenderer/$method/${e.javaClass.simpleName}", "Grid renderer handler failed",
+        ) { mapOf("channel" to "gridRenderer", "method" to method, "error" to (e.message ?: "")) }
+    }
+
     val renderHandler = BinaryMessenger.BinaryMessageHandler { message, reply ->
         val status = if (message == null) {
             STATUS_MALFORMED
@@ -40,7 +48,8 @@ internal object GridRendererChannels {
             } else {
                 try {
                     host.onRenderMessage(bytes, bytes.position(), bytes.remaining()).code
-                } catch (_: RuntimeException) {
+                } catch (e: RuntimeException) {
+                    handlerFailed("render", e)
                     STATUS_MALFORMED
                 }
             }
@@ -53,8 +62,9 @@ internal object GridRendererChannels {
             val bytes = message.order(ByteOrder.LITTLE_ENDIAN)
             try {
                 GridRendererRegistry.host?.onDisplayMessage(bytes, bytes.position(), bytes.remaining())
-            } catch (_: RuntimeException) {
+            } catch (e: RuntimeException) {
                 // Still answered below: a sender never waits for a missing reply.
+                handlerFailed("display", e)
             }
         }
         reply.reply(ChannelStatusReply.of(STATUS_OK))

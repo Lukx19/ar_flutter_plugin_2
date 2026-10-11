@@ -8,6 +8,9 @@ import com.uhg0.ar_flutter_plugin_2.visibilityingest.DurablePhoto
 import com.uhg0.ar_flutter_plugin_2.visibilityingest.IngestTrackingState
 import com.uhg0.ar_flutter_plugin_2.visibilityingest.StillCameraModel
 import io.flutter.plugin.common.BasicMessageChannel
+import com.uhg0.ar_flutter_plugin_2.sessionlog.data
+import com.uhg0.ar_flutter_plugin_2.sessionlog.full
+import com.uhg0.ar_flutter_plugin_2.sessionlog.withNativeSessionLog
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertNull
@@ -142,6 +145,15 @@ class AnchorPoseUpdateProducerTest {
             creations += next.creationCount
         }
         assertEquals(1100, creations)
+    }
+
+    @Test
+    fun `a refused query is a POSE_REFUSED session log record`() {
+        val bad = poseQuery()
+        bad.putInt(0, 0x12345678)
+        val records = withNativeSessionLog { assertNull(send(bad)) }
+        assertEquals(1L, records.full("POSE_REFUSED").single().data["queriesRefused"])
+        assertEquals(1L, producer.queriesRefused)
     }
 
     @Test

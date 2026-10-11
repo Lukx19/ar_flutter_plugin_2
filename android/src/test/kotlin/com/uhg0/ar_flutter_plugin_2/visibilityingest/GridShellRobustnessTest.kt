@@ -5,6 +5,9 @@ import com.google.ar.core.exceptions.ResourceExhaustedException
 import com.uhg0.ar_flutter_plugin_2.visibilitycontract.NativeStatusCode
 import com.uhg0.ar_flutter_plugin_2.visibilitycontract.ShellControlLayout
 import com.uhg0.ar_flutter_plugin_2.visibilitycontract.VisibilityGridFrameTap
+import com.uhg0.ar_flutter_plugin_2.sessionlog.data
+import com.uhg0.ar_flutter_plugin_2.sessionlog.full
+import com.uhg0.ar_flutter_plugin_2.sessionlog.withNativeSessionLog
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -84,6 +87,42 @@ class GridShellRobustnessTest {
         }
         assertTrue(lines[0], lines[0].contains("lastImageAgeMs=none"))
         assertTrue(lines[2], lines[2].contains("tracking=${IngestTrackingState.PAUSED}"))
+    }
+
+    @Test
+    fun `a throwing frame tap is a NATIVE_HANDLER_ERROR session log record`() {
+        val throwing = VisibilityGridFrameTap { throw ResourceExhaustedException() }
+        VisibilityGridShellRegistry.addFrameTap(throwing)
+        try {
+            val records = withNativeSessionLog { VisibilityGridShellRegistry.onArFrame(Any(), object : Frame() {}) }
+            val error = records.full("NATIVE_HANDLER_ERROR").single()
+            assertEquals("gridFrameTap/ResourceExhaustedException", error[5])
+        } finally {
+            VisibilityGridShellRegistry.removeFrameTap(throwing)
+        }
+    }
+
+    @Test
+    fun `duplicate depth images reach the session log once a second from the depth counters`() {
+        val clock = FakeClock()
+        val shell = VisibilityGridIngestShell(clock, null, telemetryLocator())
+        shell.depthMode = { com.google.ar.core.Config.DepthMode.RAW_DEPTH_ONLY }
+        shell.start(IngestShellConfig(0, IngestShellConfig.DEPTH_PREFERRED, 0, 0, 0f, 1))
+        val frame = FakeFrame().apply { goldenDepth() }
+        var t = 1_000_000_000L
+        frame.depthImageNs = t
+        val records = withNativeSessionLog {
+            for (i in 0 until 75) { // 2.5 s at 30 Hz, the same depth image every frame
+                t += 33_333_333L
+                clock.now = t
+                frame.timestampNs = t
+                frame.androidCameraTimestampNs = t
+                shell.process(frame, null)
+            }
+        }
+        val duplicates = records.full("DEPTH_DUPLICATE").single()
+        assertTrue(duplicates.data.toString(), (duplicates.data["total"] as Long) > 0L)
+        assertEquals(shell.depthProducer.duplicateDropped > 0L, true)
     }
 
     private fun telemetryLocator() = DurableJpegLocator(null)

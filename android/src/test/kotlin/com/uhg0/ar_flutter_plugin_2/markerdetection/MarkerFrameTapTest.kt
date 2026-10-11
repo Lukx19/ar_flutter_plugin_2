@@ -9,6 +9,9 @@ import com.uhg0.ar_flutter_plugin_2.visibilityingest.FakeClock
 import com.uhg0.ar_flutter_plugin_2.visibilityingest.IngestShellConfig
 import com.uhg0.ar_flutter_plugin_2.visibilityingest.VisibilityGridIngestShell
 import com.uhg0.ar_flutter_plugin_2.visibilitycontract.ShellControlLayout
+import com.uhg0.ar_flutter_plugin_2.sessionlog.data
+import com.uhg0.ar_flutter_plugin_2.sessionlog.full
+import com.uhg0.ar_flutter_plugin_2.sessionlog.withNativeSessionLog
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -21,6 +24,15 @@ class MarkerFrameTapTest {
     private val worker = ManualWorker()
 
     private fun tap(hz: Int = 10) = MarkerFrameTap(detector, groupEpoch = { 0 }, hz = hz, worker = worker, clock = { now })
+
+    @Test
+    fun `an image capture failure is a MARKER_DETECTION_FAILED session log record`() {
+        val tap = tap()
+        val records = withNativeSessionLog { tap.onFrame(ThrowingFrame { throw ResourceExhaustedException() }) }
+        val failure = records.full("MARKER_DETECTION_FAILED").single()
+        assertEquals("capture/ResourceExhaustedException", failure[5])
+        assertEquals(1, failure.data["captureFailures"])
+    }
 
     @Test
     fun `an ARCore exception while acquiring the image is counted and never leaves the tap busy`() {

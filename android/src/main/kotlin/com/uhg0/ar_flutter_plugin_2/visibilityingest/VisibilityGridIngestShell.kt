@@ -7,6 +7,7 @@ import com.uhg0.ar_flutter_plugin_2.capture.CaptureTerminal
 import com.uhg0.ar_flutter_plugin_2.visibilitycontract.IngestMessageLayout
 import com.uhg0.ar_flutter_plugin_2.visibilitycontract.ShellControlLayout
 import com.uhg0.ar_flutter_plugin_2.visibilitycontract.VisibilityGridFrameTap
+import com.uhg0.ar_flutter_plugin_2.sessionlog.NativeSessionLogEmitter
 
 /** Configuration of a started shell, from the control start message. */
 internal class IngestShellConfig(
@@ -219,7 +220,7 @@ internal class VisibilityGridIngestShell(
             lastDepthMode = mode
         }
         // Before the tracking check, so a run also shows depth stopping while not tracking.
-        if (depthTelemetry != null) logDepthTelemetry(depthTelemetry, ts, tracking)
+        if (depthTelemetry != null || NativeSessionLogEmitter.active) depthTelemetryTick(ts, tracking)
         if (tracking != IngestTrackingState.TRACKING) return
 
         source.readPose(tq)
@@ -237,11 +238,64 @@ internal class VisibilityGridIngestShell(
 
     private var lastTelemetryNs = Long.MIN_VALUE
 
-    /** At most once a second (shell clock); allocates only the line. */
-    private fun logDepthTelemetry(log: (String) -> Unit, frameNs: Long, tracking: Int) {
+    // Counter totals already handed to the session log.
+    private var loggedStale = 0L
+    private var loggedDuplicate = 0L
+    private var loggedIdentityRefused = 0L
+    private var loggedStaleAutomatic = 0L
+    private var loggedFrameFailures = 0L
+
+    /** At most once a second (shell clock): the telemetry line and the session log counters. */
+    private fun depthTelemetryTick(frameNs: Long, tracking: Int) {
         val now = clock.nowNs()
         if (lastTelemetryNs != Long.MIN_VALUE && now - lastTelemetryNs < TELEMETRY_INTERVAL_NS) return
         lastTelemetryNs = now
+        depthTelemetry?.let { logDepthTelemetry(it, frameNs, tracking) }
+        logSessionCounters(frameNs)
+    }
+
+    /**
+     * Growth of the depth and frame failure counters for the session log
+     * (the same counters as the telemetry line); allocates only when a
+     * counter grew.
+     */
+    private fun logSessionCounters(frameNs: Long) {
+        val image = depth.latestImageNs
+        val ageMs = if (image == Long.MIN_VALUE) -1L else (frameNs - image) / 1_000_000L
+        if (depth.staleDropped > loggedStale) {
+            loggedStale = NativeSessionLogEmitter.reportGrowth(
+                "DEPTH_STALE", null, depth.staleDropped, loggedStale,
+                "Depth images dropped as stale", mapOf("lastImageAgeMs" to ageMs),
+            )
+        }
+        if (depth.duplicateDropped > loggedDuplicate) {
+            loggedDuplicate = NativeSessionLogEmitter.reportGrowth(
+                "DEPTH_DUPLICATE", null, depth.duplicateDropped, loggedDuplicate,
+                "Depth images dropped as duplicates", mapOf("published" to depth.published),
+            )
+        }
+        if (depth.identityRefused > loggedIdentityRefused) {
+            loggedIdentityRefused = NativeSessionLogEmitter.reportGrowth(
+                "DEPTH_REFUSED", "identity", depth.identityRefused, loggedIdentityRefused,
+                "Depth images refused by the camera image identity check",
+            )
+        }
+        if (depth.identityStaleAutomatic > loggedStaleAutomatic) {
+            loggedStaleAutomatic = NativeSessionLogEmitter.reportGrowth(
+                "DEPTH_REFUSED", "staleAutomatic", depth.identityStaleAutomatic, loggedStaleAutomatic,
+                "Depth images older than their camera image (STALE_AUTOMATIC, counted only)",
+            )
+        }
+        if (frameFailures > loggedFrameFailures) {
+            loggedFrameFailures = NativeSessionLogEmitter.reportGrowth(
+                "NATIVE_HANDLER_ERROR", "ingestFrame", frameFailures, loggedFrameFailures,
+                "Grid ingest frame processing failed", mapOf("channel" to "frame", "method" to "ingestFrame"),
+            )
+        }
+    }
+
+    /** Allocates only the line. */
+    private fun logDepthTelemetry(log: (String) -> Unit, frameNs: Long, tracking: Int) {
         val image = depth.latestImageNs
         val ageMs = if (image == Long.MIN_VALUE) "none" else ((frameNs - image) / 1_000_000L).toString()
         log(

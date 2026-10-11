@@ -1,5 +1,6 @@
 package com.uhg0.ar_flutter_plugin_2.gridrenderer
 
+import com.uhg0.ar_flutter_plugin_2.sessionlog.NativeSessionLogEmitter
 import android.graphics.SurfaceTexture
 import android.opengl.EGL14
 import android.opengl.EGLConfig
@@ -142,6 +143,9 @@ internal class VisibilityGridRendererHost(
         } catch (e: RuntimeException) {
             cameraUpdateFailures++
             if (Integer.bitCount(cameraUpdateFailures) == 1) Log.w(TAG, "grid camera update failed ($cameraUpdateFailures)", e)
+            NativeSessionLogEmitter.failure(
+                "NATIVE_HANDLER_ERROR", "gridCameraUpdate/${e.javaClass.simpleName}", "Grid renderer camera update failed",
+            ) { mapOf("channel" to "frame", "method" to "gridCameraUpdate", "cameraUpdateFailures" to cameraUpdateFailures, "error" to (e.message ?: "")) }
             return
         }
         renderThread?.requestRender()
@@ -441,6 +445,9 @@ internal class VisibilityGridRendererHost(
         if (thread != null && thread !== renderThread) return
         renderThreadFailures++
         rendererFailed = true
+        NativeSessionLogEmitter.failure("RENDERER_FAILED", "renderThread", "Grid render thread stopped") {
+            mapOf("renderThreadFailures" to renderThreadFailures)
+        }
         // Drop anything queued after the teardown; the next working thread starts from a reset.
         core.scheduler.requireReset()
     }

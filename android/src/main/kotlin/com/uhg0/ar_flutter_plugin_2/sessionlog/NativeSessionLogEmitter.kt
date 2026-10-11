@@ -40,6 +40,12 @@ object NativeSessionLogEmitter {
     private var memoryCallbacks: ComponentCallbacks2? = null
     private var thermalListener: PowerManager.OnThermalStatusChangedListener? = null
 
+    /** Opens or closes the record window; a change forgets pending records. */
+    internal fun setActive(on: Boolean) {
+        if (on != active) buffer.reset()
+        active = on
+    }
+
     fun occur(code: String, variant: String? = null): Boolean = active && buffer.occur(code, variant)
 
     fun record(
@@ -52,6 +58,41 @@ object NativeSessionLogEmitter {
     ) {
         if (!active) return
         buffer.record(code, message, data, variant, level, admitted)
+    }
+
+    /**
+     * One occurrence of a rare native failure ([code], [variant]): a full
+     * record when the flood policy admits it, otherwise counted. [data] is
+     * built only for an admitted record.
+     */
+    inline fun failure(code: String, variant: String?, message: String, data: () -> Map<String, Any?>) {
+        if (!active) return
+        if (buffer.occur(code, variant, message)) {
+            buffer.record(code, message, data(), variant, admitted = true)
+        }
+    }
+
+    /**
+     * Growth of a native counter since [reported] (checked by the caller at
+     * most once a second): records the new and the total count under
+     * [code]/[variant] when the flood policy admits it. Returns [total], the
+     * caller's next baseline, so growth is reported once, also while no log
+     * is open.
+     */
+    fun reportGrowth(
+        code: String,
+        variant: String?,
+        total: Long,
+        reported: Long,
+        message: String,
+        data: Map<String, Any?> = emptyMap(),
+    ): Long {
+        if (total > reported) {
+            failure(code, variant, message) {
+                mapOf("new" to total - reported, "total" to total) + data
+            }
+        }
+        return total
     }
 
     /** A shutter refused by the exposure motion gate, with its scalar diagnostics. */
@@ -79,6 +120,11 @@ object NativeSessionLogEmitter {
                 "minPositiveCameraGapNs" to d.minimumPositiveCameraGapNs,
                 "duplicatePairs" to d.duplicatePairCount,
                 "timestampReadMismatches" to d.timestampReadMismatchCount,
+                // Why the motion history broke before this decision (per gate)
+                // and how many same-image pose revisions replaced a sample.
+                "historyBreak" to d.breakCounts.entries.joinToString(",") { "${it.key.name}:${it.value}" }
+                    .ifEmpty { "none" },
+                "sameImageRevisions" to d.sameImageRevisionCount,
                 "refusingPairGapMs" to refusing?.let { it.cameraGapNs / 1e6 },
                 "refusingPairTracking" to refusing?.newer?.trackingState,
             ),
@@ -120,9 +166,7 @@ object NativeSessionLogEmitter {
                             mapOf("status" to "ok", "arVersion" to arCoreVersion(appContext)),
                         )
                         "setActive" -> {
-                            val on = call.argument<Boolean>("active") == true
-                            if (on != active) buffer.reset()
-                            active = on
+                            setActive(call.argument<Boolean>("active") == true)
                             result.success(mapOf("status" to "ok"))
                         }
                         "drain" -> result.success(mapOf("status" to "ok", "records" to buffer.drain()))

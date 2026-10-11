@@ -1,5 +1,6 @@
 package com.uhg0.ar_flutter_plugin_2.markerdetection
 
+import com.uhg0.ar_flutter_plugin_2.sessionlog.NativeSessionLogEmitter
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.SystemClock
@@ -82,6 +83,9 @@ internal class MarkerFrameTap(
         } catch (e: RuntimeException) {
             detectionFailures++
             if (Integer.bitCount(detectionFailures) == 1) Log.w(TAG, "marker detection failed ($detectionFailures)", e)
+            NativeSessionLogEmitter.failure(
+                "MARKER_DETECTION_FAILED", "detect/${e.javaClass.simpleName}", "Marker detection failed",
+            ) { mapOf("stage" to "detect", "detectionFailures" to detectionFailures, "error" to (e.message ?: "")) }
         } finally {
             busy.set(false)
         }
@@ -139,6 +143,9 @@ internal class MarkerFrameTap(
             lastStartNs = now
             captureFailures++
             if (Integer.bitCount(captureFailures) == 1) Log.w(TAG, "marker image capture failed ($captureFailures)", e)
+            NativeSessionLogEmitter.failure(
+                "MARKER_DETECTION_FAILED", "capture/${e.javaClass.simpleName}", "Marker image capture failed",
+            ) { mapOf("stage" to "capture", "captureFailures" to captureFailures, "error" to (e.message ?: "")) }
         } finally {
             if (!handedOff) busy.set(false)
         }

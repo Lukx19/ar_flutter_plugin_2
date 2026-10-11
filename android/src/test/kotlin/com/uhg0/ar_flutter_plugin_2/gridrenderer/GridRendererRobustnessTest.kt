@@ -6,6 +6,9 @@ import com.google.ar.core.exceptions.FatalException
 import com.uhg0.ar_flutter_plugin_2.visibilitycontract.RendererDeltaLayout
 import com.uhg0.ar_flutter_plugin_2.visibilitycontract.VisibilityGridChannels
 import io.flutter.plugin.common.BinaryMessenger
+import com.uhg0.ar_flutter_plugin_2.sessionlog.data
+import com.uhg0.ar_flutter_plugin_2.sessionlog.full
+import com.uhg0.ar_flutter_plugin_2.sessionlog.withNativeSessionLog
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
@@ -93,6 +96,13 @@ class GridRendererRobustnessTest {
         heap.beginFrame()
         heapCore.frame()
         for (buffer in GridBuffer.values()) assertArrayEquals(reference.buffer(buffer), heap.buffer(buffer))
+    }
+
+    @Test
+    fun `a failed render thread is a RENDERER_FAILED session log record`() {
+        val host = VisibilityGridRendererHost()
+        val records = withNativeSessionLog { host.onRenderThreadFailed(null) }
+        assertEquals(1L, records.full("RENDERER_FAILED").single().data["renderThreadFailures"].toString().toLong())
     }
 
     @Test
