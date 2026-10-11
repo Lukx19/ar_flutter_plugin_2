@@ -265,10 +265,16 @@ internal class VisibilityDepthObservation(
     val payloadBytes: Int,
     internal val packedSamples: BorrowedDepthSamples? = null,
     val confidenceTimestampNs: Long = 0L,
+    val cameraImageTimestampNs: Long = 0L,
     val sourceImageWidth: Int = frame.intrinsics.imageWidth,
     val sourceImageHeight: Int = frame.intrinsics.imageHeight,
     val acquisitionMode: DepthAcquisitionMode = DepthAcquisitionMode.PROVIDED,
+    rawProjectionQualified: Boolean = false,
+    val projectionProvenance: DepthProjectionProvenance = if (rawProjectionQualified)
+        DepthProjectionProvenance.SDK_RAW_CURRENT_FRAME else DepthProjectionProvenance.UNQUALIFIED,
 ) : AutoCloseable {
+    val rawProjectionQualified: Boolean get() =
+        projectionProvenance == DepthProjectionProvenance.SDK_RAW_CURRENT_FRAME
     internal var debugOfferLedger: DepthOfferTimingLedger? = null
     internal var debugOfferId: Long = 0
     internal fun finishDebugOffer(state: Int) { debugOfferLedger?.finish(debugOfferId, state) }
@@ -316,9 +322,13 @@ internal class VisibilityDepthObservation(
             packedSamples: BorrowedDepthSamples,
             sourceRejectedSamples: Int,
             confidenceTimestampNs: Long = 0L,
+            cameraImageTimestampNs: Long = 0L,
             sourceImageWidth: Int = frame.intrinsics.imageWidth,
             sourceImageHeight: Int = frame.intrinsics.imageHeight,
             acquisitionMode: DepthAcquisitionMode = DepthAcquisitionMode.PROVIDED,
+            rawProjectionQualified: Boolean = false,
+            projectionProvenance: DepthProjectionProvenance = if (rawProjectionQualified)
+                DepthProjectionProvenance.SDK_RAW_CURRENT_FRAME else DepthProjectionProvenance.UNQUALIFIED,
         ): VisibilityDepthObservation {
             require(packedSamples.count > 0)
             return VisibilityDepthObservation(
@@ -329,9 +339,11 @@ internal class VisibilityDepthObservation(
                 payloadBytes = DEPTH_FIXED_BYTES + packedSamples.count * DEPTH_SAMPLE_BYTES,
                 packedSamples = packedSamples,
                 confidenceTimestampNs = confidenceTimestampNs,
+                cameraImageTimestampNs = cameraImageTimestampNs,
                 sourceImageWidth = sourceImageWidth,
                 sourceImageHeight = sourceImageHeight,
                 acquisitionMode = acquisitionMode,
+                projectionProvenance = projectionProvenance,
             )
         }
     }

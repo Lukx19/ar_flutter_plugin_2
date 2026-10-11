@@ -129,7 +129,7 @@ class DepthAcquisitionFundingTest {
             assertEquals(0L, runtime.snapshot().residentPayloadBytes)
             assertSame(owner, fixture.binding.currentObservationOwnership())
             assertEquals(1_024L, fixture.integration.portableOwnerMemoryReceipt().depthAcquisitionIdentityReservationBytes)
-            assertEquals(736L, DepthAcquisitionPortableMemory.MAXIMUM_INCREMENT_BYTES)
+            assertEquals(1_024L, DepthAcquisitionPortableMemory.MAXIMUM_INCREMENT_BYTES)
             assertTrue(DepthAcquisitionPortableMemory.MAXIMUM_INCREMENT_BYTES <= DepthAcquisitionPortableMemory.RESERVATION_BYTES)
         } finally { runtime.close(); fixture.close() }
     }
@@ -143,7 +143,7 @@ class DepthAcquisitionFundingTest {
                 VisibilityCameraIntrinsics(4, 3, 2.0, 2.0, 1.5, 1.0), VisibilityDepthCapability.RAW_DEPTH),
             samples = samples, sourceRejectedSamples = 0,
             payloadBytes = VisibilityDepthObservation.DEPTH_FIXED_BYTES + VisibilityDepthObservation.DEPTH_SAMPLE_BYTES,
-            acquisitionMode = DepthAcquisitionMode.RAW)
+            acquisitionMode = DepthAcquisitionMode.RAW, cameraImageTimestampNs = 200, rawProjectionQualified = true)
     }
 
     private class Fixture(rendererOwnerBytes: Long = 0L, rendererRebuildFailures: Int = 0) : AutoCloseable {
