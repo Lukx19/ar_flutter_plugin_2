@@ -201,6 +201,22 @@ if (!['true', 'false'].any { it.equalsIgnoreCase(normalizedDenseCurrentFrameExpe
 }
 def denseCurrentFrameExperiment = normalizedDenseCurrentFrameExperiment.toBoolean()
 
+// Marker detector (visibility grid markers): the native library and the
+// OpenCV prefab are built only with CAPTURE3D_GRID_MARKERS=true (or
+// -PgridMarkers=true for standalone plugin builds), so the default APK does
+// not grow.
+def gridMarkersProperty = project.findProperty('gridMarkers')?.toString()
+def gridMarkersPrefix = 'CAPTURE3D_GRID_MARKERS='
+def gridMarkersValues = encodedDartDefines?.split(',')?.collect { encoded ->
+    try { new String(java.util.Base64.decoder.decode(encoded), java.nio.charset.StandardCharsets.UTF_8) }
+    catch (Exception ignored) { null }
+}?.findAll { it?.startsWith(gridMarkersPrefix) }
+if (gridMarkersValues?.size() > 1) throw new GradleException('Duplicate CAPTURE3D_GRID_MARKERS define')
+if (gridMarkersProperty == null && gridMarkersValues?.size() == 1) {
+    gridMarkersProperty = gridMarkersValues[0].substring(gridMarkersPrefix.length())
+}
+def gridMarkers = (gridMarkersProperty ?: 'false').trim().equalsIgnoreCase('true')
+
 android {
     compileSdk 37
     ndkVersion "28.2.13676358" // Match the host app native toolchain.
@@ -231,7 +247,13 @@ android {
         targetSdkVersion 34
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         externalNativeBuild {
-            cmake { cppFlags "-std=c++17" }
+            cmake {
+                cppFlags "-std=c++17"
+                if (gridMarkers) {
+                    // OpenCV's prefab package links against the shared C++ runtime.
+                    arguments '-DCAPTURE3D_GRID_MARKERS=ON', '-DANDROID_STL=c++_shared'
+                }
+            }
         }
     }
 
@@ -249,6 +271,7 @@ android {
 
     buildFeatures {
         compose true
+        prefab gridMarkers
         // The renderer selection experiment is selected at APK build time so
         // matched tablet control/candidate runs can use the same source.
         buildConfig true
@@ -285,6 +308,10 @@ dependencies {
     testImplementation 'org.openjdk.jol:jol-core:0.17'
     androidTestImplementation 'androidx.test:runner:1.6.2'
     androidTestImplementation 'androidx.test.ext:junit:1.2.1'
+    if (gridMarkers) {
+        // Marker detector: OpenCV 4.12.0 (Apache-2.0) native libraries and headers via prefab.
+        implementation 'org.opencv:opencv:4.12.0'
+    }
 }
 
 // T5's receipt lock is execution provenance, not a bundled fixture. Forward

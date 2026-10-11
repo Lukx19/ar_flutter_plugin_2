@@ -17,6 +17,7 @@ import android.view.ViewGroup
 import com.google.ar.core.Frame
 import com.google.ar.core.TrackingState
 import com.uhg0.ar_flutter_plugin_2.visibilitycontract.VisibilityGridRendererHostSeam
+import com.uhg0.ar_flutter_plugin_2.gridrenderer.quest.QuestLineOverlay
 import java.nio.ByteBuffer
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.locks.ReentrantLock
@@ -69,6 +70,9 @@ internal class VisibilityGridRendererHost(
     @Volatile private var enabled = false
     @Volatile private var textureView: TextureView? = null
     @Volatile private var renderThread: GridRenderThread? = null
+
+    /** Guided-capture quests; drawn only after their first overlay message. */
+    val questOverlay = QuestLineOverlay().also { core.lineOverlays.addIfAbsent(it) }
 
     /** [scene] is the SceneView host view; the overlay is added to its parent above it. [engine] is unused by the GLES path. */
     override fun attach(engine: Any, scene: Any) {

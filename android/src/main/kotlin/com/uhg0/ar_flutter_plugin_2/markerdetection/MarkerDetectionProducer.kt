@@ -67,9 +67,25 @@ internal class MarkerDetectionProducer(
         MarkerDetectorNative.nativeSetQuality(handle, minSidePx, minSharpness, maxViewingAngleDeg)
     }
 
+    @Volatile private var requestedMarkerSize = Double.NaN
+    private var appliedMarkerSize = Double.NaN
+
+    /**
+     * Asks for [markerSizeMetres] from any thread; the worker applies it
+     * before its next detection (the native handle is single-threaded).
+     */
+    fun requestMarkerSize(markerSizeMetres: Double) {
+        requestedMarkerSize = markerSizeMetres
+    }
+
     /** Detects markers on [frame] and sends one message; returns the count or an error. */
     fun produce(frame: GreyFrame, nowNs: Long = System.nanoTime()): Int {
         if (!available) return MarkerDetectorNative.STATUS_UNAVAILABLE
+        val size = requestedMarkerSize
+        if (size > 0.0 && size != appliedMarkerSize) {
+            configure(size)
+            appliedMarkerSize = size
+        }
         val h = frame.header
         // Intrinsics scaled to the grey image when it differs from the
         // dimensions the intrinsics were reported for (pixel centres at

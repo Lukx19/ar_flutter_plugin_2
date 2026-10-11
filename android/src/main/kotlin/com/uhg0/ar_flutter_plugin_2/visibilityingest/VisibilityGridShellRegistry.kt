@@ -6,6 +6,8 @@ import android.os.SystemClock
 import com.google.ar.core.Config
 import com.google.ar.core.Frame
 import com.uhg0.ar_flutter_plugin_2.BuildConfig
+import com.uhg0.ar_flutter_plugin_2.gridrenderer.GridRendererChannels
+import com.uhg0.ar_flutter_plugin_2.markerdetection.GridMarkerShellTaps
 import com.uhg0.ar_flutter_plugin_2.visibilitycontract.VisibilityGridChannels
 import com.uhg0.ar_flutter_plugin_2.visibilitycontract.VisibilityGridFrameTap
 import io.flutter.plugin.common.BasicMessageChannel
@@ -46,6 +48,7 @@ internal object VisibilityGridShellRegistry {
     @Volatile private var taps: Array<VisibilityGridFrameTap> = emptyArray()
     @Volatile private var photoListeners: Array<DurablePhotoListener> = emptyArray()
     private var viewOwner: Any? = null
+    private var markers: GridMarkerShellTaps? = null
 
     private val elapsedRealtime = IngestClock { SystemClock.elapsedRealtimeNanos() }
 
@@ -70,8 +73,15 @@ internal object VisibilityGridShellRegistry {
                 .apply { setMessageHandler { message, reply -> created.pull.onPull(message, reply) } }
             controlChannel = BasicMessageChannel(messenger, VisibilityGridChannels.CONTROL, BinaryCodec.INSTANCE_DIRECT)
                 .apply { setMessageHandler(GridShellControlHandler { shell }) }
-            // Render and display channels (`VisibilityGridChannels.RENDER`, `.DISPLAY`) are
-            // registered here by the grid renderer (GridRendererChannels) at integration.
+            // Render and display channels of the instanced grid renderer; inert until the
+            // grid isolate or the UI isolate sends a message.
+            GridRendererChannels.register(messenger)
+            markers = GridMarkerShellTaps.create(
+                ingestSink = { ingestSink },
+                shell = { shell },
+            )?.also { taps ->
+                if (taps.frameTap !in extraTaps) extraTaps += taps.frameTap
+            }
             idleTimer = Thread({
                 val pull = created.pull
                 while (pull.awaitIdleDeadline()) pull.tick()
@@ -92,6 +102,12 @@ internal object VisibilityGridShellRegistry {
     private fun unregisterLocked() {
         ingestChannel?.setMessageHandler(null)
         controlChannel?.setMessageHandler(null)
+        messenger?.let(GridRendererChannels::unregister)
+        markers?.let { taps ->
+            extraTaps -= taps.frameTap
+            taps.close()
+        }
+        markers = null
         ingestChannel = null
         controlChannel = null
         shell?.close()
