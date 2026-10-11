@@ -4,6 +4,8 @@ import android.content.Context
 import android.os.SystemClock
 import android.util.Log
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.VisibilityCaptureSafePredicate
+import com.uhg0.ar_flutter_plugin_2.visibilityingest.DurableTerminalTap
+import com.uhg0.ar_flutter_plugin_2.visibilityingest.VisibilityGridShellRegistry
 import java.io.InputStream
 import java.util.concurrent.Executor
 import java.util.concurrent.ExecutorService
@@ -875,6 +877,7 @@ internal class NativeCaptureAdapterV2(
     private val nowMs: () -> Long = System::currentTimeMillis,
     private val events: (NativeCaptureEventV2) -> Unit = {},
     private val retainAssessedOriginals: Boolean = false,
+    private val durableTerminalTap: DurableTerminalTap = VisibilityGridShellRegistry.durableTerminalTap,
 ) : AutoCloseable {
     private fun captureLatencyLog(stage: String, attemptId: String) {
         Log.i(
@@ -900,6 +903,7 @@ internal class NativeCaptureAdapterV2(
         var inFlightStoreComponents: SharedCameraComponentSetV2? = null,
         var tenSecondPresented: Boolean = false,
         var terminalClaimed: Boolean = false,
+        var exposureTimestampNs: Long = 0L,
     )
     private val lock = ReentrantLock(true)
     private val storeIdle = lock.newCondition()
@@ -1280,6 +1284,7 @@ internal class NativeCaptureAdapterV2(
     private fun processComponentsLocked(value: Work, components: SharedCameraComponentSetV2) {
         check(lock.isHeldByCurrentThread)
         countExposureLocked(value)
+        value.exposureTimestampNs = components.exposureTimestampNanoseconds
         val kinds = components.streams.map { it.kind }
         if (kinds.size != kinds.toSet().size || kinds.toSet() != value.request.accepted.profile.requiredComponents) {
             closeStreams(components.streams)
@@ -1499,6 +1504,12 @@ internal class NativeCaptureAdapterV2(
             ),
         )
         emitLocked(NativeCaptureEventV2(NativeCaptureEventKindV2.HEALTH, resources = snapshot()))
+        // Visibility grid photo saved seam: once per claimed durable terminal, outside the lock.
+        if (value != null && terminal.kind == CaptureTerminalKind.COMMITTED_PICTURE) {
+            val exposureNs = if (value.exposureTimestampNs > 0L) value.exposureTimestampNs
+                else value.request.exposureTimestampNanoseconds
+            externalCallLocked { runCatching { durableTerminalTap.onDurableTerminal(value.request, terminal, exposureNs) } }
+        }
         if (!lifecycleDrain) scheduler.running?.let { next -> work[next.identity]?.let(::startLocked) }
     }
 

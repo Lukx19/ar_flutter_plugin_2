@@ -10,6 +10,7 @@ import io.flutter.plugin.common.MethodChannel
 import com.uhg0.ar_flutter_plugin_2.capabilities.MethodChannelARCameraCapabilities
 import com.uhg0.ar_flutter_plugin_2.capture.NativeCapturePreviewOwnerV2
 import com.uhg0.ar_flutter_plugin_2.capture.CapturePreviewWorkQueue
+import com.uhg0.ar_flutter_plugin_2.visibilityingest.VisibilityGridShellRegistry
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommittedBaselineAuthority
 
 class ArFlutterPlugin: FlutterPlugin, ActivityAware {
@@ -23,6 +24,8 @@ class ArFlutterPlugin: FlutterPlugin, ActivityAware {
 
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         flutterPluginBinding = binding
+        // Visibility grid ingest and control channels; inert until the grid flag path starts the shell.
+        VisibilityGridShellRegistry.register(binding.binaryMessenger, binding.applicationContext)
         val previewOwner = NativeCapturePreviewOwnerV2(binding.applicationContext.filesDir)
         val previewWorker = CapturePreviewWorkQueue {
             android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
@@ -76,6 +79,7 @@ class ArFlutterPlugin: FlutterPlugin, ActivityAware {
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+        VisibilityGridShellRegistry.unregister(binding.binaryMessenger)
         nativeCapturePreviewChannel?.setMethodCallHandler(null)
         nativeCapturePreviewChannel = null
         nativeCapturePreviewWorker?.close()

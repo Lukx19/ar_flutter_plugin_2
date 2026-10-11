@@ -46,6 +46,7 @@ import com.uhg0.ar_flutter_plugin_2.visibilitygrid.NativeRendererProjection
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.RendererPublicationTimingScope
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.CanonicalRuntimeResources
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.AndroidVisibilityGridRuntime
+import com.uhg0.ar_flutter_plugin_2.visibilityingest.VisibilityGridShellRegistry
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.CanonicalReadyHintOwner
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.ArCoreVisibilityObservationSource
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.DepthObservationPauseGate
@@ -435,6 +436,11 @@ internal class ArView(
         objectChannel.setMethodCallHandler(::onObjectCall)
         anchorChannel.setMethodCallHandler(::onAnchorCall)
         captureChannel.setMethodCallHandler(::onCaptureCall)
+        // Visibility grid shell seam: inert until the grid flag path starts it.
+        VisibilityGridShellRegistry.attachView(
+            this,
+            sceneHost::visibilityGridDepthMode,
+        ) { runCatching { captureSession.getCameraIntrinsics() }.getOrNull() }
     }
 
     override fun getView(): View = root
@@ -453,6 +459,7 @@ internal class ArView(
         }
         if (disposed) return
         disposed = true
+        VisibilityGridShellRegistry.detachView(this)
         canonicalReadyHints?.close()
         sceneHost.blockFutureResumes()
         resumeCoordinator.dispose(ResumeTerminal.CANCELLED, ::disposeAfterResumeDrained)
@@ -1267,6 +1274,8 @@ internal class ArView(
         attribution.measureNativeFrame(NativeFrameSpan.POSE) {
             captureSession.buildPoseUpdate(frame)?.let(poseBatchDispatcher::offer)
         }
+        // Visibility grid frame tap seam: returns at once unless the grid shell was started.
+        VisibilityGridShellRegistry.onArFrame(session, frame)
         attribution.measureNativeFrame(NativeFrameSpan.AR_PLANES) {
             frame.getUpdatedTrackables(Plane::class.java).forEach { plane ->
                 if (detectedPlanes.add(plane)) {
