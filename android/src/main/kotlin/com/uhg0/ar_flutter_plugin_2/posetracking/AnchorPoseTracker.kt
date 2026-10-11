@@ -197,6 +197,9 @@ internal class AnchorPoseTracker(
     initialCapacity: Int = DEFAULT_CAPACITY,
 ) {
     companion object {
+        /** [handleQuery] result of a malformed query (or a closed tracker). */
+        const val QUERY_MALFORMED = -1
+
         const val DEFAULT_CAPACITY = 2048
         const val QUEUE_CAPACITY = 128
         const val ACTIVE_TIMEOUT_NS = 10_000_000_000L
@@ -619,8 +622,8 @@ internal class AnchorPoseTracker(
 
     /**
      * Applies [query] and writes the reply (ingest header of kind 7 plus
-     * payload) to [out] from index 0. Returns the reply length, or -1 for a
-     * malformed query (counted; nothing written).
+     * payload) to [out] from index 0. Returns the reply length, or
+     * [QUERY_MALFORMED] for a malformed query (counted; nothing written).
      */
     fun handleQuery(query: ByteBuffer?, out: ByteBuffer, sequence: Int): Int {
         val nowNs = clock.nowNs()
@@ -628,7 +631,7 @@ internal class AnchorPoseTracker(
         synchronized(lock) {
             if (at < 0 || closed) {
                 if (at < 0) malformedQueries++
-                return -1
+                return QUERY_MALFORMED
             }
             val q = query!!
             val flags = q.getShort(at + PoseQueryLayout.FLAGS_OFFSET).toInt() and 0xffff

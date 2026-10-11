@@ -11,7 +11,7 @@
     <application>
         <!-- Shares exported session logs (sessionlog/NativeSessionLogEmitter). -->
         <provider
-            android:name="androidx.core.content.FileProvider"
+            android:name="com.uhg0.ar_flutter_plugin_2.sessionlog.SessionLogFileProvider"
             android:authorities="${applicationId}.sessionlog.fileprovider"
             android:exported="false"
             android:grantUriPermissions="true">

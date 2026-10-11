@@ -4,6 +4,10 @@ import com.google.ar.core.Config
 import com.uhg0.ar_flutter_plugin_2.visibilitycontract.IngestMessageLayout
 import com.uhg0.ar_flutter_plugin_2.visibilitycontract.NativeStatusCode
 import com.uhg0.ar_flutter_plugin_2.visibilitycontract.ShellControlLayout
+import com.uhg0.ar_flutter_plugin_2.sessionlog.NativeSessionLogEmitter
+import com.uhg0.ar_flutter_plugin_2.sessionlog.data
+import com.uhg0.ar_flutter_plugin_2.sessionlog.full
+import com.uhg0.ar_flutter_plugin_2.sessionlog.withNativeSessionLog
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -127,6 +131,29 @@ class IngestShellPipelineTest {
         assertEquals(1, b.getInt(IngestMessageLayout.DROPPED))
         assertEquals(IngestMessageLayout.POSE_MATCH_INTERPOLATED, b.get(IngestMessageLayout.POSE_MATCH).toInt())
         assertEquals(1_203_000_000L, b.getLong(IngestMessageLayout.FRAME_TIMESTAMP_NS))
+    }
+
+    @Test
+    fun `depth drops before a session log opens are not reported as new in it`() {
+        NativeSessionLogEmitter.setActive(false)
+        start(0, IngestShellConfig.DEPTH_PREFERRED)
+        shell.depthMode = { Config.DepthMode.RAW_DEPTH_ONLY }
+        warmFrames()
+        frame.goldenDepth()
+        frame.depthImageNs = 600 * ms
+        frameAt(1_170_000_000L)
+        assertEquals(1L, shell.depthProducer.staleDropped)
+        val records = withNativeSessionLog {
+            clock.now += 1_000 * ms
+            frame.depthImageNs = 700 * ms // 600 ms older than its frame
+            frameAt(1_300_000_000L)
+            assertEquals(2L, shell.depthProducer.staleDropped)
+            clock.now += 1_000 * ms
+            frameAt(1_333_000_000L)
+        }
+        val stale = records.full("DEPTH_STALE").first()
+        assertEquals(2L, stale.data["total"])
+        assertEquals("only the drop while the log was open is new", 1L, stale.data["new"])
     }
 
     @Test

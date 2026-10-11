@@ -147,9 +147,9 @@ class PhotoSavedEmitterTest {
         val photoOnly = 1 shl IngestMessageLayout.KIND_PHOTO_SAVED
         shell.pull.onPull(pullRequest(photoOnly), reply)
         assertEquals(IngestMessageLayout.KIND_PHOTO_SAVED, reply.kind())
-        reply.last = null
+        // A photo-only pull is a drain pull: it is answered idle at once when nothing is queued.
         shell.pull.onPull(pullRequest(photoOnly), reply)
-        assertNull("the duplicate was not queued", reply.last)
+        assertEquals("the duplicate was not queued", IngestMessageLayout.KIND_IDLE, reply.kind())
     }
 
     @Test

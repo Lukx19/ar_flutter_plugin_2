@@ -94,6 +94,11 @@ internal class GlStagedBufferTarget(
         val grown = copyName[0]
         GLES30.glBindBuffer(GLES30.GL_COPY_WRITE_BUFFER, grown)
         GLES30.glBufferData(GLES30.GL_COPY_WRITE_BUFFER, bytes, null, GLES30.GL_DYNAMIC_DRAW)
+        GlFailureCheck.allocationFailure(GLES30.glGetError(), bytes)?.let { failure ->
+            GLES30.glBindBuffer(GLES30.GL_COPY_WRITE_BUFFER, 0)
+            GLES30.glDeleteBuffers(1, copyName, 0)
+            throw IllegalStateException(failure)
+        }
         val old = names[i]
         if (old != 0) {
             GLES30.glBindBuffer(GLES30.GL_COPY_READ_BUFFER, old)

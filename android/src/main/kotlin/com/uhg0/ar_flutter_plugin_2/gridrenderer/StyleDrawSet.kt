@@ -177,9 +177,8 @@ internal class StyleDrawSet(
             GridDisplayCodes.BASE_SPLATS -> drawSplats(mode, view)
             GridDisplayCodes.BASE_VOXELS -> drawVoxels(mode, view)
         }
-        if (mode.baseLayer != GridDisplayCodes.BASE_NONE) {
-            // Far bricks have no surface slices; their summaries stand in (level of detail).
-            drawBoxes(view, GridBuffer.BRICKS, wire = false, residencyFilter = RESIDENCY_SUMMARY_ONLY, alpha = 0.22f)
+        forEachLevelOfDetailPass(mode) { buffer, residency, alpha ->
+            drawBoxes(view, buffer, wire = false, residencyFilter = residency, alpha = alpha)
         }
         if (mode.has(GridDisplayCodes.OVERLAY_SPIKE_BALLS)) drawSpikes(mode, view)
         if (mode.has(GridDisplayCodes.OVERLAY_BRICKS)) {
@@ -574,7 +573,26 @@ internal class StyleDrawSet(
         private const val SPIKE_BALL_PX = 10f
         private const val SPLAT_DEPTH_OFFSET_FACTOR = 1f
         private const val SPLAT_DEPTH_OFFSET_UNITS = 4f
-        private const val RESIDENCY_SUMMARY_ONLY = 2
+
+        /** Residency bytes of brick and region summaries (`renderer_delta.dart`). */
+        internal const val RESIDENCY_ON_DISK = 1
+        internal const val RESIDENCY_SUMMARY_ONLY = 2
+        internal const val SUMMARY_BRICK_ALPHA = 0.22f
+        internal const val PAGED_REGION_ALPHA = 0.15f
+
+        /**
+         * The level-of-detail boxes under a base layer, as (buffer, residency
+         * filter, alpha): far bricks have no surface slices, so their
+         * summaries stand in; paged-out regions have neither surfaces nor
+         * brick summaries in RAM, so their region summaries stand in (the
+         * region overlay, when on, already draws every region).
+         */
+        internal inline fun forEachLevelOfDetailPass(mode: GridDisplayState, pass: (GridBuffer, Int, Float) -> Unit) {
+            if (mode.baseLayer == GridDisplayCodes.BASE_NONE) return
+            pass(GridBuffer.BRICKS, RESIDENCY_SUMMARY_ONLY, SUMMARY_BRICK_ALPHA)
+            if (!mode.has(GridDisplayCodes.OVERLAY_REGIONS)) pass(GridBuffer.REGIONS, RESIDENCY_ON_DISK, PAGED_REGION_ALPHA)
+        }
+
         const val BRICK_METRES = GridBrickKey.BRICK_METRES
         private val BRICK_RADIUS = BRICK_METRES * sqrt(3f) * 0.5f
 
