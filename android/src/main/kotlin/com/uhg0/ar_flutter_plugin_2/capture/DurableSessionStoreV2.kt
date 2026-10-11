@@ -1,5 +1,6 @@
 package com.uhg0.ar_flutter_plugin_2.capture
 
+import com.uhg0.ar_flutter_plugin_2.storeversion.NativeStoreFormatVersions
 import java.io.File
 import java.io.InputStream
 import java.io.ByteArrayOutputStream
@@ -957,7 +958,7 @@ class DurableSessionStoreV2(
     private fun reservationOwner(identity: CaptureAttemptIdentity) = "capture:${safe(identity.lifecycleCut.sessionId)}:${safe(identity.commitId)}"
     private fun receiptHash(requestHash: String, rootHash: String) = sha256("$requestHash|$rootHash".toByteArray()).hex()
     private fun rootRecord(request: CaptureCommitRequest, requestHash: String, revision: Long, staged: List<Staged>, prior: RootPointer?) = buildString {
-        append("schema=${if (request.qualityAssessment == null) 5 else 6}\nrevision=$revision\nrequest=$requestHash\nprevious=${prior?.rootHash ?: "-"}\nsecondPrevious=${prior?.previousHash ?: "-"}\n")
+        append("schema=${if (request.qualityAssessment == null) NativeStoreFormatVersions.PHOTO_ROOT_SCHEMA_PLAIN else NativeStoreFormatVersions.PHOTO_ROOT_SCHEMA_ASSESSED}\nrevision=$revision\nrequest=$requestHash\nprevious=${prior?.rootHash ?: "-"}\nsecondPrevious=${prior?.previousHash ?: "-"}\n")
         staged.sortedBy { it.kind.ordinal }.forEach { append("component=${it.kind}:${it.descriptor.byteLength}:${it.descriptor.sha256.hex()}\n") }
         request.qualityAssessment?.let { assessment ->
             append("exposureTimestampNanoseconds=${request.exposureTimestampNanoseconds}\n")
@@ -1012,7 +1013,7 @@ class DurableSessionStoreV2(
     private fun validRootHash(location: File, hash: String, revision: Long, depth: Int): Boolean {
         if (depth > 2) return false
         val values = readRootMetadata(location, hash) ?: return false
-        if (values.schema !in setOf("5", "6") || values.revision != revision || !CaptureRootMetadataReaderV2.isHash(values.request)) return false
+        if (values.schema !in NativeStoreFormatVersions.PHOTO_ROOT_SCHEMAS_READABLE || values.revision != revision || !CaptureRootMetadataReaderV2.isHash(values.request)) return false
         val previous = values.previous
         val second = values.secondPrevious
         if (depth == 2) return true

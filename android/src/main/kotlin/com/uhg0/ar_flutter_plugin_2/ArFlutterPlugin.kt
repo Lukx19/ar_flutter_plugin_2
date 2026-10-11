@@ -10,6 +10,7 @@ import io.flutter.plugin.common.MethodChannel
 import com.uhg0.ar_flutter_plugin_2.capabilities.MethodChannelARCameraCapabilities
 import com.uhg0.ar_flutter_plugin_2.capture.NativeCapturePreviewOwnerV2
 import com.uhg0.ar_flutter_plugin_2.capture.CapturePreviewWorkQueue
+import com.uhg0.ar_flutter_plugin_2.storeversion.NativeStoreFormatVersions
 import com.uhg0.ar_flutter_plugin_2.visibilityingest.VisibilityGridShellRegistry
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommittedBaselineAuthority
 
@@ -19,6 +20,7 @@ class ArFlutterPlugin: FlutterPlugin, ActivityAware {
     private var flutterPluginBinding: FlutterPlugin.FlutterPluginBinding? = null
     private var cameraCapabilities: MethodChannelARCameraCapabilities? = null
     private var nativeCapturePreviewChannel: MethodChannel? = null
+    private var storeFormatVersionsChannel: MethodChannel? = null
     private var nativeCapturePreviewWorker: CapturePreviewWorkQueue? = null
     private val CommittedBaselineAuthority = CommittedBaselineAuthority()
 
@@ -26,6 +28,7 @@ class ArFlutterPlugin: FlutterPlugin, ActivityAware {
         flutterPluginBinding = binding
         // Visibility grid ingest and control channels; inert until the grid flag path starts the shell.
         VisibilityGridShellRegistry.register(binding.binaryMessenger, binding.applicationContext)
+        storeFormatVersionsChannel = NativeStoreFormatVersions.register(binding.binaryMessenger)
         val previewOwner = NativeCapturePreviewOwnerV2(binding.applicationContext.filesDir)
         val previewWorker = CapturePreviewWorkQueue {
             android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
@@ -81,6 +84,8 @@ class ArFlutterPlugin: FlutterPlugin, ActivityAware {
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         VisibilityGridShellRegistry.unregister(binding.binaryMessenger)
         nativeCapturePreviewChannel?.setMethodCallHandler(null)
+        storeFormatVersionsChannel?.setMethodCallHandler(null)
+        storeFormatVersionsChannel = null
         nativeCapturePreviewChannel = null
         nativeCapturePreviewWorker?.close()
         nativeCapturePreviewWorker = null
