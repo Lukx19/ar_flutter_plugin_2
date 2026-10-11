@@ -2,7 +2,12 @@ package com.uhg0.ar_flutter_plugin_2
 
 import android.app.Activity
 import android.content.Context
+import android.content.pm.ApplicationInfo
+import android.util.Log
 import com.google.ar.core.Session
+import com.uhg0.ar_flutter_plugin_2.playback.ArPlaybackSelection
+import com.uhg0.ar_flutter_plugin_2.playback.ArPlaybackSelector
+import com.uhg0.ar_flutter_plugin_2.playback.TAG as PLAYBACK_TAG
 import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.StandardMessageCodec
 import io.flutter.plugin.platform.PlatformView
@@ -23,8 +28,17 @@ class ArViewFactory(
             creationParams?.get("enableHighResCapture") as? Boolean ?: false
         val retainAssessedOriginals = selectRetainAssessedOriginals(creationParams)
         val requestedRearCameraId = creationParams?.get("rearCameraId") as? String
-        val initialSessionFeatures =
+        val requestedSessionFeatures =
             if (enableHighResCapture) setOf(Session.Feature.SHARED_CAMERA) else emptySet()
+        val playback = ArPlaybackSelector.select(
+            creationParams = creationParams,
+            isDebuggable = context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0,
+            externalFilesDir = context.getExternalFilesDir(null),
+        )
+        ArPlaybackSelector.describe(playback)?.let { line ->
+            if (playback is ArPlaybackSelection.Refused) Log.e(PLAYBACK_TAG, line) else Log.i(PLAYBACK_TAG, line)
+        }
+        val initialSessionFeatures = ArPlaybackSelector.sessionFeatures(requestedSessionFeatures, playback)
 
         return ArView(
             context = context,
@@ -36,6 +50,7 @@ class ArViewFactory(
             requestedRearCameraId = requestedRearCameraId,
             retainAssessedOriginals = retainAssessedOriginals,
             CommittedBaselineAuthority = CommittedBaselineAuthority,
+            playbackConfig = (playback as? ArPlaybackSelection.Enabled)?.config,
         )
     }
 }

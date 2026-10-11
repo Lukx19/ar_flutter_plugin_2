@@ -70,6 +70,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import com.uhg0.ar_flutter_plugin_2.capture.CaptureLifecycleDrain
+import com.uhg0.ar_flutter_plugin_2.playback.ArPlaybackConfig
+import com.uhg0.ar_flutter_plugin_2.playback.ArPlaybackController
 import java.util.concurrent.Executor
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -86,7 +88,10 @@ internal class ArView(
     requestedRearCameraId: String? = null,
     private val retainAssessedOriginals: Boolean = false,
     CommittedBaselineAuthority: CommittedBaselineAuthority,
+    /** Debug/profile ARCore playback test mode; null runs the camera. */
+    playbackConfig: ArPlaybackConfig? = null,
 ) : PlatformView {
+    private val playback = playbackConfig?.let(::ArPlaybackController)
     private val root = FrameLayout(context)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val sessionChannel = MethodChannel(messenger, "arsession_$id")
@@ -143,6 +148,10 @@ internal class ArView(
         onCoverageRendererMounted = ::setCoverageRendererMounted,
         onTouch = ::onTouch,
         onNodeGesture = ::onNodeGesture,
+        playback = playback,
+        onPlaybackViewRestart = { event ->
+            root.post { if (!disposed) sessionChannel.invokeMethod("onArPlaybackFinished", event) }
+        },
     )
     private val visibilityRendererProjection =
         NativeRendererProjection(
@@ -304,6 +313,7 @@ internal class ArView(
         },
         captureSafetySignalV2 = captureSafetySignalV2,
         retainAssessedOriginals = retainAssessedOriginals,
+        playbackActive = playback != null,
     )
 
     private val visibilitySmallSceneDebugChannel = VisibilitySmallSceneDebugChannel(
@@ -952,8 +962,11 @@ internal class ArView(
         try {
             when (call.method) {
                 "initializeCapture" -> {
-                    val config = call.arguments as? Map<String, Any?>
+                    val requested = call.arguments as? Map<String, Any?>
                         ?: throw IllegalArgumentException("Capture configuration is required")
+                    // Playback has no Shared Camera: capture starts without
+                    // Camera2 and shutter photos use the CPU camera image.
+                    val config = if (playback != null) requested + ("enableHighResCapture" to false) else requested
                     scope.launch {
                         try {
                             captureSession.initialize(config)
@@ -1277,6 +1290,7 @@ internal class ArView(
         attribution.measureNativeFrame(NativeFrameSpan.POSE) {
             captureSession.buildPoseUpdate(frame)?.let(poseBatchDispatcher::offer)
         }
+        if (playback != null) captureSession.onPlaybackFrame(frame)
         // Visibility grid frame tap seam: returns at once unless the grid shell was started.
         VisibilityGridShellRegistry.onArFrame(session, frame)
         attribution.measureNativeFrame(NativeFrameSpan.AR_PLANES) {

@@ -54,6 +54,8 @@ internal class ArCaptureSession(
     private val captureSafetySignalV2: CaptureSafetySignalV2 = CaptureSafetySignalV2(),
     private val retainAssessedOriginals: Boolean = false,
     private val isOwnerClosing: () -> Boolean = { false },
+    /** Debug/profile ARCore playback: shutter exposures use the CPU camera image. */
+    private val playbackActive: Boolean = false,
 ) {
     companion object {
         private const val TrackingPoseReadyTimeoutMs = 2_000L
@@ -128,6 +130,24 @@ internal class ArCaptureSession(
         },
         retainAssessedOriginals = retainAssessedOriginals,
     )
+    private val playbackExposureExecutor = if (playbackActive) {
+        java.util.concurrent.Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, "capture3d-playback-exposure").apply { isDaemon = true }
+        }
+    } else null
+    private val playbackExposure = playbackExposureExecutor?.let { executor ->
+        PlaybackCameraImageExposureV2(
+            refusal = { qualifier ->
+                when {
+                    !captureSafetySignalV2.isCaptureSafeFor(qualifier) -> "lifecycle-cut-before-exposure"
+                    !poseDataExtractor.isExposureMotionStable() -> "motion-skipped"
+                    else -> null
+                }
+            },
+            executor = executor,
+            encodeJpeg = { image -> nv21ToJpeg(image, config?.jpegQuality ?: 95) },
+        ).also(nativeCaptureBindingV2::attachPlaybackExposure)
+    }
     private var sharedImageCacheManager: ImageCacheManager? = null
     private var highResCaptureEnabled = false
     private var poseStreamEnabled = true
@@ -1121,6 +1141,19 @@ internal class ArCaptureSession(
 
     fun finishSharedCameraPause() = sharedCameraManager?.onArSessionPaused()
 
+    /** Frame thread; serves a pending playback-mode exposure from this frame's CPU image. */
+    fun onPlaybackFrame(frame: Frame) {
+        playbackExposure?.onFrame {
+            try {
+                frame.acquireCameraImage().use { image ->
+                    PlaybackCameraImage(yuv420888ToNv21(image), image.width, image.height, image.timestamp)
+                }
+            } catch (_: NotYetAvailableException) {
+                null
+            }
+        }
+    }
+
     fun onSessionResumed() {
         sharedCameraManager?.onArSessionResumed()
     }
@@ -1174,6 +1207,8 @@ internal class ArCaptureSession(
     }
 
     private fun disposeMainResources() {
+        playbackExposure?.close()
+        playbackExposureExecutor?.shutdown()
         poseDataExtractor.clearDebugFixture()
         syntheticCaptureCompletion.clear()
         byteCache.dispose()
@@ -1425,6 +1460,16 @@ internal class ArCaptureSession(
             }
 
             else -> error("Unsupported camera image format: ${image.format}")
+        }
+    }
+
+    private fun nv21ToJpeg(image: PlaybackCameraImage, jpegQuality: Int): ByteArray {
+        val yuvImage = YuvImage(image.nv21, ImageFormat.NV21, image.width, image.height, null)
+        return ByteArrayOutputStream().use { output ->
+            check(yuvImage.compressToJpeg(Rect(0, 0, image.width, image.height), jpegQuality, output)) {
+                "Failed to encode JPEG"
+            }
+            output.toByteArray()
         }
     }
 

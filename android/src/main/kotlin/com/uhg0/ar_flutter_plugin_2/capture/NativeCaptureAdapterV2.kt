@@ -565,6 +565,8 @@ internal class NativeCaptureBindingV2(
     private val budget get() = rootResources.budget
     private val store get() = rootResources.store
     private var sharedCamera: SharedCameraManager? = null
+    /** Debug/profile ARCore playback: CPU-image exposures when no shared camera is attached. */
+    private var playbackExposure: SharedCameraExposurePortV2? = null
     private var closed = false
     private var resourcesClosed = false
     private val durableRootCloserDelegate = lazy {
@@ -578,16 +580,24 @@ internal class NativeCaptureBindingV2(
     private val durableRootCloser by durableRootCloserDelegate
     private val bridge = SharedCameraManagerExposurePortV2(
         request = { qualifier, required, callback ->
-            val manager = synchronized(lock) { if (closed) null else sharedCamera }
-            manager?.requestAttemptQualifiedExposureV2(qualifier, required, callback) ?: false
+            val (manager, playback) = synchronized(lock) {
+                if (closed) null to null else sharedCamera to playbackExposure
+            }
+            manager?.requestAttemptQualifiedExposureV2(qualifier, required, callback)
+                ?: playback?.requestExposure(qualifier, required, callback)
+                ?: false
         },
         cancel = { qualifier ->
-            val manager = synchronized(lock) { sharedCamera }
-            manager?.cancelAttemptQualifiedExposureV2(qualifier)
+            val (manager, playback) = synchronized(lock) { sharedCamera to playbackExposure }
+            if (manager != null) manager.cancelAttemptQualifiedExposureV2(qualifier) else playback?.cancelExposure(qualifier)
         },
         fundedRequest = { qualifier, required, callback, maximumWorkingBytes ->
-            val manager = synchronized(lock) { if (closed) null else sharedCamera }
-            manager?.requestAttemptQualifiedExposureV2(qualifier, required, callback, maximumWorkingBytes) ?: false
+            val (manager, playback) = synchronized(lock) {
+                if (closed) null to null else sharedCamera to playbackExposure
+            }
+            manager?.requestAttemptQualifiedExposureV2(qualifier, required, callback, maximumWorkingBytes)
+                ?: playback?.requestExposure(qualifier, required, callback, maximumWorkingBytes)
+                ?: false
         },
     )
     private val recoveryDelegate = lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
@@ -628,6 +638,11 @@ internal class NativeCaptureBindingV2(
         // cache/correlation APIs.
     }
     fun detachSharedCamera(manager: SharedCameraManager) = synchronized(lock) { if (sharedCamera === manager) sharedCamera = null }
+    /** Playback test mode only; an attached shared camera keeps precedence. */
+    fun attachPlaybackExposure(port: SharedCameraExposurePortV2?) = synchronized(lock) {
+        if (closed) throw NativeCaptureBindingClosedV2()
+        playbackExposure = port
+    }
     fun admit(request: CaptureCommitRequest): CaptureReceipt {
         val (activeAdapter, activeRecovery) = durableOwnersForOperation()
         activeRecovery.requireAdmissionReady()
