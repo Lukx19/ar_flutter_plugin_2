@@ -73,6 +73,7 @@ internal class VisibilityGridRendererHost(
 
     /** Guided-capture quests; drawn only after their first overlay message. */
     val questOverlay = QuestLineOverlay().also { core.lineOverlays.addIfAbsent(it) }
+    val poseFrustumStyle = PoseFrustumStyle().also { core.lineOverlays.addIfAbsent(it) }
 
     /** [scene] is the SceneView host view; the overlay is added to its parent above it. [engine] is unused by the GLES path. */
     override fun attach(engine: Any, scene: Any) {
