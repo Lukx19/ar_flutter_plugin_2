@@ -2,6 +2,7 @@ package com.uhg0.ar_flutter_plugin_2.capture
 
 import com.uhg0.ar_flutter_plugin_2.diagnostics.NativeFrameAttributionOwner
 import com.uhg0.ar_flutter_plugin_2.BuildConfig
+import com.uhg0.ar_flutter_plugin_2.sessionlog.NativeSessionLogEmitter
 import android.graphics.ImageFormat
 import android.graphics.Bitmap
 import android.graphics.Rect
@@ -303,26 +304,31 @@ internal class ArCaptureSession(
                         when {
                             !captureSafetySignalV2.isCaptureSafeFor(qualifier) -> "lifecycle-cut-before-exposure"
                             !poseDataExtractor.isExposureMotionStable(onDecision =
-                                if (BuildConfig.DEBUG && motionDiagnosticCount!!.getAndIncrement() < 16) {
+                                if (NativeSessionLogEmitter.active ||
+                                    (BuildConfig.DEBUG && motionDiagnosticCount!!.get() < 16)) {
                                     { diagnostic ->
-                                        Log.i("CaptureLatency", "[DEBUG-capture-motion] stage=native_shutter " +
-                                            "attemptId=${qualifier.identity.attemptId} gate=${diagnostic.gate} " +
-                                            "decisionNs=${diagnostic.decisionNs} motionClock=androidCameraTimestamp " +
-                                            "ageMs=${diagnostic.ageMs} dwellMs=${diagnostic.stableDwellMs} " +
-                                            "historyMs=${diagnostic.historySpanMs} pairs=${diagnostic.pairCount} " +
-                                            "latestMps=${diagnostic.latestTranslationSpeedMps} " +
-                                            "latestDegps=${diagnostic.latestAngularSpeedDegreesPerSecond} " +
-                                            "medianMps=${diagnostic.medianTranslationSpeedMps} " +
-                                            "medianDegps=${diagnostic.medianAngularSpeedDegreesPerSecond} " +
-                                            "maxMps=${diagnostic.maximumTranslationSpeedMps} " +
-                                            "maxDegps=${diagnostic.maximumAngularSpeedDegreesPerSecond} " +
-                                            "minPositiveCameraGapNs=${diagnostic.minimumPositiveCameraGapNs} " +
-                                            "duplicatePairs=${diagnostic.duplicatePairCount} " +
-                                            "timestampReadMismatches=${diagnostic.timestampReadMismatchCount} " +
-                                            "breaks=${diagnostic.breakCounts.entries.joinToString(",") { "${it.key}:${it.value}" }.ifEmpty { "none" }} " +
-                                            "sameImageRevisions=${diagnostic.sameImageRevisionCount} " +
-                                            formatMotionPairDiagnostic("refusing", diagnostic.firstRefusingPair) + " " +
-                                            formatMotionPairDiagnostic("maxAngular", diagnostic.maximumAngularPair))
+                                        NativeSessionLogEmitter.recordMotionRefusal(
+                                            qualifier.identity.attemptId.toString(), diagnostic)
+                                        if (BuildConfig.DEBUG && motionDiagnosticCount!!.getAndIncrement() < 16) {
+                                            Log.i("CaptureLatency", "[DEBUG-capture-motion] stage=native_shutter " +
+                                                "attemptId=${qualifier.identity.attemptId} gate=${diagnostic.gate} " +
+                                                "decisionNs=${diagnostic.decisionNs} motionClock=androidCameraTimestamp " +
+                                                "ageMs=${diagnostic.ageMs} dwellMs=${diagnostic.stableDwellMs} " +
+                                                "historyMs=${diagnostic.historySpanMs} pairs=${diagnostic.pairCount} " +
+                                                "latestMps=${diagnostic.latestTranslationSpeedMps} " +
+                                                "latestDegps=${diagnostic.latestAngularSpeedDegreesPerSecond} " +
+                                                "medianMps=${diagnostic.medianTranslationSpeedMps} " +
+                                                "medianDegps=${diagnostic.medianAngularSpeedDegreesPerSecond} " +
+                                                "maxMps=${diagnostic.maximumTranslationSpeedMps} " +
+                                                "maxDegps=${diagnostic.maximumAngularSpeedDegreesPerSecond} " +
+                                                "minPositiveCameraGapNs=${diagnostic.minimumPositiveCameraGapNs} " +
+                                                "duplicatePairs=${diagnostic.duplicatePairCount} " +
+                                                "timestampReadMismatches=${diagnostic.timestampReadMismatchCount} " +
+                                                "breaks=${diagnostic.breakCounts.entries.joinToString(",") { "${it.key}:${it.value}" }.ifEmpty { "none" }} " +
+                                                "sameImageRevisions=${diagnostic.sameImageRevisionCount} " +
+                                                formatMotionPairDiagnostic("refusing", diagnostic.firstRefusingPair) + " " +
+                                                formatMotionPairDiagnostic("maxAngular", diagnostic.maximumAngularPair))
+                                        }
                                     }
                                 } else null) -> "motion-skipped"
                             else -> null

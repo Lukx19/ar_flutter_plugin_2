@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Session log exports shared through the share sheet (NativeSessionLogEmitter). -->
+<paths>
+    <cache-path name="session_log_export" path="session_log_export/" />
+</paths>

@@ -9,7 +9,16 @@
     <uses-feature android:glEsVersion="0x00030000" android:required="true" />
 
     <application>
-
+        <!-- Shares exported session logs (sessionlog/NativeSessionLogEmitter). -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.sessionlog.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/session_log_export_paths" />
+        </provider>
     </application>
 
 </manifest> 
