@@ -163,7 +163,7 @@ class IngestShellPipelineTest {
 
     @Test
     fun `control channel starts the shell from the start golden and rejects malformed messages`() {
-        val handler = GridShellControlHandler { shell }
+        val handler = GridShellControlHandler(shell = { shell }, markerDetectorAvailable = { true })
         val start = ByteBuffer.wrap(golden("shell_control_start.bin"))
         assertEquals(NativeStatusCode.OK, handler.handle(start))
         assertTrue(shell.started)

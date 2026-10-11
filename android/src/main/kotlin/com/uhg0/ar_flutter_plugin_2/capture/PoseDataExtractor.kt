@@ -59,6 +59,11 @@ class PoseDataExtractor(private val capacity: Int = 120) {
     private val frameIngress = PoseSlot()
     private val previousIngress = PoseSlot()
     private val motionImage = PoseSlot()
+
+    // Motion history breaks per gate and same-image pose revisions applied
+    // in place (lock); scalars for the bounded shutter diagnostic.
+    private val motionBreakCounts = LongArray(ExposureMotionGate.values().size)
+    private var sameImageRevisionCount = 0L
     private var hasMotionIngress = false
     private var motionObservedWatermarkNs = 0L
     private var motionImageWatermarkNs = 0L
@@ -210,13 +215,13 @@ class PoseDataExtractor(private val capacity: Int = 120) {
             input.rotation.sumOf { it.toDouble() * it.toDouble() } <= 0.0 -> ExposureMotionGate.INVALID_QUATERNION
             imageNs <= 0L || imageNs < motionImageWatermarkNs -> ExposureMotionGate.INVALID_GAP
             hasMotionIngress && motionIngressGate == null && !sameMotionOwner(previousIngress, input) -> ExposureMotionGate.INVALID_GAP
-            sameImageRevision -> ExposureMotionGate.INVALID_POSE
             latest != null && motionIngressGate == null &&
                 (input.observedTimestampNs - latest.observedTimestampNs > 750_000_000L ||
                     imageNs - motionImageWatermarkNs > 1_000_000_000L) -> ExposureMotionGate.INVALID_GAP
             else -> null
         }
         if (failure != null) {
+            motionBreakCounts[failure.ordinal]++
             // Retain only the interrupting pair for a truthful bounded diagnostic.
             motionPoses.clear()
             if (hasMotionIngress) motionPoses.append().copyFrom(if (sameImageRevision) motionImage else previousIngress)
@@ -229,6 +234,20 @@ class PoseDataExtractor(private val capacity: Int = 120) {
             motionPoses.append().copyFrom(input)
             motionIngressGate = null
             motionFreshnessObservedNs = input.observedTimestampNs
+        } else if (sameImageRevision && motionIngressGate == null && latest != null &&
+            latest.androidCameraTimestampNs == imageNs
+        ) {
+            // ARCore delivers "same image, revised pose" frames: the latest
+            // sample of this image takes the revised pose, so the speed gate
+            // judges the revision against the neighbouring images instead of
+            // the revision breaking the history (a stationary device received
+            // one per image and never reached the dwell). Its image and
+            // observation times stay those of the original delivery.
+            latest.position[0] = input.position[0]; latest.position[1] = input.position[1]
+            latest.position[2] = input.position[2]
+            for (k in 0..3) latest.rotation[k] = input.rotation[k]
+            for (k in 0..15) latest.transform[k] = input.transform[k]
+            sameImageRevisionCount++
         }
         // A repeated identity never updates the original image pose or its
         // observation time, including repeated revisions after invalidation.
@@ -293,6 +312,10 @@ class PoseDataExtractor(private val capacity: Int = 120) {
         val minimumPositiveCameraGapNs: Long?,
         val duplicatePairCount: Int,
         val timestampReadMismatchCount: Long,
+        /** History breaks per gate since the extractor started (non-zero gates only). */
+        val breakCounts: Map<ExposureMotionGate, Long> = emptyMap(),
+        /** Same-image pose revisions applied to the latest sample. */
+        val sameImageRevisionCount: Long = 0L,
     )
 
     // Called only when a bounded debug decision listener is installed. History
@@ -433,7 +456,10 @@ class PoseDataExtractor(private val capacity: Int = 120) {
             median(translations), median(rotations), translations.maxOrNull(), rotations.maxOrNull(),
             firstRefusingPairIndex?.let(::pairDiagnostic),
             maximumAngularPairIndex?.takeIf { it != firstRefusingPairIndex }?.let(::pairDiagnostic),
-            minimumPositiveCameraGap, duplicatePairCount, debugTimestampReadMismatchCount)
+            minimumPositiveCameraGap, duplicatePairCount, debugTimestampReadMismatchCount,
+            ExposureMotionGate.values().filter { motionBreakCounts[it.ordinal] > 0L }
+                .associateWith { motionBreakCounts[it.ordinal] },
+            sameImageRevisionCount)
     }
 
     /** Non-blocking shutter check over existing authoritative observed poses.

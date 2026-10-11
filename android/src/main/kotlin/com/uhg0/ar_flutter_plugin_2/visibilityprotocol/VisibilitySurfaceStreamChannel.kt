@@ -2,6 +2,7 @@ package com.uhg0.ar_flutter_plugin_2.visibilityprotocol
 
 import android.os.Handler
 import android.os.Looper
+import com.uhg0.ar_flutter_plugin_2.channelstatus.ChannelStatusReply
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.A_IDENTITY_MATRIX_IDENTITY
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommittedBaselineV1
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.ControlLifecycle
@@ -406,7 +407,7 @@ class VisibilitySurfaceStreamChannel(
         reply: BasicMessageChannel.Reply<ByteBuffer>,
     ) {
             if (message == null) {
-                reply.reply(null)
+                reply.reply(ChannelStatusReply.of(STATUS_NO_REQUEST))
                 return
             }
             val correlatedDebugAttempt = debugTransportProbe?.let { probe ->
@@ -418,7 +419,7 @@ class VisibilitySurfaceStreamChannel(
             if (bytes == null) {
                 telemetry.rejected()
                 if (correlatedDebugAttempt) debugTransportProbe.rejected()
-                reply.reply(null)
+                reply.reply(ChannelStatusReply.of(STATUS_REJECTED))
                 return
             }
             telemetry.submitted(bytes.size)
@@ -426,7 +427,7 @@ class VisibilitySurfaceStreamChannel(
             if (!outstandingInvocation.compareAndSet(false, true)) {
                 telemetry.rejected()
                 if (!queuedBackpressure.compareAndSet(false, true)) {
-                    reply.reply(null)
+                    reply.reply(ChannelStatusReply.of(STATUS_BACKPRESSURE))
                     return
                 }
                 telemetry.queued()
@@ -435,7 +436,7 @@ class VisibilitySurfaceStreamChannel(
                 } catch (_: RejectedExecutionException) {
                     queuedBackpressure.set(false)
                     outstandingInvocation.set(false)
-                    reply.reply(null)
+                    reply.reply(ChannelStatusReply.of(STATUS_BACKPRESSURE))
                 }
                 return
             }
@@ -1292,7 +1293,7 @@ class VisibilitySurfaceStreamChannel(
             }
             reply.reply(encoded.replyBuffer())
         } catch (_: Exception) {
-            reply.reply(null)
+            reply.reply(ChannelStatusReply.of(STATUS_WORKER_FAILED))
         } finally {
             queuedBackpressure.set(false)
             outstandingInvocation.set(false)
@@ -1344,22 +1345,33 @@ class VisibilitySurfaceStreamChannel(
         )
     }
 
-    private companion object {
-        const val MALFORMED_PACKET_ERROR_ID = 6
-        const val STREAM_BACKPRESSURE_ERROR_ID = 8
-        const val REPLAY_CONFLICT_ERROR_ID = 30
-        const val STALE_SEQUENCE_ERROR_ID = 31
-        const val SEQUENCE_GAP_ERROR_ID = 32
-        const val TRANSACTION_STATE_ERROR_ID = 34
-        const val STREAM_ROLLOVER_REQUIRED_ERROR_ID = 35
-        const val RESYNC_REQUEST_FLAG = 1 shl 2
-        const val TERMINAL_DRAIN_REQUEST_FLAG = 1 shl 5
-        const val STREAM_BINDING_ABANDONED_ERROR_ID = 142
-        const val WORKER_BINDING_LOST_ERROR_ID = 144
+    companion object {
+        /**
+         * 4-byte little-endian status replies for requests that get no stream
+         * response packet (a response packet is at least 4 KiB). Never null:
+         * the coverage worker sends from a background isolate, whose
+         * `BackgroundIsolateBinaryMessenger` cannot deliver a null reply.
+         */
+        const val STATUS_NO_REQUEST = 1
+        const val STATUS_REJECTED = 2
+        const val STATUS_BACKPRESSURE = 3
+        const val STATUS_WORKER_FAILED = 4
+
+        private const val MALFORMED_PACKET_ERROR_ID = 6
+        private const val STREAM_BACKPRESSURE_ERROR_ID = 8
+        private const val REPLAY_CONFLICT_ERROR_ID = 30
+        private const val STALE_SEQUENCE_ERROR_ID = 31
+        private const val SEQUENCE_GAP_ERROR_ID = 32
+        private const val TRANSACTION_STATE_ERROR_ID = 34
+        private const val STREAM_ROLLOVER_REQUIRED_ERROR_ID = 35
+        private const val RESYNC_REQUEST_FLAG = 1 shl 2
+        private const val TERMINAL_DRAIN_REQUEST_FLAG = 1 shl 5
+        private const val STREAM_BINDING_ABANDONED_ERROR_ID = 142
+        private const val WORKER_BINDING_LOST_ERROR_ID = 144
         // Match the production Dart exchange deadline. A 1,200-sample
         // admission reached 14.3 s under emulator capture/renderer contention;
         // the former 2 s watchdog abandoned otherwise valid exact ACK work.
-        const val DEFAULT_WORKER_TIMEOUT_MILLIS = 20_000L
-        const val MAIN_HANDLER_CLEAR_TIMEOUT_MILLIS = 2_000L
+        private const val DEFAULT_WORKER_TIMEOUT_MILLIS = 20_000L
+        private const val MAIN_HANDLER_CLEAR_TIMEOUT_MILLIS = 2_000L
     }
 }

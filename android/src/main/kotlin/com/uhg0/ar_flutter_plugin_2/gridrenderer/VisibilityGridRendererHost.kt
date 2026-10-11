@@ -72,6 +72,19 @@ internal class VisibilityGridRendererHost(
     @Volatile private var textureView: TextureView? = null
     @Volatile private var renderThread: GridRenderThread? = null
 
+    /**
+     * True after the render thread stopped on an EGL setup failure or a throw
+     * while rendering; render messages are then refused with
+     * [DeltaIntake.RENDERER_FAILED] (no queueing, no resynchronisation loop)
+     * until a new overlay surface starts a working thread.
+     */
+    @Volatile var rendererFailed = false
+        private set
+
+    /** Render threads that stopped on a failure. */
+    @Volatile var renderThreadFailures = 0
+        private set
+
     /** Guided-capture quests; drawn only after their first overlay message. */
     val questOverlay = QuestLineOverlay().also { core.lineOverlays.addIfAbsent(it) }
     val poseFrustumStyle = PoseFrustumStyle().also { core.lineOverlays.addIfAbsent(it) }
@@ -113,15 +126,30 @@ internal class VisibilityGridRendererHost(
         if (overlays.remove(layer)) renderThread?.detachLayer(layer)
     }
 
-    /** One call per ARCore frame from the SceneView frame callback; cheap when disabled. */
+    /** Camera reads that threw in [onArFrame] (frame thread). */
+    @Volatile var cameraUpdateFailures = 0
+        private set
+
+    /**
+     * One call per ARCore frame from the SceneView frame callback; cheap when
+     * disabled. Never throws: a failing camera read is counted and the
+     * previous camera matrices stay in use.
+     */
     fun onArFrame(frame: Frame) {
         if (!enabled) return
-        camera.update(frame)
+        try {
+            camera.update(frame)
+        } catch (e: RuntimeException) {
+            cameraUpdateFailures++
+            if (Integer.bitCount(cameraUpdateFailures) == 1) Log.w(TAG, "grid camera update failed ($cameraUpdateFailures)", e)
+            return
+        }
         renderThread?.requestRender()
     }
 
     fun onRenderMessage(message: ByteBuffer, offset: Int, length: Int): DeltaIntake {
         enable()
+        if (rendererFailed) return DeltaIntake.RENDERER_FAILED
         val result = core.onRenderMessage(message, offset, length)
         renderThread?.requestRender()
         return result
@@ -185,7 +213,10 @@ internal class VisibilityGridRendererHost(
     private inner class SurfaceListener : TextureView.SurfaceTextureListener {
         override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
             stopThread()
-            renderThread = GridRenderThread(surface, width, height).also { it.start() }
+            val thread = GridRenderThread(surface, width, height)
+            renderThread = thread
+            onRenderThreadStarted()
+            thread.start()
         }
 
         override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {
@@ -285,16 +316,22 @@ internal class VisibilityGridRendererHost(
         }
 
         override fun run() {
+            var failed = true
             try {
-                if (!initEgl()) return
+                if (!initEgl()) {
+                    Log.e(TAG, "grid renderer stopped: EGL setup failed (0x${Integer.toHexString(EGL14.eglGetError())})")
+                    return
+                }
                 target.create()
                 draws = StyleDrawSet(core.store, target)
                 draws.create()
                 loop()
+                failed = false
             } catch (t: Throwable) {
                 Log.e(TAG, "grid renderer stopped: ${t.message}", t)
             } finally {
                 teardown()
+                if (failed) onRenderThreadFailed(this)
             }
         }
 
@@ -388,6 +425,24 @@ internal class VisibilityGridRendererHost(
             core.store.forgetGpuBuffers()
             core.scheduler.requireReset()
         }
+    }
+
+    /** A new render thread starts on a new overlay surface: render messages are accepted again. */
+    internal fun onRenderThreadStarted() {
+        rendererFailed = false
+    }
+
+    /**
+     * Render thread [thread] stopped on a failure (after its teardown required a
+     * reset). Ignored for a thread already replaced or stopped by the host;
+     * null stands for the current thread (host tests).
+     */
+    internal fun onRenderThreadFailed(thread: Any?) {
+        if (thread != null && thread !== renderThread) return
+        renderThreadFailures++
+        rendererFailed = true
+        // Drop anything queued after the teardown; the next working thread starts from a reset.
+        core.scheduler.requireReset()
     }
 
     companion object {

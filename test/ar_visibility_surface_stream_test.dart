@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'package:ar_flutter_plugin_2/managers/ar_visibility_surface_stream.dart';
 import 'package:flutter/services.dart';
@@ -22,6 +23,34 @@ void main() {
     expect(
       await stream.exchange(Uint8List.fromList(<int>[0x7f])),
       orderedEquals(<int>[0x11, 0x22, 0x33]),
+    );
+
+    await stream.dispose();
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockDecodedMessageHandler<ByteData?>(channel, null);
+  });
+
+  test('a 4-byte status reply is reported as no response', () async {
+    final channel = BasicMessageChannel<ByteData?>(
+      'visibility_surface_stream_status_test',
+      const BinaryCodec(),
+    );
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockDecodedMessageHandler<ByteData?>(
+      channel,
+      (_) async => ByteData(4)..setUint32(0, 3, Endian.little),
+    );
+
+    final stream = ARVisibilitySurfaceStream(0, channel: channel);
+    await expectLater(
+      stream.exchange(Uint8List.fromList(<int>[0x7f])),
+      throwsA(
+        isA<StateError>().having(
+          (e) => e.message,
+          'message',
+          contains('no response (status 3)'),
+        ),
+      ),
     );
 
     await stream.dispose();

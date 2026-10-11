@@ -99,6 +99,27 @@ class PhotoSavedEmitterTest {
     }
 
     @Test
+    fun `a photo exposed before a group restart carries the epoch of its exposure`() {
+        shell.start(IngestShellConfig(0, 0, 0, 0, 0f, 3))
+        stillCamera()
+        framesAroundExposure() // epoch 3 around the exposure
+        // The group switches (control restart to epoch 4) before the photo becomes durable.
+        shell.start(IngestShellConfig(0, 0, 0, 0, 0f, 4))
+        val frame = FakeFrame()
+        frame.timestampNs = 5_200_000_000L
+        frame.androidCameraTimestampNs = exposureNs + 200_000_000L
+        shell.process(frame, SESSION)
+        val photos = mutableListOf<DurablePhoto>()
+        shell.durablePhotoListeners = arrayOf(DurablePhotoListener { photos += it })
+        shell.onDurableTerminal(request(attemptId, CaptureLane.AUTOMATIC), committed(attemptId, captureId), exposureNs)
+        assertEquals(3, photos.single().event[PhotoSavedLayout.GROUP_EPOCH_LOW].toInt())
+        // A photo exposed after the switch carries the new epoch.
+        val laterId = (32 until 64).joinToString("") { "%02x".format(it) }
+        shell.onDurableTerminal(request(attemptId, CaptureLane.AUTOMATIC), committed(attemptId, laterId), exposureNs + 250_000_000L)
+        assertEquals(4, photos.last().event[PhotoSavedLayout.GROUP_EPOCH_LOW].toInt())
+    }
+
+    @Test
     fun `missing frame pose falls back to the OpenCV shutter pose converted to OpenGL`() {
         shell.start(IngestShellConfig(0, 0, 0, 0, 0f, 3))
         stillCamera()

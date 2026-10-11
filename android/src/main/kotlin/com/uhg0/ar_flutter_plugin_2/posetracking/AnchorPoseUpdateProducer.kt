@@ -5,6 +5,7 @@ import com.google.ar.core.Frame
 import com.google.ar.core.Pose
 import com.google.ar.core.Session
 import com.google.ar.core.TrackingState
+import com.uhg0.ar_flutter_plugin_2.channelstatus.ChannelStatusReply
 import com.uhg0.ar_flutter_plugin_2.visibilitycontract.PhotoSavedLayout
 import com.uhg0.ar_flutter_plugin_2.visibilityingest.DurablePhoto
 import com.uhg0.ar_flutter_plugin_2.visibilityingest.DurablePhotoListener
@@ -25,7 +26,8 @@ import java.nio.ByteOrder
  * header (latest AR frame timestamp, camera tracking and pose, the query's
  * group epoch, tracker diagnostics in the reserved words) followed by up to
  * 1024 dirty anchor updates and up to 64 creation records. A malformed query
- * is answered with null and counted.
+ * (or a query after close) is counted and answered with the 4-byte status
+ * [STATUS_QUERY_REFUSED], never with null.
  *
  * Anchors are created for the query's keyframe requests and, while tracking
  * is active, for every durable photo ([onPhotoDurable]). Tracking stays active
@@ -70,14 +72,24 @@ internal class AnchorPoseUpdateProducer(
             .apply { setMessageHandler { message, reply -> onQuery(message, reply) } }
     }
 
-    /** Channel handler; runs on the background task queue. */
+    /**
+     * Channel handler; runs on the background task queue. Never replies null
+     * (the grid isolate sends through `BackgroundIsolateBinaryMessenger`): a
+     * refused query (malformed, or the tracker is closed) or a failing tracker
+     * is answered with the 4-byte status [STATUS_QUERY_REFUSED]; a pose reply is
+     * always longer than 4 bytes (ingest header first).
+     */
     fun onQuery(message: ByteBuffer?, reply: BasicMessageChannel.Reply<ByteBuffer>) {
         synchronized(replyLock) {
             val next = 1 - lastReply
             val b = replies[next]
-            val length = tracker.handleQuery(message, b, sequence)
+            val length = try {
+                tracker.handleQuery(message, b, sequence)
+            } catch (_: RuntimeException) {
+                -1
+            }
             if (length < 0) {
-                reply.reply(null)
+                reply.reply(ChannelStatusReply.of(STATUS_QUERY_REFUSED))
                 return
             }
             lastReply = next
@@ -142,15 +154,18 @@ internal class AnchorPoseUpdateProducer(
     /** Diagnostic counters (allocates; not for the frame path). */
     fun snapshot(): Map<String, Any> = tracker.snapshot()
 
-    private companion object {
-        fun direct(): ByteBuffer =
+    companion object {
+        /** 4-byte status reply of a refused query (malformed, or the tracker is closed). */
+        const val STATUS_QUERY_REFUSED = 2
+
+        private fun direct(): ByteBuffer =
             ByteBuffer.allocateDirect(AnchorPoseUpdateLayout.MAX_MESSAGE_BYTES).order(ByteOrder.LITTLE_ENDIAN)
 
-        fun readInt(b: ByteArray, o: Int): Int =
+        private fun readInt(b: ByteArray, o: Int): Int =
             (b[o].toInt() and 0xff) or ((b[o + 1].toInt() and 0xff) shl 8) or
                 ((b[o + 2].toInt() and 0xff) shl 16) or ((b[o + 3].toInt() and 0xff) shl 24)
 
-        fun readLong(b: ByteArray, o: Int): Long =
+        private fun readLong(b: ByteArray, o: Int): Long =
             (readInt(b, o).toLong() and 0xffffffffL) or (readInt(b, o + 4).toLong() shl 32)
     }
 }

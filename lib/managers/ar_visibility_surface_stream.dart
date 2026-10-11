@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/services.dart';
@@ -78,10 +79,8 @@ final class ARVisibilitySurfaceStream {
 
   Future<Uint8List> _exchangeNow(Uint8List request) async {
     final response = await _channel.send(ByteData.sublistView(request));
-    if (response == null) {
-      throw StateError('Visibility surface stream returned no response.');
-    }
-    return _copyResponseBytes(response);
+    _requireResponsePacket(response);
+    return _copyResponseBytes(response!);
   }
 
   Future<void> dispose() async {
@@ -131,10 +130,8 @@ final class ARVisibilitySurfaceStreamWorker {
       binaryMessenger: BackgroundIsolateBinaryMessenger.instance,
     );
     final response = await channel.send(ByteData.sublistView(request));
-    if (response == null) {
-      throw StateError('Visibility surface stream returned no response.');
-    }
-    return _copyResponseBytes(response);
+    _requireResponsePacket(response);
+    return _copyResponseBytes(response!);
   }
 }
 
@@ -152,6 +149,24 @@ final class ARVisibilitySurfaceMetrics {
   final BasicMessageChannel<ByteData> _channel;
 
   Future<ByteData?> sample() => _channel.send(ByteData(0));
+}
+
+/// Byte length of the platform's status reply for a request without a
+/// response packet (no request, rejected packet, backpressure, worker
+/// failure); response packets are at least 4 KiB. The platform never replies
+/// null, which a background isolate messenger cannot deliver.
+const int visibilitySurfaceStreamStatusReplyBytes = 4;
+
+void _requireResponsePacket(ByteData? response) {
+  if (response == null) {
+    throw StateError('Visibility surface stream returned no response.');
+  }
+  if (response.lengthInBytes == visibilitySurfaceStreamStatusReplyBytes) {
+    throw StateError(
+      'Visibility surface stream returned no response '
+      '(status ${response.getUint32(0, Endian.little)}).',
+    );
+  }
 }
 
 Uint8List _copyResponseBytes(ByteData response) => Uint8List.fromList(

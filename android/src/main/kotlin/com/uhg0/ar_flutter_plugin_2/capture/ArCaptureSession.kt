@@ -319,6 +319,8 @@ internal class ArCaptureSession(
                                             "minPositiveCameraGapNs=${diagnostic.minimumPositiveCameraGapNs} " +
                                             "duplicatePairs=${diagnostic.duplicatePairCount} " +
                                             "timestampReadMismatches=${diagnostic.timestampReadMismatchCount} " +
+                                            "breaks=${diagnostic.breakCounts.entries.joinToString(",") { "${it.key}:${it.value}" }.ifEmpty { "none" }} " +
+                                            "sameImageRevisions=${diagnostic.sameImageRevisionCount} " +
                                             formatMotionPairDiagnostic("refusing", diagnostic.firstRefusingPair) + " " +
                                             formatMotionPairDiagnostic("maxAngular", diagnostic.maximumAngularPair))
                                     }

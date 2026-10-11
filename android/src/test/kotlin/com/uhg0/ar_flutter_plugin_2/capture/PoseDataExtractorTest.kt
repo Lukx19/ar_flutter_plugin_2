@@ -463,11 +463,15 @@ class PoseDataExtractorTest {
             var diagnostic: PoseDataExtractor.ExposureMotionDiagnostic? = null
             assertTrue(!extractor.isExposureMotionStable(observedSequence * 10_000_000L) { diagnostic = it })
             val result = checkNotNull(diagnostic)
-            assertEquals(PoseDataExtractor.ExposureMotionGate.INVALID_POSE, result.gate)
+            // The rejected old input broke the motion history; the later same-image
+            // revision neither reseeds nor replaces a sample while it is broken.
+            assertEquals(PoseDataExtractor.ExposureMotionGate.INVALID_GAP, result.gate)
             assertEquals(0, checkNotNull(result.firstRefusingPair).pairIndex)
-            assertEquals(0L, result.firstRefusingPair!!.cameraGapNs)
-            assertEquals(30_000_000L, result.firstRefusingPair!!.observedGapNs)
-            assertEquals(capacity.toLong() + 4L, result.firstRefusingPair!!.newer.fixtureBindingGeneration)
+            assertEquals(-(capacity * 100_000_000L - 50_000_000L), result.firstRefusingPair!!.cameraGapNs)
+            assertEquals(10_000_000L, result.firstRefusingPair!!.observedGapNs)
+            assertEquals(capacity.toLong() + 3L, result.firstRefusingPair!!.newer.fixtureBindingGeneration)
+            assertTrue(checkNotNull(result.breakCounts[PoseDataExtractor.ExposureMotionGate.INVALID_GAP]) >= 2L)
+            assertEquals(0L, result.sameImageRevisionCount)
             insert((capacity + 1) * 100_000_000L, capacity + 4)
             insert((capacity + 2) * 100_000_000L, capacity + 5)
             for (index in retainedSnapshots.indices) {
@@ -914,39 +918,68 @@ class PoseImageClockContractTest {
     }
 
     @Test
-    fun `same image pose revision invalidates approved dwell until new distinct image dwell`() {
+    fun `same image pose revision updates the latest sample instead of breaking the dwell`() {
+        // ARCore "same image, revised pose" frames used to break the history
+        // (INVALID_POSE) once per image, so a stationary device never reached
+        // the dwell. The revision now replaces the latest sample's pose and
+        // the speed gate judges it against the neighbouring images.
         for ((positionX, angleDegrees) in listOf(0.0014481076f to 0.0, 0f to 0.0013208869)) {
             val extractor = quietHistory()
             assertTrue(extractor.isExposureMotionStable(3_400_000_000L))
-            extractor.addSample(sample(1_400_000_716L, observedTimestampNs = 3_421_121_406L,
+            extractor.addSample(sample(1_400_000_716L, observedTimestampNs = 3_400_000_716L,
                 positionX = positionX, angleDegrees = angleDegrees, androidCameraTimestampNs = 2_400_000_000L))
             var receipt: PoseDataExtractor.ExposureMotionDiagnostic? = null
-            assertTrue(!extractor.isExposureMotionStable(3_421_121_406L) { receipt = it })
-            assertEquals(PoseDataExtractor.ExposureMotionGate.INVALID_POSE, receipt!!.gate)
-            val pair = checkNotNull(receipt!!.firstRefusingPair)
-            assertEquals(716L, pair.cameraGapNs)
-            assertEquals(pair.older.androidCameraTimestampNs, pair.newer.androidCameraTimestampNs)
-            assertNull(receipt!!.latestTranslationSpeedMps)
-            assertNull(receipt!!.latestAngularSpeedDegreesPerSecond)
-            // Further revisions (including restoration of the original pose) cannot reseed.
-            for (step in 0L..5L) {
-                extractor.addSample(sample(1_500_000_000L + step * 100_000_000L,
-                    observedTimestampNs = 3_500_000_000L + step * 100_000_000L,
-                    positionX = if (step % 2L == 0L) positionX else 0f,
-                    angleDegrees = if (step % 2L == 0L) angleDegrees else 0.0,
-                    androidCameraTimestampNs = 2_400_000_000L))
-                assertTrue(!extractor.isExposureMotionStable(3_500_000_000L + step * 100_000_000L))
-            }
-            for (offset in listOf(0L, 100_000_000L, 200_000_000L, 300_000_000L, 399_999_999L)) {
-                extractor.addSample(sample(2_100_000_000L + offset,
-                    observedTimestampNs = 4_100_000_000L + offset,
-                    androidCameraTimestampNs = 2_500_000_000L + offset))
-            }
-            assertTrue(!extractor.isExposureMotionStable(4_499_999_999L))
-            extractor.addSample(sample(2_500_000_000L, observedTimestampNs = 4_500_000_000L,
-                androidCameraTimestampNs = 2_900_000_000L))
-            assertTrue(extractor.isExposureMotionStable(4_500_000_000L))
+            assertTrue(extractor.isExposureMotionStable(3_400_000_716L) { receipt = it })
+            assertEquals(PoseDataExtractor.ExposureMotionGate.APPROVED, receipt!!.gate)
+            assertEquals(1L, receipt!!.sameImageRevisionCount)
+            assertTrue(receipt!!.breakCounts.isEmpty())
+            assertEquals(0, receipt!!.duplicatePairCount)
         }
+        // A revision that moves the image too far is refused by the speed gate.
+        val jumped = quietHistory()
+        jumped.addSample(sample(1_400_000_716L, observedTimestampNs = 3_400_000_716L,
+            positionX = 0.03f, androidCameraTimestampNs = 2_400_000_000L))
+        var receipt: PoseDataExtractor.ExposureMotionDiagnostic? = null
+        assertTrue(!jumped.isExposureMotionStable(3_400_000_716L) { receipt = it })
+        assertEquals(PoseDataExtractor.ExposureMotionGate.MOVING_TOO_FAST, receipt!!.gate)
+    }
+
+    @Test
+    fun `stationary device with a pose revision after every image reaches the dwell`() {
+        // 30 Hz distinct images at 0.01 m/s; after each image a revision of the
+        // same image 0.1 us later, shifted by up to 2 mm; 600 ms.
+        val extractor = PoseDataExtractor()
+        val periodNs = 33_333_333L
+        var lastObserved = 0L
+        for (i in 0 until 19) {
+            val t = i * periodNs
+            val x = (0.01 * t / 1e9).toFloat()
+            extractor.addSample(sample(1_000_000_000L + t, observedTimestampNs = 3_000_000_000L + t,
+                positionX = x, androidCameraTimestampNs = 2_000_000_000L + t))
+            val shift = floatArrayOf(0.002f, -0.002f, 0.0005f)[i % 3]
+            lastObserved = 3_000_000_000L + t + 100L
+            extractor.addSample(sample(1_000_000_000L + t + 100L, observedTimestampNs = lastObserved,
+                positionX = x + shift, androidCameraTimestampNs = 2_000_000_000L + t))
+        }
+        var receipt: PoseDataExtractor.ExposureMotionDiagnostic? = null
+        assertTrue(extractor.isExposureMotionStable(lastObserved) { receipt = it })
+        assertEquals(PoseDataExtractor.ExposureMotionGate.APPROVED, receipt!!.gate)
+        assertTrue(receipt!!.pairCount > 1)
+        assertEquals(19L, receipt!!.sameImageRevisionCount)
+        assertTrue(receipt!!.breakCounts.isEmpty())
+    }
+
+    @Test
+    fun `motion history breaks are counted per gate`() {
+        val extractor = quietHistory()
+        extractor.addSample(sample(1_500_000_000L, observedTimestampNs = 3_500_000_000L,
+            isTracking = false, androidCameraTimestampNs = 2_500_000_000L))
+        extractor.addSample(sample(1_600_000_000L, observedTimestampNs = 3_600_000_000L,
+            positionX = Float.NaN, androidCameraTimestampNs = 2_600_000_000L))
+        var receipt: PoseDataExtractor.ExposureMotionDiagnostic? = null
+        extractor.isExposureMotionStable(3_600_000_000L) { receipt = it }
+        assertEquals(1L, receipt!!.breakCounts[PoseDataExtractor.ExposureMotionGate.NOT_TRACKING])
+        assertEquals(1L, receipt!!.breakCounts[PoseDataExtractor.ExposureMotionGate.INVALID_POSE])
     }
 
     @Test

@@ -3,6 +3,7 @@ package com.uhg0.ar_flutter_plugin_2.visibilityingest
 import android.content.Context
 import android.os.Build
 import android.os.SystemClock
+import android.util.Log
 import com.google.ar.core.Config
 import com.google.ar.core.Frame
 import com.uhg0.ar_flutter_plugin_2.BuildConfig
@@ -49,7 +50,7 @@ internal object VisibilityGridShellRegistry {
     @Volatile private var taps: Array<VisibilityGridFrameTap> = emptyArray()
     @Volatile private var photoListeners: Array<DurablePhotoListener> = emptyArray()
     private var viewOwner: Any? = null
-    private var markers: GridMarkerShellTaps? = null
+    @Volatile private var markers: GridMarkerShellTaps? = null
 
     // Pose stability: anchor pose tracker (query channel, durable photo listener, frame reads).
     @Volatile private var poseTracking: AnchorPoseUpdateProducer? = null
@@ -67,8 +68,14 @@ internal object VisibilityGridShellRegistry {
             } else {
                 null
             }
+            // Depth telemetry (1 Hz while started) in debug and profile builds only.
+            val telemetry: ((String) -> Unit)? = if (BuildConfig.DEBUG || BuildConfig.BUILD_TYPE == "profile") {
+                { line -> Log.i(TAG, line) }
+            } else {
+                null
+            }
             val created = VisibilityGridIngestShell(
-                elapsedRealtime, recorder, DurableJpegLocator(File(files, "capture-v2-native/store")),
+                elapsedRealtime, recorder, DurableJpegLocator(File(files, "capture-v2-native/store")), telemetry,
             )
             created.durablePhotoListeners = photoListeners
             shell = created
@@ -76,7 +83,9 @@ internal object VisibilityGridShellRegistry {
             ingestChannel = BasicMessageChannel(messenger, VisibilityGridChannels.INGEST, BinaryCodec.INSTANCE_DIRECT, queue)
                 .apply { setMessageHandler { message, reply -> created.pull.onPull(message, reply) } }
             controlChannel = BasicMessageChannel(messenger, VisibilityGridChannels.CONTROL, BinaryCodec.INSTANCE_DIRECT)
-                .apply { setMessageHandler(GridShellControlHandler { shell }) }
+                .apply {
+                    setMessageHandler(GridShellControlHandler(shell = { shell }, markerDetectorAvailable = { markers != null }))
+                }
             // Render and display channels of the instanced grid renderer; inert until the
             // grid isolate or the UI isolate sends a message.
             GridRendererChannels.register(messenger)
@@ -172,11 +181,25 @@ internal object VisibilityGridShellRegistry {
         }
     }
 
-    /** The composite per-frame tap; allocation-free. */
+    /** The composite per-frame tap; allocation-free, contains tap failures like [onArFrame]. */
     val frameTap = VisibilityGridFrameTap { frame ->
         val t = taps
-        for (i in t.indices) t[i].onFrame(frame)
+        for (i in t.indices) {
+            try {
+                t[i].onFrame(frame)
+            } catch (e: RuntimeException) {
+                tapFailed(e)
+            }
+        }
     }
+
+    /**
+     * Frame taps (shell, extra taps, anchor pose tracking) that threw; each
+     * failure is contained, so one tap never stops the others or the
+     * SceneView frame callback this runs in. Frame thread writes.
+     */
+    @Volatile var frameTapFailures = 0L
+        private set
 
     /** Seam called by `ArView` once per AR frame; [session] identifies the AR session. */
     fun onArFrame(session: Any, frame: Frame) {
@@ -184,11 +207,27 @@ internal object VisibilityGridShellRegistry {
         val s = shell
         for (i in t.indices) {
             val tap = t[i]
-            if (tap === s) s.onFrame(session, frame) else tap.onFrame(frame)
+            try {
+                if (tap === s) s.onFrame(session, frame) else tap.onFrame(frame)
+            } catch (e: RuntimeException) {
+                tapFailed(e)
+            }
         }
         // Pose stability: returns after one volatile read while anchor tracking is inactive.
-        poseTracking?.onArFrame(session, frame)
+        try {
+            poseTracking?.onArFrame(session, frame)
+        } catch (e: RuntimeException) {
+            tapFailed(e)
+        }
     }
+
+    private fun tapFailed(e: RuntimeException) {
+        val failures = ++frameTapFailures
+        // Logs the 1st, 2nd, 4th, 8th, ... failure so a persistent fault cannot flood the log.
+        if (failures and (failures - 1) == 0L) Log.w(TAG, "grid frame tap failed ($failures)", e)
+    }
+
+    private const val TAG = "VisibilityGridShell"
 
     /** Seam called by the native capture adapter for each durable terminal. */
     val durableTerminalTap = DurableTerminalTap { request, terminal, exposureNs ->

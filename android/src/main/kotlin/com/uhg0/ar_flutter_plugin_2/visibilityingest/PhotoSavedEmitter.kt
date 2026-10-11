@@ -149,6 +149,7 @@ internal class PhotoSavedEmitter(
 ) : DurableTerminalTap {
     companion object {
         const val RECENT = 64
+        const val EPOCH_HISTORY = 16
         private val HEX = Regex("[0-9a-f]{64}")
     }
 
@@ -181,6 +182,44 @@ internal class PhotoSavedEmitter(
 
     fun clearPoses() {
         synchronized(poseLock) { photoPoses.clear() }
+    }
+
+    // Group epochs by start time under the camera image clock (the exposure
+    // clock), newest last; a small ring because epochs change rarely.
+    private val epochStartNs = LongArray(EPOCH_HISTORY)
+    private val epochValue = IntArray(EPOCH_HISTORY)
+    private var epochCount = 0
+
+    /**
+     * AR thread: [epoch] applies from the frame with camera image time
+     * [androidCameraTimestampNs] on. A photo is stamped with the epoch active
+     * at its exposure, so a photo exposed before a group switch that becomes
+     * durable after the shell restarted still belongs to its own group.
+     */
+    fun recordEpochStart(androidCameraTimestampNs: Long, epoch: Int) {
+        if (androidCameraTimestampNs <= 0L) return
+        synchronized(poseLock) {
+            if (epochCount > 0 && epochValue[epochCount - 1] == epoch) return
+            if (epochCount == EPOCH_HISTORY) {
+                System.arraycopy(epochStartNs, 1, epochStartNs, 0, EPOCH_HISTORY - 1)
+                System.arraycopy(epochValue, 1, epochValue, 0, EPOCH_HISTORY - 1)
+                epochCount--
+            }
+            epochStartNs[epochCount] = androidCameraTimestampNs
+            epochValue[epochCount] = epoch
+            epochCount++
+        }
+    }
+
+    /**
+     * Epoch active at [exposureNs]: the newest epoch started at or before it.
+     * Without a recorded epoch or exposure time, the current epoch; before the
+     * oldest recorded start, the oldest recorded epoch (older ones were evicted).
+     */
+    internal fun epochAt(exposureNs: Long): Int = synchronized(poseLock) {
+        if (epochCount == 0 || exposureNs <= 0L) return groupEpoch()
+        for (i in epochCount - 1 downTo 0) if (epochStartNs[i] <= exposureNs) return epochValue[i]
+        epochValue[0]
     }
 
     @Synchronized
@@ -276,7 +315,7 @@ internal class PhotoSavedEmitter(
         if (request.accepted.lane == CaptureLane.AUTOMATIC) flags = flags or PhotoSavedLayout.FLAG_AUTOMATIC
         if (assessment?.reason == CaptureQualityReasonV1.BELOW_THRESHOLD) flags = flags or PhotoSavedLayout.FLAG_BLUR_REJECTED
         b.put(PhotoSavedLayout.FLAGS, flags.toByte())
-        b.put(PhotoSavedLayout.GROUP_EPOCH_LOW, groupEpoch().toByte())
+        b.put(PhotoSavedLayout.GROUP_EPOCH_LOW, epochAt(exposureNs).toByte())
     }
 
     /** Shutter pose from the recovery context: OpenCV camera-to-world to OpenGL (flip camera y and z). */

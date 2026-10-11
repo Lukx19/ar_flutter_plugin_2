@@ -14,6 +14,9 @@ internal enum class DeltaIntake(val code: Int) {
 
     /** Dropped because the message is malformed. */
     MALFORMED(2),
+
+    /** Dropped because the render thread failed; nothing is drawn until a new surface starts a working thread. */
+    RENDERER_FAILED(4),
 }
 
 /** Upload statistics of the scheduler. */
@@ -65,6 +68,9 @@ internal class DeltaUploadScheduler(
     private var applying = false
     private val readView: ByteBuffer = ring.duplicate().order(ByteOrder.LITTLE_ENDIAN)
 
+    // Write view of the ring for bulk copies (channel thread, under [lock]).
+    private val ringWriter: ByteBuffer = ring.duplicate()
+
     val counters = UploadSchedulerCounters()
 
     /** Bytes queued and not yet applied. */
@@ -101,10 +107,23 @@ internal class DeltaUploadScheduler(
                 discardAll()
                 return DeltaIntake.RESYNC_REQUIRED
             }
-            for (i in 0 until length) ring.put(at + i, src.get(offset + i))
+            copyIntoRing(src, offset, length, at)
             counters.accepted++
             if (usedBytes > counters.maxBacklogBytes) counters.maxBacklogBytes = usedBytes
             return DeltaIntake.ACCEPTED
+        }
+    }
+
+    /** Bulk copy of [length] bytes of [src] at [offset] into the ring at [at]; [src]'s position and limit are restored. */
+    private fun copyIntoRing(src: ByteBuffer, offset: Int, length: Int, at: Int) {
+        val position = src.position()
+        val limit = src.limit()
+        try {
+            src.limit(offset + length).position(offset)
+            ringWriter.limit(at + length).position(at)
+            ringWriter.put(src)
+        } finally {
+            src.limit(limit).position(position)
         }
     }
 

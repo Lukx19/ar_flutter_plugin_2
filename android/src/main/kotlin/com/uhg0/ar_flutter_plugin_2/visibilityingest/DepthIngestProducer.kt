@@ -76,6 +76,12 @@ internal class DepthIngestProducer(
     @Volatile var published = 0L; private set
     @Volatile var poseMissing = 0L; private set
 
+    /** Timestamp of the newest depth image ARCore delivered (any outcome), or MIN_VALUE. */
+    @Volatile var latestImageNs = Long.MIN_VALUE; private set
+
+    /** Camera frame timestamp of the latest acquisition attempt. */
+    @Volatile var latestFrameNs = Long.MIN_VALUE; private set
+
     fun reset() {
         staged = false
         lastAcquireNs = Long.MIN_VALUE
@@ -92,6 +98,7 @@ internal class DepthIngestProducer(
             return
         }
         frameNs = frame.timestampNs
+        latestFrameNs = frameNs
         cameraNs = frame.androidCameraTimestampNs
         acquireNs = now
         mode = depthMode
@@ -116,6 +123,7 @@ internal class DepthIngestProducer(
         confidenceRowStride: Int,
         confidencePixelStride: Int,
     ) {
+        latestImageNs = imageTimestampNs
         val acquisitionMode = if (mode == IngestFrameSource.DEPTH_MODE_RAW) DepthAcquisitionMode.RAW else DepthAcquisitionMode.AUTOMATIC
         val refusal = depthImageIdentityRefusal(
             imageTimestampNs, cameraNs, frameNs, acquisitionMode,

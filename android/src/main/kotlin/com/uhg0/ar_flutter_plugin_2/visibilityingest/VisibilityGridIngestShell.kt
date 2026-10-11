@@ -40,6 +40,14 @@ internal class VisibilityGridIngestShell(
     private val clock: IngestClock,
     val recorder: IngestRecorder?,
     jpegLocator: DurableJpegLocator = DurableJpegLocator(null),
+    /**
+     * Receives one depth telemetry line per second of started frames (debug
+     * and profile builds; null in release and tests): published, duplicate,
+     * stale-dropped, identity refusals, STALE_AUTOMATIC, not yet available,
+     * failures and the age of the newest depth image, so a device run shows
+     * why depth stops.
+     */
+    private val depthTelemetry: ((String) -> Unit)? = null,
 ) : VisibilityGridFrameTap, DurableTerminalTap {
     val pull = IngestPullHandler(clock, recorder)
     private val session = IngestSessionState()
@@ -185,6 +193,7 @@ internal class VisibilityGridIngestShell(
         }
         if (sessionIdentity != null) lastSession = sessionIdentity
         epochForEvents = session.groupEpoch
+        photoEmitter.recordEpochStart(source.androidCameraTimestampNs, session.groupEpoch)
         lastFrameNs = ts
         lastFrameNsSnapshot = ts
 
@@ -209,6 +218,8 @@ internal class VisibilityGridIngestShell(
             }
             lastDepthMode = mode
         }
+        // Before the tracking check, so a run also shows depth stopping while not tracking.
+        if (depthTelemetry != null) logDepthTelemetry(depthTelemetry, ts, tracking)
         if (tracking != IngestTrackingState.TRACKING) return
 
         source.readPose(tq)
@@ -222,6 +233,24 @@ internal class VisibilityGridIngestShell(
         if (wantPoints) points.onFrame(source)
         depth.publishStaged(false)
         points.publishStaged(false)
+    }
+
+    private var lastTelemetryNs = Long.MIN_VALUE
+
+    /** At most once a second (shell clock); allocates only the line. */
+    private fun logDepthTelemetry(log: (String) -> Unit, frameNs: Long, tracking: Int) {
+        val now = clock.nowNs()
+        if (lastTelemetryNs != Long.MIN_VALUE && now - lastTelemetryNs < TELEMETRY_INTERVAL_NS) return
+        lastTelemetryNs = now
+        val image = depth.latestImageNs
+        val ageMs = if (image == Long.MIN_VALUE) "none" else ((frameNs - image) / 1_000_000L).toString()
+        log(
+            "[grid-depth] published=${depth.published} duplicate=${depth.duplicateDropped} " +
+                "staleDropped=${depth.staleDropped} identityRefused=${depth.identityRefused} " +
+                "staleAutomatic=${depth.identityStaleAutomatic} notYetAvailable=${depth.notYetAvailable} " +
+                "failures=${depth.failures} acquired=${depth.acquired} lastImageAgeMs=$ageMs " +
+                "mode=$lastDepthMode tracking=$tracking epoch=${session.groupEpoch}",
+        )
     }
 
     private fun resetSession() {
@@ -269,3 +298,5 @@ internal class VisibilityGridIngestShell(
     internal val pointProducer: PointCloudIngestProducer get() = points
     internal val groupEpoch: Int get() = session.groupEpoch
 }
+
+private const val TELEMETRY_INTERVAL_NS = 1_000_000_000L

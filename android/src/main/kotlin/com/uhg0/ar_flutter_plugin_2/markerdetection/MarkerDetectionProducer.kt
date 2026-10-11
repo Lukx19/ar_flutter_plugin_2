@@ -41,7 +41,7 @@ internal class MarkerDetectionProducer(
     private val sink: MarkerDetectionSink,
     dictionary: Int = MarkerDetectorNative.DICTIONARY_ARUCO_MIP_36H12,
     maxRecords: Int = 64,
-) : AutoCloseable {
+) : GreyFrameDetector {
     private val writer = MarkerDetectionMessageWriter(maxRecords)
     private var handle: Long =
         if (MarkerDetectorNative.available) MarkerDetectorNative.nativeCreate(dictionary) else 0L
@@ -52,7 +52,7 @@ internal class MarkerDetectionProducer(
     var failures = 0
         private set
 
-    val available: Boolean get() = handle != 0L
+    override val available: Boolean get() = handle != 0L
 
     fun configure(
         markerSizeMetres: Double,
@@ -74,8 +74,12 @@ internal class MarkerDetectionProducer(
      * Asks for [markerSizeMetres] from any thread; the worker applies it
      * before its next detection (the native handle is single-threaded).
      */
-    fun requestMarkerSize(markerSizeMetres: Double) {
+    override fun requestMarkerSize(markerSizeMetres: Double) {
         requestedMarkerSize = markerSizeMetres
+    }
+
+    override fun detect(frame: GreyFrame) {
+        produce(frame)
     }
 
     /** Detects markers on [frame] and sends one message; returns the count or an error. */

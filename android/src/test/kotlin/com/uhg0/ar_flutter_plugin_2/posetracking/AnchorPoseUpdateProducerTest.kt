@@ -1,5 +1,6 @@
 package com.uhg0.ar_flutter_plugin_2.posetracking
 
+import com.uhg0.ar_flutter_plugin_2.channelstatus.ChannelStatusReply
 import com.uhg0.ar_flutter_plugin_2.visibilitycontract.IngestMessageLayout
 import com.uhg0.ar_flutter_plugin_2.visibilitycontract.PhotoSavedLayout
 import com.uhg0.ar_flutter_plugin_2.visibilityingest.DurableJpegLocator
@@ -33,9 +34,14 @@ class AnchorPoseUpdateProducerTest {
 
     private val reply = Capture()
 
+    /** The decoded pose reply, or null for a 4-byte refused-query status (never a null reply). */
     private fun send(query: ByteBuffer?): DecodedReply? {
         producer.onQuery(query, reply)
-        val b = reply.last ?: return null
+        val b = checkNotNull(reply.last) { "null reply: a background isolate sender would never complete" }
+        if (ChannelStatusReply.statusOf(b) != null) {
+            assertEquals(AnchorPoseUpdateProducer.STATUS_QUERY_REFUSED, ChannelStatusReply.statusOf(b))
+            return null
+        }
         return DecodedReply(b, b.position())
     }
 
@@ -139,7 +145,7 @@ class AnchorPoseUpdateProducerTest {
     }
 
     @Test
-    fun `a malformed query gets a null reply and is counted`() {
+    fun `a malformed query gets a refused status reply and is counted`() {
         val bad = poseQuery()
         bad.putInt(0, 0x12345678)
         assertNull(send(bad))
@@ -151,6 +157,12 @@ class AnchorPoseUpdateProducerTest {
         assertNull(send(truncated))
         assertEquals(4L, producer.snapshot()["malformedQueries"])
         assertEquals(4, reply.count)
+        // A query after close is refused with the same status.
+        val closed = AnchorPoseUpdateProducer(clock, FakeAnchorBackend(), readTimer = { 0L }, initialCapacity = 64)
+        closed.close()
+        val closedReply = Capture()
+        closed.onQuery(poseQuery(), closedReply)
+        assertEquals(AnchorPoseUpdateProducer.STATUS_QUERY_REFUSED, ChannelStatusReply.statusOf(closedReply.last))
         val good = checkNotNull(send(poseQuery()))
         assertEquals("sequence counts only replies", 0, good.bytes.getInt(IngestMessageLayout.SEQUENCE))
     }

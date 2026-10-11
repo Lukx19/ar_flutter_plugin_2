@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "marker_detector.h"
+#include "marker_detector_internal.h"
 
 namespace {
 
@@ -445,6 +446,22 @@ void testAbiWithoutDetector() {
   c3md_destroy(d);
 }
 
+// Boundary helpers of the JNI shim: output windows refuse negative offsets
+// and counts, and the bitmap grey buffer reports a failed allocation instead
+// of throwing (the shim sizes it before locking bitmap pixels).
+void testJniBoundaries() {
+  check(c3md::outputWindowBytes(-64, 4, 64) == -1, "negative output offset refused");
+  check(c3md::outputWindowBytes(0, -1, 64) == -1, "negative record count refused");
+  check(c3md::outputWindowBytes(16, 2, 64) == 144, "output window bytes");
+  check(c3md::ensureGreyBuffer(nullptr, 16) == C3MD_ERROR_ARGUMENT, "null detector refused");
+  C3MarkerDetector* d = c3md_create(C3MD_DICTIONARY_ARUCO_MIP_36H12);
+  check(c3md::ensureGreyBuffer(d, 4096) == C3MD_OK && c3md::greyBuffer(d).size() >= 4096, "grey buffer grows");
+  check(c3md::ensureGreyBuffer(d, static_cast<size_t>(-1)) == C3MD_ERROR_INTERNAL, "failed allocation reported");
+  check(c3md::greyBuffer(d).size() >= 4096, "grey buffer kept after a failed allocation");
+  check(c3md::ensureGreyBuffer(d, 1024) == C3MD_OK && c3md::greyBuffer(d).size() >= 4096, "grey buffer never shrinks");
+  c3md_destroy(d);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -456,6 +473,7 @@ int main(int argc, char** argv) {
   testTwelveMegapixel();
   testSharpness();
   testAbiWithoutDetector();
+  testJniBoundaries();
   if (failures == 0) std::printf("marker detector host test: all checks passed\n");
   return failures == 0 ? 0 : 1;
 }

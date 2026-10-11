@@ -20,7 +20,7 @@ namespace {
 C3MarkerDetector* handle(jlong h) { return reinterpret_cast<C3MarkerDetector*>(h); }
 
 uint8_t* directAddress(JNIEnv* env, jobject buffer, jlong minimumBytes) {
-  if (buffer == nullptr) return nullptr;
+  if (buffer == nullptr || minimumBytes < 0) return nullptr;
   auto* address = static_cast<uint8_t*>(env->GetDirectBufferAddress(buffer));
   if (address == nullptr || env->GetDirectBufferCapacity(buffer) < minimumBytes) return nullptr;
   return address;
@@ -68,8 +68,8 @@ JNIEXPORT jint JNICALL C3MD_JNI(nativeDetect)(JNIEnv* env, jclass, jlong h, jobj
                                               jint stride, jobject out, jint outOffset, jint maxRecords) {
   auto* d = handle(h);
   const uint8_t* pixels = directAddress(env, grey, static_cast<jlong>(stride) * (height - 1) + width);
-  uint8_t* target = directAddress(env, out, outOffset + static_cast<jlong>(maxRecords) * C3_MARKER_DETECTION_RECORD_BYTES);
-  if (d == nullptr || pixels == nullptr || target == nullptr || maxRecords < 0) return C3MD_ERROR_ARGUMENT;
+  uint8_t* target = directAddress(env, out, c3md::outputWindowBytes(outOffset, maxRecords, C3_MARKER_DETECTION_RECORD_BYTES));
+  if (d == nullptr || pixels == nullptr || target == nullptr) return C3MD_ERROR_ARGUMENT;
   int count = c3md_detect(d, pixels, width, height, stride);
   if (count < 0) return count;
   if (count > 0) {
@@ -88,18 +88,20 @@ JNIEXPORT jint JNICALL C3MD_JNI(nativeDetectTiePointsBitmap)(JNIEnv* env, jclass
                                                              jint searchDownscale, jint refineMethod, jobject out,
                                                              jint outOffset, jint maxRecords) {
   auto* d = handle(h);
-  uint8_t* target = directAddress(env, out, outOffset + static_cast<jlong>(maxRecords) * C3MD_TIE_POINT_BYTES);
-  if (d == nullptr || bitmap == nullptr || target == nullptr || maxRecords < 0) return C3MD_ERROR_ARGUMENT;
+  uint8_t* target = directAddress(env, out, c3md::outputWindowBytes(outOffset, maxRecords, C3MD_TIE_POINT_BYTES));
+  if (d == nullptr || bitmap == nullptr || target == nullptr) return C3MD_ERROR_ARGUMENT;
   AndroidBitmapInfo info;
   if (AndroidBitmap_getInfo(env, bitmap, &info) != ANDROID_BITMAP_RESULT_SUCCESS ||
-      info.format != ANDROID_BITMAP_FORMAT_RGBA_8888) {
+      info.format != ANDROID_BITMAP_FORMAT_RGBA_8888 || info.stride < 4 * info.width) {
     return C3MD_ERROR_ARGUMENT;
   }
+  // Sized before the pixels are locked: a failed allocation returns an error
+  // instead of throwing across JNI with the bitmap locked.
+  const int sized = c3md::ensureGreyBuffer(d, static_cast<size_t>(info.width) * info.height);
+  if (sized != C3MD_OK) return sized;
+  auto& grey = c3md::greyBuffer(d);
   void* pixels = nullptr;
   if (AndroidBitmap_lockPixels(env, bitmap, &pixels) != ANDROID_BITMAP_RESULT_SUCCESS) return C3MD_ERROR_INTERNAL;
-  auto& grey = c3md::greyBuffer(d);
-  const size_t needed = static_cast<size_t>(info.width) * info.height;
-  if (grey.size() < needed) grey.resize(needed);  // grows once to the largest still
   for (uint32_t y = 0; y < info.height; y++) {
     const uint8_t* row = static_cast<const uint8_t*>(pixels) + static_cast<size_t>(y) * info.stride;
     uint8_t* dst = grey.data() + static_cast<size_t>(y) * info.width;

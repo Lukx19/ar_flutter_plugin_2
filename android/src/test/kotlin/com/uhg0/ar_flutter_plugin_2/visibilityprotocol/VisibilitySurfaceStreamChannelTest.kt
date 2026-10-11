@@ -394,9 +394,9 @@ class VisibilitySurfaceStreamChannelTest {
         )
         val packet = request(sequence = 1, token = 88)
 
-        assertNull(messenger.tryExchange(packet))
+        assertStatusReply(VisibilitySurfaceStreamChannel.STATUS_REJECTED, messenger.tryExchange(packet))
         val stale = qualifier.copyOf().also { it[0] = 99 } + packet
-        assertNull(messenger.tryExchange(stale))
+        assertStatusReply(VisibilitySurfaceStreamChannel.STATUS_REJECTED, messenger.tryExchange(stale))
         assertEquals(0L, binding.transportInstrumentation.snapshot().acceptedRequests)
 
         val qualifiedResponse = messenger.exchange(qualifier + packet)
@@ -407,6 +407,22 @@ class VisibilitySurfaceStreamChannelTest {
         assertEquals(1L, response.requestSequence)
         assertEquals(1L, binding.transportInstrumentation.snapshot().acceptedRequests)
         binding.dispose()
+    }
+
+    @Test
+    fun `a request without bytes is answered with a status, never null`() {
+        val messenger = TestMessenger(89)
+        VisibilitySurfaceStreamChannel(messenger, 89)
+        var reply: ByteBuffer? = null
+        var replied = false
+        messenger.send("visibility_surface_stream_89", null) {
+            reply = it
+            replied = true
+        }
+        assertTrue(replied)
+        val bytes = checkNotNull(reply) { "null reply never completes a background isolate send" }
+        assertEquals(4, bytes.remaining())
+        assertEquals(VisibilitySurfaceStreamChannel.STATUS_NO_REQUEST, bytes.order(ByteOrder.LITTLE_ENDIAN).getInt(0))
     }
 
     @Test
@@ -2528,4 +2544,11 @@ private class TestMessenger(viewId: Int, private val onEngineReply: ((ByteBuffer
         assertTrue(completed.await(2, TimeUnit.SECONDS))
         return result[0]
     }
+}
+
+/** A 4-byte little-endian status reply (requests without a response packet never get null). */
+private fun assertStatusReply(expected: Int, reply: ByteArray?) {
+    val bytes = checkNotNull(reply) { "null reply never completes a background isolate send" }
+    assertEquals(4, bytes.size)
+    assertEquals(expected, ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).getInt(0))
 }

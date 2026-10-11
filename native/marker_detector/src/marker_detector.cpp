@@ -108,6 +108,17 @@ namespace c3md {
 
 std::vector<uint8_t>& greyBuffer(C3MarkerDetector* d) { return d->grey; }
 
+int ensureGreyBuffer(C3MarkerDetector* d, size_t bytes) noexcept {
+  if (d == nullptr) return C3MD_ERROR_ARGUMENT;
+  if (d->grey.size() >= bytes) return C3MD_OK;
+  try {
+    d->grey.resize(bytes);  // grows once to the largest still
+    return C3MD_OK;
+  } catch (...) {
+    return C3MD_ERROR_INTERNAL;
+  }
+}
+
 }  // namespace c3md
 
 extern "C" {
