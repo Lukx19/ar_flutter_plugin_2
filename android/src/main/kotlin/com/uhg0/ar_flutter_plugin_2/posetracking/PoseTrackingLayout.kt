@@ -51,7 +51,7 @@ internal object AnchorIds {
 
 /**
  * Query from the grid isolate: 24 B header plus keyframe requests of 56 B
- * (anchor id u32, reserved u32, subject id i64, capture ns i64, camera-to-world
+ * (anchor id u32, request flags u32, subject id i64, capture ns i64, camera-to-world
  * t xyz f32, q xyzw f32, reserved u32).
  */
 internal object PoseQueryLayout {
@@ -76,6 +76,16 @@ internal object PoseQueryLayout {
     const val FLAG_DETACH_ALL = 2
 
     const val REQUEST_ANCHOR_ID_OFFSET = 0
+
+    /** Request flags u32 (was reserved zero; additive amendment). */
+    const val REQUEST_FLAGS_OFFSET = 4
+
+    /**
+     * The request creates a submap anchor (kind [AnchorKind.SUBMAP]) instead
+     * of a keyframe anchor: same creation record and per-change update
+     * records, never detached by the anchor limit.
+     */
+    const val REQUEST_FLAG_SUBMAP = 1
     const val REQUEST_SUBJECT_OFFSET = 8
     const val REQUEST_CAPTURE_NS_OFFSET = 16
     const val REQUEST_POSE_OFFSET = 24

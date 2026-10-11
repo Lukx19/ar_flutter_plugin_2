@@ -135,6 +135,51 @@ class AnchorPoseTrackerTest {
     }
 
     @Test
+    fun `an anchor moving more than 5 cm within one frame is reported once per frame as a jump`() {
+        val jumps = ArrayList<Pair<Long, Int>>()
+        tracker.jumpListener = AnchorJumpListener { frameNs, mm -> jumps += frameNs to mm }
+        val (a, b) = createKeyframes(FIRST, FIRST + 1)
+        query()
+        a.pose[0] = 0.03f
+        step(updated = listOf(a))
+        assertTrue("3 cm is ordinary drift", jumps.isEmpty())
+        a.pose[0] = 0.10f
+        b.pose[1] = 0.25f
+        step(updated = listOf(a, b))
+        assertEquals(listOf(frame.timestampNs to 250), jumps)
+        // A move while the anchor is not tracking, and its return to tracking, are no jumps.
+        a.tracking = AnchorTracking.PAUSED
+        a.pose[0] = 1f
+        step(updated = listOf(a))
+        a.tracking = AnchorTracking.TRACKING
+        step(updated = listOf(a))
+        assertEquals(1, jumps.size)
+        assertEquals(1L, tracker.snapshot()["anchorJumps"])
+    }
+
+    @Test
+    fun `submap requests create submap anchors whose pose changes are reported and the limit never detaches`() {
+        query(requests = listOf(KeyframeRequest(FIRST, tq = identityPose(1f), flags = PoseQueryLayout.REQUEST_FLAG_SUBMAP)))
+        step()
+        val submap = backend.created.single()
+        val created = query(limit = 1, detachAfter = 1)
+        assertEquals(AnchorKind.SUBMAP, created.creations.single().kind)
+        assertEquals(AnchorCreation.CREATED, created.creations.single().status)
+        assertEquals(AnchorKind.SUBMAP, created.updates.single().kind)
+        submap.pose[0] = 1.2f
+        step(updated = listOf(submap))
+        val moved = query(limit = 1, detachAfter = 1).updates.single()
+        assertEquals(AnchorKind.SUBMAP, moved.kind)
+        assertEquals(1.2f, moved.rows[3], 1e-6f)
+        // Long stable and over the limit: a keyframe request is refused rather than detaching the submap anchor.
+        step(advanceNs = 2_000_000_000L)
+        query(limit = 1, detachAfter = 1, requests = listOf(KeyframeRequest(FIRST + 1)))
+        step()
+        assertFalse(submap.detached)
+        assertEquals(AnchorCreation.OVER_LIMIT, query(limit = 1, detachAfter = 1).creations.single().status)
+    }
+
+    @Test
     fun `over the limit without stable anchors new creations are refused`() {
         query(limit = 1)
         createKeyframes(FIRST)

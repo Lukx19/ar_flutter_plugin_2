@@ -12,6 +12,14 @@ internal val goldenDirectory = File("../test_assets/visibility_grid")
 
 internal fun golden(name: String): ByteArray = File(goldenDirectory, name).readBytes()
 
+/**
+ * The Camera2 sensor clock of `Frame.getAndroidCameraTimestamp` runs on a
+ * different base than `Frame.getTimestamp` (the depth image and point cloud
+ * clock); on the SM-X700 it is behind. Fixtures keep it 5 s behind so a
+ * comparison across the two clocks fails in tests as it does on the device.
+ */
+internal const val SENSOR_CLOCK_BEHIND_NS = 5_000_000_000L
+
 internal class FakeClock(var now: Long = 0L) : IngestClock {
     override fun nowNs(): Long = now
 }
@@ -48,6 +56,7 @@ internal class FakeFrame : IngestFrameSource {
     override var timestampNs = 0L
     override var androidCameraTimestampNs = 0L
     override var trackingState = IngestTrackingState.TRACKING
+    override var trackingFailureReason = 0
     val pose = floatArrayOf(0f, 0f, 0f, 0f, 0f, 0f, 1f)
     val texture = floatArrayOf(180f, 181f, 80f, 45f, 4f, 3f)
 

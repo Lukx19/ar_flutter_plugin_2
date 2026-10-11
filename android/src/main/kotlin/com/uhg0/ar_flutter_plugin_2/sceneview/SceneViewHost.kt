@@ -1488,6 +1488,28 @@ internal class SceneViewHost(
     fun visibilityGridDepthMode(): Config.DepthMode =
         visibilityGridDepthModeCache.current()
 
+    /**
+     * Re-applies the selected visibility grid depth mode to the running
+     * session (main thread, between SceneView frame updates). The shared
+     * camera path disables SceneView's post-resume reconfiguration, after
+     * which ARCore was seen answering "depth not yet available" for the rest
+     * of the session; the grid ingest shell asks for this after each resume
+     * and when acquired depth stalls. Returns whether the session was
+     * configured.
+     */
+    fun reapplyVisibilityGridDepthMode(): Boolean {
+        if (disposed) return false
+        val session = activeSession ?: return false
+        val mode = visibilityGridDepthModeCache.current()
+        if (mode == Config.DepthMode.DISABLED) return false
+        return runCatching {
+            val config = session.config
+            config.depthMode = mode
+            session.configure(config)
+            true
+        }.onFailure { Log.w("SceneViewHost", "Depth mode re-application failed", it) }.getOrDefault(false)
+    }
+
     fun dispose() {
         bindNativeFrameAttribution(null)
         if (!ownership.onDispose()) return

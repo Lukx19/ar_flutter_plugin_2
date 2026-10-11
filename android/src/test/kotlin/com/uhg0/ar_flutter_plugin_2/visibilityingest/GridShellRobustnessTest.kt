@@ -75,7 +75,7 @@ class GridShellRobustnessTest {
             t += 33_333_333L
             clock.now = t
             frame.timestampNs = t
-            frame.androidCameraTimestampNs = t
+            frame.androidCameraTimestampNs = t - SENSOR_CLOCK_BEHIND_NS
             frame.depthImageNs = t - 1_000_000L
             if (i == 40) frame.trackingState = IngestTrackingState.PAUSED
             shell.process(frame, null)
@@ -116,7 +116,7 @@ class GridShellRobustnessTest {
                 t += 33_333_333L
                 clock.now = t
                 frame.timestampNs = t
-                frame.androidCameraTimestampNs = t
+                frame.androidCameraTimestampNs = t - SENSOR_CLOCK_BEHIND_NS
                 shell.process(frame, null)
             }
         }
