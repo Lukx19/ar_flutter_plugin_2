@@ -38,6 +38,7 @@ internal object QuestOverlayLayout {
     const val TRAIL_FLAG_COMPLETED = 2
 
     const val STATE_CAPTURED = 2
+    const val STATE_TIMED_OUT = 3
     const val STATION_CAPTURED = 2
 
     const val MAX_DONUTS = 72
@@ -63,6 +64,10 @@ internal class QuestOverlayFrame {
     var zoneVertexCount = 0
     var zoneKind = QuestOverlayLayout.ZONE_NONE
 
+    /** On-screen diameter range of donut rings in dp; 0 selects the platform default. */
+    var ringMinDiameterDp = 0
+    var ringMaxDiameterDp = 0
+
     /** Space: floor y, ceiling y; object: centre xyz, half extents xyz. */
     val zoneParams = FloatArray(6)
 
@@ -76,6 +81,9 @@ internal class QuestOverlayFrame {
     val donutPositionTolerance = FloatArray(QuestOverlayLayout.MAX_DONUTS)
     val donutInnerCircleDegrees = FloatArray(QuestOverlayLayout.MAX_DONUTS)
     val donutAngleToleranceDegrees = FloatArray(QuestOverlayLayout.MAX_DONUTS)
+
+    /** Ring outer radius in metres; 0 selects the platform default. */
+    val donutRingRadius = FloatArray(QuestOverlayLayout.MAX_DONUTS)
 
     val trailPoint = FloatArray(QuestOverlayLayout.MAX_TRAIL_VERTICES * 3)
     val trailIndex = IntArray(QuestOverlayLayout.MAX_TRAIL_VERTICES)
@@ -119,6 +127,8 @@ internal class QuestOverlayFrame {
         layers = b.getShort(6).toInt() and 0xffff
         sequence = b.getInt(8).toLong() and 0xffffffffL
         zoneKind = b.get(20).toInt() and 0xff
+        ringMinDiameterDp = b.get(21).toInt() and 0xff
+        ringMaxDiameterDp = b.get(22).toInt() and 0xff
         for (i in 0 until 6) zoneParams[i] = b.getFloat(24 + 4 * i)
         var o = QuestOverlayLayout.HEADER_BYTES
         for (i in 0 until donuts) {
@@ -134,6 +144,7 @@ internal class QuestOverlayFrame {
             donutPositionTolerance[i] = b.getFloat(o + 32)
             donutInnerCircleDegrees[i] = b.getFloat(o + 36)
             donutAngleToleranceDegrees[i] = b.getFloat(o + 40)
+            donutRingRadius[i] = b.getFloat(o + 44)
             o += QuestOverlayLayout.DONUT_BYTES
         }
         for (i in 0 until vertices) {

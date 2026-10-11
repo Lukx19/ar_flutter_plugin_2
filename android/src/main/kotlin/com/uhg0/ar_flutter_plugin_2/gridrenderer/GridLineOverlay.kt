@@ -26,6 +26,16 @@ internal interface GridLineOverlay {
     /** Channel thread; returns whether the message was accepted. */
     fun onMessage(buffer: ByteBuffer, length: Int): Boolean
 
+    /**
+     * Whether the segments are drawn after the depth-tested ones without
+     * the depth test, so grid surfaces never hide or cut through them
+     * (guidance such as quest rings and reticles on the aimed surface).
+     */
+    val drawOnTop: Boolean get() = false
+
+    /** Render thread, before [buildLines]: projection focal length in pixels and display density. */
+    fun setView(focalPx: Float, pxPerDp: Float) {}
+
     /** Render thread; returns the number of segments emitted. */
     fun buildLines(camX: Float, camY: Float, camZ: Float, sink: GridOverlayLineSink): Int
 
@@ -55,8 +65,18 @@ internal class GridLineBatch(val capacitySegments: Int = DEFAULT_CAPACITY) : Gri
     var dropped = 0L
         private set
 
+    /** Segments `[0, depthTestedSegments)` are drawn with the depth test, the rest on top. */
+    var depthTestedSegments = 0
+        private set
+
     fun clear() {
         segments = 0
+        depthTestedSegments = 0
+    }
+
+    /** Ends the depth-tested part: later segments are drawn on top. */
+    fun endDepthTested() {
+        depthTestedSegments = segments
     }
 
     override fun line(x0: Float, y0: Float, z0: Float, x1: Float, y1: Float, z1: Float, rgba: Int) {

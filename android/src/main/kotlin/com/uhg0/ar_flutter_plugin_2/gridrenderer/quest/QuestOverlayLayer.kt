@@ -15,6 +15,9 @@ internal interface GridOverlayLayer {
     /** Called on the channel thread with one overlay message. */
     fun onMessage(buffer: ByteBuffer, length: Int): QuestOverlayStatus
 
+    /** Render thread, before [buildLines]: focal length in pixels and display density for screen-size clamps. */
+    fun setView(focalPx: Float, pxPerDp: Float) {}
+
     /** Called on the render thread; returns the number of segments emitted. */
     fun buildLines(camX: Float, camY: Float, camZ: Float, sink: OverlayLineSink): Int
 
@@ -53,6 +56,8 @@ internal class QuestOverlayLayer : GridOverlayLayer {
         }
         status
     }
+
+    override fun setView(focalPx: Float, pxPerDp: Float) = geometry.setView(focalPx, pxPerDp)
 
     override fun buildLines(camX: Float, camY: Float, camZ: Float, sink: OverlayLineSink): Int {
         if (!hasFrame) return 0
