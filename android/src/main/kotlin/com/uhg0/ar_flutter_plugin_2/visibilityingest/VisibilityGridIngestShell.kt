@@ -7,6 +7,7 @@ import com.uhg0.ar_flutter_plugin_2.capture.CaptureTerminal
 import com.uhg0.ar_flutter_plugin_2.visibilitycontract.IngestMessageLayout
 import com.uhg0.ar_flutter_plugin_2.visibilitycontract.ShellControlLayout
 import com.uhg0.ar_flutter_plugin_2.visibilitycontract.VisibilityGridFrameTap
+import com.uhg0.ar_flutter_plugin_2.sessionlog.NativeSessionLogBuffer
 import com.uhg0.ar_flutter_plugin_2.sessionlog.NativeSessionLogEmitter
 
 /** Configuration of a started shell, from the control start message. */
@@ -225,6 +226,8 @@ internal class VisibilityGridIngestShell(
             appliedVersion = configVersion
             session.groupEpoch = config?.groupEpoch?.and(0xffff) ?: 0
             resetSession()
+            depth.clearRefusalStreak()
+            refusalReported = false
             lastTracking = -1
             lastDepthMode = -1
             lastSession = sessionIdentity
@@ -303,12 +306,53 @@ internal class VisibilityGridIngestShell(
         depth.publishStaged(true)
         points.publishStaged(true)
         depth.onFrame(source, mode)
+        watchDepthRefusals(ts, tracking)
         if (mode != IngestFrameSource.DEPTH_MODE_DISABLED) watchDepthStall()
         val wantPoints = mode == IngestFrameSource.DEPTH_MODE_DISABLED ||
             (cfg != null && cfg.flags and ShellControlLayout.FLAG_POINT_CLOUD != 0)
         if (wantPoints) points.onFrame(source, tq)
         depth.publishStaged(false)
         points.publishStaged(false)
+    }
+
+    // A refused depth stream was reported (session event and session log) and not cleared yet.
+    private var refusalReported = false
+
+    /**
+     * [DEPTH_REFUSED_STREAK] identity refusals in a row (about 2 s of
+     * acquisitions) report a refused depth stream: a
+     * [IngestMessageLayout.SESSION_DEPTH_REFUSED] event with the reason, so
+     * the grid shows it, and a `DEPTH_REFUSED`/`stream` session log warning.
+     * The next image that passes the identity check clears it with reason
+     * [IngestMessageLayout.DEPTH_REFUSAL_NONE].
+     */
+    private fun watchDepthRefusals(frameNs: Long, tracking: Int) {
+        val streak = depth.refusalStreak
+        if (!refusalReported && streak >= DEPTH_REFUSED_STREAK) {
+            refusalReported = true
+            val reason = depth.lastRefusalReason
+            sessionEvents.emit(IngestMessageLayout.SESSION_DEPTH_REFUSED, reason.toLong() or (streak shl 8),
+                frameNs, tracking, session.groupEpoch)
+            NativeSessionLogEmitter.record(
+                "DEPTH_REFUSED",
+                "Every depth image is refused by the frame clock identity check; depth is not fused",
+                mapOf(
+                    "reason" to depthRefusalReasonName(reason), "consecutive" to streak,
+                    "imageLeadMs" to depth.lastImageLeadNs / 1_000_000L,
+                    "toleranceMs" to DepthIngestProducer.IMAGE_AHEAD_TOLERANCE_NS / 1_000_000L,
+                ),
+                variant = "stream",
+            )
+        } else if (refusalReported && streak == 0L) {
+            refusalReported = false
+            sessionEvents.emit(IngestMessageLayout.SESSION_DEPTH_REFUSED,
+                IngestMessageLayout.DEPTH_REFUSAL_NONE.toLong(), frameNs, tracking, session.groupEpoch)
+            NativeSessionLogEmitter.record(
+                "DEPTH_REFUSED", "Depth images pass the identity check again",
+                mapOf("refused" to depth.identityRefused), variant = "streamRecovered",
+                level = NativeSessionLogBuffer.LEVEL_INFO,
+            )
+        }
     }
 
     /**
@@ -399,6 +443,12 @@ internal class VisibilityGridIngestShell(
             loggedIdentityRefused = NativeSessionLogEmitter.reportGrowth(
                 "DEPTH_REFUSED", "identity", depth.identityRefused, loggedIdentityRefused,
                 "Depth images refused by the frame clock identity check",
+                mapOf(
+                    "reason" to depthRefusalReasonName(depth.lastRefusalReason),
+                    "imageAheadOfFrame" to depth.refusedAheadOfFrame,
+                    "invalidTimestamp" to depth.refusedInvalidTimestamp,
+                    "imageLeadMs" to depth.lastImageLeadNs / 1_000_000L,
+                ),
             )
         }
         if (depth.identityStaleAutomatic > loggedStaleAutomatic) {
@@ -423,6 +473,9 @@ internal class VisibilityGridIngestShell(
             "[grid-depth] published=${depth.published} duplicate=${depth.duplicateDropped} " +
                 "staleDropped=${depth.staleDropped} identityRefused=${depth.identityRefused} " +
                 "staleAutomatic=${depth.identityStaleAutomatic} notYetAvailable=${depth.notYetAvailable} " +
+                "refusedAhead=${depth.refusedAheadOfFrame} refusedInvalid=${depth.refusedInvalidTimestamp} " +
+                "aheadTolerated=${depth.identityAheadTolerated} refusalStreak=${depth.refusalStreak} " +
+                "imageLeadMs=${depth.lastImageLeadNs / 1_000_000L} " +
                 "failures=${depth.failures} acquired=${depth.acquired} lastImageAgeMs=$ageMs " +
                 "reapplied=$depthReapplyRequests resumes=$resumes trackingResets=$trackingResets " +
                 "mode=$lastDepthMode tracking=$tracking epoch=${session.groupEpoch}",
@@ -465,6 +518,9 @@ internal class VisibilityGridIngestShell(
             "acquired" to depth.acquired, "published" to depth.published, "staleDropped" to depth.staleDropped,
             "duplicateDropped" to depth.duplicateDropped, "identityRefused" to depth.identityRefused,
             "identityStaleAutomatic" to depth.identityStaleAutomatic, "notYetAvailable" to depth.notYetAvailable,
+            "identityAheadTolerated" to depth.identityAheadTolerated,
+            "refusedAheadOfFrame" to depth.refusedAheadOfFrame,
+            "refusedInvalidTimestamp" to depth.refusedInvalidTimestamp, "refusalStreak" to depth.refusalStreak,
             "deferred" to depth.deferred, "deferTimeouts" to depth.deferTimeouts, "poseMissing" to depth.poseMissing,
         ),
         "points" to mapOf(
@@ -489,4 +545,7 @@ internal class VisibilityGridIngestShell(
 
 private const val TELEMETRY_INTERVAL_NS = 1_000_000_000L
 private const val DEPTH_STALL_NS = 3_000_000_000L
+
+/** Identity refusals in a row that report a refused depth stream (2 s at the 4 Hz acquisition). */
+internal const val DEPTH_REFUSED_STREAK = 8L
 private const val DEPTH_REAPPLY_INTERVAL_NS = 5_000_000_000L

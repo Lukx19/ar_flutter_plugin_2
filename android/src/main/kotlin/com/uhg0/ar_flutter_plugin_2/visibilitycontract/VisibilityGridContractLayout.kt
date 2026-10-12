@@ -108,6 +108,22 @@ internal object IngestMessageLayout {
     /** The AR session resumed after a pause (additive amendment). Value: frame gap in nanoseconds. */
     const val SESSION_AR_RESUMED = 7
 
+    /**
+     * Every acquired depth image is refused, or depth is accepted again after
+     * such a run (additive amendment 2026-10-12). Value: low byte one of the
+     * `DEPTH_REFUSAL_` reasons ([DEPTH_REFUSAL_NONE] = accepted again), bits 8
+     * and up the consecutive refused images.
+     */
+    const val SESSION_DEPTH_REFUSED = 8
+
+    const val DEPTH_REFUSAL_NONE = 0
+
+    /** A non-positive depth image or frame timestamp. */
+    const val DEPTH_REFUSAL_INVALID_TIMESTAMP = 1
+
+    /** The depth image timestamp is ahead of its frame by more than the clock offset tolerance. */
+    const val DEPTH_REFUSAL_IMAGE_AHEAD_OF_FRAME = 2
+
     const val TRACKING_RESET_AR_RESUMED = 1
     const val TRACKING_RESET_TRACKING_FAILURE = 2
     const val TRACKING_RESET_ANCHOR_JUMP = 3

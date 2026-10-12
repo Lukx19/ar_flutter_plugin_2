@@ -39,6 +39,16 @@ internal class IngestSessionState {
  * An AUTOMATIC image older than its frame is counted
  * ([identityStaleAutomatic]) but not refused: the grid fuses with the pose at
  * the image timestamp instead of the frame pose.
+ *
+ * ARCore re-estimates the camera to IMU clock offset while it runs (logcat
+ * `FEATURE_DSP_CAM_IMU_DESYNC`, seen from +5 ms to -25 ms on the SM-X700);
+ * after a negative estimate every depth image is stamped a few milliseconds
+ * after its frame for as long as the estimate holds. An image ahead of its
+ * frame by at most [IMAGE_AHEAD_TOLERANCE_NS] is therefore accepted and
+ * counted ([identityAheadTolerated]); the pose at its timestamp is matched
+ * once a frame covers it. Every refusal is counted by reason, and
+ * [refusalStreak] counts the refused images since the last accepted one, so
+ * a refused stream is visible instead of silently starving depth.
  */
 internal class DepthIngestProducer(
     private val session: IngestSessionState,
@@ -47,6 +57,13 @@ internal class DepthIngestProducer(
 ) : DepthImageSink {
     companion object {
         const val ACQUIRE_INTERVAL_NS = 250_000_000L
+
+        /**
+         * Largest lead of an AUTOMATIC depth image over its frame that is a
+         * clock offset, not a foreign image: four times the largest offset
+         * seen (25.6 ms), three frames at 30 Hz.
+         */
+        const val IMAGE_AHEAD_TOLERANCE_NS = 100_000_000L
         private const val MAX_PAYLOAD = IngestMessageLayout.MAX_MESSAGE_BYTES - IngestMessageLayout.HEADER_BYTES
     }
 
@@ -71,6 +88,18 @@ internal class DepthIngestProducer(
     @Volatile var duplicateDropped = 0L; private set
     @Volatile var identityRefused = 0L; private set
     @Volatile var identityStaleAutomatic = 0L; private set
+    @Volatile var identityAheadTolerated = 0L; private set
+    @Volatile var refusedInvalidTimestamp = 0L; private set
+    @Volatile var refusedAheadOfFrame = 0L; private set
+
+    /** Identity refusals since the last image that passed the identity check. */
+    @Volatile var refusalStreak = 0L; private set
+
+    /** `DEPTH_REFUSAL_` reason of the latest refusal ([IngestMessageLayout.DEPTH_REFUSAL_NONE] before any). */
+    @Volatile var lastRefusalReason = IngestMessageLayout.DEPTH_REFUSAL_NONE; private set
+
+    /** Image minus frame timestamp of the latest acquired image (positive: image ahead). */
+    @Volatile var lastImageLeadNs = 0L; private set
     @Volatile var calibrationUnavailable = 0L; private set
     @Volatile var oversized = 0L; private set
     @Volatile var deferred = 0L; private set
@@ -89,6 +118,12 @@ internal class DepthIngestProducer(
         staged = false
         lastAcquireNs = Long.MIN_VALUE
         lastImageNs = Long.MIN_VALUE
+    }
+
+    /** Forgets the refusal run (a new shell start); counters stay. */
+    fun clearRefusalStreak() {
+        refusalStreak = 0L
+        lastRefusalReason = IngestMessageLayout.DEPTH_REFUSAL_NONE
     }
 
     /** Acquires when due; call after the frame's pose was pushed. */
@@ -126,14 +161,23 @@ internal class DepthIngestProducer(
         confidencePixelStride: Int,
     ) {
         latestImageNs = imageTimestampNs
+        lastImageLeadNs = imageTimestampNs - frameNs
         val refusal = depthIdentityRefusal(imageTimestampNs, frameNs, mode)
         if (refusal == DepthAcquisitionRefusal.STALE_AUTOMATIC) {
             identityStaleAutomatic++
         } else if (refusal != null) {
             identityRefused++
+            val reason = depthRefusalReason(imageTimestampNs, frameNs)
+            if (reason == IngestMessageLayout.DEPTH_REFUSAL_IMAGE_AHEAD_OF_FRAME) refusedAheadOfFrame++
+            else refusedInvalidTimestamp++
+            lastRefusalReason = reason
+            refusalStreak++
             sink.countSourceDrop(IngestMessageLayout.KIND_DEPTH_IMAGE)
             return
+        } else if (imageTimestampNs > frameNs) {
+            identityAheadTolerated++
         }
+        refusalStreak = 0L
         if (DepthPoseHistory.isStaleDepth(frameNs, imageTimestampNs)) {
             staleDropped++
             sink.countSourceDrop(IngestMessageLayout.KIND_DEPTH_IMAGE)
@@ -218,9 +262,11 @@ internal class DepthIngestProducer(
 /**
  * Identity check of an ingest depth image on the frame clock only: RAW keeps
  * the shared rule ([depthImageIdentityRefusal], frame clock); AUTOMATIC
- * refuses a non-positive image or frame time and an image newer than its
- * frame, and reports an older image as [DepthAcquisitionRefusal.STALE_AUTOMATIC]
- * (counted, not refused).
+ * refuses a non-positive image or frame time and an image ahead of its frame
+ * by more than [DepthIngestProducer.IMAGE_AHEAD_TOLERANCE_NS] (a smaller lead
+ * is ARCore's camera to IMU clock offset and is accepted), and reports an
+ * older image as [DepthAcquisitionRefusal.STALE_AUTOMATIC] (counted, not
+ * refused).
  */
 internal fun depthIdentityRefusal(imageNs: Long, frameNs: Long, mode: Int): DepthAcquisitionRefusal? {
     if (mode == IngestFrameSource.DEPTH_MODE_RAW) {
@@ -229,8 +275,22 @@ internal fun depthIdentityRefusal(imageNs: Long, frameNs: Long, mode: Int): Dept
             rawProjectionQualified = true, denseCurrentFrameExperimentEnabled = false,
         )
     }
-    if (imageNs <= 0L || frameNs <= 0L || imageNs > frameNs) return DepthAcquisitionRefusal.INVALID_TIMESTAMP
-    return if (imageNs != frameNs) DepthAcquisitionRefusal.STALE_AUTOMATIC else null
+    if (imageNs <= 0L || frameNs <= 0L || imageNs - frameNs > DepthIngestProducer.IMAGE_AHEAD_TOLERANCE_NS) {
+        return DepthAcquisitionRefusal.INVALID_TIMESTAMP
+    }
+    return if (imageNs < frameNs) DepthAcquisitionRefusal.STALE_AUTOMATIC else null
+}
+
+/** The `DEPTH_REFUSAL_` reason of a refused image: a non-positive time, else an image ahead of its frame. */
+internal fun depthRefusalReason(imageNs: Long, frameNs: Long): Int =
+    if (imageNs <= 0L || frameNs <= 0L) IngestMessageLayout.DEPTH_REFUSAL_INVALID_TIMESTAMP
+    else IngestMessageLayout.DEPTH_REFUSAL_IMAGE_AHEAD_OF_FRAME
+
+/** Session log name of a `DEPTH_REFUSAL_` reason. */
+internal fun depthRefusalReasonName(reason: Int): String = when (reason) {
+    IngestMessageLayout.DEPTH_REFUSAL_INVALID_TIMESTAMP -> "invalidTimestamp"
+    IngestMessageLayout.DEPTH_REFUSAL_IMAGE_AHEAD_OF_FRAME -> "imageAheadOfFrame"
+    else -> "none"
 }
 
 internal fun gapUs(errorNs: Long): Int {
