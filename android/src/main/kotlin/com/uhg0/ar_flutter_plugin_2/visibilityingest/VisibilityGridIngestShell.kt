@@ -116,7 +116,7 @@ internal class VisibilityGridIngestShell(
     // Set by [onArSessionResumed] on any thread, handled by the next frame.
     @Volatile private var resumePending = false
     private var lossFailureReason = 0
-    private var watchedAcquired = 0L
+    private var watchedImageNs = Long.MIN_VALUE
     private var depthProgressNs = Long.MIN_VALUE
     private var lastDepthReapplyNs = Long.MIN_VALUE
 
@@ -311,16 +311,22 @@ internal class VisibilityGridIngestShell(
         points.publishStaged(false)
     }
 
-    /** Depth that was acquired before and has not been acquired for [DEPTH_STALL_NS] of tracking frames is re-applied. */
+    /**
+     * Depth that was delivered before and has not delivered a new image for
+     * [DEPTH_STALL_NS] of tracking frames is re-applied. Progress is a new
+     * image timestamp, not an acquisition: ARCore keeps answering with its
+     * last depth image once depth stops (seen in dataset playback), so the
+     * acquisition count keeps rising while depth is stale.
+     */
     private fun watchDepthStall() {
         val now = clock.nowNs()
-        val acquired = depth.acquired
-        if (acquired != watchedAcquired || depthProgressNs == Long.MIN_VALUE) {
-            watchedAcquired = acquired
+        val imageNs = depth.latestImageNs
+        if (imageNs != watchedImageNs || depthProgressNs == Long.MIN_VALUE) {
+            watchedImageNs = imageNs
             depthProgressNs = now
             return
         }
-        if (acquired == 0L || now - depthProgressNs < DEPTH_STALL_NS) return
+        if (imageNs == Long.MIN_VALUE || now - depthProgressNs < DEPTH_STALL_NS) return
         if (lastDepthReapplyNs != Long.MIN_VALUE && now - lastDepthReapplyNs < DEPTH_REAPPLY_INTERVAL_NS) return
         requestDepthReapply(now)
     }

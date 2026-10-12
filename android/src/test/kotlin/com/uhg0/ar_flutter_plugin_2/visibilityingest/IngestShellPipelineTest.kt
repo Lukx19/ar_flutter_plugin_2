@@ -346,6 +346,37 @@ class IngestShellPipelineTest {
     }
 
     @Test
+    fun `depth that keeps returning the same old image for 3 s while tracking asks for the depth mode`() {
+        // Playback smoke: ARCore answered every acquisition with its last depth image
+        // (acquired grew, the image timestamp did not, staleDropped grew) and the depth
+        // mode was never re-applied.
+        start(0, IngestShellConfig.DEPTH_AUTOMATIC)
+        shell.depthMode = { Config.DepthMode.AUTOMATIC }
+        var reapplied = 0
+        shell.depthReapply = { reapplied++ }
+        frame.goldenDepth()
+        frame.confidence = null
+        var t = 1_000 * ms
+        fun run(frames: Int, freshImages: Boolean) {
+            repeat(frames) {
+                t += 100 * ms
+                clock.now = t
+                if (freshImages) frame.depthImageNs = t
+                frameAt(t)
+            }
+        }
+        run(10, freshImages = true)
+        val acquiredBefore = shell.depthProducer.acquired
+        run(29, freshImages = false)
+        assertTrue("the same image is still acquired", shell.depthProducer.acquired > acquiredBefore)
+        assertEquals("2.9 s of the same image", 0, reapplied)
+        run(2, freshImages = false)
+        assertEquals(1, reapplied)
+        run(39, freshImages = true)
+        assertEquals("fresh images are progress", 1, reapplied)
+    }
+
+    @Test
     fun `control channel starts the shell from the start golden and rejects malformed messages`() {
         val handler = GridShellControlHandler(shell = { shell }, markerDetectorAvailable = { true })
         val start = ByteBuffer.wrap(golden("shell_control_start.bin"))
