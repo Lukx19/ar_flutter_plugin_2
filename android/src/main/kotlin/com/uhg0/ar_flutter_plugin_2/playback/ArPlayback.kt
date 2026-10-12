@@ -2,7 +2,9 @@ package com.uhg0.ar_flutter_plugin_2.playback
 
 import android.util.Log
 import com.google.ar.core.Session
+import com.uhg0.ar_flutter_plugin_2.recording.ArPlaybackTrackReader
 import java.io.File
+import java.util.UUID
 
 /**
  * Debug/profile test mode: the view's ARCore session replays a Recording &
@@ -38,6 +40,8 @@ internal data class ArPlaybackConfig(
     val restart: ArPlaybackRestart,
     /** Number of earlier view restarts; 0 for the first view. */
     val restartGeneration: Int,
+    /** Custom data tracks the view reads back from every playback frame. */
+    val trackIds: List<UUID> = emptyList(),
 )
 
 internal sealed interface ArPlaybackSelection {
@@ -54,6 +58,7 @@ internal object ArPlaybackSelector {
     const val DATASET_PARAM = "arcorePlaybackDataset"
     const val RESTART_PARAM = "arcorePlaybackRestart"
     const val GENERATION_PARAM = "arcorePlaybackRestartGeneration"
+    const val TRACK_IDS_PARAM = "arcorePlaybackTrackIds"
 
     /**
      * Resolves the creation parameters. Playback needs a debuggable build
@@ -85,6 +90,7 @@ internal object ArPlaybackSelector {
                 datasetPath = file.path,
                 restart = ArPlaybackRestart.parse(creationParams?.get(RESTART_PARAM)),
                 restartGeneration = generation.coerceAtLeast(0),
+                trackIds = ArPlaybackTrackReader.parseTrackIds(creationParams?.get(TRACK_IDS_PARAM)),
             ),
         )
     }
@@ -103,7 +109,8 @@ internal object ArPlaybackSelector {
     fun describe(selection: ArPlaybackSelection): String? = when (selection) {
         ArPlaybackSelection.Disabled -> null
         is ArPlaybackSelection.Enabled -> "$LOG_PREFIX configured path=${selection.config.datasetPath} " +
-            "restart=${selection.config.restart.wireValue} generation=${selection.config.restartGeneration}"
+            "restart=${selection.config.restart.wireValue} generation=${selection.config.restartGeneration} " +
+            "tracks=${selection.config.trackIds.size}"
         is ArPlaybackSelection.Refused -> "$LOG_PREFIX refused path=${selection.requestedPath} " +
             "reason=${selection.reason} (live camera)"
     }

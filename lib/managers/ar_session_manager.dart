@@ -8,6 +8,7 @@ import 'package:ar_flutter_plugin_2/datatypes/image_format.dart';
 import 'package:ar_flutter_plugin_2/models/ar_anchor.dart';
 import 'package:ar_flutter_plugin_2/models/ar_hittest_result.dart';
 import 'package:ar_flutter_plugin_2/models/ar_capture_config.dart';
+import 'package:ar_flutter_plugin_2/models/ar_recording.dart';
 import 'package:ar_flutter_plugin_2/models/canonical_ready_hint.dart';
 import 'package:ar_flutter_plugin_2/capabilities/ar_camera_capabilities.dart';
 import 'package:ar_flutter_plugin_2/utils/json_converters.dart';
@@ -120,6 +121,10 @@ class ARSessionManager {
   /// Debug/profile ARCore playback: the dataset reached its end. The argument
   /// map carries `path`, `restart` (view, session or off) and `restarts`.
   void Function(Map<String, Object?> event)? onArPlaybackFinished;
+
+  /// Debug/profile ARCore playback: custom track records of a replayed frame
+  /// (tracks named by `ARPlaybackConfig.trackIds`), in recording order.
+  void Function(List<ARPlaybackTrackRecord> records)? onArPlaybackTrackData;
 
   CanonicalReadyHintHandler? _canonicalReadyHandler;
   bool _canonicalReadyDeliveryPending = false;
@@ -694,6 +699,29 @@ class ARSessionManager {
     }
   }
 
+  /// Debug/profile builds (Android): starts an ARCore MP4 recording of the
+  /// running session. Throws a [PlatformException] (`RECORDING_REFUSED`,
+  /// `RECORDING_FAILED`) when the session cannot record.
+  Future<ARRecordingStatus> startRecording(ARRecordingRequest request) async =>
+      ARRecordingStatus.fromMap(await _invokeOpenSession<Object?>(
+          'startRecording', request.toArguments()));
+
+  /// Stops the recording after queued track data reached a frame (bounded
+  /// natively); returns the final status. Safe when nothing records.
+  Future<ARRecordingStatus> stopRecording() async =>
+      ARRecordingStatus.fromMap(
+          await _invokeOpenSession<Object?>('stopRecording'));
+
+  /// Queues [data] for the next frame of the recording's custom track
+  /// [trackId]; false when nothing records or the native queue is full.
+  Future<bool> recordTrackData(String trackId, Uint8List data) async =>
+      await _invokeOpenSession<bool>(
+          'recordTrackData', {'trackId': trackId, 'data': data}) ??
+      false;
+
+  Future<ARRecordingStatus> recordingStatus() async => ARRecordingStatus.fromMap(
+      await _invokeOpenSession<Object?>('recordingStatus'));
+
   /// Returns native frame-cadence diagnostics for this AR view.
   Future<Map<String, Object?>> getRendererPerformanceSnapshot() async {
     return await _channel.invokeMapMethod<String, Object?>(
@@ -833,6 +861,10 @@ class ARSessionManager {
           onArPlaybackFinished?.call(arguments is Map
               ? Map<String, Object?>.from(arguments)
               : const <String, Object?>{});
+          break;
+        case 'onArPlaybackTrackData':
+          final records = ARPlaybackTrackRecord.parseEvent(call.arguments);
+          if (records.isNotEmpty) onArPlaybackTrackData?.call(records);
           break;
         case 'onPlaneDetected':
           if (onPlaneDetected != null) {

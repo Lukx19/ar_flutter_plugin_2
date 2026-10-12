@@ -72,6 +72,13 @@ import kotlinx.coroutines.cancel
 import com.uhg0.ar_flutter_plugin_2.capture.CaptureLifecycleDrain
 import com.uhg0.ar_flutter_plugin_2.playback.ArPlaybackConfig
 import com.uhg0.ar_flutter_plugin_2.playback.ArPlaybackController
+import com.uhg0.ar_flutter_plugin_2.recording.ArCoreRecordingPort
+import com.uhg0.ar_flutter_plugin_2.recording.ArPlaybackTrackReader
+import com.uhg0.ar_flutter_plugin_2.recording.ArRecordingRequestParse
+import com.uhg0.ar_flutter_plugin_2.recording.ArRecordingRequests
+import com.uhg0.ar_flutter_plugin_2.recording.ArSessionRecorder
+import com.uhg0.ar_flutter_plugin_2.recording.readTrackRecords
+import com.uhg0.ar_flutter_plugin_2.recording.recordTrackBytes
 import java.util.concurrent.Executor
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -93,6 +100,16 @@ internal class ArView(
 ) : PlatformView {
     private val playback = playbackConfig?.let(::ArPlaybackController)
     private val root = FrameLayout(context)
+    /** Developer-build ARCore session recording (`startRecording` session call). */
+    private val recorder = ArSessionRecorder()
+    /** Playback custom tracks posted to Flutter as `onArPlaybackTrackData`. */
+    private val playbackTracks = playbackConfig?.trackIds?.takeIf { it.isNotEmpty() }?.let { ids ->
+        ArPlaybackTrackReader(ids, deliver = { records ->
+            root.post {
+                if (!disposed) sessionChannel.invokeMethod("onArPlaybackTrackData", ArPlaybackTrackReader.event(records))
+            }
+        })
+    }
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val sessionChannel = MethodChannel(messenger, "arsession_$id")
     private val objectChannel = MethodChannel(messenger, "arobjects_$id")
@@ -422,6 +439,7 @@ internal class ArView(
 
     private val lifecycleObserver = object : DefaultLifecycleObserver {
         override fun onPause(owner: LifecycleOwner) {
+            stopRecordingNow()
             resumeCoordinator.invalidate(ResumeTerminal.SUPERSEDED)
             visibilityObservationRuntime.fencePause()
             captureSafetySignalV2.invalidateLifecycleForViewPause()
@@ -469,6 +487,7 @@ internal class ArView(
             disposeTerminalResult?.let(onCompleted) ?: run { disposeCompletionCallbacks += onCompleted }
         }
         if (disposed) return
+        stopRecordingNow()
         disposed = true
         VisibilityGridShellRegistry.detachView(this)
         canonicalReadyHints?.close()
@@ -656,6 +675,7 @@ internal class ArView(
                 // Dart manager uses pauseSession/resumeSession, while older
                 // callers use disableCamera/enableCamera.
                 "disableCamera", "pauseSession" -> {
+                    stopRecordingNow()
                     sessionPausedByFlutter = true
                     resumeCoordinator.invalidate(ResumeTerminal.SUPERSEDED)
                     visibilityObservationRuntime.fencePause()
@@ -675,11 +695,71 @@ internal class ArView(
                         onFailure = { result.error("SESSION_DISPOSE_FAILED", it.message, null) },
                     ) }
                 }
+                "startRecording" -> startRecording(call, result)
+                "stopRecording" -> stopRecording(result)
+                "recordTrackData" -> {
+                    val id = call.argument<String>("trackId")
+                        ?.let { runCatching { java.util.UUID.fromString(it) }.getOrNull() }
+                    val data = call.argument<ByteArray>("data")
+                    result.success(id != null && data != null && recorder.enqueue(id, data))
+                }
+                "recordingStatus" -> result.success(
+                    recorder.status(sceneHost.activeSession?.let(::ArCoreRecordingPort)),
+                )
                 else -> result.notImplemented()
             }
         } catch (error: Exception) {
             result.error("SESSION_ERROR", error.message, null)
         }
+    }
+
+    private fun startRecording(call: MethodCall, result: MethodChannel.Result) {
+        if (playback != null) {
+            result.error("RECORDING_REFUSED", "playback-active", null)
+            return
+        }
+        val session = sceneHost.activeSession
+        if (session == null || disposed) {
+            result.error("RECORDING_REFUSED", "session-unavailable", null)
+            return
+        }
+        when (val parse = ArRecordingRequests.parse(
+            call.arguments as? Map<*, *>,
+            isDebuggable = isDebuggable,
+            externalFilesDir = root.context.getExternalFilesDir(null),
+        )) {
+            is ArRecordingRequestParse.Refused -> result.error("RECORDING_REFUSED", parse.reason, null)
+            is ArRecordingRequestParse.Accepted -> recorder.start(ArCoreRecordingPort(session), parse.request).fold(
+                onSuccess = result::success,
+                onFailure = { result.error("RECORDING_FAILED", "${it.javaClass.simpleName}: ${it.message}", null) },
+            )
+        }
+    }
+
+    /** Stops after queued track data reached a frame, or after the stop timeout. */
+    private fun stopRecording(result: MethodChannel.Result) {
+        val session = sceneHost.activeSession
+        if (session == null) {
+            result.success(recorder.status(null))
+            return
+        }
+        val port = ArCoreRecordingPort(session)
+        var answered = false
+        val answer: (Map<String, Any?>) -> Unit = { status ->
+            root.post {
+                if (!answered) {
+                    answered = true
+                    result.success(status)
+                }
+            }
+        }
+        recorder.requestStop(port, answer)
+        root.postDelayed({ recorder.stopNow(port) }, ArSessionRecorder.STOP_TIMEOUT_MS)
+    }
+
+    private fun stopRecordingNow() {
+        if (!recorder.isRecording) return
+        sceneHost.activeSession?.let { recorder.stopNow(ArCoreRecordingPort(it)) }
     }
 
     private fun resumeSessionBounded(result: MethodChannel.Result) {
@@ -1291,6 +1371,8 @@ internal class ArView(
             captureSession.buildPoseUpdate(frame)?.let(poseBatchDispatcher::offer)
         }
         if (playback != null) captureSession.onPlaybackFrame(frame)
+        if (recorder.isRecording) recorder.onFrame(ArCoreRecordingPort(session)) { id, data -> frame.recordTrackBytes(id, data) }
+        playbackTracks?.onFrame { id -> frame.readTrackRecords(id) }
         // Visibility grid frame tap seam: returns at once unless the grid shell was started.
         VisibilityGridShellRegistry.onArFrame(session, frame)
         attribution.measureNativeFrame(NativeFrameSpan.AR_PLANES) {

@@ -37,11 +37,16 @@ class ARPlaybackConfig {
     required this.datasetPath,
     this.restart = ARPlaybackRestart.view,
     this.restartGeneration = 0,
+    this.trackIds = const <String>[],
   });
 
   final String datasetPath;
   final ARPlaybackRestart restart;
   final int restartGeneration;
+
+  /// Custom data tracks (UUID strings) the view reads from every playback
+  /// frame and reports with `ARSessionManager.onArPlaybackTrackData`.
+  final List<String> trackIds;
 
   /// The configuration a build may use: null in release builds and for an
   /// empty path, so release apps never replay a dataset.
@@ -49,6 +54,7 @@ class ARPlaybackConfig {
     required String datasetPath,
     String restart = 'view',
     int restartGeneration = 0,
+    List<String> trackIds = const <String>[],
     bool isReleaseBuild = kReleaseMode,
   }) {
     final path = datasetPath.trim();
@@ -57,31 +63,47 @@ class ARPlaybackConfig {
       datasetPath: path,
       restart: ARPlaybackRestart.parse(restart),
       restartGeneration: restartGeneration,
+      trackIds: trackIds,
     );
   }
 
   ARPlaybackConfig withRestartGeneration(int generation) => ARPlaybackConfig(
-        datasetPath: datasetPath,
-        restart: restart,
-        restartGeneration: generation,
-      );
+    datasetPath: datasetPath,
+    restart: restart,
+    restartGeneration: generation,
+    trackIds: trackIds,
+  );
+
+  ARPlaybackConfig withTrackIds(List<String> ids) => ARPlaybackConfig(
+    datasetPath: datasetPath,
+    restart: restart,
+    restartGeneration: restartGeneration,
+    trackIds: List<String>.unmodifiable(ids),
+  );
 
   /// Android creation parameters; merged into the AR view parameters.
   Map<String, Object> toCreationParams() => <String, Object>{
-        'arcorePlaybackDataset': datasetPath,
-        'arcorePlaybackRestart': restart.wireValue,
-        'arcorePlaybackRestartGeneration': restartGeneration,
-      };
+    'arcorePlaybackDataset': datasetPath,
+    'arcorePlaybackRestart': restart.wireValue,
+    'arcorePlaybackRestartGeneration': restartGeneration,
+    if (trackIds.isNotEmpty) 'arcorePlaybackTrackIds': trackIds,
+  };
 
   @override
   bool operator ==(Object other) =>
       other is ARPlaybackConfig &&
       other.datasetPath == datasetPath &&
       other.restart == restart &&
-      other.restartGeneration == restartGeneration;
+      other.restartGeneration == restartGeneration &&
+      listEquals(other.trackIds, trackIds);
 
   @override
-  int get hashCode => Object.hash(datasetPath, restart, restartGeneration);
+  int get hashCode => Object.hash(
+    datasetPath,
+    restart,
+    restartGeneration,
+    Object.hashAll(trackIds),
+  );
 
   @override
   String toString() =>

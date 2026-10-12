@@ -42,6 +42,18 @@ class ArPlaybackTest {
         )
     }
 
+    @Test fun playbackCarriesTheCustomTrackIds() {
+        val id = "5b0a4c1e-6f3c-4d8e-9a71-2c3d4e5f6a7b"
+        val selection = select(
+            mapOf(
+                ArPlaybackSelector.DATASET_PARAM to "recordings/walk1.mp4",
+                ArPlaybackSelector.TRACK_IDS_PARAM to listOf(id, "not-a-uuid"),
+            ),
+        ) as ArPlaybackSelection.Enabled
+        assertEquals(listOf(java.util.UUID.fromString(id)), selection.config.trackIds)
+        assertTrue(ArPlaybackSelector.describe(selection)!!.endsWith("tracks=1"))
+    }
+
     @Test fun releaseBuildsMissingFilesAndParentSegmentsAreRefused() {
         val params = mapOf(ArPlaybackSelector.DATASET_PARAM to "recordings/walk1.mp4")
         assertEquals("release-build", (select(params, debuggable = false) as ArPlaybackSelection.Refused).reason)
