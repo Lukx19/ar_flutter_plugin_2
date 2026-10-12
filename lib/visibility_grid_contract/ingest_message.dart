@@ -72,6 +72,28 @@ abstract final class SessionEventKind {
 
   /// The AR session resumed after a pause. Value: frame gap in nanoseconds.
   static const int arSessionResumed = 7;
+
+  /// Every acquired depth image is refused by the platform's identity check,
+  /// or depth passes it again after such a run (amendment 2026-10-12).
+  /// Value: low byte a [DepthRefusalCode] ([DepthRefusalCode.none] = depth
+  /// passes again), bits 8 and up the consecutive refused images.
+  static const int depthRefused = 8;
+}
+
+/// Reason byte of a [SessionEventKind.depthRefused] value.
+abstract final class DepthRefusalCode {
+  /// Depth images pass the identity check again.
+  static const int none = 0;
+
+  /// A non-positive depth image or frame timestamp.
+  static const int invalidTimestamp = 1;
+
+  /// The depth image is stamped ahead of its frame by more than the camera
+  /// to IMU clock offset tolerance.
+  static const int imageAheadOfFrame = 2;
+
+  static int reason(int value) => value & 0xff;
+  static int consecutive(int value) => value >> 8;
 }
 
 /// Cause byte of a [SessionEventKind.trackingReset] value.

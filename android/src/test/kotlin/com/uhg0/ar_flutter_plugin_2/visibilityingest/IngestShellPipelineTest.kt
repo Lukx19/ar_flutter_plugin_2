@@ -5,6 +5,7 @@ import com.uhg0.ar_flutter_plugin_2.visibilitycontract.IngestMessageLayout
 import com.uhg0.ar_flutter_plugin_2.visibilitycontract.NativeStatusCode
 import com.uhg0.ar_flutter_plugin_2.visibilitycontract.ShellControlLayout
 import com.uhg0.ar_flutter_plugin_2.sessionlog.NativeSessionLogEmitter
+import com.uhg0.ar_flutter_plugin_2.visibilitygrid.DepthAcquisitionRefusal
 import com.uhg0.ar_flutter_plugin_2.sessionlog.data
 import com.uhg0.ar_flutter_plugin_2.sessionlog.full
 import com.uhg0.ar_flutter_plugin_2.sessionlog.withNativeSessionLog
@@ -161,12 +162,102 @@ class IngestShellPipelineTest {
         assertEquals(0L, depth.identityRefused)
         assertEquals(1L, depth.identityStaleAutomatic)
         assertEquals(2L, depth.published)
-        // An image newer than its frame is refused.
+        // An image ahead of its frame by more than the clock offset tolerance is refused.
         clock.now += 300 * ms
-        frame.depthImageNs = 1_300_000_000L
+        frame.depthImageNs = 1_400_000_000L
         frameAt(1_236_000_000L)
         assertEquals(1L, depth.identityRefused)
+        assertEquals(1L, depth.refusedAheadOfFrame)
         assertEquals(2L, depth.published)
+    }
+
+    /**
+     * The SM-X700 log of 2026-10-12 15:08:45: once ARCore's camera to IMU
+     * clock offset estimate turned negative (FEATURE_DSP_CAM_IMU_DESYNC
+     * -5.8 ms, growing to -25 ms), every depth image was stamped a few
+     * milliseconds after its frame and the identity check refused all of
+     * them (identityRefused 0 -> 611, published stuck at 84).
+     */
+    @Test
+    fun `depth images a camera to IMU clock offset ahead of their frames keep publishing`() {
+        start(0, IngestShellConfig.DEPTH_AUTOMATIC)
+        shell.depthMode = { Config.DepthMode.AUTOMATIC }
+        frame.goldenDepth()
+        frame.confidence = null
+        var t = 1_000 * ms
+        val leads = longArrayOf(-33 * ms, -1 * ms, 0L, 6 * ms, 13 * ms, 25 * ms, 26 * ms)
+        var i = 0
+        repeat(120) { // 4 s at 30 Hz; the depth throttle acquires every 250 ms
+            t += 33 * ms
+            clock.now = t
+            frame.depthImageNs = t + leads[i++ % leads.size]
+            frameAt(t)
+        }
+        val depth = shell.depthProducer
+        assertEquals(0L, depth.identityRefused)
+        assertEquals(0L, depth.refusalStreak)
+        assertTrue(depth.identityAheadTolerated > 0L)
+        assertTrue("published ${depth.published} of ${depth.acquired}", depth.published >= depth.acquired - 1)
+        assertTrue(drainSessionEvents().none { it.first == IngestMessageLayout.SESSION_DEPTH_REFUSED })
+    }
+
+    @Test
+    fun `a refused depth stream is reported once with its reason and cleared when depth passes again`() {
+        start(0, IngestShellConfig.DEPTH_AUTOMATIC)
+        shell.depthMode = { Config.DepthMode.AUTOMATIC }
+        frame.goldenDepth()
+        frame.confidence = null
+        var t = 1_000 * ms
+        var lead = 150 * ms
+        fun run(frames: Int) = repeat(frames) {
+            t += 33 * ms
+            clock.now = t
+            frame.depthImageNs = t + lead
+            frameAt(t)
+        }
+        val records = withNativeSessionLog {
+            run(120) // 4 s: 16 acquisitions, all refused
+            val depth = shell.depthProducer
+            assertEquals(depth.acquired, depth.identityRefused)
+            assertEquals(depth.acquired, depth.refusedAheadOfFrame)
+            assertEquals(depth.acquired, depth.refusalStreak)
+            assertEquals(0L, depth.published)
+            lead = 10 * ms
+            run(30)
+            assertEquals(0L, depth.refusalStreak)
+            assertTrue(depth.published > 0L)
+        }
+        val events = drainSessionEvents().filter { it.first == IngestMessageLayout.SESSION_DEPTH_REFUSED }
+        assertEquals(
+            listOf(
+                IngestMessageLayout.SESSION_DEPTH_REFUSED to
+                    (IngestMessageLayout.DEPTH_REFUSAL_IMAGE_AHEAD_OF_FRAME.toLong() or (DEPTH_REFUSED_STREAK shl 8)),
+                IngestMessageLayout.SESSION_DEPTH_REFUSED to IngestMessageLayout.DEPTH_REFUSAL_NONE.toLong(),
+            ),
+            events,
+        )
+        val stream = records.full("DEPTH_REFUSED").single { it[5] == "stream" }
+        assertEquals("warning", stream[2])
+        assertEquals("imageAheadOfFrame", stream.data["reason"])
+        assertEquals(150L, stream.data["imageLeadMs"])
+        assertEquals("info", records.full("DEPTH_REFUSED").single { it[5] == "streamRecovered" }[2])
+        val growth = records.full("DEPTH_REFUSED").first { it[5] == "identity" }
+        assertEquals("imageAheadOfFrame", growth.data["reason"])
+    }
+
+    @Test
+    fun `refusal reasons separate a non-positive timestamp from an image ahead of its frame`() {
+        val automatic = IngestFrameSource.DEPTH_MODE_AUTOMATIC
+        val tolerance = DepthIngestProducer.IMAGE_AHEAD_TOLERANCE_NS
+        assertEquals(null, depthIdentityRefusal(1_000 * ms + tolerance, 1_000 * ms, automatic))
+        assertEquals(null, depthIdentityRefusal(1_000 * ms, 1_000 * ms, automatic))
+        assertEquals(DepthAcquisitionRefusal.STALE_AUTOMATIC, depthIdentityRefusal(999 * ms, 1_000 * ms, automatic))
+        assertEquals(DepthAcquisitionRefusal.INVALID_TIMESTAMP,
+            depthIdentityRefusal(1_000 * ms + tolerance + 1, 1_000 * ms, automatic))
+        assertEquals(DepthAcquisitionRefusal.INVALID_TIMESTAMP, depthIdentityRefusal(0L, 1_000 * ms, automatic))
+        assertEquals(IngestMessageLayout.DEPTH_REFUSAL_INVALID_TIMESTAMP, depthRefusalReason(0L, 1_000 * ms))
+        assertEquals(IngestMessageLayout.DEPTH_REFUSAL_INVALID_TIMESTAMP, depthRefusalReason(1_000 * ms, 0L))
+        assertEquals(IngestMessageLayout.DEPTH_REFUSAL_IMAGE_AHEAD_OF_FRAME, depthRefusalReason(2_000 * ms, 1_000 * ms))
     }
 
     @Test
