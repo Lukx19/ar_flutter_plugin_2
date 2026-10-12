@@ -13,6 +13,14 @@ internal class PlaybackCameraImage(
 )
 
 /**
+ * Exposure timestamp of a playback CPU image: the frame's Android camera
+ * timestamp (the clock of the grid's photo pose history and epoch starts),
+ * or the image timestamp when the frame has none.
+ */
+internal fun playbackExposureTimestampNs(androidCameraTimestampNs: Long, imageTimestampNs: Long): Long =
+    if (androidCameraTimestampNs > 0L) androidCameraTimestampNs else imageTimestampNs
+
+/**
  * Shutter exposures while the AR session replays an ARCore dataset
  * (debug/profile playback test mode).
  *

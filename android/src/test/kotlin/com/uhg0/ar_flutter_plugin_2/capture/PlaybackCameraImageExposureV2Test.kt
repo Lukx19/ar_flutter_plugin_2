@@ -72,6 +72,11 @@ class PlaybackCameraImageExposureV2Test {
         assertFalse(port.hasPendingExposure)
     }
 
+    @Test fun exposureIsStampedWithTheFrameAndroidCameraClock() {
+        assertEquals(9_000L, playbackExposureTimestampNs(androidCameraTimestampNs = 9_000L, imageTimestampNs = 42L))
+        assertEquals(42L, playbackExposureTimestampNs(androidCameraTimestampNs = 0L, imageTimestampNs = 42L))
+    }
+
     @Test fun missingCpuImagesFailAfterTheWaitBound() {
         val port = exposure()
         val callback = Callback()

@@ -137,13 +137,7 @@ internal class ArCaptureSession(
     } else null
     private val playbackExposure = playbackExposureExecutor?.let { executor ->
         PlaybackCameraImageExposureV2(
-            refusal = { qualifier ->
-                when {
-                    !captureSafetySignalV2.isCaptureSafeFor(qualifier) -> "lifecycle-cut-before-exposure"
-                    !poseDataExtractor.isExposureMotionStable() -> "motion-skipped"
-                    else -> null
-                }
-            },
+            refusal = ::exposureRefusalV2,
             executor = executor,
             encodeJpeg = { image -> nv21ToJpeg(image, config?.jpegQuality ?: 95) },
         ).also(nativeCaptureBindingV2::attachPlaybackExposure)
@@ -244,6 +238,46 @@ internal class ArCaptureSession(
         }
     }
 
+    /**
+     * Final exposure refusal of a qualified attempt, shared by the shared-camera
+     * still and the playback CPU-image exposure: a lifecycle cut or unstable
+     * motion refuses; a motion refusal is recorded in the session log (and in
+     * debug logcat) on both paths.
+     */
+    private fun exposureRefusalV2(qualifier: CaptureAttemptQualifierV2): String? =
+        when {
+            !captureSafetySignalV2.isCaptureSafeFor(qualifier) -> "lifecycle-cut-before-exposure"
+            !poseDataExtractor.isExposureMotionStable(onDecision =
+                if (NativeSessionLogEmitter.active ||
+                    (BuildConfig.DEBUG && motionDiagnosticCount!!.get() < 16)) {
+                    { diagnostic ->
+                        NativeSessionLogEmitter.recordMotionRefusal(
+                            qualifier.identity.attemptId.toString(), diagnostic)
+                        if (BuildConfig.DEBUG && motionDiagnosticCount!!.getAndIncrement() < 16) {
+                            Log.i("CaptureLatency", "[DEBUG-capture-motion] stage=native_shutter " +
+                                "attemptId=${qualifier.identity.attemptId} gate=${diagnostic.gate} " +
+                                "decisionNs=${diagnostic.decisionNs} motionClock=androidCameraTimestamp " +
+                                "ageMs=${diagnostic.ageMs} dwellMs=${diagnostic.stableDwellMs} " +
+                                "historyMs=${diagnostic.historySpanMs} pairs=${diagnostic.pairCount} " +
+                                "latestMps=${diagnostic.latestTranslationSpeedMps} " +
+                                "latestDegps=${diagnostic.latestAngularSpeedDegreesPerSecond} " +
+                                "medianMps=${diagnostic.medianTranslationSpeedMps} " +
+                                "medianDegps=${diagnostic.medianAngularSpeedDegreesPerSecond} " +
+                                "maxMps=${diagnostic.maximumTranslationSpeedMps} " +
+                                "maxDegps=${diagnostic.maximumAngularSpeedDegreesPerSecond} " +
+                                "minPositiveCameraGapNs=${diagnostic.minimumPositiveCameraGapNs} " +
+                                "duplicatePairs=${diagnostic.duplicatePairCount} " +
+                                "timestampReadMismatches=${diagnostic.timestampReadMismatchCount} " +
+                                "breaks=${diagnostic.breakCounts.entries.joinToString(",") { "${it.key}:${it.value}" }.ifEmpty { "none" }} " +
+                                "sameImageRevisions=${diagnostic.sameImageRevisionCount} " +
+                                formatMotionPairDiagnostic("refusing", diagnostic.firstRefusingPair) + " " +
+                                formatMotionPairDiagnostic("maxAngular", diagnostic.maximumAngularPair))
+                        }
+                    }
+                } else null) -> "motion-skipped"
+            else -> null
+        }
+
     private fun formatMotionPairDiagnostic(
         label: String,
         pair: PoseDataExtractor.ExposureMotionPairDiagnostic?,
@@ -320,40 +354,7 @@ internal class ArCaptureSession(
                     prepareSessionResume = sceneHost::prepareSharedCameraResume,
                     scenePreviewSurface = scenePreviewSurface,
                     configMap = typedConfigMap,
-                    exposureRefusalV2 = { qualifier ->
-                        when {
-                            !captureSafetySignalV2.isCaptureSafeFor(qualifier) -> "lifecycle-cut-before-exposure"
-                            !poseDataExtractor.isExposureMotionStable(onDecision =
-                                if (NativeSessionLogEmitter.active ||
-                                    (BuildConfig.DEBUG && motionDiagnosticCount!!.get() < 16)) {
-                                    { diagnostic ->
-                                        NativeSessionLogEmitter.recordMotionRefusal(
-                                            qualifier.identity.attemptId.toString(), diagnostic)
-                                        if (BuildConfig.DEBUG && motionDiagnosticCount!!.getAndIncrement() < 16) {
-                                            Log.i("CaptureLatency", "[DEBUG-capture-motion] stage=native_shutter " +
-                                                "attemptId=${qualifier.identity.attemptId} gate=${diagnostic.gate} " +
-                                                "decisionNs=${diagnostic.decisionNs} motionClock=androidCameraTimestamp " +
-                                                "ageMs=${diagnostic.ageMs} dwellMs=${diagnostic.stableDwellMs} " +
-                                                "historyMs=${diagnostic.historySpanMs} pairs=${diagnostic.pairCount} " +
-                                                "latestMps=${diagnostic.latestTranslationSpeedMps} " +
-                                                "latestDegps=${diagnostic.latestAngularSpeedDegreesPerSecond} " +
-                                                "medianMps=${diagnostic.medianTranslationSpeedMps} " +
-                                                "medianDegps=${diagnostic.medianAngularSpeedDegreesPerSecond} " +
-                                                "maxMps=${diagnostic.maximumTranslationSpeedMps} " +
-                                                "maxDegps=${diagnostic.maximumAngularSpeedDegreesPerSecond} " +
-                                                "minPositiveCameraGapNs=${diagnostic.minimumPositiveCameraGapNs} " +
-                                                "duplicatePairs=${diagnostic.duplicatePairCount} " +
-                                                "timestampReadMismatches=${diagnostic.timestampReadMismatchCount} " +
-                                                "breaks=${diagnostic.breakCounts.entries.joinToString(",") { "${it.key}:${it.value}" }.ifEmpty { "none" }} " +
-                                                "sameImageRevisions=${diagnostic.sameImageRevisionCount} " +
-                                                formatMotionPairDiagnostic("refusing", diagnostic.firstRefusingPair) + " " +
-                                                formatMotionPairDiagnostic("maxAngular", diagnostic.maximumAngularPair))
-                                        }
-                                    }
-                                } else null) -> "motion-skipped"
-                            else -> null
-                        }
-                    },
+                    exposureRefusalV2 = ::exposureRefusalV2,
                     onObservedCaptureStateChanged = {
                         onObservedControlStateChanged(this)
                     },
@@ -1146,7 +1147,12 @@ internal class ArCaptureSession(
         playbackExposure?.onFrame {
             try {
                 frame.acquireCameraImage().use { image ->
-                    PlaybackCameraImage(yuv420888ToNv21(image), image.width, image.height, image.timestamp)
+                    // The exposure is this frame: stamp it with the frame's Android camera
+                    // timestamp, the clock of the grid's photo pose history and epochs.
+                    PlaybackCameraImage(
+                        yuv420888ToNv21(image), image.width, image.height,
+                        playbackExposureTimestampNs(frame.androidCameraTimestamp, image.timestamp),
+                    )
                 }
             } catch (_: NotYetAvailableException) {
                 null

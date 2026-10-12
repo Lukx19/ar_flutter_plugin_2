@@ -2174,6 +2174,49 @@ class NativeCaptureAdapterV2Test {
         return CaptureCommitRequest(accepted, components, 1, digest("pose"), digest("camera"), digest("validation"), digest("ledger"))
     }
 
+    @Test
+    fun `playback exposure refusal is a terminal that frees the lane and the next attempt commits from a frame`() {
+        val store = FakeStore()
+        val safety = CaptureSafetySignalV2()
+        val events = mutableListOf<NativeCaptureEventV2>()
+        var motion: String? = "motion-skipped"
+        val playback = PlaybackCameraImageExposureV2(
+            refusal = { qualifier -> if (!safety.isCaptureSafeFor(qualifier)) "lifecycle-cut-before-exposure" else motion },
+            executor = { it.run() },
+            encodeJpeg = { bytes(CaptureComponentKind.JPEG) },
+            analyzeJpeg = { _, _ -> PreviewBlurQuality(500.0, 160, 120, "jpegLaplacianVarianceV1") },
+        )
+        // The binding's funded route with no shared camera attached (playback test mode).
+        val bridge = SharedCameraManagerExposurePortV2(
+            request = { q, r, c -> playback.requestExposure(q, r, c) },
+            cancel = playback::cancelExposure,
+            fundedRequest = { q, r, c, bytes -> playback.requestExposure(q, r, c, bytes) },
+        )
+        val adapter = NativeCaptureAdapterV2(store, bridge, safety, events = events::add)
+        val image = PlaybackCameraImage(ByteArray(640 * 480 * 3 / 2), 640, 480, timestampNs = 42L)
+        try {
+            val refused = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG), ordinal = 1)
+            adapter.admit(refused)
+            val abandoned = events.single { it.kind == NativeCaptureEventKindV2.ABANDONED }
+            assertEquals(refused.accepted.identity.attemptId, abandoned.attemptId)
+            assertEquals("camera-motion-skipped", store.terminals.single().terminal?.reason)
+            assertEquals(0, adapter.snapshot().running)
+            assertFalse(playback.hasPendingExposure)
+
+            motion = null
+            val saved = request(CaptureLane.MANUAL, setOf(CaptureComponentKind.JPEG), ordinal = 2)
+            adapter.admit(saved)
+            assertTrue("a safe, still attempt waits for the next frame", playback.hasPendingExposure)
+            playback.onFrame { image }
+            val committed = events.single { it.kind == NativeCaptureEventKindV2.COMMITTED }
+            assertEquals(saved.accepted.identity.attemptId, committed.attemptId)
+            assertEquals(1L, adapter.snapshot().committed)
+            assertEquals(0, adapter.snapshot().running)
+        } finally {
+            adapter.close()
+        }
+    }
+
     private class FakeExposure : SharedCameraExposurePortV2 {
         val requests = mutableListOf<Pair<CaptureAttemptQualifierV2, Set<CaptureComponentKind>>>()
         val cancellations = mutableListOf<CaptureAttemptQualifierV2>()

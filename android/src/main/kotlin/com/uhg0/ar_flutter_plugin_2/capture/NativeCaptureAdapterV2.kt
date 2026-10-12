@@ -904,10 +904,10 @@ internal class NativeCaptureAdapterV2(
     private val retainAssessedOriginals: Boolean = false,
     private val durableTerminalTap: DurableTerminalTap = VisibilityGridShellRegistry.durableTerminalTap,
 ) : AutoCloseable {
-    private fun captureLatencyLog(stage: String, attemptId: String) {
+    private fun captureLatencyLog(stage: String, attemptId: String, detail: String = "") {
         Log.i(
             "CaptureLatency",
-            "stage=$stage attemptId=$attemptId elapsedRealtimeNs=${SystemClock.elapsedRealtimeNanos()}",
+            "stage=$stage attemptId=$attemptId elapsedRealtimeNs=${SystemClock.elapsedRealtimeNanos()}$detail",
         )
     }
 
@@ -1219,12 +1219,11 @@ internal class NativeCaptureAdapterV2(
                 discardPendingComponentsLocked(value)
                 value.exposureRequested = false
                 safety.release(value.qualifier)
-                abandonLocked(
-                    value.request,
-                    submissionFailure?.let { "camera-$it" }
-                        ?: pendingLifecycleReason?.let { "$it-before-exposure" }
-                        ?: "exposure-request-rejected",
-                )
+                val reason = submissionFailure?.let { "camera-$it" }
+                    ?: pendingLifecycleReason?.let { "$it-before-exposure" }
+                    ?: "exposure-request-rejected"
+                captureLatencyLog("native_camera_request_refused", value.request.accepted.identity.attemptId, " reason=$reason")
+                abandonLocked(value.request, reason)
                 return
             }
             captureLatencyLog("native_camera_request_accepted", value.request.accepted.identity.attemptId)
@@ -1534,6 +1533,8 @@ internal class NativeCaptureAdapterV2(
     private fun emitTerminalLocked(value: Work?, receipt: CaptureReceipt, recoveryContext: NativeCaptureRecoveryContextV2?) {
         val identity = receipt.identity
         val terminal = checkNotNull(receipt.terminal)
+        // Every live terminal is visible next to the admission stages.
+        captureLatencyLog("native_terminal", identity.attemptId, " kind=${terminal.kind} reason=${terminal.reason}")
         emitLocked(
             NativeCaptureEventV2(
                 if (terminal.kind == CaptureTerminalKind.COMMITTED_PICTURE) {
