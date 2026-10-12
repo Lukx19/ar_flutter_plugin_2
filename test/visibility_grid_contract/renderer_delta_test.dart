@@ -198,11 +198,14 @@ void main() {
       spikeNearestK: 512,
       pointSize: 6.5,
       colourTableGeneration: 3,
+      minQuality: 64,
     );
     expectGoldenBytes('display_mode.bin', mode);
     expect(modeView.validate(mode.length), ContractStatus.ok);
     expect(modeView.spikeNearestK, 512);
     expect(modeView.pointSize, 6.5);
+    expect(modeView.minQuality, 64);
+    expect(mode.sublist(DisplayModeLayout.reservedOffset), everyElement(0));
 
     final table = Uint8List(ColourTableLayout.bytes);
     final tableView = ColourTableView()..attach(ByteData.sublistView(table));

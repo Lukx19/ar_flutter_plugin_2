@@ -161,6 +161,7 @@ class DeltaUploadSchedulerTest {
         assertEquals(512, state.spikeNearestK)
         assertEquals(6.5f, state.pointSizePx)
         assertEquals(3L, state.colourTableGeneration)
+        assertEquals(64, state.minQuality)
         val table = File(goldens, "colour_table.bin").readBytes()
         assertEquals(DisplayIntake.COLOUR_TABLE, handler.onMessage(table))
         assertEquals(0x0af540ff, handler.rgba(GridDisplayCodes.COLOUR_COVERAGE, 10))
@@ -169,6 +170,32 @@ class DeltaUploadSchedulerTest {
         mode[4] = 9
         assertEquals(DisplayIntake.REJECTED, handler.onMessage(mode))
         assertEquals(DisplayIntake.REJECTED, handler.onMessage(ByteArray(4)))
+    }
+
+    @Test
+    fun `minimum quality reaches the render state and an older message draws every surface`() {
+        val core = GridRendererCore(ByteArrayGpuTarget())
+        w.displayMode(GridDisplayCodes.BASE_SPLATS, 0, GridDisplayCodes.COLOUR_CONFIDENCE, 0, minQuality = 200)
+        assertEquals(DisplayIntake.MODE, core.onDisplayMessage(w.buffer, 0, w.length))
+        val state = GridDisplayState()
+        assertTrue(core.display.snapshotMode(state, -1))
+        assertEquals(200, state.minQuality)
+        // Byte 20 was reserved zero: a message written before the threshold decodes as 0.
+        w.displayMode(GridDisplayCodes.BASE_POINTS, 0, GridDisplayCodes.COLOUR_COVERAGE, 0)
+        assertEquals(DisplayIntake.MODE, core.onDisplayMessage(w.buffer, 0, w.length))
+        assertTrue(core.display.snapshotMode(state, state.modeVersion))
+        assertEquals(0, state.minQuality)
+    }
+
+    @Test
+    fun `surface and voxel shaders discard instances below the minimum quality`() {
+        for (source in listOf(GridRendererShaders.POINTS_VS, GridRendererShaders.SPLAT_VS, GridRendererShaders.SPIKE_VS)) {
+            assertTrue(source.contains("uniform int u_minQuality;"))
+            assertTrue(source.contains("int((a_meta1 >> 16u) & 255u) >= u_minQuality"))
+            assertTrue(source.contains("!surfaceValid()"))
+        }
+        assertTrue(GridRendererShaders.VOXEL_VS.contains("uniform int u_minQuality;"))
+        assertTrue(GridRendererShaders.VOXEL_VS.contains("< min(u_minQuality, 254)"))
     }
 
     @Test

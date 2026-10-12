@@ -117,7 +117,7 @@ internal class RendererDeltaWriter(capacity: Int = RendererDeltaLayout.MAX_MESSA
     /** Writes a 32 B display mode message; returns its length. */
     fun displayMode(
         baseLayer: Int, overlayBits: Int, colourAttribute: Int, sizeRule: Int,
-        spikeNearestK: Int = 512, pointSizePx: Float = 6f, generation: Int = 1,
+        spikeNearestK: Int = 512, pointSizePx: Float = 6f, generation: Int = 1, minQuality: Int = 0,
     ): Int {
         for (i in 0 until DisplayModeLayout.BYTES) buffer.put(i, 0)
         buffer.putInt(0, DisplayModeLayout.MAGIC)
@@ -129,6 +129,7 @@ internal class RendererDeltaWriter(capacity: Int = RendererDeltaLayout.MAX_MESSA
         buffer.putShort(DisplayModeLayout.SPIKE_NEAREST_K, spikeNearestK.toShort())
         buffer.putFloat(DisplayModeLayout.POINT_SIZE, pointSizePx)
         buffer.putInt(DisplayModeLayout.COLOUR_TABLE_GENERATION, generation)
+        buffer.put(DisplayModeLayout.MIN_QUALITY, minQuality.toByte())
         length = DisplayModeLayout.BYTES
         return length
     }

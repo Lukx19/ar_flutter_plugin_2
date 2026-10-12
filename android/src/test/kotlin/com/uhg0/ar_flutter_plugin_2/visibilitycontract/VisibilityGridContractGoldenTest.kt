@@ -178,6 +178,7 @@ class VisibilityGridContractGoldenTest {
         assertEquals(DisplayModeLayout.MAGIC, display.getInt(0))
         assertEquals(512, display.getShort(DisplayModeLayout.SPIKE_NEAREST_K).toInt())
         assertEquals(6.5f, display.getFloat(DisplayModeLayout.POINT_SIZE))
+        assertEquals(64, display.get(DisplayModeLayout.MIN_QUALITY).toInt() and 0xff)
         val table = golden("colour_table.bin")
         assertEquals(ColourTableLayout.BYTES, table.capacity())
         assertEquals(3, table.getInt(ColourTableLayout.GENERATION))

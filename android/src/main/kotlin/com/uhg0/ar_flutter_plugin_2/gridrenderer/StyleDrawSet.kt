@@ -206,6 +206,7 @@ internal class StyleDrawSet(
         GLES30.glUniform1i(p.colors, 0)
         GLES30.glUniform1i(p.selectedOnly, 0)
         GLES30.glUniform1i(p.grey, 0)
+        GLES30.glUniform1i(p.minQuality, mode.minQuality)
     }
 
     /**
@@ -526,6 +527,7 @@ internal class StyleDrawSet(
         val residencyFilter: Int
         val alpha: Int
         val grey: Int
+        val minQuality: Int
 
         init {
             val v = compile(GLES30.GL_VERTEX_SHADER, vs)
@@ -554,6 +556,7 @@ internal class StyleDrawSet(
             residencyFilter = loc("u_residencyFilter")
             alpha = loc("u_alpha")
             grey = loc("u_grey")
+            minQuality = loc("u_minQuality")
         }
 
         private fun compile(type: Int, source: String): Int {

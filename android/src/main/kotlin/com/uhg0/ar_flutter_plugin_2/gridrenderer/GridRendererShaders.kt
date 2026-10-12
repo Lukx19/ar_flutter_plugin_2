@@ -10,6 +10,14 @@ package com.uhg0.ar_flutter_plugin_2.gridrenderer
  * completion << 8 | confidence << 16 | age << 24, bins 3 x u32), 5-6 brick or
  * region summary, 11 compact voxel (i16 x, y, z, colour u16). Colour tables
  * are one 256 x 5 RGBA8 texture, row = contract colour attribute code.
+ *
+ * Quality threshold: `u_minQuality` (0-255, display mode byte 20) discards
+ * surface instances whose confidence byte is below it (points, splats, spike
+ * balls and their spikes) and voxels whose confidence (colour high byte,
+ * capped at 254 by the exporter) is below min(u_minQuality, 254). The
+ * confidence byte is the fusion weight scaled to the weight cap: it grows
+ * with every agreeing depth or feature observation and falls when samples
+ * are de-integrated, so it is the record's stability signal.
  */
 internal object GridRendererShaders {
     private const val SURFACE_HEADER = """#version 300 es
@@ -28,6 +36,7 @@ uniform int u_sizeRule;
 uniform float u_fixedPx;
 uniform int u_selectedOnly;
 uniform int u_grey;
+uniform int u_minQuality;
 uniform highp sampler2D u_colors;
 out vec4 v_color;
 const vec4 OFFSCREEN = vec4(2.0, 2.0, 2.0, 1.0);
@@ -42,7 +51,8 @@ vec3 octDecode(vec2 e) {
 bool surfaceValid() {
   bool published = ((a_meta0 >> 24u) & 1u) != 0u;
   bool selected = ((a_meta0 >> 26u) & 1u) != 0u;
-  return published && (u_selectedOnly == 0 || selected);
+  bool good = int((a_meta1 >> 16u) & 255u) >= u_minQuality;
+  return published && good && (u_selectedOnly == 0 || selected);
 }
 float surfaceSize() { return unpackHalf2x16(a_meta0 & 0xffffu).x; }
 float coverage() { return float(a_meta1 & 255u) / 255.0; }
@@ -191,6 +201,7 @@ layout(location = 11) in ivec4 a_voxel;
 uniform mat4 u_viewProj;
 uniform int u_colorAttr;
 uniform int u_grey;
+uniform int u_minQuality;
 uniform highp sampler2D u_colors;
 out vec4 v_color;
 const vec3 STRIP[14] = vec3[14](
@@ -201,6 +212,7 @@ const vec3 STRIP[14] = vec3[14](
 void main() {
   if (a_voxel == ivec4(-1)) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); v_color = vec4(0.0); return; }
   uint colour = uint(a_voxel.w) & 0xffffu;
+  if (int((colour >> 8u) & 255u) < min(u_minQuality, 254)) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); v_color = vec4(0.0); return; }
   bool byConfidence = u_colorAttr == 1;
   uint value = byConfidence ? (colour >> 8u) & 255u : colour & 255u;
   vec3 corner = STRIP[gl_VertexID];

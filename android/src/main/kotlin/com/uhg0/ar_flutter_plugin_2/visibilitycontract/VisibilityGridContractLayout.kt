@@ -237,6 +237,9 @@ internal object DisplayModeLayout {
     const val SPIKE_NEAREST_K = 10
     const val POINT_SIZE = 12
     const val COLOUR_TABLE_GENERATION = 16
+
+    /** u8 minimum surface quality (confidence byte); reserved zero before, so 0 draws every surface. */
+    const val MIN_QUALITY = 20
 }
 
 internal object ColourTableLayout {

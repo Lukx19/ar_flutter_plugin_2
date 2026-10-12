@@ -56,6 +56,9 @@ internal class GridDisplayState {
     var pointSizePx = 6f
     var colourTableGeneration = 0L
 
+    /** Surfaces with a confidence byte below this (0-255) are not drawn; 0 draws all. */
+    var minQuality = 0
+
     /** Increments with every accepted display mode message. */
     var modeVersion = 0L
 
@@ -67,6 +70,7 @@ internal class GridDisplayState {
         spikeNearestK = other.spikeNearestK
         pointSizePx = other.pointSizePx
         colourTableGeneration = other.colourTableGeneration
+        minQuality = other.minQuality
         modeVersion = other.modeVersion
     }
 
@@ -130,6 +134,7 @@ internal class DisplayModeHandler {
                     pending.pointSizePx = if (px.isFinite()) px.coerceIn(1f, 64f) else 6f
                     pending.colourTableGeneration =
                         b.getInt(offset + DisplayModeLayout.COLOUR_TABLE_GENERATION).toLong() and 0xffffffffL
+                    pending.minQuality = b.get(offset + DisplayModeLayout.MIN_QUALITY).toInt() and 0xff
                     pending.modeVersion++
                 }
                 DisplayIntake.MODE

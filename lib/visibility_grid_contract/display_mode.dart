@@ -36,6 +36,12 @@ abstract final class DisplaySizeRule {
 
 /// 32 B display mode message (UI isolate to platform). Switching a mode sends
 /// only this message.
+///
+/// Byte 20 is the minimum surface quality (0-255): the renderer discards
+/// surfaces whose confidence byte (fusion weight scaled to the weight cap)
+/// is below it, and voxels whose confidence (colour high byte) is below
+/// min(it, 254). It was reserved zero before, so an older message reads as
+/// 0 (draw every surface) and the version stays 1.
 abstract final class DisplayModeLayout {
   static final int magic = contractMagic('C3DM');
   static const int version = 1;
@@ -47,7 +53,8 @@ abstract final class DisplayModeLayout {
   static const int spikeNearestKOffset = 10; // u16
   static const int pointSizeOffset = 12; // f32
   static const int colourTableGenerationOffset = 16; // u32
-  static const int reservedOffset = 20; // u32 x3
+  static const int minQualityOffset = 20; // u8
+  static const int reservedOffset = 21; // 11 bytes, zero
 }
 
 final class DisplayModeView extends ContractRecordView {
@@ -70,6 +77,7 @@ final class DisplayModeView extends ContractRecordView {
     required int spikeNearestK,
     required double pointSize,
     required int colourTableGeneration,
+    required int minQuality,
   }) {
     clear();
     setU32(0, DisplayModeLayout.magic);
@@ -82,6 +90,7 @@ final class DisplayModeView extends ContractRecordView {
     setF32(DisplayModeLayout.pointSizeOffset, pointSize);
     setU32(
         DisplayModeLayout.colourTableGenerationOffset, colourTableGeneration);
+    setU8(DisplayModeLayout.minQualityOffset, minQuality);
   }
 
   int get baseLayer => u8(DisplayModeLayout.baseLayerOffset);
@@ -92,6 +101,7 @@ final class DisplayModeView extends ContractRecordView {
   double get pointSize => f32(DisplayModeLayout.pointSizeOffset);
   int get colourTableGeneration =>
       u32(DisplayModeLayout.colourTableGenerationOffset);
+  int get minQuality => u8(DisplayModeLayout.minQualityOffset);
 }
 
 /// Colour table message (UI isolate to platform): 12 B header (magic `C3CT`,
