@@ -520,23 +520,34 @@ internal class ArView(
                 visibilityObservationSource.close()
                 visibilityObservationRuntime.close()
             },
+            // A slow observation close (for example a loaded emulator) still
+            // releases the session and capture root once it has closed, so
+            // the next AR view can take them.
+            afterLateSuccess = {
+                Log.w("ArView", "Observation shutdown finished after its deadline; releasing session and owners")
+                disposeAfterObservationClosed()
+            },
         ) { drainResult ->
             if (drainResult.isFailure) {
                 Log.e("ArView", "Observation shutdown failed; session and owners retained", drainResult.exceptionOrNull())
                 settleDispose(drainResult)
                 return@run
             }
-            visibilityStorageBudgetCoordinator.close()
-            visibilityGridV2Binding.dispose()
-            lifecycle.removeObserver(lifecycleObserver)
-            captureSession.dispose { result ->
-                if (result.isFailure) {
-                    Log.e("ArView", "Native capture close failed; session retained", result.exceptionOrNull())
-                    settleDispose(result)
-                } else disposeAfterCaptureClosed()
-            }
+            disposeAfterObservationClosed()
         }
         if (!accepted) settleDispose(Result.failure(IllegalStateException("Observation shutdown already owns its lifecycle drain")))
+    }
+
+    private fun disposeAfterObservationClosed() {
+        visibilityStorageBudgetCoordinator.close()
+        visibilityGridV2Binding.dispose()
+        lifecycle.removeObserver(lifecycleObserver)
+        captureSession.dispose { result ->
+            if (result.isFailure) {
+                Log.e("ArView", "Native capture close failed; session retained", result.exceptionOrNull())
+                settleDispose(result)
+            } else disposeAfterCaptureClosed()
+        }
     }
 
     private fun disposeAfterCaptureClosed() {

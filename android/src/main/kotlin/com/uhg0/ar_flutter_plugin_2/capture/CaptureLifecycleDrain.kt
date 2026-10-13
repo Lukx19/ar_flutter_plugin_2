@@ -37,8 +37,18 @@ internal class CaptureLifecycleDrain(
             if (preparation.isSuccess) runCatching(pauseMain) else preparation
     }
 
-    /** Timeout keeps ownership until the old barrier actually terminates. */
-    fun run(timeoutMillis: Long, barrier: () -> Unit, completion: (Result<Unit>) -> Unit): Boolean {
+    /**
+     * Timeout keeps ownership until the old barrier actually terminates. A
+     * barrier that then succeeds runs [afterLateSuccess] on Main (once, after
+     * the drain is free again) so its owner can finish a teardown that the
+     * timeout reported as failed; without it a late result is ignored.
+     */
+    fun run(
+        timeoutMillis: Long,
+        barrier: () -> Unit,
+        afterLateSuccess: (() -> Unit)? = null,
+        completion: (Result<Unit>) -> Unit,
+    ): Boolean {
         check(timeoutMillis > 0)
         if (active != null) return false
         val attempt = Attempt(completion)
@@ -57,7 +67,11 @@ internal class CaptureLifecycleDrain(
                     if (active !== attempt) return@execute
                     active = null
                     attempt.cancelDeadline?.invoke()
-                    if (attempt.settled.compareAndSet(false, true)) attempt.completion(result)
+                    if (attempt.settled.compareAndSet(false, true)) {
+                        attempt.completion(result)
+                    } else if (result.isSuccess) {
+                        afterLateSuccess?.invoke()
+                    }
                 }
             }
         } catch (failure: RuntimeException) {

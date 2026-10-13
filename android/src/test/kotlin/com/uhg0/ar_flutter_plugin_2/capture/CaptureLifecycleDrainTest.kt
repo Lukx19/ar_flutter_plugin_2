@@ -51,10 +51,40 @@ class CaptureLifecycleDrainTest {
         assertTrue(f.drain.shutdown(1000, {}, { released++ }) { assertTrue(it.isFailure); completions++ })
         f.expired!!(); f.expired!!(); f.main.next(); f.main.next()
         assertEquals(1, completions); assertEquals(0, released)
-        assertFalse(f.drain.run(1000, {}, {}))
+        assertFalse(f.drain.run(1000, {}) {})
         f.worker.next(); f.main.next()
         assertEquals(1, completions); assertEquals(0, released)
-        assertTrue(f.drain.run(1000, {}, {}))
+        assertTrue(f.drain.run(1000, {}) {})
+    }
+
+    @Test fun `late successful barrier runs its continuation once after the drain is free`() {
+        val f = Fixture(); var late = 0; val completions = mutableListOf<Result<Unit>>()
+        var drainFreeDuringLate = false
+        assertTrue(f.drain.run(1000, {}, afterLateSuccess = {
+            late++
+            drainFreeDuringLate = f.drain.run(1000, {}) {}
+        }) { completions += it })
+        f.expired!!(); f.main.next()
+        assertEquals(1, completions.size); assertTrue(completions.single().isFailure)
+        assertEquals(0, late)
+        f.worker.next(); f.main.next()
+        assertEquals(1, late); assertTrue(drainFreeDuringLate)
+        assertEquals(1, completions.size)
+    }
+
+    @Test fun `late failed barrier keeps owners and skips the continuation`() {
+        val f = Fixture(); var late = 0; var completions = 0
+        assertTrue(f.drain.run(1000, { error("still owned") }, afterLateSuccess = { late++ }) { completions++ })
+        f.expired!!(); f.main.next()
+        f.worker.next(); f.main.next()
+        assertEquals(1, completions); assertEquals(0, late)
+    }
+
+    @Test fun `on-time barrier never runs the late continuation`() {
+        val f = Fixture(); var late = 0; var completions = 0
+        assertTrue(f.drain.run(1000, {}, afterLateSuccess = { late++ }) { assertTrue(it.isSuccess); completions++ })
+        f.worker.next(); f.main.next()
+        assertEquals(1, completions); assertEquals(0, late)
     }
 
     @Test fun `failed background image barrier keeps Main resources and reports exact failure`() {
