@@ -1,6 +1,7 @@
 package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererStyleRowV1
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.VisibilitySurfaceStreamChannel
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommittedBaselineAuthority
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommittedBaselineV1
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.ControlCodec
@@ -2019,7 +2020,7 @@ class VisibilityGridIntegrationTest {
                 staleReply,
             )
             assertTrue(staleReply.completed.await(2, TimeUnit.SECONDS))
-            assertEquals(null, staleReply.bytes)
+            assertEquals(VisibilitySurfaceStreamChannel.STATUS_REJECTED, staleReply.status)
             assertEquals(1, projection.pressureRevisions().styleRevision)
         } finally {
             integration.close(); binding.dispose(); coordinator.close(); directory.deleteRecursively()

@@ -63,9 +63,10 @@ class SampleLeasePoolTest {
             assertEquals(832L, depth.primitiveBytes)
             // 32-byte object headers, 24-byte array headers, 8-byte alignment,
             // two slots, two live lease/view/generation envelopes and one
-            // frozen 4x4 pose per possible live observation.
+            // frozen 4x4 pose per possible live observation; depth adds one
+            // acquisition observation identity per possible live observation.
             assertEquals(3_880L, feature.portableMaximumOwnedBytes)
-            assertEquals(4_184L, depth.portableMaximumOwnedBytes)
+            assertEquals(4_216L, depth.portableMaximumOwnedBytes)
             assertTrue(feature.portableOwnedBytes < feature.portableMaximumOwnedBytes)
             assertTrue(depth.portableOwnedBytes < depth.portableMaximumOwnedBytes)
             assertTrue(

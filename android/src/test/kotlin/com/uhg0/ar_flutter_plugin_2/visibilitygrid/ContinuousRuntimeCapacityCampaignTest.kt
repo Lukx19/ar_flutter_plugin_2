@@ -476,7 +476,11 @@ class ContinuousRuntimeCapacityCampaignTest {
             val rendererRebuildBytes = RENDERER_ROWS.toLong() * Long.SIZE_BYTES
             val rendererBytes = VisibilityGridRendererState.ownedStorageBytes(RENDERER_ROWS).toLong() +
                 rendererRebuildBytes
-            val rendererHandoffBytes = PresentationDescriptor.estimatedBackingBytes(RENDERER_ROWS).toLong()
+            // A published descriptor owns its rows and its frozen geometry page.
+            val rendererHandoffBytes = PresentationDescriptor.estimatedBackingBytes(
+                RENDERER_ROWS,
+                includesGeometry = true,
+            ).toLong()
             assertTrue(maximumObservedRendererHandoff <= rendererHandoffBytes)
             val ownerMemory = integration.portableOwnerMemoryReceipt()
             val verificationProofBytes = completeCurrent.cowProofAndIndexBytes

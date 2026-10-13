@@ -92,7 +92,10 @@ class VisibilityProtocolVgs2RecoveryCorpusTest {
                 ),
                 staleReply,
             )
-            require(staleReply.completed.await(2, TimeUnit.SECONDS) && staleReply.bytes == null)
+            require(
+                staleReply.completed.await(2, TimeUnit.SECONDS) &&
+                    staleReply.status == VisibilitySurfaceStreamChannel.STATUS_REJECTED,
+            )
             val finalized = RecordingResult()
             channel.invokeMethod(
                 "finalizeDebugV2Issue98Handoff",

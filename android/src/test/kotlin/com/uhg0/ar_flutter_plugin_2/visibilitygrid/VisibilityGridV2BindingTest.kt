@@ -1,6 +1,8 @@
 package com.uhg0.ar_flutter_plugin_2.visibilitygrid
 
+import com.uhg0.ar_flutter_plugin_2.channelstatus.ChannelStatusReply
 import com.uhg0.ar_flutter_plugin_2.pointcloud.CoverageRendererStyleRowV1
+import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.VisibilitySurfaceStreamChannel
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommittedBaselineAuthority
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommittedBaselineScopeV1
 import com.uhg0.ar_flutter_plugin_2.visibilityprotocol.CommittedBaselineV1
@@ -1869,7 +1871,7 @@ class VisibilityGridV2BindingTest {
                 staleReply,
             )
             assertTrue(staleReply.completed.await(2, TimeUnit.SECONDS))
-            assertEquals(null, staleReply.bytes)
+            assertEquals(VisibilitySurfaceStreamChannel.STATUS_REJECTED, staleReply.status)
             val handoff = RecordingResult()
             channel.invokeMethod(
                 "finalizeDebugV2Issue98Handoff",
@@ -1960,7 +1962,7 @@ class VisibilityGridV2BindingTest {
                 stale,
             )
             assertTrue(stale.completed.await(2, TimeUnit.SECONDS))
-            assertEquals(null, stale.bytes)
+            assertEquals(VisibilitySurfaceStreamChannel.STATUS_REJECTED, stale.status)
             assertEquals(observationCut, binding.currentObservationOwnership())
         } finally {
             binding.dispose()
@@ -3351,6 +3353,10 @@ internal class RecordingResult(
 internal class RecordingBinaryReply : BinaryMessenger.BinaryReply {
     val completed = CountDownLatch(1)
     var bytes: ByteArray? = null
+
+    /** The 4-byte channel status of the reply, or null for a payload reply. */
+    val status: Int?
+        get() = bytes?.let { ChannelStatusReply.statusOf(ByteBuffer.wrap(it)) }
 
     override fun reply(reply: ByteBuffer?) {
         bytes = reply?.duplicate()?.let { buffer ->
