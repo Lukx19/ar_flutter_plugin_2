@@ -19,6 +19,7 @@ public class SwiftArFlutterPlugin: NSObject, FlutterPlugin {
     )
     registrar.addMethodCallDelegate(CameraCapabilitiesHandler(), channel: capabilitiesChannel)
     VisibilityGridShellRegistry.shared.register(messenger: registrar.messenger())
+    GridRendererChannels.shared.register(messenger: registrar.messenger())
   }
 
   public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
@@ -29,6 +30,7 @@ public class SwiftArFlutterPlugin: NSObject, FlutterPlugin {
   /// frame observer, parked pull) unless a later engine registered since.
   public func detachFromEngine(for registrar: FlutterPluginRegistrar) {
     VisibilityGridShellRegistry.shared.unregister(messenger: registrar.messenger())
+    GridRendererChannels.shared.unregister(messenger: registrar.messenger())
   }
 
 }
