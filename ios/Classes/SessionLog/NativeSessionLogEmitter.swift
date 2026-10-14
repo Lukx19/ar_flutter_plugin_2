@@ -33,13 +33,16 @@ final class NativeSessionLogEmitter {
   }
 
   /// Opens or closes the record window; a change forgets pending records.
+  /// The buffer is reset before the new state is published (as Android does),
+  /// so a record admitted right after the window opens is kept. The buffer has
+  /// its own lock and never calls back into the emitter, so holding the
+  /// emitter lock here cannot deadlock.
   func setActive(_ on: Bool) {
-    lock.lock()
-    let changed = on != isActive
-    if on && !isActive { generation += 1 }
+    lock.lock(); defer { lock.unlock() }
+    guard on != isActive else { return }
+    buffer.reset()
+    if on { generation += 1 }
     isActive = on
-    lock.unlock()
-    if changed { buffer.reset() }
   }
 
   func occur(_ code: String, variant: String? = nil, message: String = "") -> Bool {

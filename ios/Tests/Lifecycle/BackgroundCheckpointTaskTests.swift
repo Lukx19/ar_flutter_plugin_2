@@ -82,6 +82,9 @@ final class BackgroundCheckpointTaskTests: XCTestCase {
     XCTAssertEqual(runner.begun, [1, 2])
     task.stopObserving()
     XCTAssertEqual(runner.ended, [1, 2])
+    XCTAssertEqual(task.lastEndReason, .detached)
+    let record = emitter.buffer.drain().last
+    XCTAssertEqual((record?[4] as? [String: Any])?["endReason"] as? String, "detached")
     center.post(name: UIApplication.didEnterBackgroundNotification, object: nil)
     XCTAssertEqual(runner.begun, [1, 2], "no observation after stop")
     XCTAssertEqual(task.begun, task.ended)

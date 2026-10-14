@@ -7,10 +7,12 @@ import XCTest
 ///
 /// The archive round trip uses the world map retained with the iPhone 12 Pro
 /// recording `room2-iphone12pro-20261014` (Git LFS, 7 MB, in the app
-/// repository next to this submodule). `ARWorldMap` has no public
-/// initializer, so tests that need a real map skip when that file is absent
-/// or still an LFS pointer (`git lfs pull --include` the file), and on the
-/// simulator, whose ARKit stub refuses to code `ARWorldMap`.
+/// repository next to this submodule). The Runner project bundles that file
+/// into RunnerTests as `worldmap.arworldmap`, so a device run reads it from
+/// the test bundle. `ARWorldMap` has no public initializer, so the tests that
+/// need a real map skip on the simulator, whose ARKit stub refuses to code
+/// `ARWorldMap`; on a device a missing fixture or an unpulled LFS pointer
+/// fails them (`git lfs pull --include` the file before building).
 final class WorldMapTests: XCTestCase {
   private var sessionDirectory: URL!
 
@@ -24,25 +26,43 @@ final class WorldMapTests: XCTestCase {
     try? FileManager.default.removeItem(at: sessionDirectory)
   }
 
-  static var recordedWorldMapURL: URL {
+  static let recordedWorldMapResource = "worldmap.arworldmap"
+
+  /// The bundled fixture, then (simulator builds only) the source tree.
+  static var recordedWorldMapURL: URL? {
+    for bundle in Bundle.allBundles + [Bundle.main] {
+      if let url = bundle.url(forResource: recordedWorldMapResource, withExtension: nil) {
+        return url
+      }
+    }
+    #if targetEnvironment(simulator)
     var root = URL(fileURLWithPath: #filePath)
     for _ in 0..<6 { root.deleteLastPathComponent() }
     return root.appendingPathComponent(
-      "benchmarks/visibility_grid/recordings/ios/room2-iphone12pro-20261014/worldmap.arworldmap")
+      "benchmarks/visibility_grid/recordings/ios/room2-iphone12pro-20261014/\(recordedWorldMapResource)")
+    #else
+    return nil
+    #endif
+  }
+
+  private struct MissingFixture: LocalizedError {
+    let errorDescription: String?
   }
 
   private func recordedWorldMapData() throws -> Data {
     // The simulator's ARKit is a stub whose ARWorldMap refuses secure
-    // coding; these tests run on a device (`ios_device.py xctest --device`).
+    // coding; these tests run on a device (`ios_device.py xctest --device`),
+    // where a missing fixture is a failure, never a skip.
     guard ARWorldTrackingConfiguration.isSupported, ARWorldMap.supportsSecureCoding else {
       throw XCTSkip("ARWorldMap coding needs ARKit world tracking (a device, not the simulator)")
     }
-    let url = Self.recordedWorldMapURL
-    guard let data = try? Data(contentsOf: url) else {
-      throw XCTSkip("recorded world map not available at \(url.path)")
+    guard let url = Self.recordedWorldMapURL, let data = try? Data(contentsOf: url) else {
+      throw MissingFixture(errorDescription:
+        "recorded world map \(Self.recordedWorldMapResource) is not in the RunnerTests bundle")
     }
     if data.count < 1024, String(decoding: data, as: UTF8.self).hasPrefix("version https://git-lfs") {
-      throw XCTSkip("recorded world map is a Git LFS pointer; run git lfs pull")
+      throw MissingFixture(errorDescription:
+        "recorded world map is a Git LFS pointer; run git lfs pull and rebuild the tests")
     }
     return data
   }

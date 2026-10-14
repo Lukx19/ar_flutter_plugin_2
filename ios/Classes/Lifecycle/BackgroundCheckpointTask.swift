@@ -37,10 +37,12 @@ final class ApplicationBackgroundTasks: BackgroundTaskRunning {
 /// - the app returning to the foreground (`willEnterForeground`);
 /// - the hold window [holdSeconds] elapsing (the checkpoint's pause budget
 ///   is 1 s; the window allows a slow flash write several times over);
-/// - the system expiration handler (recorded as a warning).
+/// - the system expiration handler (recorded as a warning);
+/// - the plugin detaching from the engine ([stopObserving] or deinit).
 ///
 /// Every outcome is one `BACKGROUND_TASK_ENDED` session log record with
-/// `endReason` (`foreground`, `holdElapsed`, `expired`) and `heldMs`.
+/// `endReason` (`foreground`, `holdElapsed`, `expired`, `detached`) and
+/// `heldMs`.
 /// Callbacks run on the main thread (`UIApplication` notifications and the
 /// expiration handler), so the state needs no lock; [schedule] defers the
 /// hold timeout on the main queue.
@@ -49,6 +51,8 @@ final class BackgroundCheckpointTask {
     case foreground
     case holdElapsed
     case expired
+    /// The plugin detached from the engine while a task was held.
+    case detached
   }
 
   static let taskName = "capture3d.durability.checkpoint"
@@ -109,7 +113,7 @@ final class BackgroundCheckpointTask {
   func stopObserving() {
     tokens.forEach(notificationCenter.removeObserver)
     tokens = []
-    end(.foreground)
+    end(.detached)
   }
 
   func didEnterBackground() {
