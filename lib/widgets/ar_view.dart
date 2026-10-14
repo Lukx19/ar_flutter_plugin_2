@@ -1,6 +1,7 @@
 import 'package:ar_flutter_plugin_2/managers/ar_anchor_manager.dart';
 import 'package:ar_flutter_plugin_2/managers/ar_location_manager.dart';
 import 'package:ar_flutter_plugin_2/models/ar_capture_config.dart';
+import 'package:ar_flutter_plugin_2/models/ar_capture_view_config.dart';
 import 'package:ar_flutter_plugin_2/models/ar_playback_config.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
@@ -36,7 +37,8 @@ abstract class PlatformARView {
       @required PlaneDetectionConfig planeDetectionConfig,
       ARCaptureConfig? captureConfig,
       String? rearCameraId,
-      ARPlaybackConfig? playback});
+      ARPlaybackConfig? playback,
+      ARCaptureViewConfig? captureView});
 
   /// Callback function that is executed once the view is established
   void onPlatformViewCreated(int id);
@@ -95,7 +97,9 @@ class AndroidARView implements PlatformARView {
       PlaneDetectionConfig? planeDetectionConfig,
       ARCaptureConfig? captureConfig,
       String? rearCameraId,
-      ARPlaybackConfig? playback}) {
+      ARPlaybackConfig? playback,
+      ARCaptureViewConfig? captureView}) {
+    // [captureView] is the iOS capture view; Android ignores it.
     _context = context;
     _arViewCreatedCallback = arViewCreatedCallback;
     _planeDetectionConfig = planeDetectionConfig;
@@ -171,7 +175,8 @@ class IosARView implements PlatformARView {
       PlaneDetectionConfig? planeDetectionConfig,
       ARCaptureConfig? captureConfig,
       String? rearCameraId,
-      ARPlaybackConfig? playback}) {
+      ARPlaybackConfig? playback,
+      ARCaptureViewConfig? captureView}) {
     _context = context;
     _arViewCreatedCallback = arViewCreatedCallback;
     _planeDetectionConfig = planeDetectionConfig;
@@ -179,12 +184,15 @@ class IosARView implements PlatformARView {
     // Assessed-original production is unsupported on iOS. Reader capability is
     // independent; do not advertise a producer mode this platform cannot honor.
     _captureConfig = captureConfig?.copyWith(retainAssessedOriginals: false);
-    // This is used in the platform side to register the view.
-    final String viewType = 'ar_flutter_plugin_2';
-    // Pass parameters to the platform side.
-    final Map<String, dynamic> creationParams = <String, dynamic>{};
+    // The capture route runs the ARKit capture view on a Metal host; every
+    // other route keeps the legacy view.
+    final String viewType = iosViewType(captureView);
+    final Map<String, dynamic> creationParams = <String, dynamic>{
+      ...?captureView?.toCreationParams(),
+    };
 
     return UiKitView(
+      key: ValueKey<ARCaptureViewConfig?>(captureView),
       viewType: viewType,
       layoutDirection: TextDirection.ltr,
       creationParams: creationParams,
@@ -193,6 +201,14 @@ class IosARView implements PlatformARView {
     );
   }
 }
+
+/// Platform view type of the iOS AR view: the capture view when
+/// [captureView] is set, the legacy view otherwise.
+String iosViewType(ARCaptureViewConfig? captureView) =>
+    captureView == null ? legacyViewType : ARCaptureViewConfig.viewType;
+
+/// Platform view type of the legacy AR view (both platforms).
+const String legacyViewType = 'ar_flutter_plugin_2';
 
 /// If camera permission is granted, [ARView] creates a platform-dependent view from the factory method [PlatformARView]. To instantiate an [ARView],
 /// the calling widget needs to pass the callback function [onARViewCreated] to which the function [createManagers] returns managers such as the
@@ -223,6 +239,10 @@ class ARView extends StatefulWidget {
   /// builds; changes rebuild the native platform view.
   final ARPlaybackConfig? playback;
 
+  /// iOS capture view configuration; set only by the capture route. Null
+  /// keeps the legacy iOS view. Android ignores it.
+  final ARCaptureViewConfig? captureView;
+
   /// Configures whether or not to display the device's platform type above the AR view. Defaults to false
   final bool showPlatformType;
 
@@ -233,6 +253,7 @@ class ARView extends StatefulWidget {
       this.captureConfig,
       this.rearCameraId,
       this.playback,
+      this.captureView,
       this.showPlatformType = false,
       this.permissionPromptDescription =
           "Camera permission must be given to the app for AR functions to work",
@@ -305,7 +326,8 @@ class _ARViewState extends State<ARView> {
                     planeDetectionConfig: widget.planeDetectionConfig,
                     captureConfig: widget.captureConfig,
                     rearCameraId: widget.rearCameraId,
-                    playback: widget.playback)),
+                    playback: widget.playback,
+                    captureView: widget.captureView)),
           ]);
         }
       case (PermissionStatus.denied):
