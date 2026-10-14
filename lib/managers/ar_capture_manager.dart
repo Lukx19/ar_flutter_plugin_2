@@ -344,9 +344,28 @@ class ARCaptureManager {
   Future<void>? _disposeAttempt;
   CaptureInitializationResult? _initializationResult;
 
-  bool get isSupported =>
+  /// Native still capture exists on Android (ARCore Shared Camera) and iOS
+  /// (ARKit high-resolution frames into the same durable store).
+  static bool get platformSupportsCapture =>
       debugIsSupportedOverride ??
-      (Platform.isAndroid || Platform.environment.containsKey('FLUTTER_TEST'));
+      (Platform.isAndroid ||
+          Platform.isIOS ||
+          Platform.environment.containsKey('FLUTTER_TEST'));
+
+  /// Manual ISO, exposure, white balance, flash and focus controls drive
+  /// Camera2 on Android. ARKit owns these while its session runs, so the iOS
+  /// capture channel answers them with [cameraControlUnsupportedCode].
+  static bool get platformSupportsManualCameraControls =>
+      debugManualCameraControlsOverride ?? !Platform.isIOS;
+
+  @visibleForTesting
+  static bool? debugManualCameraControlsOverride;
+
+  /// Error code of a camera control the platform does not provide.
+  static const String cameraControlUnsupportedCode =
+      'CAMERA_CONTROL_UNSUPPORTED';
+
+  bool get isSupported => platformSupportsCapture;
   bool get isEnabled =>
       _closeState == ARCaptureCloseState.active &&
       isSupported &&

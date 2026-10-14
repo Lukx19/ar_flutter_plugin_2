@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:io';
 import 'dart:math' show sqrt;
 import 'dart:typed_data';
 
@@ -557,10 +556,7 @@ class ARSessionManager {
   /// Synchronous validation of capture configuration
   void _validateCaptureConfigSync(ARCaptureConfig config) {
     // Check platform support
-    final isCaptureSupported = ARCaptureManager.debugIsSupportedOverride ??
-        (Platform.isAndroid ||
-            Platform.environment.containsKey('FLUTTER_TEST'));
-    if (!isCaptureSupported) {
+    if (!ARCaptureManager.platformSupportsCapture) {
       throw ARSessionException('Capture not supported on this platform');
     }
 
