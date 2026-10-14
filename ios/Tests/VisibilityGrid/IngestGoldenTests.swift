@@ -7,19 +7,19 @@ import XCTest
 /// Every message kind the iOS shell produces equals the golden bytes shared
 /// with Dart and Kotlin (`test_assets/visibility_grid/`).
 final class IngestGoldenTests: XCTestCase {
-  private let clock = FakeIngestClock(GoldenFixture.acquireNs)
+  private let clock = FakeIngestClock(IngestGoldenHeader.acquireNs)
   private lazy var pull = IngestPullHandler(clock: clock)
   private let capture = ReplyCapture()
 
   private func pullOnce(mask: Int = 0x17e) -> Data {
-    clock.now = GoldenFixture.sendNs
+    clock.now = IngestGoldenHeader.sendNs
     pull.onPull(pullRequest(mask: mask), reply: capture.reply)
     return capture.last!
   }
 
   func testDepthProducerWritesTheDepthGolden() throws {
     let golden = try VisibilityGridGoldens.data("ingest_depth_u16.bin")
-    GoldenFixture.primeSequence(pull, kind: IngestMessageLayout.kindDepthImage, golden: golden, clock: clock)
+    IngestGoldenHeader.primeSequence(pull, kind: IngestMessageLayout.kindDepthImage, golden: golden, clock: clock)
     let producer = DepthIngestProducer(sink: pull)
     producer.downscale = 1
     let metres: [Float] = (1...12).map { Float($0) * 0.25 }
@@ -31,7 +31,7 @@ final class IngestGoldenTests: XCTestCase {
                       confidenceRowBytes: 4, confidenceMapping: .identity),
           // 180, 181, 80, 45 at the 4x3 payload from a 1920x1440 camera image.
           intrinsics: simd_float4(86_400, 86_880, 38_400, 21_600), imageWidth: 1920, imageHeight: 1440,
-          context: GoldenFixture.context, sourceFlags: IngestMessageLayout.sourceDepth)
+          context: IngestGoldenHeader.context, sourceFlags: IngestMessageLayout.sourceDepth)
       }
     }
     XCTAssertTrue(offered)
@@ -40,7 +40,7 @@ final class IngestGoldenTests: XCTestCase {
 
   func testPointProducerWritesThePointsGoldenDroppingNonFiniteAndFarPoints() throws {
     let golden = try VisibilityGridGoldens.data("ingest_points.bin")
-    GoldenFixture.primeSequence(pull, kind: IngestMessageLayout.kindPointCloud, golden: golden, clock: clock)
+    IngestGoldenHeader.primeSequence(pull, kind: IngestMessageLayout.kindPointCloud, golden: golden, clock: clock)
     let producer = PointCloudIngestProducer(sink: pull)
     // The golden predates the confidence gate and carries a 0.25 point.
     producer.minConfidence = 0
@@ -54,7 +54,7 @@ final class IngestGoldenTests: XCTestCase {
       ids.withUnsafeBufferPointer { i in
         confidences.withUnsafeBufferPointer { c in
           XCTAssertTrue(producer.publish(points: p, identifiers: i, confidences: c,
-                                         cameraPosition: simd_float3(0.5, 1.25, -2), context: GoldenFixture.context))
+                                         cameraPosition: simd_float3(0.5, 1.25, -2), context: IngestGoldenHeader.context))
         }
       }
     }
@@ -71,7 +71,7 @@ final class IngestGoldenTests: XCTestCase {
     let ids: [UInt64] = [0x1234_5678_9abc_def0]
     points.withUnsafeBufferPointer { p in
       ids.withUnsafeBufferPointer { i in
-        var context = GoldenFixture.context
+        var context = IngestGoldenHeader.context
         context.cameraToWorld = matrix_identity_float4x4
         XCTAssertTrue(producer.publish(points: p, identifiers: i, confidences: nil, cameraPosition: .zero, context: context))
       }
@@ -94,7 +94,7 @@ final class IngestGoldenTests: XCTestCase {
 
   func testPhotoSavedMessageEqualsTheGoldenThroughTheWriter() throws {
     let golden = try VisibilityGridGoldens.data("ingest_photo_saved.bin")
-    GoldenFixture.primeSequence(pull, kind: IngestMessageLayout.kindPhotoSaved, golden: golden, clock: clock)
+    IngestGoldenHeader.primeSequence(pull, kind: IngestMessageLayout.kindPhotoSaved, golden: golden, clock: clock)
     let b = IngestMessageBuffer(capacity: golden.count)
     IngestMessageWriter.begin(b, kind: IngestMessageLayout.kindPhotoSaved)
     IngestMessageWriter.payloadBytes(b, PhotoSavedLayout.bytes)
@@ -108,7 +108,7 @@ final class IngestGoldenTests: XCTestCase {
 
   func testSessionEventEqualsTheGoldenThroughTheWriter() throws {
     let golden = try VisibilityGridGoldens.data("ingest_session_event.bin")
-    GoldenFixture.primeSequence(pull, kind: IngestMessageLayout.kindSessionEvent, golden: golden, clock: clock)
+    IngestGoldenHeader.primeSequence(pull, kind: IngestMessageLayout.kindSessionEvent, golden: golden, clock: clock)
     let b = IngestMessageBuffer(capacity: golden.count)
     IngestMessageWriter.begin(b, kind: IngestMessageLayout.kindSessionEvent)
     IngestMessageWriter.payloadBytes(b, IngestMessageLayout.sessionEventBytes)
@@ -190,10 +190,10 @@ final class IngestGoldenTests: XCTestCase {
 
   /// Header fields of the golden fixture after begin and payload size.
   private func writeFixtureHeader(_ b: IngestMessageBuffer) {
-    IngestMessageWriter.timing(b, sampleNs: GoldenFixture.sampleNs, frameNs: GoldenFixture.frameNs, acquireNs: GoldenFixture.acquireNs)
+    IngestMessageWriter.timing(b, sampleNs: IngestGoldenHeader.sampleNs, frameNs: IngestGoldenHeader.frameNs, acquireNs: IngestGoldenHeader.acquireNs)
     IngestMessageWriter.pose(
       b, trackingState: IngestTrackingState.tracking, poseMatch: IngestMessageLayout.poseMatchInterpolated,
-      groupEpoch: 3, poseGapUs: -1250, cameraToWorld: GoldenFixture.pose)
+      groupEpoch: 3, poseGapUs: -1250, cameraToWorld: IngestGoldenHeader.pose)
   }
 }
 

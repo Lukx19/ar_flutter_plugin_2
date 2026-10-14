@@ -73,7 +73,7 @@ func messageBuffer(_ data: Data) -> IngestMessageBuffer {
 /// saved and session event goldens): sequence 7 with two drops, sample 1 s,
 /// frame 1.17 s, acquire 2 s, send 2.0005 s, tracking, interpolated, epoch 3,
 /// gap -1250 us, translation (0.5, 1.25, -2).
-enum GoldenFixture {
+enum IngestGoldenHeader {
   static let sampleNs: Int64 = 1_000_000_000
   static let frameNs: Int64 = 1_170_000_000
   static let acquireNs: Int64 = 2_000_000_000
