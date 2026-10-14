@@ -165,6 +165,44 @@ final class AnchorPoseTrackerTests: XCTestCase {
     XCTAssertFalse(producer.tracker.armed)
   }
 
+  func testTrackingResetOnTheSameSessionEndsEveryAnchorOfThePreviousEpoch() {
+    producer.tracker.onSessionStarted(epoch: 1)
+    _ = send(query(requests: [1, 2]))
+    frameAt(1_000)
+    _ = send(query())
+    XCTAssertEqual(producer.tracker.trackedAnchors, 2)
+    producer.tracker.onSessionStarted(epoch: 1)
+    XCTAssertEqual(producer.tracker.trackedAnchors, 2, "same epoch keeps the anchors")
+
+    _ = send(query(requests: [3]))
+    producer.tracker.onSessionStarted(epoch: 2)
+    XCTAssertEqual(producer.tracker.trackedAnchors, 0)
+    XCTAssertEqual(producer.tracker.pendingDetaches, 2)
+    XCTAssertEqual(producer.tracker.sessionReplacements, 1)
+    XCTAssertTrue(producer.tracker.armed)
+    frameAt(2_000)
+    XCTAssertEqual(backend.detached, 2, "detached on the same session object")
+    XCTAssertEqual(backend.created.count, 2, "the queued creation is abandoned")
+
+    let reply = send(query())
+    let p = IngestMessageLayout.headerBytes
+    XCTAssertEqual(reply.u16(p), 2, "one final record per anchor")
+    XCTAssertEqual(reply.u16(p + 2), 1, "abandoned creation result")
+    let update = p + AnchorPoseUpdateLayout.prefixBytes
+    for i in 0..<2 {
+      XCTAssertEqual(reply.u8(update + i * AnchorPoseUpdateLayout.updateBytes + AnchorPoseUpdateLayout.updateTrackingOffset),
+                     AnchorTracking.stopped)
+    }
+    let creation = update + 2 * AnchorPoseUpdateLayout.updateBytes
+    XCTAssertEqual(reply.u8(creation + AnchorPoseUpdateLayout.creationStatusOffset), AnchorCreation.notTracking)
+    XCTAssertEqual(reply.u32(AnchorPoseUpdateLayout.trackedAnchorsOffset), 0)
+
+    // Old anchors stay out of later replies even when ARKit still reports them.
+    backend.created[0].tq[0] += 1
+    frameAt(3_000)
+    XCTAssertEqual(send(query()).u16(p), 0)
+  }
+
   func testInactiveAfterTenSecondsWithoutQuery() {
     _ = send(query(requests: [1]))
     frameAt(1)

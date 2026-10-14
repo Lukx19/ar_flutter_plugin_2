@@ -147,6 +147,7 @@ final class AnchorPoseTracker {
   private var stableNs = Int64(PoseQueryLayout.defaultDetachAfterSeconds) * 1_000_000_000
   private weak var lastSession: AnyObject?
   private var hadSession = false
+  private var lastEpoch: Int?
 
   // Latest AR frame.
   private var frameNs: Int64 = 0
@@ -280,6 +281,44 @@ final class AnchorPoseTracker {
     maxReadNs = max(maxReadNs, readTimer.nowNs() - start)
     lock.unlock()
     if jumpM > 0 { jumpListener?(ts, Int(jumpM * 1000)) }
+  }
+
+  /// The frame source (re)started at [epoch]. A run with `.resetTracking`
+  /// keeps the same ARSession but moves the world origin, so an epoch change
+  /// ends every anchor of the previous epoch: each is detached on the next
+  /// frame and reported once more as a final record with stopped tracking,
+  /// and queued creations answer not tracking.
+  func onSessionStarted(epoch: Int) {
+    lock.lock(); defer { lock.unlock() }
+    let previous = lastEpoch
+    lastEpoch = epoch
+    guard let previous, previous != epoch, !closed else { return }
+    if attached > 0 || requestHead < requests.count {
+      sessionReplacements += 1
+      endAllAnchorsLocked()
+      abandonRequestsLocked()
+    }
+    previousFrameNs = 0
+  }
+
+  /// Hands every attached anchor to the AR queue for detaching and marks its
+  /// slot final with stopped tracking, so the next reply reports it once.
+  private func endAllAnchorsLocked() {
+    for s in 0..<count {
+      guard let a = anchors[s] else { continue }
+      pendingDetach.append(a)
+      if let key = anchorKeys[s] { keyIndex[key] = nil }
+      anchors[s] = nil
+      anchorKeys[s] = nil
+      final[s] = true
+      tracking[s] = UInt8(AnchorTracking.stopped)
+      if !dirty[s] {
+        dirty[s] = true
+        dirtyCount += 1
+      }
+    }
+    attached = 0
+    armedFlag = !closed && (active || !pendingDetach.isEmpty)
   }
 
   private func processRequestsLocked(session: AnyObject, ts: Int64) {

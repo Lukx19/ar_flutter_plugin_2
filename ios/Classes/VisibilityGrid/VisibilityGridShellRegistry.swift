@@ -228,6 +228,7 @@ private final class GridFrameObserver: ARFrameObserver {
   }
 
   func frameSource(_ source: ARFrameSource, didStart configuration: ARConfiguration, epoch: Int) {
+    poseTracking.tracker.onSessionStarted(epoch: epoch)
     shell.onSessionStarted(
       sourceEpoch: epoch, depthMode: ingestDepthMode(configuration, deliversSceneDepth: source.deliversSceneDepth))
   }
