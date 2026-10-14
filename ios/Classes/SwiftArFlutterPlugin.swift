@@ -9,6 +9,7 @@ public class SwiftArFlutterPlugin: NSObject, FlutterPlugin {
     
     let factory = IosARViewFactory(messenger: registrar.messenger())
     registrar.register(factory, withId: "ar_flutter_plugin_2")
+    CaptureARViewFactory.register(with: registrar)
 
     let capabilitiesChannel = FlutterMethodChannel(
       name: "ar_flutter_plugin_2/camera_capabilities",

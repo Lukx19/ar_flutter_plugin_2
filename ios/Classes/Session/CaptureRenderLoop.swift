@@ -1,0 +1,97 @@
+import ARKit
+import MetalKit
+import UIKit
+
+/// `MTKView` delegate of the capture view: one render pass per display
+/// frame with the camera background first and the grid overlay (when one is
+/// registered) on top. Runs on the main thread. The current `ARFrame` is read
+/// for the duration of one draw only; the Core Video textures wrapping its
+/// image live until the GPU finishes with them.
+final class CaptureRenderLoop: NSObject, MTKViewDelegate {
+  static let colorPixelFormat: MTLPixelFormat = .bgra8Unorm
+  static let depthPixelFormat: MTLPixelFormat = .depth32Float
+  static let overlayNearPlane: Float = 0.01
+  static let overlayFarPlane: Float = 100
+
+  private weak var host: ARSessionHost?
+  private let background: CameraBackgroundRenderer
+  private let commandQueue: MTLCommandQueue
+  private let overlays: GridOverlayRegistry
+  private var preparedOverlayRevision = -1
+
+  init(device: MTLDevice, host: ARSessionHost, overlays: GridOverlayRegistry = .shared) throws {
+    guard let queue = device.makeCommandQueue() else { throw CaptureRenderError.metalUnavailable }
+    queue.label = "capture view"
+    commandQueue = queue
+    background = try CameraBackgroundRenderer(
+      device: device,
+      colorPixelFormat: CaptureRenderLoop.colorPixelFormat,
+      depthPixelFormat: CaptureRenderLoop.depthPixelFormat)
+    self.host = host
+    self.overlays = overlays
+    super.init()
+  }
+
+  /// Applies the formats the renderers were built for.
+  func configure(_ view: MTKView) {
+    view.device = background.device
+    view.colorPixelFormat = CaptureRenderLoop.colorPixelFormat
+    view.depthStencilPixelFormat = CaptureRenderLoop.depthPixelFormat
+    view.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+    view.clearDepth = 1
+    view.framebufferOnly = true
+    view.enableSetNeedsDisplay = false
+    view.preferredFramesPerSecond = 60
+    view.autoResizeDrawable = true
+    view.delegate = self
+  }
+
+  func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
+
+  func draw(in view: MTKView) {
+    guard let pass = view.currentRenderPassDescriptor,
+          let commandBuffer = commandQueue.makeCommandBuffer(),
+          let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass)
+    else { return }
+    commandBuffer.label = "capture view frame"
+    var imageTextures: [CVMetalTexture] = []
+    let viewport = view.bounds.size
+    if let host = host, host.lifecycleState == .running,
+       viewport.width > 0, viewport.height > 0,
+       let frame = host.session.currentFrame {
+      let orientation = view.window?.windowScene?.interfaceOrientation ?? .portrait
+      let displayTransform = frame.displayTransform(for: orientation, viewportSize: viewport)
+      imageTextures = background.encode(
+        capturedImage: frame.capturedImage, displayTransform: displayTransform, into: encoder) ?? []
+      if let overlay = overlays.overlay {
+        if preparedOverlayRevision != overlays.revision {
+          overlay.prepare(
+            device: background.device,
+            colorPixelFormat: CaptureRenderLoop.colorPixelFormat,
+            depthPixelFormat: CaptureRenderLoop.depthPixelFormat)
+          preparedOverlayRevision = overlays.revision
+        }
+        let camera = frame.camera
+        let context = GridOverlayFrameContext(
+          viewMatrix: camera.viewMatrix(for: orientation),
+          projectionMatrix: camera.projectionMatrix(
+            for: orientation, viewportSize: viewport,
+            zNear: CGFloat(CaptureRenderLoop.overlayNearPlane), zFar: CGFloat(CaptureRenderLoop.overlayFarPlane)),
+          cameraTransform: camera.transform,
+          viewportSize: viewport,
+          drawableSize: view.drawableSize,
+          orientation: orientation,
+          frameTimestamp: frame.timestamp,
+          trackingState: camera.trackingState)
+        encoder.pushDebugGroup("grid overlay")
+        overlay.encodeOverlay(into: encoder, context: context)
+        encoder.popDebugGroup()
+      }
+    }
+    encoder.endEncoding()
+    if let drawable = view.currentDrawable { commandBuffer.present(drawable) }
+    let retained = imageTextures
+    commandBuffer.addCompletedHandler { _ in withExtendedLifetime(retained) {} }
+    commandBuffer.commit()
+  }
+}
