@@ -6,7 +6,8 @@
 # VisibilityGridShellRegistry.swift) are left out. A temporary Swift package
 # links the logic files and these tests by symlink, so nothing is copied and
 # the iOS sources stay the single source. Usage: run_host_tests.sh [swift test
-# arguments, for example --filter IngestGoldenTests].
+# arguments, for example --filter IngestGoldenTests]. The run stops after 14
+# minutes.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -42,4 +43,10 @@ let package = Package(
 EOF
 
 cd "$work"
-VISIBILITY_GRID_GOLDENS="$goldens" swift test "$@"
+# Bounded below the 15-minute limit; SIGALRM (exit 142) is an overrun, not a pass.
+rc=0
+VISIBILITY_GRID_GOLDENS="$goldens" perl -e 'alarm 840; exec @ARGV' swift test "$@" || rc=$?
+if [[ $rc -eq 142 ]]; then
+  echo "STOPPED: 14-minute bound reached; not passing evidence" >&2
+fi
+exit $rc
