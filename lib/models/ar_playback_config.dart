@@ -24,11 +24,14 @@ enum ARPlaybackRestart {
   }
 }
 
-/// Debug/profile test mode: the AR session replays an ARCore Recording &
-/// Playback dataset instead of the camera.
+/// Debug/profile test mode: the AR session replays a recording instead of
+/// the camera: an ARCore Recording & Playback dataset on Android, a recorded
+/// ARKit session folder on the iOS capture view.
 ///
-/// [datasetPath] is an absolute device path or a path relative to the app's
-/// external files directory (`recordings/walk1.mp4`). [restartGeneration]
+/// [datasetPath] is an absolute device path or a relative path: on Android
+/// relative to the app's external files directory (`recordings/walk1.mp4`),
+/// on iOS a folder under the app's `Library/Application Support/recordings/`
+/// (`room2-iphone12pro-20261014`; a leading `recordings/` is accepted). [restartGeneration]
 /// counts view restarts; it is part of the creation parameters so a new
 /// generation creates a new platform view and ARCore session.
 @immutable
@@ -81,7 +84,8 @@ class ARPlaybackConfig {
     trackIds: List<String>.unmodifiable(ids),
   );
 
-  /// Android creation parameters; merged into the AR view parameters.
+  /// Creation parameters of the Android AR view and the iOS capture view;
+  /// merged into the view parameters (the iOS view reads the same keys).
   Map<String, Object> toCreationParams() => <String, Object>{
     'arcorePlaybackDataset': datasetPath,
     'arcorePlaybackRestart': restart.wireValue,

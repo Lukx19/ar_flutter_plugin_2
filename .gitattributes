@@ -1,2 +1,5 @@
 test_assets/visibility_grid/*.bin binary
 test_assets/grid_renderer/*.bin binary
+test_assets/arkit_playback/**/*.bin binary
+test_assets/arkit_playback/**/*.mov binary
+test_assets/arkit_playback/**/*.jpg binary

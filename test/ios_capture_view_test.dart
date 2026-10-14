@@ -1,5 +1,6 @@
 import 'package:ar_flutter_plugin_2/capabilities/arkit_capabilities.dart';
 import 'package:ar_flutter_plugin_2/models/ar_capture_view_config.dart';
+import 'package:ar_flutter_plugin_2/models/ar_playback_config.dart';
 import 'package:ar_flutter_plugin_2/widgets/ar_view.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -24,11 +25,14 @@ void main() {
     messenger.setMockMethodCallHandler(SystemChannels.platform_views, null);
   });
 
-  Widget host(ARCaptureViewConfig? captureView) => MaterialApp(
+  Widget host(ARCaptureViewConfig? captureView,
+          {ARPlaybackConfig? playback}) =>
+      MaterialApp(
         home: Builder(
           builder: (context) => IosARView().build(
             context: context,
             captureView: captureView,
+            playback: playback,
           ),
         ),
       );
@@ -81,6 +85,44 @@ void main() {
     await tester.pumpAndSettle();
     expect(calls.where((call) => call.method == 'create'), hasLength(2));
     expect(params(created()), containsPair('sceneDepth', false));
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pumpAndSettle();
+  }, variant: TargetPlatformVariant.only(TargetPlatform.iOS));
+
+  testWidgets(
+      'a playback configuration reaches the capture view and a new '
+      'generation recreates it', (tester) async {
+    const playback = ARPlaybackConfig(
+      datasetPath: 'room2-iphone12pro-20261014',
+      restart: ARPlaybackRestart.session,
+    );
+    await tester.pumpWidget(host(const ARCaptureViewConfig(sceneDepth: true),
+        playback: playback));
+    await tester.pumpAndSettle();
+    expect(
+        params(created()),
+        allOf(
+          containsPair('arcorePlaybackDataset', 'room2-iphone12pro-20261014'),
+          containsPair('arcorePlaybackRestart', 'session'),
+          containsPair('arcorePlaybackRestartGeneration', 0),
+          containsPair('sceneDepth', true),
+        ));
+    await tester.pumpWidget(host(const ARCaptureViewConfig(sceneDepth: true),
+        playback: playback.withRestartGeneration(1)));
+    await tester.pumpAndSettle();
+    expect(calls.where((call) => call.method == 'create'), hasLength(2));
+    expect(params(created()),
+        containsPair('arcorePlaybackRestartGeneration', 1));
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pumpAndSettle();
+  }, variant: TargetPlatformVariant.only(TargetPlatform.iOS));
+
+  testWidgets('the legacy iOS view ignores a playback configuration',
+      (tester) async {
+    await tester.pumpWidget(host(null,
+        playback: const ARPlaybackConfig(datasetPath: 'room2')));
+    await tester.pumpAndSettle();
+    expect(params(created()), isEmpty);
     await tester.pumpWidget(const SizedBox.shrink());
     await tester.pumpAndSettle();
   }, variant: TargetPlatformVariant.only(TargetPlatform.iOS));

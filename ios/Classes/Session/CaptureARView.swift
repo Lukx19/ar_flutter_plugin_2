@@ -28,14 +28,17 @@ final class CaptureChannelExtensionRegistry {
 }
 
 /// The capture route's platform view on iOS: one `ARSession` ([ARSessionHost])
-/// drawn by a plain Metal `MTKView` ([CaptureRenderLoop]), reached through the
-/// [CaptureSessionSource] seam. Serves the per-view
+/// drawn by a plain Metal `MTKView` ([CaptureRenderLoop]). In debug and
+/// profile builds the creation parameters can select a recorded session
+/// ([RecordedFrameSource], [RecordedPlaybackSelector]) that replays in place
+/// of the camera; every consumer sees it as the frame source. Serves the per-view
 /// channels the capture route uses on Android with the same method names and
 /// reply shapes:
 ///
 /// - `arsession_<id>`: `init`, `showPlanes`, `getCameraPose`, `pauseSession` /
 ///   `disableCamera`, `resumeSession` / `enableCamera`, `dispose`; sends
-///   `onError`.
+///   `onError` and, when a replayed recording ends in `view` restart mode,
+///   `onArPlaybackFinished` (path, restart, restarts).
 /// - `arcapture_<id>`: `initializeCapture`, `dispose`, and the host replies in
 ///   [CaptureChannelHostReplies] (`replayNativeCaptureRecoveryV2`); sends
 ///   `onPoseBatch` (`pose_batch_v2`, 30 Hz, one batch in flight, none while
@@ -117,12 +120,29 @@ final class CaptureARView: NSObject, FlutterPlatformView {
         self?.sessionChannel.invokeMethod("onError", arguments: [CaptureViewMessageCode.metalUnavailable])
       }
     }
+    if let recorded = source as? RecordedFrameSource {
+      recorded.onPlaybackFinished = { [weak self] event in
+        guard let self = self, !self.disposed else { return }
+        self.sessionChannel.invokeMethod("onArPlaybackFinished", arguments: event)
+      }
+    }
     source.start()
   }
 
-  /// The frame source of the view: the live session host.
+  /// The live session host, or a recorded session when the creation
+  /// parameters select one that opens (debug and profile builds only).
   static func makeSource(creationParams: Any?) -> CaptureSessionSource {
     let options = ARSessionOptions(creationParams: creationParams)
+    let selection = RecordedPlaybackSelector.select(creationParams: creationParams)
+    if let line = RecordedPlaybackSelector.describe(selection) { RecordedPlaybackLog.write(line) }
+    if case .enabled(let config) = selection {
+      do {
+        let session = try RecordedSession(directory: config.directory)
+        return RecordedFrameSource(session: session, config: config, options: options)
+      } catch {
+        RecordedPlaybackLog.write("refused path=\(config.directory.path) reason=open-failed error=\(error) (live camera)")
+      }
+    }
     let plan = ARSessionConfigurationPlan(options: options, capabilities: ARCameraCapabilities.current())
     return ARSessionHost(plan: plan)
   }
@@ -230,6 +250,7 @@ final class CaptureARView: NSObject, FlutterPlatformView {
     poseSink.close()
     source.removeFrameObserver(poseStream)
     source.onSessionFailure = nil
+    (source as? RecordedFrameSource)?.onPlaybackFinished = nil
     captureExtension?.captureViewWillDispose()
     captureExtension = nil
     source.dispose()
