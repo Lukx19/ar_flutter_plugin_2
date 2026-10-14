@@ -1,4 +1,5 @@
 import Foundation
+import Metal
 import simd
 import XCTest
 
@@ -83,6 +84,7 @@ final class GridLineOverlayTests: XCTestCase {
     }
 
     func isInScope(_ x: Float, _ y: Float, _ z: Float) -> Bool { x >= 0 }
+    func reset() {}
   }
 
   // MARK: routing and the line batch
@@ -414,5 +416,35 @@ final class GridLineOverlayTests: XCTestCase {
       return 1
     }
     func isInScope(_ x: Float, _ y: Float, _ z: Float) -> Bool { true }
+    func reset() {}
+  }
+
+  // MARK: overlay lifetime
+
+  /// A new capture view starts without the previous view's quest frame,
+  /// marker outlines and pose frusta (the Android renderer host is created
+  /// per view); an engine detach forgets them too.
+  func testANewCaptureViewAndAnEngineDetachDropThePreviousOverlayFrames() throws {
+    guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("no Metal device") }
+    let host = try GridRendererHost(device: device)
+    let batch = GridLineBatch()
+    let install = {
+      host.beginView()
+      XCTAssertEqual(host.core.display(self.questReference), .overlay)
+      XCTAssertEqual(host.core.display(self.poseMessage(self.both, [self.pose(1, PoseFrustumStyle.kindPhoto)])), .overlay)
+      XCTAssertEqual(host.core.display(
+        self.markerMessage([(7, MarkerOutlineLayout.stateStable, 3, 0.1, 1, 2, -3, 0)])), .overlay)
+      XCTAssertTrue(host.core.scopeOverlay() === host.questOverlay)
+      XCTAssertGreaterThan(host.core.buildOverlayLines(camX: 2, camY: 1.2, camZ: 3, batch: batch), 8 + 4)
+    }
+    install()
+    host.beginView()
+    XCTAssertEqual(host.core.buildOverlayLines(camX: 2, camY: 1.2, camZ: 3, batch: batch), 0)
+    XCTAssertNil(host.core.scopeOverlay())
+    XCTAssertEqual(host.poseFrustumStyle.poseCount, 0)
+    install()
+    host.releaseBuffers()
+    XCTAssertEqual(host.core.buildOverlayLines(camX: 2, camY: 1.2, camZ: 3, batch: batch), 0)
+    XCTAssertNil(host.core.scopeOverlay())
   }
 }

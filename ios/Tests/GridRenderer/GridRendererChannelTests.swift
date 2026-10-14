@@ -81,6 +81,30 @@ final class GridRendererChannelTests: XCTestCase {
     XCTAssertFalse(channels.isRegistered(messenger: second))
     XCTAssertTrue(second.handledChannels.isEmpty)
   }
+
+  func testEveryCaptureViewPrepareResetsTheLineOverlays() throws {
+    guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("no Metal device") }
+    let host = try GridRendererHost(device: device)
+    let probe = ResetCountingOverlay()
+    host.core.addLineOverlay(probe)
+    let overlay = GridRendererOverlay(host: host)
+    overlay.prepare(device: device, colorPixelFormat: .bgra8Unorm, depthPixelFormat: .depth32Float)
+    XCTAssertEqual(probe.resets, 1)
+    overlay.prepare(device: device, colorPixelFormat: .bgra8Unorm, depthPixelFormat: .depth32Float)
+    XCTAssertEqual(probe.resets, 2, "a new capture view starts without the previous overlay frames")
+    host.releaseBuffers()
+    XCTAssertEqual(probe.resets, 3)
+  }
+
+  private final class ResetCountingOverlay: GridLineOverlay {
+    var resets = 0
+    var messageMagic: UInt32 { 0x2222_2222 }
+    var greyOutside: Bool { false }
+    func onMessage(_ message: UnsafeRawBufferPointer) -> Bool { false }
+    func buildLines(camX: Float, camY: Float, camZ: Float, sink: GridOverlayLineSink) -> Int { 0 }
+    func isInScope(_ x: Float, _ y: Float, _ z: Float) -> Bool { true }
+    func reset() { resets += 1 }
+  }
 }
 
 /// Records channel handlers and the task queues they were installed on.

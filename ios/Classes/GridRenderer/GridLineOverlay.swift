@@ -35,6 +35,11 @@ protocol GridLineOverlay: AnyObject {
 
   /// Render thread; called per visible brick centre while [greyOutside] is true.
   func isInScope(_ x: Float, _ y: Float, _ z: Float) -> Bool
+
+  /// Forgets every received frame, as a fresh overlay: a new capture view
+  /// starts without the previous view's guidance, outlines or frusta (the
+  /// Android host is created per view). Any thread.
+  func reset()
 }
 
 extension GridLineOverlay {

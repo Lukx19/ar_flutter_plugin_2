@@ -144,6 +144,7 @@ final class GridRendererOverlay: GridOverlayRenderer, GridOverlayFrameUploader {
   }
 
   func prepare(device: MTLDevice, colorPixelFormat: MTLPixelFormat, depthPixelFormat: MTLPixelFormat) {
+    host.beginView()
     guard device === host.device else {
       NSLog("[GridRenderer] capture view uses another Metal device; grid not drawn")
       return

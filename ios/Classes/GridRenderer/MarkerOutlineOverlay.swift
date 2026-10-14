@@ -99,6 +99,13 @@ final class MarkerOutlineOverlay: GridLineOverlay {
     return true
   }
 
+  /// Drops the outlines; the next [buildLines] shows none until a message arrives.
+  func reset() {
+    lock.lock(); defer { lock.unlock() }
+    stagingCount = 0
+    stagingVersion += 1
+  }
+
   func buildLines(camX: Float, camY: Float, camZ: Float, sink: GridOverlayLineSink) -> Int {
     lock.lock()
     if stagingVersion != shownVersion {

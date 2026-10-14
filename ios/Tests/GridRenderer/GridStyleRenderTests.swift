@@ -412,4 +412,5 @@ private final class ScopeLineOverlay: GridLineOverlay {
   }
   var greyOutside: Bool { true }
   func isInScope(_ x: Float, _ y: Float, _ z: Float) -> Bool { false }
+  func reset() {}
 }

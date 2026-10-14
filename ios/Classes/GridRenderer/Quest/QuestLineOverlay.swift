@@ -31,6 +31,12 @@ final class QuestOverlayLayer {
     geometry.setView(focalPx: focalPx, pxPerDp: pxPerDp)
   }
 
+  /// Drops the shown frame: no lines and no greyed scope until the next message.
+  func reset() {
+    lock.lock(); defer { lock.unlock() }
+    hasFrame = false
+  }
+
   func buildLines(camX: Float, camY: Float, camZ: Float, sink: GridOverlayLineSink) -> Int {
     lock.lock(); defer { lock.unlock() }
     if !hasFrame { return 0 }
@@ -80,5 +86,9 @@ final class QuestLineOverlay: GridLineOverlay {
 
   func isInScope(_ x: Float, _ y: Float, _ z: Float) -> Bool {
     layer.isInScope(x, y, z)
+  }
+
+  func reset() {
+    layer.reset()
   }
 }

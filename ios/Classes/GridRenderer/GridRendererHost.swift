@@ -133,8 +133,17 @@ final class GridRendererHost {
   /// Draw statistics of the last encoded frame.
   var drawCounters: StyleDrawCounters? { draws?.counters }
 
-  /// Releases the GPU buffers (engine detached); the grid must resend everything.
+  /// A new capture view starts drawing: overlays forget the previous view's
+  /// quest frame, marker outlines and pose frusta, as the Android host that
+  /// is created per view. Grid buffers stay (they belong to the device).
+  func beginView() {
+    core.resetLineOverlays()
+  }
+
+  /// Releases the GPU buffers (engine detached) and the overlays' frames;
+  /// the grid must resend everything.
   func releaseBuffers() {
+    core.resetLineOverlays()
     target.releaseBuffers()
     core.store.forgetGpuBuffers()
     core.scheduler.requireReset()

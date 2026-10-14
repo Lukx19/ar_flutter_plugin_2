@@ -173,6 +173,17 @@ final class PoseFrustumStyle: GridLineOverlay {
     rotations[s * 4 + 3] = qw
   }
 
+  /// Forgets every pose, the show flags and the colour table, as a new style.
+  func reset() {
+    lock.lock(); defer { lock.unlock() }
+    clearLocked()
+    flags = 0
+    colourFresh = PoseFrustumStyle.defaultFresh
+    colourStabilizing = PoseFrustumStyle.defaultStabilizing
+    colourStable = PoseFrustumStyle.defaultStable
+    colourFlash = PoseFrustumStyle.defaultFlash
+  }
+
   private func clearLocked() {
     for i in indexSlots.indices { indexSlots[i] = PoseFrustumStyle.emptySlot }
     count = 0

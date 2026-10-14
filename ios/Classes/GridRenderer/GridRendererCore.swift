@@ -49,6 +49,11 @@ final class GridRendererCore {
     if !overlays.contains(where: { $0 === overlay }) { overlays.append(overlay) }
   }
 
+  /// Resets every line overlay to its fresh state (a new capture view starts).
+  func resetLineOverlays() {
+    for overlay in lineOverlays { overlay.reset() }
+  }
+
   func removeLineOverlay(_ overlay: GridLineOverlay) {
     overlayLock.lock(); defer { overlayLock.unlock() }
     overlays.removeAll { $0 === overlay }
