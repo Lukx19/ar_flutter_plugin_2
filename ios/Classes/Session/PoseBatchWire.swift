@@ -193,3 +193,38 @@ final class PoseBatchDispatcher {
     }
   }
 }
+
+/// Pose samples to `onPoseBatch` on the capture channel, main thread only.
+/// Open between capture `initializeCapture` and capture `dispose`. While the
+/// session is paused it drops every offer, including samples the delegate
+/// queue handed to the main queue before the pause, so no pose reaches Dart
+/// between `pauseSession` and `resumeSession`.
+final class PoseBatchSink {
+  private let dispatcher: PoseBatchDispatcher
+  private(set) var isOpen = false
+  private(set) var isPaused = false
+
+  init(dispatcher: PoseBatchDispatcher) {
+    self.dispatcher = dispatcher
+  }
+
+  func open() { isOpen = true }
+
+  func close() {
+    isOpen = false
+    dispatcher.clear()
+  }
+
+  /// Drops queued samples and every later offer until [resume].
+  func pause() {
+    isPaused = true
+    dispatcher.clear()
+  }
+
+  func resume() { isPaused = false }
+
+  func offer(_ sample: Data) {
+    guard isOpen, !isPaused else { return }
+    dispatcher.offer(sample)
+  }
+}

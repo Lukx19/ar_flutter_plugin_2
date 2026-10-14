@@ -27,31 +27,6 @@ final class CaptureChannelExtensionRegistry {
   var makeExtension: ((CaptureChannelContext) -> CaptureChannelExtension)?
 }
 
-/// Pose samples to `onPoseBatch` on the capture channel, main thread only.
-/// Open between capture `initializeCapture` and capture `dispose`.
-private final class PoseBatchSink {
-  private let dispatcher: PoseBatchDispatcher
-  private(set) var isOpen = false
-
-  init(dispatcher: PoseBatchDispatcher) {
-    self.dispatcher = dispatcher
-  }
-
-  func open() { isOpen = true }
-
-  func close() {
-    isOpen = false
-    dispatcher.clear()
-  }
-
-  func clearPending() { dispatcher.clear() }
-
-  func offer(_ sample: Data) {
-    guard isOpen else { return }
-    dispatcher.offer(sample)
-  }
-}
-
 /// The capture route's platform view on iOS: one `ARSession` ([ARSessionHost])
 /// drawn by a plain Metal `MTKView` ([CaptureRenderLoop]). Serves the per-view
 /// channels the capture route uses on Android with the same method names and
@@ -60,8 +35,10 @@ private final class PoseBatchSink {
 /// - `arsession_<id>`: `init`, `showPlanes`, `getCameraPose`, `pauseSession` /
 ///   `disableCamera`, `resumeSession` / `enableCamera`, `dispose`; sends
 ///   `onError`.
-/// - `arcapture_<id>`: `initializeCapture`, `dispose`; sends `onPoseBatch`
-///   (`pose_batch_v2`, 30 Hz, one batch in flight).
+/// - `arcapture_<id>`: `initializeCapture`, `dispose`, and the host replies in
+///   [CaptureChannelHostReplies] (`replayNativeCaptureRecoveryV2`); sends
+///   `onPoseBatch` (`pose_batch_v2`, 30 Hz, one batch in flight, none while
+///   the session is paused).
 /// - `arobjects_<id>`, `aranchors_<id>`: `init` only (the capture route does
 ///   not place objects or cloud anchors on iOS).
 ///
@@ -191,12 +168,13 @@ final class CaptureARView: NSObject, FlutterPlatformView {
   private func pauseSession() {
     guard !disposed else { return }
     metalView.isPaused = true
-    poseSink.clearPending()
+    poseSink.pause()
     host.pause()
   }
 
   private func resumeSession() {
     metalView.isPaused = false
+    poseSink.resume()
     host.resume()
   }
 
@@ -227,6 +205,9 @@ final class CaptureARView: NSObject, FlutterPlatformView {
       result(nil)
     default:
       if !disposed, captureExtension?.handleCaptureCall(call, result: result) == true { return }
+      if let reply = CaptureChannelHostReplies.reply(for: call.method) {
+        return result(reply)
+      }
       result(FlutterMethodNotImplemented)
     }
   }

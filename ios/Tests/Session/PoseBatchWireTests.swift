@@ -182,4 +182,39 @@ final class PoseBatchWireTests: XCTestCase {
     stream.enable()
     XCTAssertEqual(stream.admit(timestampNs: 2_000_000_000), 1)
   }
+
+  func testSinkDropsSamplesOfferedWhilePausedAndResumesAfterwards() {
+    var sent: [PoseBatch] = []
+    var acknowledgements: [() -> Void] = []
+    let sink = PoseBatchSink(dispatcher: PoseBatchDispatcher { batch, acknowledge in
+      sent.append(batch)
+      acknowledgements.append(acknowledge)
+    })
+    let sample = Data(repeating: 2, count: PoseBatchWire.sampleBytes)
+    sink.offer(sample)
+    XCTAssertEqual(sent.count, 0, "closed sink sends nothing")
+    sink.open()
+    sink.offer(sample)
+    sink.offer(sample)
+    XCTAssertEqual(sent.count, 1)
+    sink.pause()
+    // A sample queued on the main queue before the pause arrives afterwards.
+    sink.offer(sample)
+    acknowledgements[0]()
+    XCTAssertEqual(sent.count, 1, "no pose reaches Dart while paused")
+    sink.resume()
+    sink.offer(sample)
+    XCTAssertEqual(sent.count, 2)
+    XCTAssertEqual(sent[1].sampleCount, 1)
+    XCTAssertEqual(sent[1].droppedOldestCount, 0)
+  }
+
+  func testCaptureInitSequenceReplayIsAnsweredWithAnEmptyList() {
+    let reply = CaptureChannelHostReplies.reply(
+      for: CaptureChannelHostReplies.replayNativeCaptureRecoveryV2)
+    XCTAssertEqual(CaptureChannelHostReplies.replayNativeCaptureRecoveryV2,
+                   "replayNativeCaptureRecoveryV2")
+    XCTAssertEqual((reply as? [Any])?.count, 0)
+    XCTAssertNil(CaptureChannelHostReplies.reply(for: "captureImageAttempt"))
+  }
 }
