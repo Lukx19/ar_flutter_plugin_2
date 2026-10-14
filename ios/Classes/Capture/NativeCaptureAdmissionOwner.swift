@@ -138,6 +138,13 @@ final class NativeCaptureAdmissionOwner {
 
   var activeAttemptCount: Int { work.count }
   var exposedAttemptCount: Int { work.values.filter { $0.exposureRequested }.count }
+  /// Identities live in this owner now: the cut a later lifecycle drain may touch.
+  var liveAttemptIdentities: Set<CaptureAttemptIdentity> { Set(work.keys) }
+
+  /// Exposed attempts among [cut] that have not reached a terminal yet.
+  func exposedAttemptCount(in cut: Set<CaptureAttemptIdentity>) -> Int {
+    work.values.filter { $0.exposureRequested && cut.contains($0.request.accepted.identity) }.count
+  }
 
   // MARK: Admission
 
@@ -192,10 +199,12 @@ final class NativeCaptureAdmissionOwner {
 
   // MARK: Lifecycle
 
-  func onLifecycle(_ event: CaptureLifecycleEvent) {
+  /// Applies [event] to every live attempt, or only to those in [cut] (the
+  /// attempts that were live when the lifecycle change arrived).
+  func onLifecycle(_ event: CaptureLifecycleEvent, cut: Set<CaptureAttemptIdentity>? = nil) {
     let runningBefore = running
     lifecycleDrain = true
-    for value in Array(work.values) {
+    for value in Array(work.values) where cut?.contains(value.request.accepted.identity) ?? true {
       switch event {
       case .automaticDisabled:
         if value.request.accepted.lane == .automatic && running != value.request.accepted.identity {

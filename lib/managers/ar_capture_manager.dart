@@ -352,19 +352,6 @@ class ARCaptureManager {
           Platform.isIOS ||
           Platform.environment.containsKey('FLUTTER_TEST'));
 
-  /// Manual ISO, exposure, white balance, flash and focus controls drive
-  /// Camera2 on Android. ARKit owns these while its session runs, so the iOS
-  /// capture channel answers them with [cameraControlUnsupportedCode].
-  static bool get platformSupportsManualCameraControls =>
-      debugManualCameraControlsOverride ?? !Platform.isIOS;
-
-  @visibleForTesting
-  static bool? debugManualCameraControlsOverride;
-
-  /// Error code of a camera control the platform does not provide.
-  static const String cameraControlUnsupportedCode =
-      'CAMERA_CONTROL_UNSUPPORTED';
-
   bool get isSupported => platformSupportsCapture;
   bool get isEnabled =>
       _closeState == ARCaptureCloseState.active &&

@@ -9,7 +9,6 @@ import 'package:flutter_test/flutter_test.dart';
 void main() {
   tearDown(() {
     ARCaptureManager.debugIsSupportedOverride = null;
-    ARCaptureManager.debugManualCameraControlsOverride = null;
   });
 
   final context = <String, Object?>{
@@ -132,10 +131,6 @@ void main() {
     expect(ARCaptureManager.platformSupportsCapture, isTrue);
     ARCaptureManager.debugIsSupportedOverride = false;
     expect(ARCaptureManager.platformSupportsCapture, isFalse);
-    ARCaptureManager.debugManualCameraControlsOverride = false;
-    expect(ARCaptureManager.platformSupportsManualCameraControls, isFalse);
-    expect(ARCaptureManager.cameraControlUnsupportedCode,
-        'CAMERA_CONTROL_UNSUPPORTED');
   });
 }
 

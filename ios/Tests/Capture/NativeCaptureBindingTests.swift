@@ -24,7 +24,7 @@ final class NativeCaptureBindingTests: XCTestCase {
     super.tearDown()
   }
 
-  private func binding() -> NativeCaptureBinding {
+  private func binding(nowMs: @escaping () -> Int64 = { Int64(Date().timeIntervalSince1970 * 1000) }) -> NativeCaptureBinding {
     let files = appFiles!
     return NativeCaptureBinding(
       openResources: {
@@ -33,6 +33,7 @@ final class NativeCaptureBindingTests: XCTestCase {
         return NativeCaptureRootResources(lease: lease, store: store)
       },
       exposure: camera,
+      nowMs: nowMs,
       events: { [unowned self] event in
         let map = NativeCaptureWire.event(event)
         DispatchQueue.main.async { self.events.append(map) }
@@ -132,6 +133,53 @@ final class NativeCaptureBindingTests: XCTestCase {
     XCTAssertEqual(replay.first?["reason"] as? String, "recovered-proven-absent")
     XCTAssertEqual(replay.first?["attemptId"] as? String, request.accepted.identity.attemptId)
     XCTAssertNotNil(replay.first?["recoveryContext"])
+  }
+
+  func testPauseCutsOnlyAttemptsLiveWhenThePauseArrived() throws {
+    var clock: Int64 = 1_000_000
+    let binding = binding(nowMs: { clock })
+    let first = CaptureFixture.request()
+    let second = CaptureFixture.request(attemptId: "6f1c2d3e-0000-4000-8000-000000000002", commitId: "commit-2", lane: .automatic)
+    _ = try complete { binding.admit(CaptureFixture.admissionMap(first), completion: $0) }.get()
+    binding.onSessionPaused()
+    drain(binding)
+    // The session resumes and a second attempt is admitted before the first settles.
+    _ = try complete { binding.admit(CaptureFixture.admissionMap(second), completion: $0) }.get()
+    clock += NativeCaptureBinding.pauseSettleMs + 1_000
+    camera.deliverJpeg(0)
+    drain(binding)
+    XCTAssertEqual(camera.requests.count, 2, "the second attempt is exposed after the first commits")
+    // A deadline tick past the pause settle must not cut the second attempt.
+    let tick = expectation(description: "deadline tick")
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { tick.fulfill() }
+    wait(for: [tick], timeout: 5)
+    drain(binding)
+    camera.deliverJpeg(1)
+    drain(binding)
+    let committed = events.filter { $0["kind"] as? String == "committed" }.compactMap { $0["attemptId"] as? String }
+    XCTAssertEqual(committed, [first.accepted.identity.attemptId, second.accepted.identity.attemptId])
+    XCTAssertFalse(events.contains { $0["kind"] as? String == "recovering" })
+    XCTAssertEqual(photos.count, 2)
+  }
+
+  func testCloseCutIsDurableWhenTheViewDropsTheBindingAtOnce() throws {
+    let exposed = CaptureFixture.request()
+    let waiting = CaptureFixture.request(attemptId: "6f1c2d3e-0000-4000-8000-000000000002", commitId: "commit-2", lane: .automatic)
+    var first: NativeCaptureBinding? = binding()
+    _ = try complete { first!.admit(CaptureFixture.admissionMap(exposed), completion: $0) }.get()
+    _ = try complete { first!.admit(CaptureFixture.admissionMap(waiting), completion: $0) }.get()
+    let closed = expectation(description: "closed")
+    first!.close { closed.fulfill() }
+    first = nil
+    wait(for: [closed], timeout: 10)
+
+    events = []
+    let restarted = binding()
+    let replay = try complete { restarted.replay(completion: $0) }.get()
+    let byAttempt = Dictionary(uniqueKeysWithValues: replay.compactMap { event in (event["attemptId"] as? String).map { ($0, event) } })
+    XCTAssertEqual(byAttempt[waiting.accepted.identity.attemptId]?["kind"] as? String, "abandoned")
+    XCTAssertEqual(byAttempt[waiting.accepted.identity.attemptId]?["reason"] as? String, "view-replaced-before-exposure")
+    XCTAssertEqual(byAttempt[exposed.accepted.identity.attemptId]?["reason"] as? String, "recovered-proven-absent")
   }
 
   func testCommittedPhotoMaterializesAPreviewAfterReconcile() throws {

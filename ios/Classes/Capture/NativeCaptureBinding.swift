@@ -62,7 +62,9 @@ final class NativeCaptureBinding {
   private var owner: NativeCaptureAdmissionOwner?
   private var deadlineTimer: DispatchSourceTimer?
   private var closed = false
-  private var pauseDeadlineMs: Int64?
+  /// A pending pause settle: only the attempts live when the pause arrived
+  /// are cut, so admissions after a resume keep their own terminal.
+  private var pauseSettle: (deadlineMs: Int64, cut: Set<CaptureAttemptIdentity>)?
 
   init(openResources: @escaping () throws -> NativeCaptureRootResources, exposure: StillExposurePort,
        nowMs: @escaping () -> Int64 = { Int64(Date().timeIntervalSince1970 * 1000) },
@@ -144,21 +146,26 @@ final class NativeCaptureBinding {
     queue.async { [weak self] in _ = try? self?.ensureOpen() }
   }
 
-  /// The AR session paused: exposed attempts get up to 5 s to reach their
-  /// terminal, then every remaining attempt is cut as backgrounded.
+  /// The AR session paused: exposed attempts live at the pause get up to 5 s
+  /// to reach their terminal, then those attempts that remain are cut as
+  /// backgrounded (Android `onLifecycle(event, cuts)`). Attempts admitted
+  /// after the pause are never part of that cut.
   func onSessionPaused() {
     queue.async { [weak self] in
-      guard let self = self, !self.closed, self.owner != nil else { return }
-      self.pauseDeadlineMs = self.nowMs() + Self.pauseSettleMs
+      guard let self = self, !self.closed, let owner = self.owner else { return }
+      let cut = owner.liveAttemptIdentities.union(self.pauseSettle?.cut ?? [])
+      self.pauseSettle = (self.nowMs() + Self.pauseSettleMs, cut)
       self.checkPauseSettled()
     }
   }
 
   /// Closes the owner: exposed attempts transfer to restart recovery, others
   /// are abandoned; the store and root lease are released. Idempotent.
+  /// The block holds the binding strongly so the cut becomes durable even
+  /// when the view drops its last reference right after calling close.
   func close(completion: @escaping () -> Void = {}) {
-    queue.async { [weak self] in
-      self?.closeOnQueue()
+    queue.async {
+      self.closeOnQueue()
       DispatchQueue.main.async(execute: completion)
     }
   }
@@ -227,10 +234,10 @@ final class NativeCaptureBinding {
   }
 
   private func checkPauseSettled() {
-    guard let deadline = pauseDeadlineMs, let owner = owner else { return }
-    if owner.exposedAttemptCount == 0 || nowMs() >= deadline {
-      pauseDeadlineMs = nil
-      owner.onLifecycle(.backgrounded)
+    guard let settle = pauseSettle, let owner = owner else { return }
+    if owner.exposedAttemptCount(in: settle.cut) == 0 || nowMs() >= settle.deadlineMs {
+      pauseSettle = nil
+      owner.onLifecycle(.backgrounded, cut: settle.cut)
     }
   }
 

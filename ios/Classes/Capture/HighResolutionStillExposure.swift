@@ -88,7 +88,7 @@ final class HighResolutionStillExposure: StillExposurePort {
   static let maximumFallbackFrameAge: TimeInterval = 0.5
 
   private let session: () -> ARSession?
-  private let jpegQuality: Int
+  private var configuredJpegQuality: Int
   private let deviceModel: String
   private let encodeQueue = DispatchQueue(label: "capture3d.still-encode", qos: .userInitiated)
   private let lock = NSLock()
@@ -97,8 +97,15 @@ final class HighResolutionStillExposure: StillExposurePort {
 
   init(session: @escaping () -> ARSession?, jpegQuality: Int, deviceModel: String = ARCameraCapabilities.hardwareModelIdentifier()) {
     self.session = session
-    self.jpegQuality = jpegQuality
+    self.configuredJpegQuality = jpegQuality
     self.deviceModel = deviceModel
+  }
+
+  /// JPEG quality of the next encode; a repeated initializeCapture updates it
+  /// so the staged route, the durable route and the snapshot share one exposure.
+  var jpegQuality: Int {
+    get { lock.lock(); defer { lock.unlock() }; return configuredJpegQuality }
+    set { lock.lock(); configuredJpegQuality = newValue; lock.unlock() }
   }
 
   var snapshot: Counters {

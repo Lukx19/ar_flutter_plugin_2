@@ -150,8 +150,16 @@ final class NativeCaptureChannel: CaptureChannelExtension {
     config = parsed
     cache = StagedStillCache(config: parsed)
     let frameSource = context.frameSource
-    let exposure = HighResolutionStillExposure(session: { [weak frameSource] in frameSource?.session }, jpegQuality: parsed.jpegQuality)
-    stills = exposure
+    // One exposure per view: the binding keeps the first one, so a repeated
+    // initialize only updates its quality.
+    let exposure: HighResolutionStillExposure
+    if let existing = stills {
+      existing.jpegQuality = parsed.jpegQuality
+      exposure = existing
+    } else {
+      exposure = HighResolutionStillExposure(session: { [weak frameSource] in frameSource?.session }, jpegQuality: parsed.jpegQuality)
+      stills = exposure
+    }
     if binding == nil {
       let channel = context.channel
       let created = NativeCaptureBinding(
