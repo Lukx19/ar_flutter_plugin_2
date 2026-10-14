@@ -195,6 +195,16 @@ final class IngestGoldenTests: XCTestCase {
       b, trackingState: IngestTrackingState.tracking, poseMatch: IngestMessageLayout.poseMatchInterpolated,
       groupEpoch: 3, poseGapUs: -1250, cameraToWorld: IngestGoldenHeader.pose)
   }
+  func testCameraToWorldIsWrittenWithAnExactRigidBottomRow() {
+    var arkit = IngestGoldenHeader.pose
+    arkit.columns.3.w = 0.99999994
+    arkit.columns.0.w = 1e-9
+    let fixed = IngestMessageWriter.rigidBottomRow(arkit)
+    XCTAssertEqual(fixed.columns.3.w, 1)
+    XCTAssertEqual(fixed.columns.0.w, 0)
+    XCTAssertEqual(fixed.columns.3.x, 0.5)
+    XCTAssertEqual(IngestMessageWriter.rigidBottomRow(simd_float4x4()), simd_float4x4())
+  }
 }
 
 /// The photo of the shared photo saved golden: photo id bytes 0-31, attempt

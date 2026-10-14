@@ -85,7 +85,21 @@ enum IngestMessageWriter {
     b.u8(IngestMessageLayout.poseMatch, poseMatch)
     b.u16(IngestMessageLayout.groupEpoch, groupEpoch)
     b.i32(IngestMessageLayout.poseGapUs, poseGapUs)
-    writeColumnMajor(b, IngestMessageLayout.cameraToWorld, m)
+    writeColumnMajor(b, IngestMessageLayout.cameraToWorld, rigidBottomRow(m))
+  }
+
+  /// The contract's camera-to-world is a rigid transform with an exact
+  /// 0 0 0 1 bottom row (as ARCore writes it). ARKit's `camera.transform`
+  /// can carry 0.99999994 in the corner, so the row is written exactly.
+  /// An all-zero matrix (pose missing) stays zero.
+  static func rigidBottomRow(_ m: simd_float4x4) -> simd_float4x4 {
+    if m == simd_float4x4() { return m }
+    var r = m
+    r.columns.0.w = 0
+    r.columns.1.w = 0
+    r.columns.2.w = 0
+    r.columns.3.w = 1
+    return r
   }
 
   static func writeColumnMajor(_ b: IngestMessageBuffer, _ o: Int, _ m: simd_float4x4) {
