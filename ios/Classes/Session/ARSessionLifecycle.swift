@@ -48,6 +48,14 @@ struct ARSessionLifecycle: Equatable {
     }
   }
 
+  /// The session channel's `init`: runs a session that never ran and changes
+  /// nothing otherwise. Like Android's `init` (display configuration only),
+  /// it never resumes a session paused by Flutter nor resets its world frame;
+  /// only `resumeSession` continues it.
+  mutating func initialize() -> ARSessionCommand {
+    state == .idle ? start() : .none
+  }
+
   /// Re-runs a running or paused session with `.resetTracking` (for example
   /// after a configuration change that invalidates the world frame).
   mutating func restart(now: TimeInterval) -> ARSessionCommand {

@@ -63,7 +63,8 @@ final class IngestPullHandler: IngestMessageSink {
   private let clock: IngestClock
   private let lock = NSLock()
 
-  /// Called with the delay after which [tick] should run (a pull was parked).
+  /// Called with the delay after which [idleCheckFired] should run (a pull
+  /// was parked). At most one check is armed at a time.
   var scheduleIdleCheck: ((Int64) -> Void)?
 
   /// Receives every replied message (debug recording), on the reply path.
@@ -88,6 +89,9 @@ final class IngestPullHandler: IngestMessageSink {
   private var pending: IngestReply?
   private var pendingMask = 0
   private var pendingSinceNs: Int64 = 0
+  /// One idle check is scheduled at a time: set when [scheduleIdleCheck] is
+  /// called, cleared when it fires ([idleCheckFired]).
+  private var idleCheckArmed = false
   private var closed = false
 
   // Counters (read under the lock).
@@ -185,18 +189,31 @@ final class IngestPullHandler: IngestMessageSink {
         pending = reply
         pendingMask = mask
         pendingSinceNs = clock.nowNs()
-        schedule = Self.idleAfterNs
+        // An armed check fires before this pull's deadline (deadlines only
+        // move later) and re-arms for the remainder.
+        if !idleCheckArmed {
+          idleCheckArmed = true
+          schedule = Self.idleAfterNs
+        }
       }
     }
     lock.unlock()
     if schedule >= 0 { scheduleIdleCheck?(schedule) }
   }
 
+  /// The scheduled idle check ran: disarms it, then [tick]s.
+  func idleCheckFired() {
+    lock.lock(); idleCheckArmed = false; lock.unlock()
+    tick()
+  }
+
   /// Answers a parked pull with idle once it waited [idleAfterNs]; returns ns
-  /// until the parked pull's deadline, or -1 when nothing is parked.
+  /// until the parked pull's deadline, or -1 when nothing is parked. Arms an
+  /// idle check for the remainder unless one is armed already.
   @discardableResult
   func tick() -> Int64 {
     var remaining: Int64 = -1
+    var schedule = false
     lock.lock()
     if let p = pending {
       let waited = clock.nowNs() - pendingSinceNs
@@ -205,10 +222,14 @@ final class IngestPullHandler: IngestMessageSink {
         replyIdleLocked(p)
       } else {
         remaining = Self.idleAfterNs - waited
+        if !idleCheckArmed {
+          idleCheckArmed = true
+          schedule = true
+        }
       }
     }
     lock.unlock()
-    if remaining > 0 { scheduleIdleCheck?(remaining) }
+    if schedule { scheduleIdleCheck?(remaining) }
     return remaining
   }
 

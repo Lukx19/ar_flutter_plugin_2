@@ -27,6 +27,8 @@ final class VisibilityGridShellRegistry {
   private var poseTracking: AnchorPoseUpdateProducer?
   private var anchorBackend: ARKitAnchorBackend?
   private var channels: [FlutterBasicMessageChannel] = []
+  /// Messenger of the engine that owns the shell (the latest registration).
+  private weak var registeredMessenger: FlutterBinaryMessenger?
   private var observer: GridFrameObserver?
   private var sourceObservation: UUID?
   private weak var source: ARFrameSource?
@@ -44,9 +46,10 @@ final class VisibilityGridShellRegistry {
     unregisterLocked()
     let created = VisibilityGridIngestShell(clock: clock, recorder: Self.makeRecorder())
     shell = created
+    registeredMessenger = messenger
     let pull = created.pull
     pull.scheduleIdleCheck = { [weak pull, idleQueue] delayNs in
-      idleQueue.asyncAfter(deadline: .now() + .nanoseconds(Int(delayNs))) { pull?.tick() }
+      idleQueue.asyncAfter(deadline: .now() + .nanoseconds(Int(delayNs))) { pull?.idleCheckFired() }
     }
     let backend = ARKitAnchorBackend()
     anchorBackend = backend
@@ -106,7 +109,22 @@ final class VisibilityGridShellRegistry {
     unregisterLocked()
   }
 
+  /// The engine of [messenger] detached: releases the shell when that engine
+  /// owns it; a later engine's registration stays.
+  func unregister(messenger: FlutterBinaryMessenger) {
+    lock.lock(); defer { lock.unlock() }
+    guard let owner = registeredMessenger, owner === messenger else { return }
+    unregisterLocked()
+  }
+
+  /// True while the engine of [messenger] owns the shell.
+  func isRegistered(messenger: FlutterBinaryMessenger) -> Bool {
+    lock.lock(); defer { lock.unlock() }
+    return shell != nil && registeredMessenger === messenger
+  }
+
   private func unregisterLocked() {
+    registeredMessenger = nil
     for channel in channels { channel.setMessageHandler(nil) }
     channels = []
     if let id = sourceObservation { ARFrameSourceRegistry.shared.stopObserving(id) }
@@ -141,6 +159,7 @@ final class VisibilityGridShellRegistry {
     s.onSourceAttached(
       sourceEpoch: configuration == nil ? nil : n.epoch,
       depthMode: ingestDepthMode(configuration, deliversSceneDepth: n.deliversSceneDepth),
+      depthSize: ingestDepthSize(n),
       replacesSession: replaces
     )
     n.addFrameObserver(o)
@@ -191,21 +210,18 @@ final class VisibilityGridShellRegistry {
     }
     return IngestRecorder(
       directory: support.appendingPathComponent("visibility_grid/recordings", isDirectory: true),
-      deviceModel: deviceModelIdentifier()
+      deviceModel: ARCameraCapabilities.hardwareModelIdentifier()
     )
     #else
     return nil
     #endif
   }
+}
 
-  /// Hardware model identifier, for example `iPhone13,3`.
-  static func deviceModelIdentifier() -> String {
-    var info = utsname()
-    uname(&info)
-    return withUnsafeBytes(of: &info.machine) { raw in
-      String(decoding: raw.prefix { $0 != 0 }, as: UTF8.self)
-    }
-  }
+/// The requested grid depth size of [source], as the ingest shell takes it.
+func ingestDepthSize(_ source: ARFrameSource) -> IngestDepthSize {
+  let size = source.depthOutputSize
+  return IngestDepthSize(width: size.width, height: size.height)
 }
 
 /// Bridges the session host's frame observer seam to the shell and the anchor tracker.
@@ -230,7 +246,8 @@ private final class GridFrameObserver: ARFrameObserver {
   func frameSource(_ source: ARFrameSource, didStart configuration: ARConfiguration, epoch: Int) {
     poseTracking.tracker.onSessionStarted(epoch: epoch)
     shell.onSessionStarted(
-      sourceEpoch: epoch, depthMode: ingestDepthMode(configuration, deliversSceneDepth: source.deliversSceneDepth))
+      sourceEpoch: epoch, depthMode: ingestDepthMode(configuration, deliversSceneDepth: source.deliversSceneDepth),
+      depthSize: ingestDepthSize(source))
   }
 
   func frameSourceInterruptionEnded(_ source: ARFrameSource) {

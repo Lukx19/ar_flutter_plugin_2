@@ -1,5 +1,15 @@
 import 'package:flutter/foundation.dart';
 
+/// Creation parameter keys of the iOS capture view; the Swift twin is
+/// `ARCaptureViewParameter`.
+abstract final class ARCaptureViewParameter {
+  static const String sceneDepth = 'sceneDepth';
+  static const String depthWidth = 'depthWidth';
+  static const String depthHeight = 'depthHeight';
+  static const String highResolutionFrameCapture =
+      'highResolutionFrameCapture';
+}
+
 /// Creation configuration of the iOS capture view (`capture3d/capture_ar_view`):
 /// one ARKit session on a Metal view host, used by the capture route only.
 ///
@@ -31,12 +41,14 @@ class ARCaptureViewConfig {
   /// Choose the video format recommended for high-resolution frame capture.
   final bool highResolutionFrameCapture;
 
-  /// Creation parameters for the platform view.
+  /// Creation parameters for the platform view ([ARCaptureViewParameter]
+  /// keys; the Swift host reads the same names in `ARSessionOptions`).
   Map<String, Object> toCreationParams() => <String, Object>{
-        'sceneDepth': sceneDepth,
-        'depthWidth': depthWidth,
-        'depthHeight': depthHeight,
-        'highResolutionFrameCapture': highResolutionFrameCapture,
+        ARCaptureViewParameter.sceneDepth: sceneDepth,
+        ARCaptureViewParameter.depthWidth: depthWidth,
+        ARCaptureViewParameter.depthHeight: depthHeight,
+        ARCaptureViewParameter.highResolutionFrameCapture:
+            highResolutionFrameCapture,
       };
 
   @override

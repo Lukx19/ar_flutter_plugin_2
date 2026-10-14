@@ -42,11 +42,55 @@ struct ARVideoFormatDescription: Equatable {
   }
 }
 
+/// The ARKit capability query Dart sends (`ARKitCapabilityQuery`): one
+/// channel, method and reply key set, served by the plugin's
+/// `ar_flutter_plugin_2/camera_capabilities` handler. Android has no handler
+/// for [method] and replies not-implemented.
+enum ARKitCapabilityChannel {
+  static let name = "ar_flutter_plugin_2/camera_capabilities"
+  static let method = "getARKitCapabilities"
+
+  /// Reply keys; Dart parses the same names (`ARKitCapabilityReplyKey`).
+  enum Key {
+    static let platform = "platform"
+    static let modelIdentifier = "modelIdentifier"
+    static let worldTracking = "worldTracking"
+    static let sceneDepth = "sceneDepth"
+    static let smoothedSceneDepth = "smoothedSceneDepth"
+    static let sceneReconstruction = "sceneReconstruction"
+    static let lidarDepth = "lidarDepth"
+    static let highResolutionFrameCapture = "highResolutionFrameCapture"
+    static let worldMap = "worldMap"
+    static let videoFormats = "videoFormats"
+    static let highResolutionFrameCaptureFormat = "highResolutionFrameCaptureFormat"
+  }
+}
+
+/// Creation parameter keys of the capture view (`capture3d/capture_ar_view`);
+/// Dart writes the same names (`ARCaptureViewConfig.toCreationParams`).
+enum ARCaptureViewParameter {
+  static let sceneDepth = "sceneDepth"
+  static let smoothedSceneDepth = "smoothedSceneDepth"
+  static let depthWidth = "depthWidth"
+  static let depthHeight = "depthHeight"
+  static let highResolutionFrameCapture = "highResolutionFrameCapture"
+}
+
+/// Size of the depth map sent to the visibility grid ingest.
+struct ARDepthOutputSize: Equatable {
+  var width: Int
+  var height: Int
+
+  /// LiDAR 256x192 reduced 2x2 (decision 5.2); Dart's default too.
+  static let standard = ARDepthOutputSize(width: 128, height: 96)
+}
+
 /// What ARKit supports on this device. The Dart device preset table is
 /// confirmed against these values at run time (no camera capability probe on
 /// iOS).
 struct ARCameraCapabilities: Equatable {
-  var deviceModel: String
+  /// Hardware model identifier, for example `iPhone13,3`.
+  var modelIdentifier: String
   var worldTrackingSupported: Bool
   var sceneDepthSupported: Bool
   var smoothedSceneDepthSupported: Bool
@@ -63,7 +107,7 @@ struct ARCameraCapabilities: Equatable {
 
   static func current() -> ARCameraCapabilities {
     ARCameraCapabilities(
-      deviceModel: hardwareModelIdentifier(),
+      modelIdentifier: hardwareModelIdentifier(),
       worldTrackingSupported: ARWorldTrackingConfiguration.isSupported,
       sceneDepthSupported: ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth),
       smoothedSceneDepthSupported: ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth),
@@ -73,28 +117,30 @@ struct ARCameraCapabilities: Equatable {
         .recommendedVideoFormatForHighResolutionFrameCapturing.map(ARVideoFormatDescription.init))
   }
 
-  /// Reply of `getARCapabilities` on `capture3d/ar_capabilities`.
+  /// Reply of [ARKitCapabilityChannel.method].
   var channelMap: [String: Any] {
+    typealias Key = ARKitCapabilityChannel.Key
     var map: [String: Any] = [
-      "platform": "ios",
-      "deviceModel": deviceModel,
-      "worldTracking": worldTrackingSupported,
-      "sceneDepth": sceneDepthSupported,
-      "smoothedSceneDepth": smoothedSceneDepthSupported,
-      "sceneReconstruction": sceneReconstructionSupported,
-      "lidarDepth": hasLiDARDepth,
-      "highResolutionFrameCapture": supportsHighResolutionFrameCapture,
-      "worldMap": supportsWorldMap,
-      "videoFormats": videoFormats.map { $0.channelMap },
+      Key.platform: "ios",
+      Key.modelIdentifier: modelIdentifier,
+      Key.worldTracking: worldTrackingSupported,
+      Key.sceneDepth: sceneDepthSupported,
+      Key.smoothedSceneDepth: smoothedSceneDepthSupported,
+      Key.sceneReconstruction: sceneReconstructionSupported,
+      Key.lidarDepth: hasLiDARDepth,
+      Key.highResolutionFrameCapture: supportsHighResolutionFrameCapture,
+      Key.worldMap: supportsWorldMap,
+      Key.videoFormats: videoFormats.map { $0.channelMap },
     ]
     if let format = highResolutionFrameCaptureFormat {
-      map["highResolutionFrameCaptureFormat"] = format.channelMap
+      map[Key.highResolutionFrameCaptureFormat] = format.channelMap
     }
     return map
   }
 
-  /// Model identifier such as `iPhone13,3` (simulators report their host
-  /// architecture; `SIMULATOR_MODEL_IDENTIFIER` is preferred there).
+  /// The plugin's one model identifier source: `utsname.machine`, such as
+  /// `iPhone13,3` (simulators report their host architecture there, so
+  /// `SIMULATOR_MODEL_IDENTIFIER` is preferred on a simulator).
   static func hardwareModelIdentifier() -> String {
     if let simulated = ProcessInfo.processInfo.environment["SIMULATOR_MODEL_IDENTIFIER"] {
       return simulated
@@ -109,23 +155,34 @@ struct ARCameraCapabilities: Equatable {
   }
 }
 
-/// Session options from the platform view creation parameters.
+/// Session options from the capture view creation parameters
+/// ([ARCaptureViewParameter]). Absent or malformed values keep the defaults,
+/// which match Dart's `ARCaptureViewConfig` defaults.
 struct ARSessionOptions: Equatable {
   /// Request LiDAR `sceneDepth` when supported. Disabled for points-only runs
   /// on a LiDAR phone (plan 5.2).
   var sceneDepth = true
   var smoothedSceneDepth = false
   /// Use the video format recommended for high-resolution frame capture.
-  var highResolutionVideoFormat = true
+  var highResolutionFrameCapture = false
+  /// Depth map size sent to the grid when [sceneDepth] is on.
+  var depthOutputSize = ARDepthOutputSize.standard
 
   init() {}
 
   init(creationParams: Any?) {
     self.init()
     guard let map = creationParams as? [String: Any] else { return }
-    if let value = map["sceneDepth"] as? Bool { sceneDepth = value }
-    if let value = map["smoothedSceneDepth"] as? Bool { smoothedSceneDepth = value }
-    if let value = map["highResolutionVideoFormat"] as? Bool { highResolutionVideoFormat = value }
+    if let value = map[ARCaptureViewParameter.sceneDepth] as? Bool { sceneDepth = value }
+    if let value = map[ARCaptureViewParameter.smoothedSceneDepth] as? Bool { smoothedSceneDepth = value }
+    if let value = map[ARCaptureViewParameter.highResolutionFrameCapture] as? Bool {
+      highResolutionFrameCapture = value
+    }
+    if let width = map[ARCaptureViewParameter.depthWidth] as? Int,
+       let height = map[ARCaptureViewParameter.depthHeight] as? Int,
+       width > 0, height > 0 {
+      depthOutputSize = ARDepthOutputSize(width: width, height: height)
+    }
   }
 }
 
@@ -134,13 +191,15 @@ struct ARSessionConfigurationPlan: Equatable {
   var sceneDepth: Bool
   var smoothedSceneDepth: Bool
   var videoFormat: ARVideoFormatDescription?
+  var depthOutputSize: ARDepthOutputSize
 
   var deliversSceneDepth: Bool { sceneDepth }
 
   init(options: ARSessionOptions, capabilities: ARCameraCapabilities) {
     sceneDepth = options.sceneDepth && capabilities.sceneDepthSupported
     smoothedSceneDepth = options.smoothedSceneDepth && capabilities.smoothedSceneDepthSupported
-    videoFormat = options.highResolutionVideoFormat ? capabilities.highResolutionFrameCaptureFormat : nil
+    videoFormat = options.highResolutionFrameCapture ? capabilities.highResolutionFrameCaptureFormat : nil
+    depthOutputSize = options.depthOutputSize
   }
 
   func makeConfiguration() -> ARWorldTrackingConfiguration {

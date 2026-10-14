@@ -51,6 +51,20 @@ final class VisibilityGridIngestShellTests: XCTestCase {
     XCTAssertTrue(drain().isEmpty)
   }
 
+  func testTheSourceDepthSizeReachesTheDepthProducer() {
+    frame.lidarDepth()
+    shell.onSourceAttached(
+      sourceEpoch: 1, depthMode: IngestDepthMode.raw, depthSize: IngestDepthSize(width: 256, height: 192),
+      replacesSession: false)
+    XCTAssertEqual(shell.depth.requestedSize, IngestDepthSize(width: 256, height: 192))
+    shell.start(config())
+    frameAt(1_000_000_000)
+    let depth = drain().filter { $0.ingestKind == IngestMessageLayout.kindDepthImage }
+    XCTAssertEqual(depth.first?.u16(IngestMessageLayout.width), 256)
+    shell.onSessionStarted(sourceEpoch: 2, depthMode: IngestDepthMode.raw, depthSize: IngestDepthSize(width: 128, height: 96))
+    XCTAssertEqual(shell.depth.requestedSize, IngestDepthSize(width: 128, height: 96))
+  }
+
   func testLidarDepthFlowsWithTheStartEpochAndPointsOnlyWhenRequested() {
     frame.lidarDepth()
     frame.points = [[0, 0, -1]]

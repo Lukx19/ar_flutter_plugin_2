@@ -93,7 +93,8 @@ final class CaptureARView: NSObject, FlutterPlatformView {
     renderLoop?.configure(metalView)
     host.addFrameObserver(poseStream)
     host.onSessionFailure = { [weak self] error in
-      self?.sessionChannel.invokeMethod("onError", arguments: [error.localizedDescription])
+      NSLog("[CaptureARView] ARKit session failed: %@", error.localizedDescription)
+      self?.sessionChannel.invokeMethod("onError", arguments: [CaptureViewMessageCode.sessionFailure(error)])
     }
     if let makeExtension = CaptureChannelExtensionRegistry.shared.makeExtension {
       captureExtension = makeExtension(
@@ -115,7 +116,7 @@ final class CaptureARView: NSObject, FlutterPlatformView {
 
     if renderLoop == nil {
       DispatchQueue.main.async { [weak self] in
-        self?.sessionChannel.invokeMethod("onError", arguments: ["Metal is unavailable; the camera cannot be shown."])
+        self?.sessionChannel.invokeMethod("onError", arguments: [CaptureViewMessageCode.metalUnavailable])
       }
     }
     host.start()
@@ -141,7 +142,8 @@ final class CaptureARView: NSObject, FlutterPlatformView {
   private func handleSessionCall(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
     switch call.method {
     case "init":
-      if !disposed { host.start() }
+      // Android semantics: configuration only; a paused session stays paused.
+      if !disposed { host.initialize() }
       result(nil)
     case "showPlanes":
       result(nil)
@@ -196,7 +198,7 @@ final class CaptureARView: NSObject, FlutterPlatformView {
       if captureExtension?.handleCaptureCall(call, result: result) == true { return }
       result([
         "mode": "previewFallback",
-        "warning": "Still capture is not available on iOS yet; the pose stream is active.",
+        "warning": CaptureViewMessageCode.stillCaptureUnavailable,
       ])
     case "dispose":
       poseStream.disable()
@@ -243,7 +245,6 @@ final class CaptureARView: NSObject, FlutterPlatformView {
 /// Creates [CaptureARView]s for the view type `capture3d/capture_ar_view`.
 final class CaptureARViewFactory: NSObject, FlutterPlatformViewFactory {
   static let viewType = "capture3d/capture_ar_view"
-  static let capabilitiesChannelName = "capture3d/ar_capabilities"
 
   private let messenger: FlutterBinaryMessenger
 
@@ -252,18 +253,10 @@ final class CaptureARViewFactory: NSObject, FlutterPlatformViewFactory {
     super.init()
   }
 
-  /// Registers the capture view factory and the ARKit capabilities channel.
+  /// Registers the capture view factory. The ARKit capabilities query is
+  /// served on [ARKitCapabilityChannel] by the plugin registration.
   static func register(with registrar: FlutterPluginRegistrar) {
     registrar.register(CaptureARViewFactory(messenger: registrar.messenger()), withId: viewType)
-    let capabilities = FlutterMethodChannel(name: capabilitiesChannelName, binaryMessenger: registrar.messenger())
-    capabilities.setMethodCallHandler { call, result in
-      switch call.method {
-      case "getARCapabilities":
-        result(ARCameraCapabilities.current().channelMap)
-      default:
-        result(FlutterMethodNotImplemented)
-      }
-    }
   }
 
   func create(withFrame frame: CGRect, viewIdentifier viewId: Int64, arguments args: Any?) -> FlutterPlatformView {

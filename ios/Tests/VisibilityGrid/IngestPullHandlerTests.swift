@@ -42,6 +42,32 @@ final class IngestPullHandlerTests: XCTestCase {
     XCTAssertFalse(pull.isParked)
   }
 
+  func testOneIdleCheckIsArmedAtATime() {
+    var scheduled: [Int64] = []
+    pull.scheduleIdleCheck = { scheduled.append($0) }
+    pull.onPull(pullRequest(), reply: capture.reply)
+    clock.now += 100_000_000
+    // A new pull answers the parked one idle and parks itself; the armed check covers it.
+    pull.onPull(pullRequest(), reply: capture.reply)
+    pull.onPull(pullRequest(), reply: capture.reply)
+    XCTAssertEqual(capture.count, 2)
+    XCTAssertEqual(pull.tick(), IngestPullHandler.idleAfterNs, "a tick while armed does not schedule")
+    XCTAssertEqual(scheduled, [IngestPullHandler.idleAfterNs])
+    // The armed check fires at the first pull's deadline and re-arms for the remainder.
+    clock.now += 400_000_000
+    pull.idleCheckFired()
+    XCTAssertEqual(scheduled, [IngestPullHandler.idleAfterNs, 100_000_000])
+    XCTAssertTrue(pull.isParked)
+    clock.now += 100_000_000
+    pull.idleCheckFired()
+    XCTAssertFalse(pull.isParked)
+    XCTAssertEqual(capture.count, 3)
+    XCTAssertEqual(scheduled.count, 2, "nothing parked: no new check")
+    // The next park arms again.
+    pull.onPull(pullRequest(), reply: capture.reply)
+    XCTAssertEqual(scheduled.count, 3)
+  }
+
   func testOfferDeliversToTheParkedPullAtOnce() {
     pull.onPull(pullRequest(), reply: capture.reply)
     clock.now = 7_000

@@ -11,7 +11,7 @@ final class ARCameraCapabilitiesTests: XCTestCase {
 
   static func capabilities(lidar: Bool, highResolution: Bool) -> ARCameraCapabilities {
     ARCameraCapabilities(
-      deviceModel: "iPhone13,3",
+      modelIdentifier: "iPhone13,3",
       worldTrackingSupported: true,
       sceneDepthSupported: lidar,
       smoothedSceneDepthSupported: lidar,
@@ -23,7 +23,7 @@ final class ARCameraCapabilitiesTests: XCTestCase {
   func testChannelMapReportsLiDARFormatsAndHighResolutionCapture() {
     let map = ARCameraCapabilitiesTests.capabilities(lidar: true, highResolution: true).channelMap
     XCTAssertEqual(map["platform"] as? String, "ios")
-    XCTAssertEqual(map["deviceModel"] as? String, "iPhone13,3")
+    XCTAssertEqual(map["modelIdentifier"] as? String, "iPhone13,3")
     XCTAssertEqual(map["worldTracking"] as? Bool, true)
     XCTAssertEqual(map["sceneDepth"] as? Bool, true)
     XCTAssertEqual(map["smoothedSceneDepth"] as? Bool, true)
@@ -50,12 +50,20 @@ final class ARCameraCapabilitiesTests: XCTestCase {
 
   func testSessionOptionsFromCreationParameters() {
     XCTAssertEqual(ARSessionOptions(creationParams: nil), ARSessionOptions())
+    let defaults = ARSessionOptions()
+    XCTAssertTrue(defaults.sceneDepth)
+    XCTAssertFalse(defaults.highResolutionFrameCapture, "standard video format unless requested")
+    XCTAssertEqual(defaults.depthOutputSize, ARDepthOutputSize(width: 128, height: 96))
     let options = ARSessionOptions(creationParams: [
-      "sceneDepth": false, "smoothedSceneDepth": true, "highResolutionVideoFormat": false,
+      "sceneDepth": false, "smoothedSceneDepth": true, "highResolutionFrameCapture": true,
+      "depthWidth": 256, "depthHeight": 192,
     ])
     XCTAssertFalse(options.sceneDepth)
     XCTAssertTrue(options.smoothedSceneDepth)
-    XCTAssertFalse(options.highResolutionVideoFormat)
+    XCTAssertTrue(options.highResolutionFrameCapture)
+    XCTAssertEqual(options.depthOutputSize, ARDepthOutputSize(width: 256, height: 192))
+    let malformed = ARSessionOptions(creationParams: ["depthWidth": 0, "depthHeight": 96])
+    XCTAssertEqual(malformed.depthOutputSize, .standard, "a non-positive size keeps the default")
   }
 
   func testPlanUsesDepthOnlyWhenSupportedAndRequested() {
@@ -64,7 +72,14 @@ final class ARCameraCapabilitiesTests: XCTestCase {
     XCTAssertTrue(plan.sceneDepth)
     XCTAssertTrue(plan.deliversSceneDepth)
     XCTAssertFalse(plan.smoothedSceneDepth)
-    XCTAssertEqual(plan.videoFormat, ARCameraCapabilitiesTests.highResolutionFormat)
+    XCTAssertNil(plan.videoFormat, "high-resolution format only on request")
+    XCTAssertEqual(plan.depthOutputSize, .standard)
+
+    var highResolution = ARSessionOptions()
+    highResolution.highResolutionFrameCapture = true
+    XCTAssertEqual(
+      ARSessionConfigurationPlan(options: highResolution, capabilities: lidar).videoFormat,
+      ARCameraCapabilitiesTests.highResolutionFormat)
 
     var pointsOnly = ARSessionOptions()
     pointsOnly.sceneDepth = false

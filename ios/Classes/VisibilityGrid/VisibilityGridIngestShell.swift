@@ -134,9 +134,12 @@ final class VisibilityGridIngestShell: GridShellControlTarget {
   /// The AR session (re)started; [sourceEpoch] is the frame source's epoch.
   /// A new epoch is a new session generation (a run with `.resetTracking`);
   /// the same epoch after a pause is a resume.
-  func onSessionStarted(sourceEpoch: Int, depthMode: Int) {
+  /// [depthSize] is the depth map size the capture view requested; nil keeps
+  /// the producer's block downscale.
+  func onSessionStarted(sourceEpoch: Int, depthMode: Int, depthSize: IngestDepthSize? = nil) {
     frameLock.lock(); defer { frameLock.unlock() }
     sessionDepthMode = depthMode
+    depth.requestedSize = depthSize
     if let last = lastSourceEpoch {
       if sourceEpoch != last {
         restartPending = true
@@ -151,9 +154,12 @@ final class VisibilityGridIngestShell: GridShellControlTarget {
   /// Follows a frame source. [sourceEpoch] is nil while its session has not
   /// run yet (the start callback follows); [replacesSession] is true when a
   /// previous source existed (a new capture view owns a new `ARSession`).
-  func onSourceAttached(sourceEpoch: Int?, depthMode: Int, replacesSession: Bool) {
+  func onSourceAttached(
+    sourceEpoch: Int?, depthMode: Int, depthSize: IngestDepthSize? = nil, replacesSession: Bool
+  ) {
     frameLock.lock(); defer { frameLock.unlock() }
     sessionDepthMode = depthMode
+    depth.requestedSize = depthSize
     if replacesSession { restartPending = true }
     lastSourceEpoch = sourceEpoch
     sessionStopped = false

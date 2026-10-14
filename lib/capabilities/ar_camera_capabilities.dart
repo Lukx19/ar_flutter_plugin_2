@@ -11,9 +11,12 @@ import '../datatypes/image_format.dart';
 class ARCameraCapabilities {
   static const int capabilityPresetVersion = 12;
 
+  /// Name of the plugin's capability channel (Android camera queries; the
+  /// iOS ARKit query `ARKitCapabilityQuery` uses it too).
+  static const String channelName = 'ar_flutter_plugin_2/camera_capabilities';
+
   /// Platform channel for camera capability queries
-  static const MethodChannel _channel =
-      MethodChannel('ar_flutter_plugin_2/camera_capabilities');
+  static const MethodChannel _channel = MethodChannel(channelName);
 
   /// Platform availability check - currently supports Android only
   bool get isSupported => _supportedOverride ?? Platform.isAndroid;

@@ -24,6 +24,19 @@ final class ARSessionLifecycleTests: XCTestCase {
     XCTAssertEqual(lifecycle.epoch, 1)
   }
 
+  func testInitRunsOnlyANeverStartedSessionAndKeepsAPausedOnePaused() {
+    var lifecycle = ARSessionLifecycle()
+    XCTAssertEqual(lifecycle.initialize(), .run(resetTracking: true))
+    XCTAssertEqual(lifecycle.initialize(), .none, "running: configuration only")
+    _ = lifecycle.pause(now: 1)
+    XCTAssertEqual(lifecycle.initialize(), .none, "Android init does not resume a Flutter pause")
+    XCTAssertEqual(lifecycle.state, .paused)
+    XCTAssertEqual(lifecycle.epoch, 1, "the world frame is kept")
+    XCTAssertEqual(lifecycle.resume(), .run(resetTracking: false))
+    _ = lifecycle.dispose()
+    XCTAssertEqual(lifecycle.initialize(), .none)
+  }
+
   func testResumeOfANeverStartedSessionStartsIt() {
     var lifecycle = ARSessionLifecycle()
     XCTAssertEqual(lifecycle.resume(), .run(resetTracking: true))
@@ -104,7 +117,7 @@ final class ARSessionHostTests: XCTestCase {
   private static let plan = ARSessionConfigurationPlan(
     options: ARSessionOptions(),
     capabilities: ARCameraCapabilities(
-      deviceModel: "test", worldTrackingSupported: true, sceneDepthSupported: true,
+      modelIdentifier: "test", worldTrackingSupported: true, sceneDepthSupported: true,
       smoothedSceneDepthSupported: true, sceneReconstructionSupported: true,
       videoFormats: [], highResolutionFrameCaptureFormat: nil))
 
@@ -135,6 +148,35 @@ final class ARSessionHostTests: XCTestCase {
     XCTAssertEqual(host.epoch, 2)
     XCTAssertEqual(host.lifecycleState, .disposed)
     XCTAssertTrue(host.deliversSceneDepth)
+  }
+
+  func testSessionFailuresReachDartAsStableCodes() {
+    XCTAssertEqual(
+      CaptureViewMessageCode.sessionFailure(ARError(.cameraUnauthorized)), CaptureViewMessageCode.cameraUnauthorized)
+    XCTAssertEqual(
+      CaptureViewMessageCode.sessionFailure(ARError(.sensorFailed)), CaptureViewMessageCode.sessionFailed)
+    XCTAssertEqual(
+      CaptureViewMessageCode.sessionFailure(NSError(domain: "test", code: 1)), CaptureViewMessageCode.sessionFailed)
+    let codes = [
+      CaptureViewMessageCode.metalUnavailable, CaptureViewMessageCode.cameraUnauthorized,
+      CaptureViewMessageCode.sessionFailed, CaptureViewMessageCode.stillCaptureUnavailable,
+    ]
+    XCTAssertEqual(Set(codes).count, codes.count)
+    for code in codes {
+      XCTAssertNotNil(code.range(of: "^ARKIT_[A-Z_]+$", options: .regularExpression), code)
+    }
+  }
+
+  func testHostInitAfterPauseLeavesTheSessionPaused() {
+    let driver = FakeSessionDriver()
+    let host = makeHost(driver)
+    host.initialize()
+    host.pause()
+    host.initialize()
+    XCTAssertEqual(driver.calls, [.run(resetTracking: true), .pause])
+    XCTAssertEqual(host.lifecycleState, .paused)
+    XCTAssertEqual(host.epoch, 1)
+    host.dispose()
   }
 
   func testObserversReceiveStartAndStopOnTheDelegateQueue() {

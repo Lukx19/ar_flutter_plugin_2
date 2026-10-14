@@ -15,12 +15,19 @@ struct IngestSampleContext {
   var poseGapUs: Int32 = 0
 }
 
+/// Depth map size requested for the grid ingest (Foundation-only twin of the
+/// session host's `ARDepthOutputSize`).
+struct IngestDepthSize: Equatable {
+  var width: Int
+  var height: Int
+}
+
 /// Kind 1 depth image producer (contract 2.4, iOS mapping of plan section 3).
 ///
 /// At most every [acquireIntervalNs] of frame time it converts the frame's
 /// LiDAR depth (`ARFrame.sceneDepth`, f32 metres, 256x192) to u16
-/// millimetres, downscaled by [downscale] (default 2, so 128x96, decision
-/// 5.2) with a nearest-valid rule per block, and maps `ARConfidenceLevel`
+/// millimetres, downscaled to the capture view's [requestedSize] (default
+/// 128x96, decision 5.2; see [blockFactor]) with a nearest-valid rule per block, and maps `ARConfidenceLevel`
 /// low/medium/high to 0/128/255. Intrinsics are `ARCamera.intrinsics`
 /// scaled from the camera image to the payload size. The staging buffer is
 /// allocated once; the pull handler copies it on offer.
@@ -36,8 +43,21 @@ final class DepthIngestProducer {
   private let sink: IngestMessageSink
   private let staging = IngestMessageBuffer(capacity: IngestMessageLayout.maxMessageBytes)
 
-  /// Block size of the downscale (1 keeps the full 256x192 map).
+  /// Block size of the downscale (1 keeps the full 256x192 map) when no
+  /// [requestedSize] is set.
   var downscale = DepthIngestProducer.defaultDownscale
+
+  /// Depth map size the capture view requested (`depthWidth`/`depthHeight`);
+  /// set by the shell from the frame source under its frame lock.
+  var requestedSize: IngestDepthSize?
+
+  /// Block size for a [sourceWidth] x [sourceHeight] map: the largest integer
+  /// factor whose output still covers [requestedSize] on both axes (128x96
+  /// from 256x192 is 2, 256x192 is 1), or [downscale] without a request.
+  func blockFactor(sourceWidth: Int, sourceHeight: Int) -> Int {
+    guard let size = requestedSize, size.width > 0, size.height > 0 else { return max(1, downscale) }
+    return max(1, min(sourceWidth / size.width, sourceHeight / size.height))
+  }
 
   private var lastAcquireNs: Int64 = .min
   private var lastSampleNs: Int64 = .min
@@ -92,7 +112,7 @@ final class DepthIngestProducer {
       duplicateDropped += 1
       return false
     }
-    let s = max(1, downscale)
+    let s = blockFactor(sourceWidth: planes.width, sourceHeight: planes.height)
     let w = planes.width / s
     let h = planes.height / s
     let withConfidence = planes.confidence != nil

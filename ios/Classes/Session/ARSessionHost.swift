@@ -1,6 +1,29 @@
 import ARKit
 import Foundation
 
+/// Stable codes the capture view sends to Dart in place of English text
+/// (`onError`, the `initializeCapture` warning). Dart localizes them in
+/// `capture_message_localizer.dart`; English details go to the device log
+/// only.
+enum CaptureViewMessageCode {
+  /// No Metal device: the camera image cannot be drawn.
+  static let metalUnavailable = "ARKIT_METAL_UNAVAILABLE"
+  /// ARKit reports that camera access is denied.
+  static let cameraUnauthorized = "ARKIT_CAMERA_UNAUTHORIZED"
+  /// Any other ARKit session failure.
+  static let sessionFailed = "ARKIT_SESSION_FAILED"
+  /// `initializeCapture` without a still capture extension: poses only.
+  static let stillCaptureUnavailable = "ARKIT_STILL_CAPTURE_UNAVAILABLE"
+
+  /// The code of an `ARSession` failure.
+  static func sessionFailure(_ error: Error) -> String {
+    if let arError = error as? ARError, arError.code == .cameraUnauthorized {
+      return cameraUnauthorized
+    }
+    return sessionFailed
+  }
+}
+
 /// The two `ARSession` calls the host drives; a fake replaces it in tests.
 protocol ARSessionDriving: AnyObject {
   func run(_ configuration: ARConfiguration, options: ARSession.RunOptions)
@@ -75,6 +98,7 @@ final class ARSessionHost: NSObject, ARFrameSource, ARSessionDelegate {
   // MARK: ARFrameSource
 
   var deliversSceneDepth: Bool { plan.deliversSceneDepth }
+  var depthOutputSize: ARDepthOutputSize { plan.depthOutputSize }
 
   var epoch: Int {
     lock.lock(); defer { lock.unlock() }
@@ -112,6 +136,8 @@ final class ARSessionHost: NSObject, ARFrameSource, ARSessionDelegate {
   // MARK: Control (main thread)
 
   func start() { perform { $0.start() } }
+  /// The session channel's `init` ([ARSessionLifecycle.initialize]).
+  func initialize() { perform { $0.initialize() } }
   func pause() {
     let now = clock()
     perform { $0.pause(now: now) }

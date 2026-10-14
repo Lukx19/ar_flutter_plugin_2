@@ -121,6 +121,34 @@ final class DepthIngestProducerTests: XCTestCase {
     XCTAssertEqual(capture.last?.count, IngestMessageLayout.headerBytes + 256 * 192 * 3)
   }
 
+  func testRequestedSizeChoosesTheBlockFactor() {
+    let producer = DepthIngestProducer(sink: pull)
+    XCTAssertEqual(producer.blockFactor(sourceWidth: 256, sourceHeight: 192), 2, "no request keeps the 2x2 default")
+    producer.requestedSize = IngestDepthSize(width: 128, height: 96)
+    XCTAssertEqual(producer.blockFactor(sourceWidth: 256, sourceHeight: 192), 2)
+    producer.requestedSize = IngestDepthSize(width: 256, height: 192)
+    XCTAssertEqual(producer.blockFactor(sourceWidth: 256, sourceHeight: 192), 1)
+    producer.requestedSize = IngestDepthSize(width: 64, height: 48)
+    XCTAssertEqual(producer.blockFactor(sourceWidth: 256, sourceHeight: 192), 4)
+    producer.requestedSize = IngestDepthSize(width: 100, height: 96)
+    XCTAssertEqual(producer.blockFactor(sourceWidth: 256, sourceHeight: 192), 2, "output covers the request")
+    producer.requestedSize = IngestDepthSize(width: 512, height: 384)
+    XCTAssertEqual(producer.blockFactor(sourceWidth: 256, sourceHeight: 192), 1, "never upsampled")
+  }
+
+  func testRequestedFullSizeSendsTheFullMap() {
+    let producer = DepthIngestProducer(sink: pull)
+    producer.requestedSize = IngestDepthSize(width: 256, height: 192)
+    let frame = FakeIngestFrame()
+    frame.timestampNs = 1
+    frame.lidarDepth()
+    producer.onFrame(frame, mode: IngestDepthMode.raw, context: IngestSampleContext(
+      sampleNs: 1, frameNs: 1, acquireNs: 1, trackingState: 1, groupEpoch: 0, cameraToWorld: matrix_identity_float4x4))
+    pull.onPull(pullRequest(), reply: capture.reply)
+    XCTAssertEqual(capture.last?.u16(IngestMessageLayout.width), 256)
+    XCTAssertEqual(capture.last?.u16(IngestMessageLayout.height), 192)
+  }
+
   func testAcquisitionIsThrottledToFourHertzOfFrameTimeAndSkipsDisabledOrMissingDepth() {
     let producer = DepthIngestProducer(sink: pull)
     let frame = FakeIngestFrame()

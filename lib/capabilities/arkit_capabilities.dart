@@ -1,8 +1,21 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
+import 'ar_camera_capabilities.dart';
+
+/// Reply keys of [ARKitCapabilityQuery.method]; the Swift host writes the
+/// same names (`ARKitCapabilityChannel.Key`).
+abstract final class ARKitCapabilityReplyKey {
+  static const String modelIdentifier = 'modelIdentifier';
+  static const String sceneDepth = 'sceneDepth';
+  static const String smoothedSceneDepth = 'smoothedSceneDepth';
+  static const String highResolutionFrameCapture =
+      'highResolutionFrameCapture';
+  static const String worldMap = 'worldMap';
+}
+
 /// ARKit capabilities the iOS session host reports at run time
-/// (`getARKitCapabilities` on `ar_flutter_plugin_2/camera_capabilities`).
+/// ([ARKitCapabilityQuery.method] on [ARKitCapabilityQuery.channelName]).
 @immutable
 class ARKitCapabilities {
   const ARKitCapabilities({
@@ -34,14 +47,15 @@ class ARKitCapabilities {
     if (reply is! Map) {
       return null;
     }
-    final sceneDepth = reply['sceneDepth'];
-    final highResolution = reply['highResolutionFrameCapture'];
+    final sceneDepth = reply[ARKitCapabilityReplyKey.sceneDepth];
+    final highResolution =
+        reply[ARKitCapabilityReplyKey.highResolutionFrameCapture];
     if (sceneDepth is! bool || highResolution is! bool) {
       return null;
     }
-    final smoothed = reply['smoothedSceneDepth'];
-    final worldMap = reply['worldMap'];
-    final model = reply['modelIdentifier'];
+    final smoothed = reply[ARKitCapabilityReplyKey.smoothedSceneDepth];
+    final worldMap = reply[ARKitCapabilityReplyKey.worldMap];
+    final model = reply[ARKitCapabilityReplyKey.modelIdentifier];
     return ARKitCapabilities(
       sceneDepth: sceneDepth,
       highResolutionFrameCapture: highResolution,
@@ -77,8 +91,11 @@ class ARKitCapabilityQuery {
     MethodChannel channel = defaultChannel,
   }) : _channel = channel;
 
-  static const MethodChannel defaultChannel =
-      MethodChannel('ar_flutter_plugin_2/camera_capabilities');
+  /// The plugin's capability channel; on iOS the Swift handler there answers
+  /// [method] (`ARKitCapabilityChannel`), Android replies not-implemented.
+  static const String channelName = ARCameraCapabilities.channelName;
+
+  static const MethodChannel defaultChannel = MethodChannel(channelName);
 
   static const String method = 'getARKitCapabilities';
 

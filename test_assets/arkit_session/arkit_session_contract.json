@@ -1,0 +1,65 @@
+{
+  "capabilityQuery": {
+    "channel": "ar_flutter_plugin_2/camera_capabilities",
+    "method": "getARKitCapabilities",
+    "host": {
+      "modelIdentifier": "iPhone13,3",
+      "worldTracking": true,
+      "sceneDepth": true,
+      "smoothedSceneDepth": true,
+      "sceneReconstruction": true,
+      "highResolutionFrameCapture": true
+    },
+    "reply": {
+      "platform": "ios",
+      "modelIdentifier": "iPhone13,3",
+      "worldTracking": true,
+      "sceneDepth": true,
+      "smoothedSceneDepth": true,
+      "sceneReconstruction": true,
+      "lidarDepth": true,
+      "highResolutionFrameCapture": true,
+      "worldMap": true
+    }
+  },
+  "captureView": {
+    "viewType": "capture3d/capture_ar_view",
+    "cases": [
+      {
+        "name": "LiDAR depth at the default size, standard video format",
+        "config": { "sceneDepth": true },
+        "creationParams": {
+          "sceneDepth": true,
+          "depthWidth": 128,
+          "depthHeight": 96,
+          "highResolutionFrameCapture": false
+        }
+      },
+      {
+        "name": "full-size depth with the high-resolution video format",
+        "config": {
+          "sceneDepth": true,
+          "depthWidth": 256,
+          "depthHeight": 192,
+          "highResolutionFrameCapture": true
+        },
+        "creationParams": {
+          "sceneDepth": true,
+          "depthWidth": 256,
+          "depthHeight": 192,
+          "highResolutionFrameCapture": true
+        }
+      },
+      {
+        "name": "points-only",
+        "config": { "sceneDepth": false },
+        "creationParams": {
+          "sceneDepth": false,
+          "depthWidth": 128,
+          "depthHeight": 96,
+          "highResolutionFrameCapture": false
+        }
+      }
+    ]
+  }
+}

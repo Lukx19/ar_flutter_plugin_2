@@ -35,6 +35,9 @@ protocol ARFrameSource: AnyObject {
   /// True when the configuration delivers LiDAR `sceneDepth` (sets the
   /// LiDAR-class source flag, bit 2, in ingest headers).
   var deliversSceneDepth: Bool { get }
+  /// Depth map size the capture view requested for the grid
+  /// (`depthWidth`/`depthHeight` creation parameters).
+  var depthOutputSize: ARDepthOutputSize { get }
   var epoch: Int { get }
   func addFrameObserver(_ observer: ARFrameObserver)
   func removeFrameObserver(_ observer: ARFrameObserver)

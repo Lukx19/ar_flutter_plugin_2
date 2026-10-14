@@ -6,13 +6,15 @@ public class SwiftArFlutterPlugin: NSObject, FlutterPlugin {
     let channel = FlutterMethodChannel(name: "ar_flutter_plugin_2", binaryMessenger: registrar.messenger())
     let instance = SwiftArFlutterPlugin()
     registrar.addMethodCallDelegate(instance, channel: channel)
-    
+    // Published so the engine calls `detachFromEngine(for:)` on teardown.
+    registrar.publish(instance)
+
     let factory = IosARViewFactory(messenger: registrar.messenger())
     registrar.register(factory, withId: "ar_flutter_plugin_2")
     CaptureARViewFactory.register(with: registrar)
 
     let capabilitiesChannel = FlutterMethodChannel(
-      name: "ar_flutter_plugin_2/camera_capabilities",
+      name: ARKitCapabilityChannel.name,
       binaryMessenger: registrar.messenger()
     )
     registrar.addMethodCallDelegate(CameraCapabilitiesHandler(), channel: capabilitiesChannel)
@@ -23,6 +25,12 @@ public class SwiftArFlutterPlugin: NSObject, FlutterPlugin {
     result("iOS " + UIDevice.current.systemVersion)
   }
 
+  /// The engine went away: release the grid shell it owns (channels,
+  /// frame observer, parked pull) unless a later engine registered since.
+  public func detachFromEngine(for registrar: FlutterPluginRegistrar) {
+    VisibilityGridShellRegistry.shared.unregister(messenger: registrar.messenger())
+  }
+
 }
 
 private final class CameraCapabilitiesHandler: NSObject, FlutterPlugin {
@@ -30,6 +38,8 @@ private final class CameraCapabilitiesHandler: NSObject, FlutterPlugin {
 
   func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
     switch call.method {
+    case ARKitCapabilityChannel.method:
+      result(ARCameraCapabilities.current().channelMap)
     case "getDeviceCapabilityProfile":
       result([
         "presetVersion": 11,
