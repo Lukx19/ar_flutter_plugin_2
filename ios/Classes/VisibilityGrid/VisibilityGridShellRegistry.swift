@@ -12,9 +12,9 @@ import Foundation
 ///   queues (`makeBackgroundTaskQueue`), pulled by the grid isolate through
 ///   `BackgroundIsolateBinaryMessenger`; control
 ///   (`capture3d/visibility_grid/control`) runs on the platform thread.
-/// - Frames come from the current `ARFrameSource` through
+/// - Frames (live or recorded) come from the current `ARFrameSource` through
 ///   `ARFrameSourceRegistry.shared.observe` and an `ARFrameObserver`; no
-///   `ARFrame` is retained.
+///   frame is retained.
 /// - The capture layer reports durable photos to [photoSavedEmitter]; other
 ///   producers (marker detections) offer messages to [ingestSink].
 ///
@@ -155,7 +155,7 @@ final class VisibilityGridShellRegistry {
       s.onSessionStopped()
       return
     }
-    let configuration = n.session.configuration
+    let configuration = n.runConfiguration
     s.onSourceAttached(
       sourceEpoch: configuration == nil ? nil : n.epoch,
       depthMode: ingestDepthMode(configuration, deliversSceneDepth: n.deliversSceneDepth),
@@ -236,14 +236,14 @@ private final class GridFrameObserver: ARFrameObserver {
     self.backend = backend
   }
 
-  func frameSource(_ source: ARFrameSource, didUpdate frame: ARFrame) {
-    shell.process(ARKitIngestFrame(frame: frame))
+  func frameSource(_ source: ARFrameSource, didUpdate frame: CaptureFrame) {
+    shell.process(CaptureIngestFrame(frame: frame))
     guard poseTracking.tracker.armed else { return }
-    backend.cameraTracking = anchorTracking(frame.camera.trackingState)
-    poseTracking.onFrame(session: source.session, frame: ARKitAnchorFrame(frame))
+    backend.cameraTracking = anchorTracking(frame.trackingState)
+    poseTracking.onFrame(session: source.anchorHost, frame: CaptureAnchorFrame(frame))
   }
 
-  func frameSource(_ source: ARFrameSource, didStart configuration: ARConfiguration, epoch: Int) {
+  func frameSource(_ source: ARFrameSource, didStart configuration: CaptureRunConfiguration, epoch: Int) {
     poseTracking.tracker.onSessionStarted(epoch: epoch)
     shell.onSessionStarted(
       sourceEpoch: epoch, depthMode: ingestDepthMode(configuration, deliversSceneDepth: source.deliversSceneDepth),

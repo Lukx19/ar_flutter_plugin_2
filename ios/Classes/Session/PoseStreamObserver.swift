@@ -91,16 +91,15 @@ final class PoseStreamObserver: ARFrameObserver {
     return sequence
   }
 
-  func frameSource(_ source: ARFrameSource, didUpdate frame: ARFrame) {
+  func frameSource(_ source: ARFrameSource, didUpdate frame: CaptureFrame) {
     let timestampNs = PoseWireSample.nanoseconds(frame.timestamp)
     guard let sequence = admit(timestampNs: timestampNs) else { return }
-    let camera = frame.camera
     let sample = PoseWireSample(
       sequence: sequence,
       systemTimestampMs: Int64((Date().timeIntervalSince1970 * 1000).rounded(.down)),
       timestampNs: timestampNs,
-      cameraTransform: camera.transform,
-      trackingState: camera.trackingState)
+      cameraTransform: frame.cameraTransform,
+      trackingState: frame.trackingState)
     deliver(PoseBatchWire.encode(sample))
   }
 

@@ -4,8 +4,8 @@ import UIKit
 
 /// `MTKView` delegate of the capture view: one render pass per display
 /// frame with the camera background first and the grid overlay (when one is
-/// registered) on top. Runs on the main thread. The current `ARFrame` is read
-/// for the duration of one draw only; the Core Video textures wrapping its
+/// registered) on top. Runs on the main thread. The source's current
+/// [CaptureFrame] is read for the duration of one draw only; the Core Video textures wrapping its
 /// image live until the GPU finishes with them.
 final class CaptureRenderLoop: NSObject, MTKViewDelegate {
   static let colorPixelFormat: MTLPixelFormat = .bgra8Unorm
@@ -13,13 +13,13 @@ final class CaptureRenderLoop: NSObject, MTKViewDelegate {
   static let overlayNearPlane: Float = 0.01
   static let overlayFarPlane: Float = 100
 
-  private weak var host: ARSessionHost?
+  private weak var source: ARFrameSource?
   private let background: CameraBackgroundRenderer
   private let commandQueue: MTLCommandQueue
   private let overlays: GridOverlayRegistry
   private var preparedOverlayRevision = -1
 
-  init(device: MTLDevice, host: ARSessionHost, overlays: GridOverlayRegistry = .shared) throws {
+  init(device: MTLDevice, source: ARFrameSource, overlays: GridOverlayRegistry = .shared) throws {
     guard let queue = device.makeCommandQueue() else { throw CaptureRenderError.metalUnavailable }
     queue.label = "capture view"
     commandQueue = queue
@@ -27,7 +27,7 @@ final class CaptureRenderLoop: NSObject, MTKViewDelegate {
       device: device,
       colorPixelFormat: CaptureRenderLoop.colorPixelFormat,
       depthPixelFormat: CaptureRenderLoop.depthPixelFormat)
-    self.host = host
+    self.source = source
     self.overlays = overlays
     super.init()
   }
@@ -56,9 +56,9 @@ final class CaptureRenderLoop: NSObject, MTKViewDelegate {
     commandBuffer.label = "capture view frame"
     var imageTextures: [CVMetalTexture] = []
     let viewport = view.bounds.size
-    if let host = host, host.lifecycleState == .running,
+    if let source = source, source.lifecycleState == .running,
        viewport.width > 0, viewport.height > 0,
-       let frame = host.session.currentFrame {
+       let frame = source.currentFrame {
       let orientation = view.window?.windowScene?.interfaceOrientation ?? .portrait
       let displayTransform = frame.displayTransform(for: orientation, viewportSize: viewport)
       imageTextures = background.encode(
@@ -71,18 +71,17 @@ final class CaptureRenderLoop: NSObject, MTKViewDelegate {
             depthPixelFormat: CaptureRenderLoop.depthPixelFormat)
           preparedOverlayRevision = overlays.revision
         }
-        let camera = frame.camera
         let context = GridOverlayFrameContext(
-          viewMatrix: camera.viewMatrix(for: orientation),
-          projectionMatrix: camera.projectionMatrix(
+          viewMatrix: frame.viewMatrix(for: orientation),
+          projectionMatrix: frame.projectionMatrix(
             for: orientation, viewportSize: viewport,
             zNear: CGFloat(CaptureRenderLoop.overlayNearPlane), zFar: CGFloat(CaptureRenderLoop.overlayFarPlane)),
-          cameraTransform: camera.transform,
+          cameraTransform: frame.cameraTransform,
           viewportSize: viewport,
           drawableSize: view.drawableSize,
           orientation: orientation,
           frameTimestamp: frame.timestamp,
-          trackingState: camera.trackingState)
+          trackingState: frame.trackingState)
         encoder.pushDebugGroup("grid overlay")
         overlay.encodeOverlay(into: encoder, context: context)
         encoder.popDebugGroup()
