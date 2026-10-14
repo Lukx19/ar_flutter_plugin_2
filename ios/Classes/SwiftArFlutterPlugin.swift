@@ -15,6 +15,7 @@ public class SwiftArFlutterPlugin: NSObject, FlutterPlugin {
       binaryMessenger: registrar.messenger()
     )
     registrar.addMethodCallDelegate(CameraCapabilitiesHandler(), channel: capabilitiesChannel)
+    VisibilityGridShellRegistry.shared.register(messenger: registrar.messenger())
   }
 
   public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
