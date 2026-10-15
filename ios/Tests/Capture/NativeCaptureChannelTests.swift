@@ -64,7 +64,7 @@ final class NativeCaptureChannelTests: XCTestCase {
   /// The Android runtime camera controls answer on the channel through
   /// the AR session's configurable camera after `initializeCapture`; the
   /// frame source keeps running (a control never pauses AR); a recorded
-  /// playback has no camera to control.
+  /// playback has no camera to control; closing the view resets the camera.
   func testCameraControlsRunOnTheConfigurableCameraWithoutPausingAR() throws {
     let source = StillFrameSource()
     let device = FakeCameraControlDevice()
@@ -89,6 +89,12 @@ final class NativeCaptureChannelTests: XCTestCase {
     let unsupported = call(channel, "setFlashMode", ["mode": "on"]) as? FlutterError
     XCTAssertEqual(unsupported?.code, "CONTROL_UNSUPPORTED")
     XCTAssertEqual(source.lifecycleState, .running, "controls never pause the AR session")
+    // Closing the view returns the shared camera to auto with the torch off.
+    channel.captureViewWillDispose()
+    XCTAssertFalse(device.isTorchOn)
+    XCTAssertEqual(device.exposureMode, .auto)
+    XCTAssertTrue(device.isWhiteBalanceAuto)
+    XCTAssertEqual(device.violations, [])
 
     let playback = StillFrameSource()
     playback.replaysRecordedStills = true

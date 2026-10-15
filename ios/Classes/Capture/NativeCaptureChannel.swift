@@ -119,6 +119,12 @@ final class NativeCaptureChannel: CaptureChannelExtension {
   func captureViewWillDispose() {
     guard !disposed else { return }
     disposed = true
+    // The configurable camera is shared by the process: return it to auto
+    // (torch off) so a later view or screen never inherits manual settings.
+    if let controls = controls {
+      do { try controls.reset() } catch { NSLog("capture3d camera controls: reset on dispose failed: %@", "\(error)") }
+    }
+    controls = nil
     if let observer = pauseObserver { context.frameSource.removeFrameObserver(observer) }
     pauseObserver = nil
     binding?.close()

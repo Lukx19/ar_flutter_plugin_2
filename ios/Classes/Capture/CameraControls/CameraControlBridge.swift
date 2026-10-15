@@ -189,6 +189,15 @@ final class CameraControlBridge {
 
   static func micros(_ seconds: Double) -> Int64 { Int64((seconds * 1_000_000).rounded()) }
 
+  /// The exposure range in whole microseconds inside the device's range:
+  /// the minimum rounded up and the maximum rounded down, so a clamped value
+  /// never leaves `activeFormat` (AVFoundation raises an exception for a
+  /// duration outside it). Nil when no whole microsecond fits.
+  static func microsRange(_ minimum: Double, _ maximum: Double) -> ClosedRange<Int64>? {
+    let low = Int64((minimum * 1_000_000).rounded(.up)), high = Int64((maximum * 1_000_000).rounded(.down))
+    return low <= high ? low...high : nil
+  }
+
   private func supportedISORange() throws -> [Int] {
     guard device.supportsCustomExposure, device.maxISO >= device.minISO, device.minISO > 0 else {
       throw CameraControlError.unsupported("Runtime ISO control is not supported on this camera")
@@ -197,10 +206,11 @@ final class CameraControlBridge {
   }
 
   private func supportedExposureRange() throws -> [String: Int64] {
-    guard device.supportsCustomExposure, device.maxExposureSeconds >= device.minExposureSeconds, device.minExposureSeconds > 0 else {
+    guard device.supportsCustomExposure, device.minExposureSeconds > 0,
+          let range = Self.microsRange(device.minExposureSeconds, device.maxExposureSeconds) else {
       throw CameraControlError.unsupported("Manual exposure time is not supported on this camera")
     }
-    return ["min": Self.micros(device.minExposureSeconds), "max": Self.micros(device.maxExposureSeconds)]
+    return ["min": range.lowerBound, "max": range.upperBound]
   }
 
   private func setISO(_ value: Int) throws -> Int {
@@ -425,8 +435,12 @@ final class CameraControlBridge {
   // MARK: Flash
 
   private func setFlashMode(_ name: String) throws -> Bool {
-    if name != "off" && !device.hasTorch {
-      try apply("flash mode off") { try device.setTorch(false) }
+    // A camera without a torch has nothing to switch: Android stages
+    // `off` for any request; nothing on the device changes.
+    if !device.hasTorch {
+      guard CameraControlBridge.androidFlashModes.contains(name) else {
+        throw CameraControlError.unsupported("Flash mode \(name) is not supported on this camera")
+      }
       return true
     }
     guard name == "off" || name == "torch" else {
@@ -446,6 +460,28 @@ final class CameraControlBridge {
       "isFlashReady": device.hasTorch && device.isTorchAvailable,
       "flashStatus": device.hasTorch ? (device.isTorchAvailable ? "ready" : "unavailable") : "unavailable",
     ]
+  }
+
+  static let androidFlashModes: Set<String> = ["off", "auto", "on", "redEyeReduction", "torch"]
+
+  // MARK: Reset
+
+  /// Returns the camera ARKit runs to its automatic state when the capture
+  /// view closes: torch off, continuous auto exposure with no bias,
+  /// continuous auto focus and continuous auto white balance, in one
+  /// configuration lock. The device is shared by the process, so a later
+  /// view would otherwise inherit manual settings or a lit torch.
+  func reset() throws {
+    try device.configure {
+      if device.hasTorch { try device.setTorch(false) }
+      device.setExposureMode(.auto)
+      device.setExposureBias(0)
+      if device.focusModes.contains(.continuous) { device.setFocusMode(.continuous) }
+      device.setWhiteBalance(kelvin: nil)
+    }
+    whiteBalanceMode = "auto"
+    manualTemperature = nil
+    focusRegion = nil
   }
 
   // MARK: Configuration

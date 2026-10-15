@@ -77,35 +77,54 @@ final class ARKitCaptureControlDevice: CameraControlDevice {
     try change()
   }
 
+  /// Manual exposure, clamped to the active format: AVFoundation raises an
+  /// exception for a duration or ISO outside it.
   func setCustomExposure(seconds: Double?, iso: Float?) {
-    let duration = seconds.map { CMTime(seconds: $0, preferredTimescale: 1_000_000_000) } ?? AVCaptureDevice.currentExposureDuration
-    let value = iso ?? AVCaptureDevice.currentISO
+    guard device.isExposureModeSupported(.custom) else { return }
+    let format = device.activeFormat
+    var duration = AVCaptureDevice.currentExposureDuration
+    if let seconds = seconds {
+      duration = CMTimeMinimum(CMTimeMaximum(CMTime(seconds: seconds, preferredTimescale: 1_000_000_000), format.minExposureDuration),
+                               format.maxExposureDuration)
+    }
+    let value = iso.map { min(max($0, format.minISO), format.maxISO) } ?? AVCaptureDevice.currentISO
     device.setExposureModeCustom(duration: duration, iso: value, completionHandler: nil)
   }
 
+  // Every assignment below checks that the device supports the mode first:
+  // AVFoundation raises an exception for an unsupported mode.
+
   func setExposureMode(_ mode: CameraExposureModeValue) {
     switch mode {
-    case .auto: device.exposureMode = .continuousAutoExposure
-    case .locked: device.exposureMode = .locked
+    case .auto:
+      if device.isExposureModeSupported(.continuousAutoExposure) { device.exposureMode = .continuousAutoExposure }
+    case .locked:
+      if device.isExposureModeSupported(.locked) { device.exposureMode = .locked }
     case .custom: setCustomExposure(seconds: nil, iso: nil)
     }
   }
 
-  func setExposureBias(_ bias: Float) { device.setExposureTargetBias(bias, completionHandler: nil) }
+  func setExposureBias(_ bias: Float) {
+    device.setExposureTargetBias(min(max(bias, device.minExposureTargetBias), device.maxExposureTargetBias), completionHandler: nil)
+  }
 
   func setFocusMode(_ mode: CameraFocusModeValue) {
+    let value: AVCaptureDevice.FocusMode
     switch mode {
-    case .auto: device.focusMode = .autoFocus
-    case .continuous: device.focusMode = .continuousAutoFocus
-    case .locked: device.focusMode = .locked
+    case .auto: value = .autoFocus
+    case .continuous: value = .continuousAutoFocus
+    case .locked: value = .locked
     }
+    if device.isFocusModeSupported(value) { device.focusMode = value }
   }
 
   func setLensPosition(_ position: Float) {
+    guard device.isLockingFocusWithCustomLensPositionSupported else { return }
     device.setFocusModeLocked(lensPosition: min(max(position, 0), 1), completionHandler: nil)
   }
 
   func setFocusPoint(x: Double, y: Double) {
+    guard device.isFocusPointOfInterestSupported else { return }
     device.focusPointOfInterest = CGPoint(x: x, y: y)
     if device.isExposurePointOfInterestSupported, device.exposureMode != .custom {
       device.exposurePointOfInterest = CGPoint(x: x, y: y)
@@ -114,9 +133,10 @@ final class ARKitCaptureControlDevice: CameraControlDevice {
 
   func setWhiteBalance(kelvin: Float?) {
     guard let kelvin = kelvin else {
-      device.whiteBalanceMode = .continuousAutoWhiteBalance
+      if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) { device.whiteBalanceMode = .continuousAutoWhiteBalance }
       return
     }
+    guard device.isLockingWhiteBalanceWithCustomDeviceGainsSupported else { return }
     var gains = device.deviceWhiteBalanceGains(for: AVCaptureDevice.WhiteBalanceTemperatureAndTintValues(temperature: kelvin, tint: 0))
     let maximum = device.maxWhiteBalanceGain
     gains.redGain = min(max(gains.redGain, 1), maximum)
@@ -125,9 +145,12 @@ final class ARKitCaptureControlDevice: CameraControlDevice {
     device.setWhiteBalanceModeLocked(with: gains, completionHandler: nil)
   }
 
-  func lockWhiteBalance() { device.whiteBalanceMode = .locked }
+  func lockWhiteBalance() {
+    if device.isWhiteBalanceModeSupported(.locked) { device.whiteBalanceMode = .locked }
+  }
 
   func setTorch(_ on: Bool) throws {
+    guard device.hasTorch, device.isTorchModeSupported(on ? .on : .off) else { return }
     if on {
       try device.setTorchModeOn(level: AVCaptureDevice.maxAvailableTorchLevel)
     } else {

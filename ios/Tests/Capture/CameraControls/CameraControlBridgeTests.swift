@@ -9,8 +9,9 @@ final class FakeCameraControlDevice: CameraControlDevice {
   var minISO: Float = 34
   var maxISO: Float = 3264
   var iso: Float = 100
-  var minExposureSeconds = 0.000_014
-  var maxExposureSeconds = 1.0 / 3.0
+  /// Not whole microseconds, as on real formats (29.05 us, 41666.67 us).
+  var minExposureSeconds = 1.0 / 34_420
+  var maxExposureSeconds = 1.0 / 24
   var exposureSeconds = 1.0 / 60.0
   var exposureMode: CameraExposureModeValue = .auto
   var supportsCustomExposure = true
@@ -36,6 +37,9 @@ final class FakeCameraControlDevice: CameraControlDevice {
   private(set) var configurations = 0
   private(set) var locked = false
   private(set) var focusPoint: (Double, Double)?
+  /// Values AVFoundation would refuse with an exception (outside the active
+  /// format, an unsupported mode, a torch change without a torch).
+  private(set) var violations: [String] = []
 
   func configure(_ change: () throws -> Void) throws {
     if configurationFails { throw NSError(domain: "AVFoundationErrorDomain", code: -11800) }
@@ -49,6 +53,10 @@ final class FakeCameraControlDevice: CameraControlDevice {
 
   func setCustomExposure(seconds: Double?, iso: Float?) {
     requireLocked()
+    if let seconds = seconds, !(minExposureSeconds...maxExposureSeconds).contains(seconds) {
+      violations.append("exposure \(seconds) s outside \(minExposureSeconds)...\(maxExposureSeconds)")
+    }
+    if let iso = iso, !(minISO...maxISO).contains(iso) { violations.append("ISO \(iso) outside \(minISO)...\(maxISO)") }
     exposureMode = .custom
     if let seconds = seconds { exposureSeconds = seconds }
     if let iso = iso { self.iso = iso }
@@ -56,7 +64,11 @@ final class FakeCameraControlDevice: CameraControlDevice {
 
   func setExposureMode(_ mode: CameraExposureModeValue) { requireLocked(); exposureMode = mode }
   func setExposureBias(_ bias: Float) { requireLocked(); exposureBias = bias }
-  func setFocusMode(_ mode: CameraFocusModeValue) { requireLocked(); focusMode = mode }
+  func setFocusMode(_ mode: CameraFocusModeValue) {
+    requireLocked()
+    if !focusModes.contains(mode) { violations.append("focus mode \(mode) unsupported") }
+    focusMode = mode
+  }
   func setLensPosition(_ position: Float) { requireLocked(); focusMode = .locked; lensPosition = position }
   func setFocusPoint(x: Double, y: Double) { requireLocked(); focusPoint = (x, y) }
 
@@ -70,6 +82,7 @@ final class FakeCameraControlDevice: CameraControlDevice {
 
   func setTorch(_ on: Bool) throws {
     requireLocked()
+    if !hasTorch { violations.append("torch change without a torch") }
     isTorchOn = on
   }
 }
@@ -89,6 +102,11 @@ final class CameraControlBridgeTests: XCTestCase {
     bridge = CameraControlBridge(device: device)
   }
 
+  override func tearDown() {
+    XCTAssertEqual(device.violations, [], "no value AVFoundation would refuse reaches the device")
+    super.tearDown()
+  }
+
   private func call(_ method: String, _ arguments: [String: Any] = [:]) throws -> Any? {
     try bridge.handle(method, arguments)
   }
@@ -106,14 +124,14 @@ final class CameraControlBridgeTests: XCTestCase {
 
   func testExposureControlsClampToTheActiveFormatAndReplyLikeAndroid() throws {
     XCTAssertEqual(try call("getSupportedISORange") as? [Int], [34, 3264])
-    XCTAssertEqual(try map("getSupportedExposureRange")["min"] as? Int64, 14)
-    XCTAssertEqual(try map("getSupportedExposureRange")["max"] as? Int64, 333_333)
+    XCTAssertEqual(try map("getSupportedExposureRange")["min"] as? Int64, 30, "minimum rounded up")
+    XCTAssertEqual(try map("getSupportedExposureRange")["max"] as? Int64, 41_666, "maximum rounded down")
     XCTAssertEqual(try map("setISO", ["isoValue": 12_800])["actualISO"] as? Int, 3264, "clamped to the range")
     XCTAssertEqual(device.exposureMode, .custom)
-    XCTAssertEqual(try map("setExposureTime", ["exposureTimeMicroseconds": 5])["actualExposureTimeMicroseconds"] as? Int64, 14)
+    XCTAssertEqual(try map("setExposureTime", ["exposureTimeMicroseconds": 5])["actualExposureTimeMicroseconds"] as? Int64, 30)
     XCTAssertEqual(device.iso, 3264, "setting the time keeps the ISO")
     XCTAssertEqual(try call("getCurrentISO") as? Int, 3264)
-    XCTAssertEqual(try call("getCurrentExposureTime") as? Int64, 14)
+    XCTAssertEqual(try call("getCurrentExposureTime") as? Int64, 30)
     var state = try map("getCurrentExposureState")
     XCTAssertEqual(state["exposureMode"] as? String, "manual")
     XCTAssertEqual(state["isAutoExposureEnabled"] as? Bool, false)
@@ -125,6 +143,58 @@ final class CameraControlBridgeTests: XCTestCase {
     XCTAssertEqual(state["isAutoExposureEnabled"] as? Bool, true, "a locked auto exposure is still auto")
     XCTAssertEqual(try call("unlockExposure") as? Bool, true)
     XCTAssertEqual(device.exposureMode, .auto)
+  }
+
+  /// Ranges that are not whole microseconds: both edges stay inside the
+  /// device range (the fake records any value AVFoundation would refuse).
+  func testExposureTimeEdgesStayInsideTheActiveFormat() throws {
+    for requested: Int64 in [0, 29, 30, 41_666, 41_667, 10_000_000] {
+      let applied = try XCTUnwrap(try map("setExposureTime", ["exposureTimeMicroseconds": requested])["actualExposureTimeMicroseconds"] as? Int64)
+      XCTAssertTrue((30...41_666).contains(applied), "\(requested) -> \(applied)")
+      XCTAssertTrue((device.minExposureSeconds...device.maxExposureSeconds).contains(device.exposureSeconds), "\(requested)")
+    }
+    device.minISO = 33.5
+    device.maxISO = 3168.7
+    XCTAssertEqual(try call("getSupportedISORange") as? [Int], [34, 3168])
+    XCTAssertEqual(try map("setISO", ["isoValue": 1])["actualISO"] as? Int, 34)
+    XCTAssertEqual(try map("setISO", ["isoValue": 99_999])["actualISO"] as? Int, 3168)
+    // A range inside one microsecond has no whole value: unsupported.
+    device.minExposureSeconds = 0.000_010_2
+    device.maxExposureSeconds = 0.000_010_8
+    assertCode(CameraControlError.unsupportedCode, "getSupportedExposureRange")
+  }
+
+  func testATorchlessCameraIsNeverAskedToSwitchItsTorch() throws {
+    device.hasTorch = false
+    device.isTorchAvailable = false
+    XCTAssertEqual(try call("setFlashMode", ["mode": "off"]) as? Bool, true)
+    XCTAssertEqual(try call("setTorchEnabled", ["enabled": false]) as? Bool, true)
+    XCTAssertEqual(try call("setTorchEnabled", ["enabled": true]) as? Bool, true, "Android stages off")
+    XCTAssertEqual(try call("isFlashAvailable") as? Bool, false)
+    XCTAssertEqual(try map("getCurrentFlashState")["flashStatus"] as? String, "unavailable")
+    XCTAssertEqual(device.configurations, 0, "nothing on the device changes")
+    try bridge.reset()
+    XCTAssertFalse(device.isTorchOn)
+  }
+
+  func testResetReturnsTheSharedCameraToAutoWithTheTorchOff() throws {
+    _ = try call("setISO", ["isoValue": 400])
+    _ = try call("setExposureCompensation", ["evStep": 1])
+    _ = try call("setFocusDistance", ["distance": 0.3])
+    _ = try call("setColorTemperature", ["colorTemperatureK": 4000])
+    _ = try call("setTorchEnabled", ["enabled": true])
+    try bridge.reset()
+    XCTAssertEqual(device.exposureMode, .auto)
+    XCTAssertEqual(device.exposureBias, 0)
+    XCTAssertEqual(device.focusMode, .continuous)
+    XCTAssertTrue(device.isWhiteBalanceAuto)
+    XCTAssertFalse(device.isTorchOn)
+    let state = try map("getCurrentWhiteBalanceState")
+    XCTAssertEqual(state["currentMode"] as? String, "auto")
+    XCTAssertEqual(state["isAutoWhiteBalanceEnabled"] as? Bool, true)
+    let fresh = CameraControlBridge(device: device)
+    let exposure = try XCTUnwrap(try fresh.handle("getCurrentExposureState", [:]) as? [String: Any?])
+    XCTAssertEqual(exposure["exposureMode"] as? String, "auto", "a new bridge agrees with the device")
   }
 
   func testExposureCompensationMovesInThirdEvSteps() throws {

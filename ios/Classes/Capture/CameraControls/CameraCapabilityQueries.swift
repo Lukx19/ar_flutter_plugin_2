@@ -45,8 +45,11 @@ enum CameraCapabilityQueries {
       guard let range = snapshot.isoRange else { return .success([Int]()) }
       return .success(commonISOValues.filter { Float($0) >= range.lowerBound && Float($0) <= range.upperBound })
     case "getSupportedExposureRange":
-      guard let range = snapshot.exposureRange else { return .success([String: Int64]()) }
-      return .success(["min": CameraControlBridge.micros(range.lowerBound), "max": CameraControlBridge.micros(range.upperBound)])
+      guard let range = snapshot.exposureRange,
+            let micros = CameraControlBridge.microsRange(range.lowerBound, range.upperBound) else {
+        return .success([String: Int64]())
+      }
+      return .success(["min": micros.lowerBound, "max": micros.upperBound])
     case "isResolutionSupported":
       guard let map = arguments as? [String: Any], let width = map["width"] as? Int, let height = map["height"] as? Int else {
         return .failure(CameraControlError(code: "INVALID_ARGUMENTS", message: "Width and height are required"))
