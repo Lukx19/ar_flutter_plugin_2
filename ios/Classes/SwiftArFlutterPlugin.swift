@@ -124,10 +124,15 @@ private final class CameraCapabilitiesHandler: NSObject, FlutterPlugin {
         "rearConcurrentCameraIds": [],
         "cached": false,
       ])
-    case "getSupportedFormats", "getSupportedResolutions", "getSupportedSharedCameraResolutions", "getSupportedISORange":
+    case let method where CameraCapabilityQueries.handles(method):
+      // Android-shaped queries answered from ARKit and its configurable camera.
+      switch CameraCapabilityQueries.answer(method, arguments: call.arguments, snapshot: CameraCapabilityQueries.current()) {
+      case .success(let value): result(value)
+      case .failure(let error): result(FlutterError(code: error.code, message: error.message, details: nil))
+      }
+    case "getSupportedSharedCameraResolutions":
+      // ARCore shared-camera validation has no iOS counterpart.
       result([])
-    case "isFormatSupported", "isResolutionSupported":
-      result(false)
     case "getARCoreAvailability":
       result([
         "name": "UNSUPPORTED_PLATFORM",
@@ -135,8 +140,6 @@ private final class CameraCapabilitiesHandler: NSObject, FlutterPlugin {
         "transient": false,
         "unknown": false,
       ])
-    case "getSupportedExposureRange", "getCameraIntrinsics":
-      result(FlutterError(code: "UNSUPPORTED_PLATFORM", message: "iOS capture is not implemented.", details: nil))
     case "saveSharedCameraUnsupported", "saveSharedCameraSupported", "saveRawJpegProbeResult", "resetCapabilityProfileForTesting":
       result(nil)
     default:

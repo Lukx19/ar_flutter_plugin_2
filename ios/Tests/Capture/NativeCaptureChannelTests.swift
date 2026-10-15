@@ -61,6 +61,48 @@ final class NativeCaptureChannelTests: XCTestCase {
     XCTAssertEqual(capacity["maxEntries"] as? Int, 2, "the new configuration applies afterwards")
   }
 
+  /// The Android runtime camera controls answer on the channel through
+  /// the AR session's configurable camera after `initializeCapture`; the
+  /// frame source keeps running (a control never pauses AR); a recorded
+  /// playback has no camera to control.
+  func testCameraControlsRunOnTheConfigurableCameraWithoutPausingAR() throws {
+    let source = StillFrameSource()
+    let device = FakeCameraControlDevice()
+    let files = appFiles!
+    let channel = NativeCaptureChannel(
+      context: CaptureChannelContext(
+        viewId: 10, channel: FlutterMethodChannel(name: "arcapture_10", binaryMessenger: SilentMessenger()),
+        frameSource: source),
+      openResources: { try NativeCaptureBinding.productionResources(appFiles: files) },
+      controlDevice: { device })
+    defer { channel.captureViewWillDispose() }
+
+    let early = call(channel, "setISO", ["isoValue": 200]) as? FlutterError
+    XCTAssertEqual(early?.code, "CAPTURE_NOT_INITIALIZED")
+    XCTAssertFalse(call(channel, "initializeCapture", configuration(mode: "single", maxCacheSize: 2)) is FlutterError)
+    let iso = try XCTUnwrap(call(channel, "setISO", ["isoValue": 200]) as? [String: Any])
+    XCTAssertEqual(iso["actualISO"] as? Int, 200)
+    XCTAssertEqual(device.iso, 200)
+    let focus = try XCTUnwrap(call(channel, "getCurrentFocusState", nil) as? [String: Any])
+    XCTAssertTrue(focus["focusRegion"] is NSNull, "absent values are sent as null")
+    XCTAssertEqual(call(channel, "setTorchEnabled", ["enabled": true]) as? Bool, true)
+    let unsupported = call(channel, "setFlashMode", ["mode": "on"]) as? FlutterError
+    XCTAssertEqual(unsupported?.code, "CONTROL_UNSUPPORTED")
+    XCTAssertEqual(source.lifecycleState, .running, "controls never pause the AR session")
+
+    let playback = StillFrameSource()
+    playback.replaysRecordedStills = true
+    let replay = NativeCaptureChannel(
+      context: CaptureChannelContext(
+        viewId: 11, channel: FlutterMethodChannel(name: "arcapture_11", binaryMessenger: SilentMessenger()),
+        frameSource: playback),
+      openResources: { try NativeCaptureBinding.productionResources(appFiles: files.appendingPathComponent("replay")) },
+      controlDevice: { device })
+    defer { replay.captureViewWillDispose() }
+    XCTAssertFalse(call(replay, "initializeCapture", configuration(mode: "single", maxCacheSize: 2)) is FlutterError)
+    XCTAssertEqual((call(replay, "getSupportedISORange", nil) as? FlutterError)?.code, "CONTROL_UNSUPPORTED")
+  }
+
   private func configuration(mode: String, maxCacheSize: Int) -> [String: Any] {
     [
       "format": "jpeg", "resolution": ["width": 1920, "height": 1440], "captureIntervalMs": 0,

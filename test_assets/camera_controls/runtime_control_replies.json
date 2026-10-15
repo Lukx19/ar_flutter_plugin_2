@@ -1,0 +1,34 @@
+{
+  "schema": "capture3d-camera-control-replies-v1",
+  "description": "Reply shapes of the arcapture_<id> runtime camera controls shared by Android (Runtime*ControlBridge) and iOS (CameraControlBridge); read by the Dart, Kotlin and Swift contract tests.",
+  "stateKeys": {
+    "getCurrentExposureState": ["currentExposureTime", "currentISO", "exposureCompensation", "exposureMode", "isAutoExposureEnabled", "isExposureLocked"],
+    "getExposureCompensationInfo": ["currentCompensation", "maxCompensation", "minCompensation", "stepSize"],
+    "getCurrentFocusState": ["currentFocusDistance", "currentFocusMode", "focusRegion", "focusStatus", "isAutofocusEnabled", "isFocusLocked", "isFocusPeakingEnabled"],
+    "getCurrentWhiteBalanceState": ["currentColorTemperature", "currentMode", "isAutoWhiteBalanceEnabled", "isWhiteBalanceLocked", "status"],
+    "getCurrentFlashState": ["currentFlashMode", "flashStatus", "isFlashReady", "isTorchEnabled"],
+    "getSupportedExposureRange": ["max", "min"],
+    "getSupportedColorTemperatureRange": ["max", "min"]
+  },
+  "setterReplyKeys": {
+    "setISO": "actualISO",
+    "setExposureTime": "actualExposureTimeMicroseconds",
+    "setExposureCompensation": "actualCompensation",
+    "setFocusDistance": "actualDistance",
+    "setColorTemperature": "actualColorTemperature"
+  },
+  "focusRegionKeys": ["height", "left", "top", "width"],
+  "modeNames": {
+    "focus": ["auto", "continuous", "edof", "fixed", "infinity", "macro"],
+    "whiteBalance": ["auto", "cloudyDaylight", "daylight", "fluorescent", "incandescent", "manual", "shade", "twilight", "warmFluorescent"],
+    "flash": ["auto", "off", "on", "redEyeReduction", "torch"]
+  },
+  "errorCodes": ["CONTROL_UNSUPPORTED", "CONTROL_UPDATE_FAILED"],
+  "examples": {
+    "getCurrentExposureState": {"currentISO": 200, "currentExposureTime": 16667, "isAutoExposureEnabled": false, "isExposureLocked": false, "exposureCompensation": 0.3333333333333333, "exposureMode": "manual"},
+    "getExposureCompensationInfo": {"minCompensation": -8.0, "maxCompensation": 8.0, "currentCompensation": 0.0, "stepSize": 0.3333333333333333},
+    "getCurrentFocusState": {"currentFocusDistance": 0.5, "isAutofocusEnabled": true, "currentFocusMode": "auto", "isFocusLocked": false, "isFocusPeakingEnabled": false, "focusStatus": "locked", "focusRegion": {"left": 0.425, "top": 0.425, "width": 0.15, "height": 0.15}},
+    "getCurrentWhiteBalanceState": {"currentMode": "manual", "currentColorTemperature": 4500, "isWhiteBalanceLocked": false, "isAutoWhiteBalanceEnabled": false, "status": "locked"},
+    "getCurrentFlashState": {"currentFlashMode": "torch", "isTorchEnabled": true, "isFlashReady": true, "flashStatus": "ready"}
+  }
+}

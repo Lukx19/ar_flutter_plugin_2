@@ -51,26 +51,22 @@ final class NativeCaptureRegistration {
   }
 }
 
-/// Methods of the Android capture channel that drive Camera2 controls. ARKit
-/// owns exposure, focus, white balance and the torch while a session runs, so
-/// iOS answers each with the defined `CAMERA_CONTROL_UNSUPPORTED` error.
-enum AndroidOnlyCameraControls {
-  static let errorCode = "CAMERA_CONTROL_UNSUPPORTED"
-  static let methods: Set<String> = [
-    "setISO", "setExposureTime", "setAutoExposureEnabled", "getCurrentISO", "getCurrentExposureTime",
-    "getSupportedISORange", "getSupportedExposureRange", "getCurrentExposureState", "getExposureCompensationInfo",
-    "setExposureCompensation", "lockExposure", "unlockExposure", "setFocusDistance", "setAutofocusEnabled",
-    "focusAtPoint", "getCurrentFocusState", "getSupportedFocusModes", "setFocusMode", "setWhiteBalanceMode",
-    "setColorTemperature", "getCurrentWhiteBalanceState", "getSupportedColorTemperatureRange", "lockWhiteBalance",
-    "unlockWhiteBalance", "setWhiteBalanceFromPoint", "getSupportedWhiteBalanceModes", "setFlashMode",
-    "getCurrentFlashState", "isFlashAvailable", "setTorchEnabled",
-  ]
+/// The Android runtime camera controls of `arcapture_<id>` (Camera2 on
+/// Android) answered on the camera ARKit runs ([CameraControlBridge]).
+/// Without a configurable camera (simulator, recorded playback) every one
+/// answers the defined `CONTROL_UNSUPPORTED` error.
+enum CameraControlMethods {
+  static let errorCode = CameraControlError.unsupportedCode
+  static var methods: Set<String> { CameraControlBridge.methods }
 
-  static func error(_ method: String) -> FlutterError {
+  static func unavailable(_ method: String, reason: String) -> FlutterError {
     FlutterError(
-      code: errorCode,
-      message: "\(method) is not available on iOS: ARKit controls exposure, focus, white balance and flash.",
+      code: errorCode, message: "\(method) is not available: \(reason)",
       details: ["platform": "ios", "method": method])
+  }
+
+  static func error(_ error: CameraControlError) -> FlutterError {
+    FlutterError(code: error.code, message: error.message, details: ["platform": "ios"])
   }
 }
 
@@ -105,14 +101,19 @@ final class NativeCaptureChannel: CaptureChannelExtension {
   private var disposed = false
   private let previewOwner = NativeCapturePreviewOwner()
   private let openResources: () throws -> NativeCaptureRootResources
+  private let controlDevice: () -> CameraControlDevice?
+  private var controls: CameraControlBridge?
 
-  /// [openResources] opens the durable root (tests pass a temporary one).
+  /// [openResources] opens the durable root (tests pass a temporary one);
+  /// [controlDevice] gives the AR session's configurable camera.
   init(context: CaptureChannelContext,
        openResources: @escaping () throws -> NativeCaptureRootResources = {
          try NativeCaptureBinding.productionResources()
-       }) {
+       },
+       controlDevice: @escaping () -> CameraControlDevice? = { ARKitCaptureControlDevice.primary() }) {
     self.context = context
     self.openResources = openResources
+    self.controlDevice = controlDevice
   }
 
   func captureViewWillDispose() {
@@ -126,8 +127,8 @@ final class NativeCaptureChannel: CaptureChannelExtension {
 
   func handleCaptureCall(_ call: FlutterMethodCall, result: @escaping FlutterResult) -> Bool {
     let method = call.method
-    if AndroidOnlyCameraControls.methods.contains(method) {
-      result(AndroidOnlyCameraControls.error(method))
+    if CameraControlMethods.methods.contains(method) {
+      cameraControl(method, call.arguments as? [String: Any] ?? [:], result)
       return true
     }
     if AndroidOnlyCaptureDebugRoutes.methods.contains(method) {
@@ -294,6 +295,41 @@ final class NativeCaptureChannel: CaptureChannelExtension {
         shotImage: ShotImageRecord(
           shotId: shot.shotId, index: image.index, count: reported.count, mode: shot.mode.rawValue,
           flags: image.flags.rawValue))
+    }
+  }
+
+  // MARK: Camera controls
+
+  /// One Android runtime camera control on the camera ARKit runs, after
+  /// `initializeCapture` (Android: `CAPTURE_NOT_INITIALIZED` before it).
+  /// The AR session keeps running: controls only lock the capture device
+  /// for configuration. A recorded playback has no camera to control.
+  private func cameraControl(_ method: String, _ arguments: [String: Any], _ result: FlutterResult) {
+    guard requireInitialized(result) != nil else { return }
+    if context.frameSource.replaysRecordedStills {
+      return result(CameraControlMethods.unavailable(method, reason: "a recorded session replays; it has no camera to control"))
+    }
+    if controls == nil, let device = controlDevice() { controls = CameraControlBridge(device: device) }
+    guard let controls = controls else {
+      return result(CameraControlMethods.unavailable(method, reason: "ARKit offers no configurable camera on this device"))
+    }
+    do {
+      let value = try controls.handle(method, arguments)
+      result(Self.channelValue(value))
+    } catch let error as CameraControlError {
+      result(CameraControlMethods.error(error))
+    } catch {
+      result(FlutterError(code: CameraControlError.updateFailedCode, message: "\(error)", details: nil))
+    }
+  }
+
+  /// Optional map values become NSNull, as the Android codec sends null.
+  static func channelValue(_ value: Any?) -> Any {
+    switch value {
+    case nil: return NSNull()
+    case let map as [String: Any?]:
+      return map.mapValues { channelValue($0) }
+    default: return value!
     }
   }
 

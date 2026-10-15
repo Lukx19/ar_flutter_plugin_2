@@ -356,9 +356,10 @@ final class NativeCaptureBindingTests: XCTestCase {
     XCTAssertEqual(report["nativeStorageBudget"] as? Int, 2, "settlement markers")
   }
 
-  func testAndroidOnlyCameraControlsAnswerTheDefinedError() {
-    let error = AndroidOnlyCameraControls.error("setISO")
-    XCTAssertEqual(error.code, "CAMERA_CONTROL_UNSUPPORTED")
-    XCTAssertTrue(AndroidOnlyCameraControls.methods.isSuperset(of: ["setISO", "getSupportedWhiteBalanceModes", "isFlashAvailable", "setFocusMode"]))
+  func testCameraControlsWithoutAConfigurableCameraAnswerTheAndroidError() {
+    let error = CameraControlMethods.unavailable("setISO", reason: "no camera")
+    XCTAssertEqual(error.code, "CONTROL_UNSUPPORTED")
+    XCTAssertTrue(CameraControlMethods.methods.isSuperset(of: ["setISO", "getSupportedWhiteBalanceModes", "isFlashAvailable", "setFocusMode"]))
+    XCTAssertEqual(CameraControlMethods.methods.count, 30, "every Android runtime camera control")
   }
 }

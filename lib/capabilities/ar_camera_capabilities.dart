@@ -18,15 +18,28 @@ class ARCameraCapabilities {
   /// Platform channel for camera capability queries
   static const MethodChannel _channel = MethodChannel(channelName);
 
-  /// Platform availability check - currently supports Android only
+  /// ARCore capability profile, availability and shared-camera probes:
+  /// Android only.
   bool get isSupported => _supportedOverride ?? Platform.isAndroid;
 
+  /// The camera queries (resolutions, formats, ISO and exposure ranges,
+  /// resolution and format checks, intrinsics): Android (Camera2) and iOS
+  /// (ARKit formats and the camera ARKit runs; JPEG only, intrinsics only
+  /// while a capture view runs).
+  bool get supportsCameraQueries =>
+      _cameraQueriesOverride ??
+      _supportedOverride ??
+      (Platform.isAndroid || Platform.isIOS);
+
   final bool? _supportedOverride;
+  final bool? _cameraQueriesOverride;
 
   /// Initialize capability querier
   ARCameraCapabilities({
     @visibleForTesting bool? supportedOverride,
-  }) : _supportedOverride = supportedOverride;
+    @visibleForTesting bool? cameraQueriesOverride,
+  })  : _supportedOverride = supportedOverride,
+        _cameraQueriesOverride = cameraQueriesOverride;
 
   /// Queries ARCore's authoritative asynchronous availability state.
   Future<ARCoreAvailability> getARCoreAvailability() async {
@@ -111,7 +124,7 @@ class ARCameraCapabilities {
   /// Get list of all supported camera resolutions
   /// Returns empty list on unsupported platforms
   Future<List<CameraResolution>> getSupportedResolutions() async {
-    if (!isSupported) return [];
+    if (!supportsCameraQueries) return [];
 
     try {
       final List<dynamic> result =
@@ -153,7 +166,7 @@ class ARCameraCapabilities {
   /// Get list of all supported image formats
   /// Returns empty list on unsupported platforms
   Future<List<CaptureFormat>> getSupportedFormats() async {
-    if (!isSupported) return [];
+    if (!supportsCameraQueries) return [];
 
     try {
       final List<dynamic> result =
@@ -171,7 +184,7 @@ class ARCameraCapabilities {
   /// Get supported ISO sensitivity range for camera
   /// Returns empty list on unsupported platforms
   Future<List<int>> getSupportedISORange() async {
-    if (!isSupported) return [];
+    if (!supportsCameraQueries) return [];
 
     try {
       final List<dynamic> result =
@@ -187,7 +200,7 @@ class ARCameraCapabilities {
   /// Returns map with 'min' and 'max' Duration keys
   /// Returns empty map on unsupported platforms
   Future<Map<String, Duration>> getSupportedExposureRange() async {
-    if (!isSupported) return {};
+    if (!supportsCameraQueries) return {};
 
     try {
       final Map<dynamic, dynamic> result =
@@ -205,7 +218,7 @@ class ARCameraCapabilities {
   /// Check if specific resolution is supported on current device
   /// Returns false on unsupported platforms
   Future<bool> isResolutionSupported(CameraResolution resolution) async {
-    if (!isSupported) return false;
+    if (!supportsCameraQueries) return false;
 
     try {
       return await _channel.invokeMethod(
@@ -219,7 +232,7 @@ class ARCameraCapabilities {
   /// Check if specific format is supported on current device
   /// Returns false on unsupported platforms
   Future<bool> isFormatSupported(CaptureFormat format) async {
-    if (!isSupported) return false;
+    if (!supportsCameraQueries) return false;
 
     try {
       return await _channel.invokeMethod('isFormatSupported', format.wireValue);
@@ -232,7 +245,7 @@ class ARCameraCapabilities {
   /// Get camera intrinsics for the default camera
   /// Returns null on unsupported platforms or if intrinsics cannot be extracted
   Future<ARCameraIntrinsics?> getCameraIntrinsics() async {
-    if (!isSupported) return null;
+    if (!supportsCameraQueries) return null;
 
     try {
       final Map<dynamic, dynamic>? result =
