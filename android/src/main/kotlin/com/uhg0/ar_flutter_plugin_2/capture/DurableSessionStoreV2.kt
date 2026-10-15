@@ -264,7 +264,9 @@ class DurableSessionStoreV2(
             val captureId = safe(request.accepted.identity.attemptId)
             val assets = path(location, "assets", captureId).also(files::ensureDirectory)
             staged.forEach { moveImmutable(it.file, path(assets, "${it.kind.name.lowercase()}.${it.descriptor.sha256.hex()}.blob"), it.descriptor) }
-            val prior = selectedRoot(location)
+            // A root whose pointer rename is not yet directory-durable still has a durable root
+            // object and receipt: the next commit builds on it instead of overwriting its slot.
+            val prior = selectedRoot(location, includeUncertain = true)
             val revision = (prior?.revision ?: 0L) + 1L
             val rootBytes = rootRecord(request, requestHash, revision, staged, prior)
             val rootHash = sha256(rootBytes).hex()
@@ -280,8 +282,8 @@ class DurableSessionStoreV2(
             faults.at(DurableStoreFaultPointV2.RECEIPT_WRITE)
             writePropertiesExclusive(receiptFile(location, request.accepted.identity), receiptProperties(committed, rootHash))
             faults.at(DurableStoreFaultPointV2.RECEIPT_FILE_SYNC)
-            publishPointer(location, RootPointer(revision, rootHash, request.accepted.identity.commitId))
-            budget.commit(reservation, actualBytes)
+            publishPointer(location, RootPointer(revision, rootHash, request.accepted.identity.commitId), prior)
+            budget.settle(reservation, actualBytes)
             deleteTree(staging, DurableStoreFaultPointV2.DELETE_RECLAIM)
             committed
         } catch (error: Throwable) {
@@ -369,7 +371,9 @@ class DurableSessionStoreV2(
             val captureId = safe(identity.attemptId)
             val assets = path(location, "assets", captureId).also(files::ensureDirectory)
             staged.forEach { moveImmutable(it.file, path(assets, "${it.kind.name.lowercase()}.${it.descriptor.sha256.hex()}.blob"), it.descriptor) }
-            val prior = selectedRoot(location)
+            // A root whose pointer rename is not yet directory-durable still has a durable root
+            // object and receipt: the next commit builds on it instead of overwriting its slot.
+            val prior = selectedRoot(location, includeUncertain = true)
             val revision = (prior?.revision ?: 0L) + 1L
             val rootBytes = rootRecord(request, requestHash, revision, staged, prior)
             val rootHash = sha256(rootBytes).hex()
@@ -389,8 +393,8 @@ class DurableSessionStoreV2(
                 },
             )
             faults.at(DurableStoreFaultPointV2.RECEIPT_FILE_SYNC)
-            publishPointer(location, RootPointer(revision, rootHash, identity.commitId))
-            budget.commit(requireNotNull(reservation), actualBytes)
+            publishPointer(location, RootPointer(revision, rootHash, identity.commitId), prior)
+            budget.settle(requireNotNull(reservation), actualBytes)
             deleteTree(staging, DurableStoreFaultPointV2.DELETE_RECLAIM)
             committed
         } catch (error: Throwable) {
@@ -419,11 +423,13 @@ class DurableSessionStoreV2(
             check(revision == (selected?.revision ?: 0L) + 1L && rootPrevious(location, rootHash) == selected?.rootHash) {
                 "Unknown receipt cannot rebase over a different root cut"
             }
-            publishPointer(location, RootPointer(revision, rootHash, request.accepted.identity.commitId))
+            publishPointer(location, RootPointer(revision, rootHash, request.accepted.identity.commitId), selected)
+        } else {
+            uncertainRootHashes.remove(rootHash)
         }
         val accepted = readProperties(acceptedFile(location, request.accepted.identity))
         budget.reservation(accepted.getProperty("reservationToken"))?.let { reservation ->
-            budget.commit(reservation, request.components.fold(0L) { total, component -> Math.addExact(total, component.byteLength) })
+            budget.settle(reservation, request.components.fold(0L) { total, component -> Math.addExact(total, component.byteLength) })
         }
         deleteTree(path(attemptDirectory(location, request.accepted.identity), "staging"), DurableStoreFaultPointV2.DELETE_RECLAIM)
         receipt(location, request.accepted.identity)!!
@@ -463,6 +469,11 @@ class DurableSessionStoreV2(
         require(terminal.kind == CaptureTerminalKind.ABANDONED_ATTEMPT)
         val location = location(terminal.identity)
         receipt(location, terminal.identity)?.let { return it }
+        // A receipt outside the retained graph (pointer cut unknown) keeps its assets and liability
+        // for rebase or restart recovery; abandonment must not delete a possibly committed photo.
+        if (files.isFile(receiptFile(location, terminal.identity))) {
+            throw DurableStoreConflictV2("Attempt has an unresolved durable receipt")
+        }
         val accepted = acceptedFile(location, terminal.identity).takeIf(files::isFile)?.let(::readProperties)
         faults.at(DurableStoreFaultPointV2.ABANDONMENT_CLEANUP)
         deleteTree(path(attemptDirectory(location, terminal.identity), "staging"), DurableStoreFaultPointV2.ABANDONMENT_CLEANUP)
@@ -499,7 +510,10 @@ class DurableSessionStoreV2(
             files.walk(session).filter { it.name == "accepted.properties" }.forEach { accepted ->
                 val attempt = requireNotNull(accepted.parentFile)
                 val receipt = path(attempt, "receipt.properties")
-                val acceptedValues = readProperties(accepted)
+                val acceptedBytes = files.readBytes(accepted)
+                val acceptedValues = parseProperties(acceptedBytes)
+                // An unfinished acceptance preceded no exposure; reconciliation releases its reservation.
+                if (!isFinishedAcceptedRecord(acceptedBytes, acceptedValues)) return@forEach
                 if (!files.isFile(receipt)) {
                     val abandoned = Properties().apply {
                         setProperty("kind", CaptureTerminalKind.ABANDONED_ATTEMPT.name)
@@ -519,7 +533,7 @@ class DurableSessionStoreV2(
                         receiptValues.getProperty("rootHash") in retainedRootHashes(session)) {
                         acceptedValues.getProperty("reservationToken")?.let { token ->
                             budget.reservation(token)?.let { reservation ->
-                                budget.commit(reservation, committedComponentBytes(session, receiptValues.getProperty("rootHash")))
+                                budget.settle(reservation, committedComponentBytes(session, receiptValues.getProperty("rootHash")))
                             }
                         }
                         deleteTree(path(attempt, "staging"), DurableStoreFaultPointV2.DELETE_RECLAIM)
@@ -558,6 +572,12 @@ class DurableSessionStoreV2(
             val session = files.child("sessions", sessionHash)
             val accepted = path(session, "attempts", attemptHash, "accepted.properties")
             if (!files.isFile(accepted)) continue
+            val acceptedBytes = files.readBytes(accepted)
+            // The accepted record is created under its final name and then written, after its
+            // index entry: a record cut short is an acceptance that never finished, and no exposure
+            // can precede it. It is neither repaired nor projected and leaves the index; binding-open
+            // reconciliation releases its reservation.
+            if (!isFinishedAcceptedRecord(acceptedBytes, parseProperties(acceptedBytes))) continue
             validEntries += sessionHash to attemptHash
             repairAcceptedCandidate(session, accepted)
             result += run {
@@ -609,6 +629,59 @@ class DurableSessionStoreV2(
             writeRecoveryIndex(validEntries)
         }
         result
+    }
+
+    /**
+     * Startup recovery at binding open: the bounded projection, then reservation reconciliation
+     * before the first admission.
+     */
+    internal fun recoverAtOpen(
+        shouldContinue: () -> Boolean = { true },
+        log: (String) -> Unit = ::logStoreWarning,
+    ): List<RecoveryProjectionV2> = recoverAndProject(shouldContinue = shouldContinue).also {
+        if (shouldContinue()) reconcileReservations(log)
+    }
+
+    /**
+     * Reservation-driven reconciliation: every live reservation names its attempt
+     * (`capture:<session>:<commit>`). Without a finished accepted record naming it, the reservation
+     * is released; otherwise the attempt is repaired by the recovery rules (no receipt: abandoned
+     * and released; committed receipt in the retained graph: settled; partial receipt or root
+     * outside the retained graph: the liability stays). Committed roots, receipts and assets are
+     * never deleted. A failure on one reservation is logged and the next one goes on; it never
+     * throws. Returns the number of reservations closed.
+     */
+    internal fun reconcileReservations(log: (String) -> Unit = ::logStoreWarning): Int = synchronized(mutex) {
+        val live = try { budget.liveReservations() } catch (error: Exception) {
+            log("reservation reconciliation skipped: $error")
+            return@synchronized 0
+        }
+        var closed = 0
+        for (reservation in live) {
+            try {
+                if (reconcileLocked(reservation)) closed++
+            } catch (error: Exception) {
+                log("reservation ${reservation.owner} not reconciled: $error")
+            }
+        }
+        closed
+    }
+
+    private fun reconcileLocked(reservation: StorageBudgetReservationV2): Boolean {
+        val parts = reservation.owner.split(':')
+        if (parts.size != 3 || parts[0] != "capture" || !parts[1].matches(SAFE_HASH) || !parts[2].matches(SAFE_HASH)) {
+            throw DurableStoreConflictV2("Reservation owner is not a capture attempt")
+        }
+        val session = files.child("sessions", parts[1])
+        val accepted = path(session, "attempts", parts[2], "accepted.properties")
+        val acceptedBytes = if (files.isFile(accepted)) files.readBytes(accepted) else null
+        val acceptedValues = acceptedBytes?.let(::parseProperties)
+        if (acceptedBytes == null || !isFinishedAcceptedRecord(acceptedBytes, requireNotNull(acceptedValues)) ||
+            acceptedValues.getProperty("reservationToken") != reservation.token) {
+            return budget.release(reservation)
+        }
+        repairAcceptedCandidate(session, accepted)
+        return budget.reservation(reservation.token) == null
     }
 
     /** Schema-qualified exact identity; only written at new acceptance, never inferred for old records. */
@@ -707,7 +780,7 @@ class DurableSessionStoreV2(
         ) {
             acceptedValues.getProperty("reservationToken")?.let { token ->
                 budget.reservation(token)?.let { reservation ->
-                    budget.commit(reservation, committedComponentBytes(session, receiptValues.getProperty("rootHash")))
+                    budget.settle(reservation, committedComponentBytes(session, receiptValues.getProperty("rootHash")))
                 }
             }
             deleteTree(path(attempt, "staging"), DurableStoreFaultPointV2.DELETE_RECLAIM)
@@ -981,13 +1054,13 @@ class DurableSessionStoreV2(
         if (prior.requestHash == requestHash(request)) return prior
         throw DurableStoreConflictV2("Changed replay conflicts with durable terminal identity")
     }
-    private fun selectedRoot(location: File): RootPointer? {
+    private fun selectedRoot(location: File, includeUncertain: Boolean = false): RootPointer? {
         var selected: RootPointer? = null
         for (slot in 0..1) {
             val file = path(location, if (slot == 0) "root-A.ptr" else "root-B.ptr")
             if (!files.isFile(file)) continue
             val pointer = files.readDescriptor(file) { rootMetadata.pointer(it::read) } ?: continue
-            if (pointer.hash in uncertainRootHashes) continue
+            if (!includeUncertain && pointer.hash in uncertainRootHashes) continue
             val candidate = RootPointer(pointer.revision, pointer.hash, pointer.commit,
                 if (slot == 0) "A" else "B", rootPrevious(location, pointer.hash))
             if (!validRoot(location, candidate)) continue
@@ -1022,12 +1095,18 @@ class DurableSessionStoreV2(
         if (depth == 0 && revision >= 3 && second != rootPrevious(location, previous)) return false
         return true
     }
-    private fun publishPointer(location: File, pointer: RootPointer) {
-        val old = selectedRoot(location)
-        val target = path(location, if (old?.slot == "A") "root-B.ptr" else "root-A.ptr")
+    /** Publishes [pointer] into the slot that does not hold [prior], the root it supersedes. */
+    private fun publishPointer(location: File, pointer: RootPointer, prior: RootPointer?) {
+        val target = path(location, if (prior?.slot == "A") "root-B.ptr" else "root-A.ptr")
         try {
             writeAtomic(target, "${pointer.revision}\n${pointer.rootHash}\n${pointer.commitId}\n".toByteArray())
             uncertainRootHashes.remove(pointer.rootHash)
+            // The parent fsync also made every earlier rename in this directory durable.
+            for (slot in listOf("root-A.ptr", "root-B.ptr")) {
+                val file = path(location, slot)
+                if (!files.isFile(file)) continue
+                files.readDescriptor(file) { rootMetadata.pointer(it::read) }?.let { uncertainRootHashes.remove(it.hash) }
+            }
         } catch (error: PointerDirectorySyncUnknownV2) {
             uncertainRootHashes += pointer.rootHash
             throw error
@@ -1036,7 +1115,14 @@ class DurableSessionStoreV2(
     private fun moveImmutable(from: File, target: File, descriptor: CaptureComponentDescriptor) { if (files.isFile(target)) { val measured = files.digestAndLength(target); check(measured.first == descriptor.byteLength && measured.second.hex() == descriptor.sha256.hex()) { "Immutable asset conflict" }; files.delete(from, DurableStoreFaultPointV2.DELETE_RECLAIM); return }; files.moveAtomic(from, target) }
     private fun propertiesBytes(properties: Properties) = buildString { properties.stringPropertyNames().sorted().forEach { append(it).append('=').append(properties.getProperty(it)).append('\n') } }.toByteArray()
     private fun writePropertiesExclusive(file: File, properties: Properties, point: DurableStoreFaultPointV2 = DurableStoreFaultPointV2.ACCEPTED_RECORD) = writeExclusive(file, propertiesBytes(properties), point)
-    private fun readProperties(file: File) = Properties().apply { files.readBytes(file).inputStream().use(::load) }
+    private fun readProperties(file: File) = parseProperties(files.readBytes(file))
+    private fun parseProperties(bytes: ByteArray) = Properties().apply { bytes.inputStream().use(::load) }
+    /**
+     * An accepted record is written whole as sorted `key=value` lines, so a finished one ends with
+     * a newline and carries `session`, its last key; anything else is a write cut short.
+     */
+    private fun isFinishedAcceptedRecord(bytes: ByteArray, values: Properties) =
+        bytes.isNotEmpty() && bytes.last() == '\n'.code.toByte() && values.getProperty("session") != null
     private fun writeExclusive(file: File, bytes: ByteArray, point: DurableStoreFaultPointV2 = DurableStoreFaultPointV2.ACCEPTED_RECORD) = files.writeExclusive(file, bytes, point)
     private fun writeImmutable(file: File, bytes: ByteArray) {
         files.writeImmutable(file, bytes, DurableStoreFaultPointV2.ROOT_WRITE)
@@ -1062,6 +1148,7 @@ class DurableSessionStoreV2(
     private data class RootPointer(val revision: Long, val rootHash: String, val commitId: String, val slot: String = "", val previousHash: String? = null)
     private companion object {
         const val RECOVERY_INDEX_CAPACITY = 3
+        fun logStoreWarning(message: String) { android.util.Log.w("Capture3DStore", message) }
         val SAFE_HASH = Regex("[0-9a-f]{64}")
     }
 }

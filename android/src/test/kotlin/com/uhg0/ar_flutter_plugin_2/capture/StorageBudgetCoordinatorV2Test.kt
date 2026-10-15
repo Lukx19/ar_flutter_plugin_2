@@ -4,6 +4,7 @@ import java.io.File
 import java.nio.file.Files
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
@@ -113,7 +114,8 @@ class StorageBudgetCoordinatorV2Test {
         val token = first.reserve("capture:session:one", 80)!!
         assertEquals(80L, token.bytes)
         assertTrue(first.physicallyAllocatedBytes(token.token) >= token.bytes)
-        assertNull(first.reserve("capture:session:two", 11))
+        assertNull(first.reserve("capture:session:two", 21))
+        assertNull(first.reserve("capture:session:two", 91))
 
         val restarted = StorageBudgetCoordinatorV2(root, policy, physicalFilesystem()) { 100 }
         assertEquals(80, restarted.reservedBytes())
@@ -270,6 +272,130 @@ class StorageBudgetCoordinatorV2Test {
         val reservation = coordinator.reserve("capture:session:one", 20)!!
         assertTrue(coordinator.release(reservation))
         assertTrue(!coordinator.release(reservation))
+    }
+
+    @Test fun `capture share quota counts committed photos once against free space`() {
+        val root = directory()
+        val policy = StorageBudgetPolicyV2(StorageBudgetQuotaV2.CaptureShare(minimumBytes = 1_000), 0)
+        var free = 1_000_000L
+        StorageBudgetCoordinatorV2(root, policy, physicalFilesystem()) { free }.use { coordinator ->
+            coordinator.settle(coordinator.reserve("capture:session:photos", 400_000)!!, 400_000)
+            // 400 kB of photos now occupy disk; 600 kB stay free. Half of the capacity is 500 kB.
+            free = 600_000L
+            assertNull(coordinator.reserve("capture:session:over", 100_001))
+            val next = coordinator.reserve("capture:session:next", 100_000)!!
+            assertEquals(100_000L, coordinator.reservedBytes())
+            // The physically backed reservation leaves the free space; the share stays 500 kB.
+            free = 500_000L
+            assertNull(coordinator.reserve("capture:session:over", 1))
+            coordinator.settle(next, 100_000)
+            assertEquals(500_000L, coordinator.committedBytes())
+        }
+        // Committed bytes above the share never block opening: queries and releases go on.
+        free = 0L
+        StorageBudgetCoordinatorV2(root, policy, physicalFilesystem()) { free }.use { reopened ->
+            assertEquals(500_000L, reopened.committedBytes())
+            assertNull(reopened.reserve("capture:session:full", 1))
+            free = 2_000_000L
+            assertEquals(750_000L, reopened.reserve("capture:session:after", 750_000)!!.bytes)
+        }
+    }
+
+    @Test fun `fixed quota free space bounds only new bytes`() {
+        val coordinator = StorageBudgetCoordinatorV2(
+            directory(), StorageBudgetPolicyV2(1_000, 10), physicalFilesystem(),
+        ) { 100 }
+        val first = coordinator.reserve("capture:session:one", 80)!!
+        // The 80 bytes already left the reported free space; 90 new bytes fit above the floor.
+        val second = coordinator.reserve("capture:session:two", 90)!!
+        assertNull(coordinator.reserve("capture:session:three", 91))
+        coordinator.commit(first, 80)
+        coordinator.commit(second, 90)
+        assertEquals(170L, coordinator.committedBytes())
+        coordinator.close()
+    }
+
+    @Test fun `settlement closes a reservation whose capture share shrank after admission`() {
+        var free = 1_000_000L
+        StorageBudgetCoordinatorV2(
+            directory(), StorageBudgetPolicyV2(StorageBudgetQuotaV2.CaptureShare(minimumBytes = 0), 0), physicalFilesystem(),
+        ) { free }.use { coordinator ->
+            val reservation = coordinator.reserve("capture:session:one", 400_000)!!
+            free = 0L
+            assertThrows(IllegalStateException::class.java) { coordinator.commit(reservation, 400_000) }
+            coordinator.settle(reservation, 400_000)
+            assertEquals(400_000L, coordinator.committedBytes())
+            assertEquals(0L, coordinator.reservedBytes())
+        }
+    }
+
+    @Test fun `plain committing record charges exactly once across process reopen`() {
+        val root = directory(); val policy = StorageBudgetPolicyV2(1_000_000, 0)
+        val first = StorageBudgetCoordinatorV2(root, policy, physicalFilesystem()) { 10_000_000 }
+        val reservation = first.reserve("capture:session:one", 8_192)!!
+        val metadata = File(root, "reservations-v2/${reservation.token}.reservation")
+        val allocation = File(root, "reservations-v2/${reservation.token}.allocation")
+        // Cut after the durable commit record and before the ledger: the charge must survive.
+        metadata.writeText("capture:session:one\n8192\nCOMMITTING:4096:0\n")
+        first.close()
+        StorageBudgetCoordinatorV2(root, policy, physicalFilesystem()) { 10_000_000 }.use { reopened ->
+            assertEquals(4_096L, reopened.committedBytes())
+            assertEquals(0L, reopened.reservedBytes())
+            assertFalse(metadata.exists())
+            assertFalse(allocation.exists())
+        }
+
+        // Cut after the ledger and before the record deletion: no second charge.
+        val second = StorageBudgetCoordinatorV2(root, policy, physicalFilesystem()) { 10_000_000 }
+        val again = second.reserve("capture:session:two", 8_192)!!
+        val againMetadata = File(root, "reservations-v2/${again.token}.reservation")
+        againMetadata.writeText("capture:session:two\n8192\nCOMMITTING:1000:4096\n")
+        File(root, "ledger-v2").writeText("5096\n")
+        second.close()
+        StorageBudgetCoordinatorV2(root, policy, physicalFilesystem()) { 10_000_000 }.use { reopened ->
+            assertEquals(5_096L, reopened.committedBytes())
+            assertEquals(0L, reopened.reservedBytes())
+            assertFalse(againMetadata.exists())
+        }
+    }
+
+    @Test fun `unfinished reservation records are orphans and never block the ledger`() {
+        val root = directory(); val policy = StorageBudgetPolicyV2(1_000_000, 0)
+        StorageBudgetCoordinatorV2(root, policy, physicalFilesystem()) { 10_000_000 }.use { coordinator ->
+            coordinator.reserve("capture:session:live", 4_096)!!
+        }
+        val reservations = File(root, "reservations-v2")
+        fun cut(tokenSeed: Char, record: String, allocation: Boolean) {
+            val token = tokenSeed.toString().repeat(64)
+            File(reservations, "$token.reservation").writeText(record)
+            if (allocation) File(reservations, "$token.allocation").writeBytes(ByteArray(4_096))
+        }
+        cut('a', "", allocation = true)
+        cut('b', "capture:session:cut\n40", allocation = true)
+        cut('c', "capture:session:cut\n", allocation = true)
+        cut('d', "canonical-surface:canonical:selector\n32768\nPOINTER\n${"e".repeat(64)}\n", allocation = true)
+        cut('f', "canonical-surface:canonical:v6-migration\n16384\n", allocation = false)
+        cut('9', "canonical-surface:canonical:v6-migration\n16384\ncandidate.staging\n", allocation = false)
+        File(reservations, "0".repeat(64) + ".reservation").writeBytes(ByteArray(12))
+
+        StorageBudgetCoordinatorV2(root, policy, physicalFilesystem()) { 10_000_000 }.use { reopened ->
+            assertEquals(4_096L, reopened.reservedBytes())
+            assertEquals(1, reopened.liveReservations().size)
+            assertEquals(2, reservations.listFiles().orEmpty().size)
+            assertEquals(4_096L, reopened.reserve("capture:session:after", 4_096)!!.bytes)
+        }
+    }
+
+    @Test fun `reservation metadata is published whole without a temporary file`() {
+        val root = directory()
+        StorageBudgetCoordinatorV2(root, StorageBudgetPolicyV2(1_000_000, 0), physicalFilesystem()) { 10_000_000 }.use { coordinator ->
+            val reservation = coordinator.reserve("capture:session:one", 4_096)!!
+            assertEquals(
+                "capture:session:one\n4096\n",
+                File(root, "reservations-v2/${reservation.token}.reservation").readText(),
+            )
+            assertTrue(File(root, "reservations-v2").listFiles().orEmpty().none { it.name.endsWith(".part") })
+        }
     }
 
     @Test fun `safe filesystem syncs the actual parent after authority replacement`() {

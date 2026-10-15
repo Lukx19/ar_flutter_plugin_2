@@ -532,6 +532,116 @@ class DurableSessionStoreV2Test {
         secondBudget.close()
     }
 
+    @Test fun `accepted record cut before or inside its write is proven absent and never fails recovery`() {
+        val root = directory(); val budget = budget(root); val store = store(root, budget)
+        val committed = request("cut-committed", "cut-committed-attempt", "kept".toByteArray())
+        store.acceptCaptureBeforeExposure(committed)
+        store.commitStreamed(committed, streams("kept".toByteArray()))
+        val empty = request("cut-empty", "cut-empty-attempt", "a".toByteArray())
+        val partial = request("cut-partial", "cut-partial-attempt", "b".toByteArray())
+        store.acceptCaptureBeforeExposure(empty)
+        store.acceptCaptureBeforeExposure(partial)
+        store.close(); budget.close()
+        // Crash states of the in-place write: created but unwritten, and cut inside the last value.
+        acceptedFile(root, empty).writeBytes(ByteArray(0))
+        val partialRecord = acceptedFile(root, partial)
+        val text = partialRecord.readText()
+        partialRecord.writeText(text.substring(0, text.indexOf("session=") + "session=ses".length))
+
+        val reopenedBudget = budget(root); val reopened = store(root, reopenedBudget)
+        val logged = mutableListOf<String>()
+        val projections = reopened.recoverAtOpen(log = { logged += it })
+
+        assertEquals(listOf(committed.accepted.identity.attemptId), projections.map { it.attemptId })
+        assertEquals(CaptureTerminalKind.COMMITTED_PICTURE, projections.single().kind)
+        assertEquals(emptyList<String>(), logged)
+        assertEquals(0L, reopenedBudget.reservedBytes())
+        val index = java.util.Properties().apply { File(root, "store/recovery-index.properties").inputStream().use(::load) }
+        assertEquals("1", index.getProperty("count"))
+        reopened.recover()
+        assertEquals(CaptureAttemptPhase.COMMITTED_PICTURE, reopened.queryReceipt(committed.accepted.identity)?.phase)
+        val later = request("cut-later", "cut-later-attempt", "later".toByteArray())
+        reopened.acceptCaptureBeforeExposure(later)
+        assertEquals(CaptureAttemptPhase.COMMITTED_PICTURE, reopened.commitStreamed(later, streams("later".toByteArray())).phase)
+        assertEquals(0L, reopenedBudget.reservedBytes())
+        reopened.close(); reopenedBudget.close()
+    }
+
+    @Test fun `binding open reconciles every leaked reservation against its accepted record`() {
+        val root = directory(); val budget = budget(root)
+        val unknown = request("reconcile-unknown", "reconcile-unknown-attempt", "jpeg".toByteArray())
+        val failing = store(root, budget, DurableStoreFaultInjectorV2 {
+            if (it == DurableStoreFaultPointV2.POINTER_SLOT_REPLACE) throw IllegalStateException("pointer cut")
+        })
+        failing.acceptCaptureBeforeExposure(unknown)
+        assertThrows(IllegalStateException::class.java) { failing.commitStreamed(unknown, streams("jpeg".toByteArray())) }
+        failing.close()
+        val store = store(root, budget)
+        // Accepted attempts beyond the bounded startup projection (index three, projection two).
+        val accepted = List(4) { request("reconcile-accepted-$it", "reconcile-accepted-attempt-$it", "x".toByteArray(), "session-$it") }
+        accepted.forEach { store.acceptCaptureBeforeExposure(it) }
+        // Crash between the reservation and the accepted record.
+        budget.reserve("capture:${sha256Hex("session-1")}:${sha256Hex("never-accepted")}", 4_096)!!
+        // An accepted record naming another reservation.
+        budget.reserve("capture:${sha256Hex(accepted[0].accepted.identity.lifecycleCut.sessionId)}:${sha256Hex(accepted[0].accepted.identity.commitId)}", 4_096)!!
+        // An owner that is not a capture attempt stays and is logged.
+        val foreign = budget.reserve("canonical-surface:canonical:selector", 4_096)!!
+        store.close(); budget.close()
+
+        val reopenedBudget = budget(root); val reopened = store(root, reopenedBudget)
+        val logged = mutableListOf<String>()
+        val projections = reopened.recoverAtOpen(log = { logged += it })
+
+        assertEquals(2, projections.size)
+        assertEquals(1, logged.size)
+        assertTrue(logged.single().contains("canonical-surface:canonical:selector"))
+        val unknownReservation = readAcceptedToken(root, unknown)
+        assertEquals(setOf(unknownReservation, foreign.token), reopenedBudget.liveReservations().map { it.token }.toSet())
+        accepted.forEach { assertEquals(CaptureAttemptPhase.ABANDONED_ATTEMPT, reopened.queryReceipt(it.accepted.identity)?.phase) }
+        assertEquals(CaptureAttemptPhase.COMMITTED_PICTURE, reopened.rebaseSameAttempt(unknown).phase)
+        assertEquals(setOf(foreign.token), reopenedBudget.liveReservations().map { it.token }.toSet())
+        assertEquals(0, reopened.reconcileReservations(log = { logged += it }))
+        reopened.close(); reopenedBudget.close()
+    }
+
+    @Test fun `next commit builds on a root whose pointer directory sync is unknown`() {
+        val root = directory(); val quota = budget(root); var injected = false
+        val store = store(root, quota, DurableStoreFaultInjectorV2 {
+            if (it == DurableStoreFaultPointV2.POINTER_DIRECTORY_SYNC && !injected) {
+                injected = true
+                throw IllegalStateException("before-directory-fsync")
+            }
+        })
+        val uncertain = request("uncertain-root", "uncertain-root-attempt", "first".toByteArray())
+        store.acceptBeforeExposure(uncertain.accepted)
+        assertThrows(PointerDirectorySyncUnknownV2::class.java) { store.commitStreamed(uncertain, streams("first".toByteArray())) }
+        assertNull(store.queryReceipt(uncertain.accepted.identity))
+        // Abandonment keeps the possibly committed photo and its liability.
+        assertThrows(DurableStoreConflictV2::class.java) { store.abandonCapture(uncertain, abandonment(uncertain, "store-unknown")) }
+        assertTrue(hasAsset(root, uncertain))
+
+        val next = request("after-uncertain", "after-uncertain-attempt", "second".toByteArray())
+        store.acceptBeforeExposure(next.accepted)
+        val nextReceipt = store.commitStreamed(next, streams("second".toByteArray()))
+        assertEquals(2L, nextReceipt.terminal?.captureRevision)
+        assertEquals(CaptureAttemptPhase.COMMITTED_PICTURE, store.queryReceipt(uncertain.accepted.identity)?.phase)
+        assertEquals(CaptureAttemptPhase.COMMITTED_PICTURE, store.rebaseSameAttempt(uncertain).phase)
+        assertEquals(0L, quota.reservedBytes())
+
+        val restarted = store(root, budget(root))
+        assertEquals(CaptureAttemptPhase.COMMITTED_PICTURE, restarted.queryReceipt(uncertain.accepted.identity)?.phase)
+        assertEquals(CaptureAttemptPhase.COMMITTED_PICTURE, restarted.queryReceipt(next.accepted.identity)?.phase)
+    }
+
+    private fun acceptedFile(root: File, request: CaptureCommitRequest) = File(
+        root,
+        "store/sessions/${sha256Hex(request.accepted.identity.lifecycleCut.sessionId)}/attempts/" +
+            "${sha256Hex(request.accepted.identity.commitId)}/accepted.properties",
+    )
+    private fun readAcceptedToken(root: File, request: CaptureCommitRequest): String = java.util.Properties().apply {
+        acceptedFile(root, request).inputStream().use(::load)
+    }.getProperty("reservationToken")
+
     private fun request(commit: String, attempt: String, jpeg: ByteArray, session: String = "session-1", dng: ByteArray? = null): CaptureCommitRequest {
         val identity = CaptureAttemptIdentity(attempt, commit, 1, CaptureLifecycleCut(session, 1, "group-1", 1, "ar-1", "view-1", 1, "binding-1", 1, 1))
         val kinds = if (dng == null) setOf(CaptureComponentKind.JPEG) else setOf(CaptureComponentKind.JPEG, CaptureComponentKind.DNG)
