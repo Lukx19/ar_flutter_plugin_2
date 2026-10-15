@@ -19,6 +19,10 @@ enum class DurableStoreFaultPointV2 {
     RECEIPT_WRITE, RECEIPT_FILE_SYNC, POINTER_SLOT_REPLACE, POINTER_DIRECTORY_SYNC,
     ABANDONMENT_RECORD, ABANDONMENT_CLEANUP, TOMBSTONE_RECORD, TOMBSTONE_DIRECTORY_SYNC,
     DELETE_RECLAIM, RECOVERY,
+    /** Cut after a complete temporary receipt and before its rename. */
+    RECEIPT_REPLACE,
+    /** Cut after a complete temporary ledger reservation record and before its rename. */
+    RESERVATION_RECORD_REPLACE,
 }
 
 fun interface DurableStoreFaultInjectorV2 { fun at(point: DurableStoreFaultPointV2) }

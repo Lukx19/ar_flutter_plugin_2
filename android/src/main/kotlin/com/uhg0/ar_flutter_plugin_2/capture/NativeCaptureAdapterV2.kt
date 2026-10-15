@@ -605,7 +605,8 @@ internal class NativeCaptureBindingV2(
         // onto its worker and race close-before-first-use.
         rootResources
         NativeCaptureRecoveryDispatcherV2(
-            recover = { shouldContinue -> store.recoverAndProject(shouldContinue = shouldContinue) },
+            // Projection, then reservation reconciliation before the first admission.
+            recover = { shouldContinue -> store.recoverAtOpen(shouldContinue) },
             events = events,
         )
     }
@@ -779,10 +780,8 @@ internal class NativeCaptureBindingV2(
         try {
             budget = StorageBudgetCoordinatorV2(
                 java.io.File(authority.root, "budget"),
-                StorageBudgetPolicyV2(
-                    (context.filesDir.usableSpace / 2).coerceAtLeast(CAPTURE_COEXISTENCE_BYTES),
-                    0,
-                ),
+                // Half of free plus held bytes, measured at each check, at least the coexistence floor.
+                StorageBudgetPolicyV2(StorageBudgetQuotaV2.CaptureShare(CAPTURE_COEXISTENCE_BYTES), 0),
             )
             val store = DurableSessionStoreV2(java.io.File(authority.root, "store"), budget)
             return NativeCaptureRootResourcesV2(authority, budget, store)

@@ -4,8 +4,37 @@ import java.io.File
 import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 
-data class StorageBudgetPolicyV2(val quotaBytes: Long, val freeSpaceFloorBytes: Long) {
-    init { require(quotaBytes >= 0 && freeSpaceFloorBytes >= 0) }
+/** Global quota of one ledger, evaluated at every check. */
+sealed interface StorageBudgetQuotaV2 {
+    fun bytes(freeBytes: Long, committed: Long, reserved: Long): Long
+
+    /** A constant quota. */
+    data class Fixed(val quotaBytes: Long) : StorageBudgetQuotaV2 {
+        init { require(quotaBytes >= 0) }
+        override fun bytes(freeBytes: Long, committed: Long, reserved: Long) = quotaBytes
+    }
+
+    /**
+     * Half of the capture capacity, at least [minimumBytes]. The capacity is the free space plus
+     * the bytes the ledger already holds: committed photos and physically backed reservations
+     * occupy disk and are no longer part of the free space.
+     */
+    data class CaptureShare(val minimumBytes: Long) : StorageBudgetQuotaV2 {
+        init { require(minimumBytes >= 0) }
+        override fun bytes(freeBytes: Long, committed: Long, reserved: Long): Long {
+            val held = committed + reserved
+            val capacity = maxOf(freeBytes, 0L) + held
+            // A wrapped sum means the capacity is no limit.
+            if (held < committed || capacity < held) return Long.MAX_VALUE
+            return maxOf(capacity / 2, minimumBytes)
+        }
+    }
+}
+
+data class StorageBudgetPolicyV2(val quota: StorageBudgetQuotaV2, val freeSpaceFloorBytes: Long) {
+    constructor(quotaBytes: Long, freeSpaceFloorBytes: Long) :
+        this(StorageBudgetQuotaV2.Fixed(quotaBytes), freeSpaceFloorBytes)
+    init { require(freeSpaceFloorBytes >= 0) }
 }
 
 data class StorageBudgetReservationV2(
@@ -34,9 +63,10 @@ class StorageBudgetCoordinatorV2(
     directory: File,
     private val policy: StorageBudgetPolicyV2,
     filesystemBackend: DescriptorFilesystemV2 = AndroidDescriptorFilesystemV2(),
+    faults: DurableStoreFaultInjectorV2 = DurableStoreFaultInjectorV2 { },
     private val freeBytes: () -> Long = { directory.usableSpace },
 ) : AutoCloseable {
-    private val files = SafeFilesystemV2(directory, DurableStoreFaultInjectorV2 { }, filesystemBackend)
+    private val files = SafeFilesystemV2(directory, faults, filesystemBackend)
     private val ledger = files.child("ledger-v2")
     private val reservationsDirectory = files.child("reservations-v2")
     private val reclaimsDirectory = files.child("reclaims-v2")
@@ -60,14 +90,14 @@ class StorageBudgetCoordinatorV2(
 
     fun reserve(owner: String, bytes: Long): StorageBudgetReservationV2? = withAuthority {
         require(owner.matches(OWNER)) { "Storage reservation owner is non-canonical" }
-        if (bytes <= 0 || !canCharge(bytes)) return@withAuthority null
+        if (bytes <= 0 || !canCharge(bytes, streamed = true)) return@withAuthority null
         val token = sha256("$owner:$bytes:${nextTokenLocked()}".toByteArray()).hex()
         val reservation = StorageBudgetReservationV2(token, owner, bytes)
         val allocation = allocationFile(token)
         val metadata = metadataFile(token)
         try {
             files.allocateExclusive(allocation, bytes)
-            files.writeExclusive(metadata, "$owner\n$bytes\n".toByteArray(), DurableStoreFaultPointV2.ACCEPTED_RECORD)
+            writeReservationRecord(metadata, "$owner\n$bytes\n")
             reservations[token] = reservation
             persistLedgerLocked()
             reservation
@@ -92,7 +122,7 @@ class StorageBudgetCoordinatorV2(
         require(owner.matches(OWNER) && publicationId.matches(POINTER_PUBLICATION))
         require(slot in 0..1 && listOf(rootBeforeBytes, slotBeforeBytes, selectorBeforeBytes, commitBytes).all { it >= 0L })
         require(commitBytes <= maximumPhysicalBytes && maximumPhysicalBytes > 0L)
-        if (!canCharge(maximumPhysicalBytes)) return@withAuthority null
+        if (!canCharge(maximumPhysicalBytes, streamed = true)) return@withAuthority null
         val token = sha256("$owner:$publicationId:$maximumPhysicalBytes:${nextTokenLocked()}".toByteArray()).hex()
         val reservation = StorageBudgetReservationV2(
             token, owner, maximumPhysicalBytes,
@@ -107,10 +137,9 @@ class StorageBudgetCoordinatorV2(
         val metadata = metadataFile(token)
         try {
             files.allocateExclusive(allocation, maximumPhysicalBytes)
-            files.writeExclusive(
+            writeReservationRecord(
                 metadata,
-                "$owner\n$maximumPhysicalBytes\nPOINTER\n$publicationId\n$slot\n$rootBeforeBytes\n$slotBeforeBytes\n$selectorBeforeBytes\n$commitBytes\n".toByteArray(),
-                DurableStoreFaultPointV2.ACCEPTED_RECORD,
+                "$owner\n$maximumPhysicalBytes\nPOINTER\n$publicationId\n$slot\n$rootBeforeBytes\n$slotBeforeBytes\n$selectorBeforeBytes\n$commitBytes\n",
             )
             reservations[token] = reservation
             persistLedgerLocked()
@@ -165,7 +194,7 @@ class StorageBudgetCoordinatorV2(
         require(fileBytes.values.all { it >= 0L } && maximumPhysicalBytes > 0L)
         if (reservations.values.any { it.targetName == targetPath })
             return@withAuthority StorageBudgetCandidateReservationV2.TargetReserved
-        if (!canCharge(maximumPhysicalBytes)) return@withAuthority StorageBudgetCandidateReservationV2.QuotaRefused
+        if (!canCharge(maximumPhysicalBytes, streamed = false)) return@withAuthority StorageBudgetCandidateReservationV2.QuotaRefused
         val token = sha256("$owner:$maximumPhysicalBytes:${nextTokenLocked()}".toByteArray()).hex()
         val reservation = StorageBudgetReservationV2(
             token, owner, maximumPhysicalBytes, stagingPath, targetPath,
@@ -186,11 +215,7 @@ class StorageBudgetCoordinatorV2(
             val actual = files.allocatedTreeBytes(staging)
             require(actual in 1..maximumPhysicalBytes)
             require(freeBytes() >= policy.freeSpaceFloorBytes) { "Candidate violates free-space floor" }
-            files.writeExclusive(
-                metadata,
-                "$owner\n$maximumPhysicalBytes\n$stagingPath\n$targetPath\n".toByteArray(),
-                DurableStoreFaultPointV2.ACCEPTED_RECORD,
-            )
+            writeReservationRecord(metadata, "$owner\n$maximumPhysicalBytes\n$stagingPath\n$targetPath\n")
             require(freeBytes() >= policy.freeSpaceFloorBytes)
             reservations[token] = reservation
             ownedCandidateTokens += token
@@ -279,14 +304,32 @@ class StorageBudgetCoordinatorV2(
             commitPointerLocked(current, actualBytes)
             return@withAuthority
         }
-        val other = reservedBytesLocked() - current.bytes
-        val violatesFreeFloor = actualBytes > freeBytes() - policy.freeSpaceFloorBytes - other
-        if (actualBytes > policy.quotaBytes - committed || violatesFreeFloor) {
+        val free = freeBytes()
+        // Reservations are physically backed: the free space already excludes every one of them.
+        val violatesFreeFloor = actualBytes > free - policy.freeSpaceFloorBytes
+        if (actualBytes > quotaLocked(free) - committed || violatesFreeFloor) {
             throw IllegalStateException("Committed bytes would violate the global storage budget")
         }
-        committed = Math.addExact(committed, actualBytes)
-        deleteReservationLocked(current)
-        persistLedgerLocked()
+        commitPlainLocked(current, actualBytes)
+    }
+
+    /**
+     * Closes a plain reservation into committed bytes after its data is durable. The reservation
+     * was charged against the quota when it was made, so no budget check applies here: a quota
+     * that shrank since (the capture share follows free space) never strands a durable commit.
+     */
+    fun settle(reservation: StorageBudgetReservationV2, actualBytes: Long) = withAuthority {
+        val current = requireReservationLocked(reservation)
+        require(actualBytes in 0..current.bytes) { "Settlement exceeds reservation" }
+        require(current.stagingName == null && current.pointerPublicationId == null) {
+            "Only plain reservations settle"
+        }
+        commitPlainLocked(current, actualBytes)
+    }
+
+    /** Every live reservation, for reconciliation against its owner's durable records. */
+    fun liveReservations(): List<StorageBudgetReservationV2> = withAuthority {
+        reservations.values.sortedBy(StorageBudgetReservationV2::token)
     }
 
     fun release(reservation: StorageBudgetReservationV2): Boolean = withAuthority {
@@ -438,10 +481,35 @@ class StorageBudgetCoordinatorV2(
         reservations.clear()
         val metadata = files.list(reservationsDirectory).filter { it.name.matches(Regex("[0-9a-f]{64}\\.reservation")) }
         metadata.sortedBy(File::getName).forEach { file ->
-            val lines = files.readLines(file)
-            require(lines.size in setOf(2, 4, 5, 9, 10) && lines[0].matches(OWNER)) { "Corrupt storage reservation" }
-            val bytes = lines[1].toLongOrNull() ?: error("Corrupt storage reservation bytes")
+            val record = files.readBytes(file)
+            val lines = record.toString(Charsets.UTF_8).lines().dropLastWhile(String::isEmpty)
             val token = file.name.removeSuffix(".reservation")
+            if (isUnfinishedReservationRecord(record, lines, token)) {
+                // A reserve that never returned: an orphan without authority. Its allocation goes
+                // with it; an orphan candidate staging tree is reclaimed below.
+                files.delete(file, DurableStoreFaultPointV2.DELETE_RECLAIM)
+                if (files.isFile(allocationFile(token))) files.delete(allocationFile(token), DurableStoreFaultPointV2.DELETE_RECLAIM)
+                return@forEach
+            }
+            require(lines.size in setOf(2, 3, 4, 5, 9, 10) && lines[0].matches(OWNER)) { "Corrupt storage reservation" }
+            val bytes = lines[1].toLongOrNull() ?: error("Corrupt storage reservation bytes")
+            if (lines.size == 3) {
+                // Plain reservation cut inside its commit: complete the charge exactly once.
+                val state = lines[2].split(':')
+                val actual = state.getOrNull(1)?.toLongOrNull()
+                val previous = state.getOrNull(2)?.toLongOrNull()
+                require(state.size == 3 && state[0] == "COMMITTING" && actual != null && actual in 0..bytes && previous != null) {
+                    "Corrupt plain reservation commit"
+                }
+                require(committed in setOf(previous, Math.addExact(previous, actual))) { "Plain commit does not match the ledger" }
+                if (committed == previous) {
+                    committed = Math.addExact(previous, actual)
+                    persistLedgerLocked()
+                }
+                files.delete(file, DurableStoreFaultPointV2.DELETE_RECLAIM)
+                if (files.isFile(allocationFile(token))) files.delete(allocationFile(token), DurableStoreFaultPointV2.DELETE_RECLAIM)
+                return@forEach
+            }
             if (lines.size == 2 || lines.size in setOf(9, 10)) {
                 require(bytes > 0 && files.isFile(allocationFile(token)) && files.length(allocationFile(token)) == bytes) {
                     "Reservation is not physically backed"
@@ -525,25 +593,52 @@ class StorageBudgetCoordinatorV2(
                     }
                     .forEach { files.deleteTree(it, DurableStoreFaultPointV2.DELETE_RECLAIM) }
             }
-        if (committed > policy.quotaBytes || policy.freeSpaceFloorBytes > freeBytes()) {
-            throw IllegalStateException("Storage budget cannot open within its physical quota/floor")
-        }
+        // Committed bytes above the quota (a capture share follows free space) or free space below
+        // the floor do not block opening: recovery, queries, settlement and reclaims go on, and
+        // canCharge refuses new charges.
     }
 
-    private fun canCharge(bytes: Long): Boolean {
+    /**
+     * Committed bytes and allocations already occupy disk, so the free space need not hold them
+     * again. It must hold the new allocation and the pending write of every streamed reservation:
+     * a streamed (allocation-backed) reservation keeps its allocation until its data, written
+     * beside it, is settled. Candidate reservations allocate their own target files in place and
+     * add no write.
+     */
+    private fun canCharge(bytes: Long, streamed: Boolean): Boolean {
         val reserved = reservedBytesLocked()
         if (committed > Long.MAX_VALUE - reserved || committed + reserved > Long.MAX_VALUE - bytes) return false
         val charged = committed + reserved + bytes
-        return charged <= policy.quotaBytes && charged <= freeBytes() - policy.freeSpaceFloorBytes
+        val pending = pendingWriteBytesLocked()
+        val newBytes = if (streamed) { if (bytes > Long.MAX_VALUE / 2) return false; 2 * bytes } else bytes
+        if (pending > Long.MAX_VALUE - newBytes) return false
+        val free = freeBytes()
+        return pending + newBytes <= free - policy.freeSpaceFloorBytes && charged <= quotaLocked(free)
     }
+    /** Bytes still to be written beside the allocations of live streamed reservations. */
+    private fun pendingWriteBytesLocked() = reservations.values.filter { it.stagingName == null }
+        .fold(0L) { total, value -> Math.addExact(total, value.bytes) }
+    /**
+     * Earlier versions wrote reservation metadata in place after its allocation, so a cut left an
+     * empty, unterminated or line-truncated record. Such a record never became an authority:
+     * no line, fewer than two lines, a pointer record short of its fields, a candidate prefix
+     * (two lines without an allocation, or three lines that are not a commit state).
+     */
+    private fun isUnfinishedReservationRecord(record: ByteArray, lines: List<String>, token: String): Boolean =
+        record.isEmpty() || record.last() != '\n'.code.toByte() || lines.size < 2 ||
+            (lines.size == 2 && !files.isFile(allocationFile(token))) ||
+            (lines.size == 3 && !lines[2].startsWith("COMMITTING:")) ||
+            (lines.getOrNull(2) == "POINTER" && lines.size < 9)
+    private fun quotaLocked(free: Long) = policy.quota.bytes(free, committed, reservedBytesLocked())
     private fun reservedBytesLocked() = reservations.values.fold(0L) { total, value -> Math.addExact(total, value.bytes) }
     private fun requireReservationLocked(value: StorageBudgetReservationV2) =
         reservations[value.token]?.also { check(it == value) { "Storage reservation token conflict" } }
             ?: error("Storage reservation is stale or already closed")
     private fun commitCandidateLocked(value: StorageBudgetReservationV2, actualBytes: Long) {
         require(value.stagingName != null && actualBytes in 1..value.bytes)
-        require(actualBytes <= policy.quotaBytes - committed)
-        require(freeBytes() >= policy.freeSpaceFloorBytes)
+        val free = freeBytes()
+        require(actualBytes <= quotaLocked(free) - committed)
+        require(free >= policy.freeSpaceFloorBytes)
         files.atomicReplace(
             metadataFile(value.token),
             "${value.owner}\n${value.bytes}\n${value.stagingName}\n${value.targetName}\nCOMMITTING:$actualBytes:$committed\n".toByteArray(),
@@ -558,9 +653,9 @@ class StorageBudgetCoordinatorV2(
     }
     private fun commitPointerLocked(value: StorageBudgetReservationV2, actualBytes: Long) {
         require(value.pointerPublicationId != null && actualBytes in 0..value.bytes)
-        val other = reservedBytesLocked() - value.bytes
-        val violatesFreeFloor = actualBytes > freeBytes() - policy.freeSpaceFloorBytes - other
-        require(actualBytes <= policy.quotaBytes - committed && !violatesFreeFloor)
+        val free = freeBytes()
+        val violatesFreeFloor = actualBytes > free - policy.freeSpaceFloorBytes
+        require(actualBytes <= quotaLocked(free) - committed && !violatesFreeFloor)
         files.atomicReplace(
             metadataFile(value.token),
             (pointerMetadata(value) + "COMMITTING:$actualBytes:$committed\n").toByteArray(),
@@ -570,6 +665,25 @@ class StorageBudgetCoordinatorV2(
         persistLedgerLocked()
         deleteReservationLocked(value)
     }
+    /**
+     * Charges a plain reservation through a durable COMMITTING record: the record carries the
+     * ledger value before the charge, so recovery completes a cut between ledger and deletion
+     * exactly once and never drops the charge.
+     */
+    private fun commitPlainLocked(value: StorageBudgetReservationV2, actualBytes: Long) {
+        require(value.stagingName == null && value.pointerPublicationId == null && actualBytes in 0..value.bytes)
+        files.atomicReplace(
+            metadataFile(value.token),
+            "${value.owner}\n${value.bytes}\nCOMMITTING:$actualBytes:$committed\n".toByteArray(),
+            DurableStoreFaultPointV2.POINTER_SLOT_REPLACE,
+        )
+        committed = Math.addExact(committed, actualBytes)
+        persistLedgerLocked()
+        deleteReservationLocked(value)
+    }
+    /** Reservation metadata is published whole by rename; a cut leaves only its temporary file. */
+    private fun writeReservationRecord(metadata: File, record: String) =
+        files.atomicReplace(metadata, record.toByteArray(), DurableStoreFaultPointV2.RESERVATION_RECORD_REPLACE, null)
     private fun deleteReservationLocked(value: StorageBudgetReservationV2) {
         files.delete(metadataFile(value.token), DurableStoreFaultPointV2.DELETE_RECLAIM)
         if (value.stagingName == null) {
