@@ -75,6 +75,41 @@ final class RecordedFrameSourceTests: XCTestCase {
     XCTAssertTrue(source.deliversSceneDepth)
   }
 
+  /// An observer that blocks the delegate queue never builds a backlog:
+  /// at most one replayed frame waits, newer frames replace it and count as
+  /// dropped, and the newest frame is delivered once the observer returns.
+  func testSlowObserverKeepsAtMostOneUndeliveredFrame() throws {
+    let source = try makeSource(try RecordedSessionFixture.room2URL(), restart: .view)
+    let observer = RecordingFrameObserver()
+    let release = DispatchSemaphore(value: 0)
+    let finished = expectation(description: "replay finished")
+    source.onPlaybackFinished = { _ in finished.fulfill() }
+    let lock = NSLock()
+    var blocked = false
+    observer.onEvent = { [weak observer] in
+      guard let observer = observer else { return }
+      lock.lock()
+      let first = !blocked && observer.frames.count == 1
+      if first { blocked = true }
+      lock.unlock()
+      // The first frame holds the delegate queue until the replay ended.
+      if first { _ = release.wait(timeout: .now() + 5) }
+    }
+    source.addFrameObserver(observer)
+    source.start()
+    wait(for: [finished], timeout: 5)
+    release.signal()
+    let last = try source.session.frame(at: source.session.frameCount - 1)
+    let deadline = Date().addingTimeInterval(5)
+    while (observer.frames.last as? RecordedCaptureFrame)?.recordedTimestamp != last.timestamp && Date() < deadline {
+      usleep(10_000)
+    }
+    let delivered = observer.frames.count
+    XCTAssertEqual((observer.frames.last as? RecordedCaptureFrame)?.recordedTimestamp, last.timestamp, "the newest frame is delivered")
+    XCTAssertEqual(delivered, 2, "the blocked frame and the one that waited")
+    XCTAssertEqual(source.droppedFrameCount, source.session.frameCount - delivered)
+  }
+
   func testDecodedVideoIsReusedBetweenVideoFrames() throws {
     let source = try makeSource(try RecordedSessionFixture.room2URL())
     let observer = RecordingFrameObserver()

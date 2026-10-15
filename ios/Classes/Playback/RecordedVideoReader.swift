@@ -17,6 +17,13 @@ final class RecordedVideoReader {
   private var nextIndex: UInt32 = 0
   /// Segments that failed to open or decode; never retried.
   private var failedSegments = Set<Int>()
+  /// Where a movie really ended when it holds fewer frames than `meta.json`
+  /// lists (an unflushed last fragment): segment position to the first
+  /// missing video index. Indexes from there on return nil at once.
+  private var segmentEnds: [Int: UInt32] = [:]
+  /// Number of segment opens (tests: a short movie is never reopened for
+  /// its missing indexes).
+  private(set) var opens = 0
 
   /// Called once per failed segment with its file name and the reason.
   var onSegmentFailed: ((String, String) -> Void)?
@@ -31,6 +38,7 @@ final class RecordedVideoReader {
   func image(videoIndex: UInt32) -> CVPixelBuffer? {
     guard let position = segments.firstIndex(where: { $0.contains(videoIndex) }),
           !failedSegments.contains(position) else { return nil }
+    if let end = segmentEnds[position], videoIndex >= end { return nil }
     if position != segmentPosition || videoIndex < nextIndex {
       guard open(position) else { return nil }
     }
@@ -39,6 +47,10 @@ final class RecordedVideoReader {
       guard let sample = output.copyNextSampleBuffer() else {
         if let reader = reader, reader.status == .failed {
           fail(position, reason: reader.error.map { "\($0)" } ?? "reader failed")
+        } else {
+          // The movie ended before the indexes meta.json lists: remember
+          // the real end instead of decoding the segment again per index.
+          segmentEnds[position] = nextIndex
         }
         close()
         return nil
@@ -61,6 +73,7 @@ final class RecordedVideoReader {
 
   private func open(_ position: Int) -> Bool {
     close()
+    opens += 1
     let segment = segments[position]
     let asset = AVURLAsset(url: directory.appendingPathComponent(segment.file))
     do {

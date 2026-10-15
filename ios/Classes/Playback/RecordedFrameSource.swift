@@ -110,6 +110,22 @@ final class RecordedFrameSource: CaptureSessionSource {
 
   // Delegate queue only.
   private var lastDeliveredTracking: ARCamera.TrackingState?
+  /// The one replayed frame waiting for the delegate queue (under [lock]):
+  /// a newer frame replaces it, as live ARKit drops frames its delegate
+  /// cannot take, so decoded buffers never pile up behind slow observers.
+  private var pendingDelivery: PendingDelivery?
+  private var deliveryQueued = false
+  private var droppedFrames = 0
+  /// Signalled whenever the delegate queue takes the waiting frame.
+  private let deliveryTaken = DispatchSemaphore(value: 0)
+  /// Since when the observers have been busy with one frame (under [lock]);
+  /// nil between deliveries.
+  private var deliveringSince: TimeInterval?
+  /// How long observers may stay busy with one frame before the waiting
+  /// frame is replaced. While the delegate queue merely has not started the
+  /// waiting delivery yet (a burst, a loaded host), the replay waits instead,
+  /// so frames are dropped only for slow observers, as live ARKit does.
+  static let deliveryGrace: TimeInterval = 0.1
 
   init(
     session: RecordedSession,
@@ -167,6 +183,12 @@ final class RecordedFrameSource: CaptureSessionSource {
   var epoch: Int {
     lock.lock(); defer { lock.unlock() }
     return lifecycle.epoch
+  }
+
+  /// Replayed frames replaced before the delegate queue took them.
+  var droppedFrameCount: Int {
+    lock.lock(); defer { lock.unlock() }
+    return droppedFrames
   }
 
   /// Replay restarts so far: earlier view generations plus session restarts.
@@ -441,9 +463,63 @@ final class RecordedFrameSource: CaptureSessionSource {
     if token == replayToken && position == index { position = index + 1 }
   }
 
+  private struct PendingDelivery {
+    var prepared: PreparedFrame
+    var timestamp: TimeInterval
+    var reinitialises: Bool
+    var token: Int
+  }
+
+  /// Hands [prepared] to the delegate queue, keeping at most one frame
+  /// undelivered: while the previous frame still waits, the replay waits for
+  /// the delegate queue to take it, unless the observers have been busy with
+  /// an earlier frame for [deliveryGrace]; then the newer frame replaces the
+  /// waiting one (a re-initialisation it carried is kept) and the replaced
+  /// frame counts as dropped.
   private func deliver(_ prepared: PreparedFrame, timestamp: TimeInterval, reinitialises: Bool, token: Int) {
-    delegateQueue.async { [weak self] in
-      guard let self = self else { return }
+    lock.lock()
+    while pendingDelivery != nil, token == replayToken {
+      let busyFor = deliveringSince.map { clock() - $0 }
+      if let busy = busyFor, busy >= Self.deliveryGrace { break }
+      lock.unlock()
+      _ = deliveryTaken.wait(timeout: .now() + Self.deliveryGrace - (busyFor ?? 0))
+      lock.lock()
+    }
+    var next = PendingDelivery(prepared: prepared, timestamp: timestamp, reinitialises: reinitialises, token: token)
+    if let waiting = pendingDelivery {
+      droppedFrames += 1
+      if waiting.token == token && waiting.reinitialises { next.reinitialises = true }
+      if droppedFrames == 1 || droppedFrames % 100 == 0 {
+        RecordedPlaybackLog.write("dropped frame=\(waiting.prepared.record.frameIndex) dropped=\(droppedFrames) (observers behind the replay)")
+      }
+    }
+    pendingDelivery = next
+    let enqueue = !deliveryQueued
+    deliveryQueued = true
+    lock.unlock()
+    guard enqueue else { return }
+    delegateQueue.async { [weak self] in self?.deliverPending() }
+  }
+
+  /// Delegate queue: delivers the frame waiting at this moment.
+  private func deliverPending() {
+    lock.lock()
+    let next = pendingDelivery
+    pendingDelivery = nil
+    deliveryQueued = false
+    deliveringSince = next == nil ? nil : clock()
+    lock.unlock()
+    deliveryTaken.signal()
+    guard let delivery = next else { return }
+    deliverNow(delivery.prepared, timestamp: delivery.timestamp, reinitialises: delivery.reinitialises, token: delivery.token)
+    lock.lock()
+    deliveringSince = nil
+    lock.unlock()
+    deliveryTaken.signal()
+  }
+
+  private func deliverNow(_ prepared: PreparedFrame, timestamp: TimeInterval, reinitialises: Bool, token: Int) {
+    do {
       let record = prepared.record
       self.lock.lock()
       guard token == self.replayToken else { self.lock.unlock(); return }
@@ -515,9 +591,10 @@ final class RecordedFrameSource: CaptureSessionSource {
     let report = !finishedReported
     finishedReported = true
     let count = restarts
+    let dropped = droppedFrames
     lock.unlock()
     guard report else { return false }
-    RecordedPlaybackLog.write("finished path=\(session.directory.path) restarts=\(count) next=\(restart.rawValue)")
+    RecordedPlaybackLog.write("finished path=\(session.directory.path) restarts=\(count) next=\(restart.rawValue) dropped=\(dropped)")
     if restart == .view {
       let event: [String: Any] = ["path": session.directory.path, "restart": restart.rawValue, "restarts": count]
       DispatchQueue.main.async { [weak self] in self?.onPlaybackFinished?(event) }

@@ -141,6 +141,26 @@ final class RecordedSessionTests: XCTestCase {
     reader.close()
   }
 
+  /// meta.json lists more video frames than the movie holds (the
+  /// recorder's last fragment was never flushed): the missing indexes return
+  /// nil at once and never decode the segment again.
+  func testShortMovieRemembersItsEndAndIsNotReopenedPerMissingIndex() throws {
+    let session = try RecordedSession(directory: try RecordedSessionFixture.room2URL())
+    let segment = try XCTUnwrap(session.videoSegments.first)
+    XCTAssertEqual(segment.frames, 12)
+    let reader = RecordedVideoReader(directory: session.directory, segments: [
+      RecordedVideoSegment(file: segment.file, firstVideoIndex: segment.firstVideoIndex, frames: 30),
+    ])
+    XCTAssertNotNil(reader.image(videoIndex: 11))
+    for index: UInt32 in 12..<30 { XCTAssertNil(reader.image(videoIndex: index), "video index \(index)") }
+    XCTAssertEqual(reader.opens, 1, "the missing indexes never reopen the movie")
+    XCTAssertNotNil(reader.image(videoIndex: 2), "an earlier present index still reopens")
+    XCTAssertNil(reader.image(videoIndex: 20))
+    XCTAssertNotNil(reader.image(videoIndex: 3))
+    XCTAssertEqual(reader.opens, 2)
+    reader.close()
+  }
+
   func testMissingVideoLeavesNoSegmentAndThePlaceholderHasTheRecordedSize() throws {
     let session = try RecordedSession(directory: try RecordedSessionFixture.room2Copy(omitting: ["video_000.mov"]))
     XCTAssertFalse(session.hasVideo)
