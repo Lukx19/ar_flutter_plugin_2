@@ -73,6 +73,8 @@ protocol CaptureFrame {
   var lightEstimate: CaptureLightEstimate? { get }
   /// Anchors of the frame's session, as `ARFrame.anchors`.
   var anchors: [ARAnchor] { get }
+  /// How much of the scene the session has mapped (`ARFrame.worldMappingStatus`).
+  var worldMappingStatus: ARFrame.WorldMappingStatus { get }
 }
 
 /// What one run of a frame source delivers (the part of an
@@ -85,9 +87,13 @@ struct CaptureRunConfiguration: Equatable {
   }
 
   let depth: Depth
+  /// The run started from a saved world map (`initialWorldMap`) and
+  /// relocalizes into that map's world frame.
+  let hasInitialWorldMap: Bool
 
-  init(depth: Depth) {
+  init(depth: Depth, hasInitialWorldMap: Bool = false) {
     self.depth = depth
+    self.hasInitialWorldMap = hasInitialWorldMap
   }
 
   /// Raw `sceneDepth` is preferred over `smoothedSceneDepth`.
@@ -100,6 +106,7 @@ struct CaptureRunConfiguration: Equatable {
     } else {
       depth = .none
     }
+    hasInitialWorldMap = (configuration as? ARWorldTrackingConfiguration)?.initialWorldMap != nil
   }
 }
 
@@ -160,4 +167,5 @@ struct ARKitCaptureFrame: CaptureFrame {
   }
 
   var anchors: [ARAnchor] { frame.anchors }
+  var worldMappingStatus: ARFrame.WorldMappingStatus { frame.worldMappingStatus }
 }

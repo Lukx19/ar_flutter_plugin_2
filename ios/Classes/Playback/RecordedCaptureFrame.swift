@@ -122,6 +122,8 @@ struct RecordedCaptureFrame: CaptureFrame {
   let featurePoints: CaptureFeaturePoints?
   let lightEstimate: CaptureLightEstimate?
   let anchors: [ARAnchor]
+  /// The recorded `ARFrame.worldMappingStatus`; a still answers not available.
+  var worldMappingStatus: ARFrame.WorldMappingStatus = .notAvailable
 
   func displayTransform(for orientation: UIInterfaceOrientation, viewportSize: CGSize) -> CGAffineTransform {
     RecordedCameraGeometry.displayTransform(

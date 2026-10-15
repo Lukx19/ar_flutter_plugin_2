@@ -20,17 +20,21 @@ public class SwiftArFlutterPlugin: NSObject, FlutterPlugin {
     registrar.addMethodCallDelegate(CameraCapabilitiesHandler(), channel: capabilitiesChannel)
     VisibilityGridShellRegistry.shared.register(messenger: registrar.messenger())
     GridRendererChannels.shared.register(messenger: registrar.messenger())
+    SessionLifecycleServices.shared.register(messenger: registrar.messenger())
   }
 
   public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
     result("iOS " + UIDevice.current.systemVersion)
   }
 
-  /// The engine went away: release the grid shell it owns (channels,
-  /// frame observer, parked pull) unless a later engine registered since.
+  /// The engine went away: release the grid shell (channels, frame
+  /// observer, parked pull), the grid renderer channels and the session log,
+  /// world map and background task services it owns, unless a later engine
+  /// registered since.
   public func detachFromEngine(for registrar: FlutterPluginRegistrar) {
     VisibilityGridShellRegistry.shared.unregister(messenger: registrar.messenger())
     GridRendererChannels.shared.unregister(messenger: registrar.messenger())
+    SessionLifecycleServices.shared.unregister(messenger: registrar.messenger())
   }
 
 }

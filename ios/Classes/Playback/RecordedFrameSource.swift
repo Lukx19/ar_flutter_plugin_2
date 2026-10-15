@@ -477,7 +477,8 @@ final class RecordedFrameSource: CaptureSessionSource {
         depth: prepared.depth,
         featurePoints: prepared.featurePoints,
         lightEstimate: record.lightEstimate,
-        anchors: self.anchors.snapshot)
+        anchors: self.anchors.snapshot,
+        worldMappingStatus: ARFrame.WorldMappingStatus(rawValue: Int(record.worldMappingStatus)) ?? .notAvailable)
       self.lock.lock()
       self.latestFrame = frame
       let started = self.observers.started
