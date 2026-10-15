@@ -10,6 +10,12 @@ protocol NativeCaptureStorePort: AnyObject {
   func queryReceipt(_ identity: CaptureAttemptIdentity) throws -> CaptureReceipt?
   func rebaseSameAttempt(_ request: CaptureCommitRequest) throws -> CaptureReceipt
   func abandon(_ request: CaptureCommitRequest, terminal: CaptureTerminal) throws -> CaptureReceipt
+  /// File of the committed JPEG of [terminal]; nil when unknown.
+  func committedImageURL(_ terminal: CaptureTerminal) -> URL?
+}
+
+extension NativeCaptureStorePort {
+  func committedImageURL(_ terminal: CaptureTerminal) -> URL? { nil }
 }
 
 extension DurableCaptureStore: NativeCaptureStorePort {
@@ -73,6 +79,8 @@ struct DurableTerminalPhoto {
   var request: CaptureCommitRequest
   var terminal: CaptureTerminal
   var metadata: StillExposureMetadata?
+  /// The committed JPEG in the durable store (read only; for tie points).
+  var imageURL: URL? = nil
 }
 
 /// The per-view native admission owner (Android `NativeCaptureAdapterV2`):
@@ -408,7 +416,9 @@ final class NativeCaptureAdmissionOwner {
     emit(NativeCaptureEvent(kind: .health, resources: snapshot()))
     // Photo saved seam: once per claimed durable committed terminal.
     if let value = value, terminal.kind == .committedPicture {
-      durableTerminal(DurableTerminalPhoto(request: value.request, terminal: terminal, metadata: value.metadata))
+      durableTerminal(DurableTerminalPhoto(
+        request: value.request, terminal: terminal, metadata: value.metadata,
+        imageURL: store.committedImageURL(terminal)))
     }
     if !lifecycleDrain { startRunningIfReady() }
   }

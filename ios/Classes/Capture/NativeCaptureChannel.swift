@@ -228,7 +228,8 @@ final class NativeCaptureChannel: CaptureChannelExtension {
       captureId: captureId, attemptId: photo.terminal.identity.attemptId,
       exposureTimestampNs: metadata?.exposureTimestampNs ?? 0, cameraToWorld: metadata?.cameraToWorld,
       intrinsics: metadata?.intrinsics, width: metadata?.width ?? 0, height: metadata?.height ?? 0,
-      sharpness: metadata?.sharpness, automatic: photo.request.accepted.lane == .automatic, blurRejected: false))
+      sharpness: metadata?.sharpness, automatic: photo.request.accepted.lane == .automatic, blurRejected: false,
+      imageURL: photo.imageURL))
   }
 
   // MARK: Durable previews

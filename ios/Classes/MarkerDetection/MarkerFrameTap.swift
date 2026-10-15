@@ -14,16 +14,6 @@ struct MarkerDetectionSettings: Equatable {
   var groupEpoch: Int
 }
 
-extension VisibilityGridIngestShell {
-  /// Settings of a started shell; nil while stopped.
-  var markerDetectionSettings: MarkerDetectionSettings? {
-    guard isStarted else { return nil }
-    return MarkerDetectionSettings(
-      enabled: markerDetectionEnabled, hz: markerDetectionHz, markerSizeMetres: markerSizeMetres,
-      groupEpoch: currentGroupEpoch)
-  }
-}
-
 /// Live marker detection on the camera image, the iOS twin of the Android
 /// `MarkerFrameTap` and `MarkerDetectionProducer`: an [ARFrameObserver] that,
 /// at most [hz] times a second of frame time while the shell runs with marker

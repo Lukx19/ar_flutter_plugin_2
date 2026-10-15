@@ -301,9 +301,10 @@ final class MarkerDetectionTests: XCTestCase {
     let event = IngestMessageBuffer(capacity: PhotoSavedLayout.bytes)
     PhotoSavedEmitter.fillEvent(event, record: record, groupEpoch: 7)
     let eventBytes = [UInt8](event.data(PhotoSavedLayout.bytes))
-    producer.imageURL = { _ in Self.asset("marker_detection/\(image.file)") }
-    producer.onPhotoDurable(event: eventBytes, record: record)
-    producer.imageURL = { _ in nil }
+    // The durable record names its committed image; a record without one sends an empty batch.
+    var named = record
+    named.imageURL = Self.asset("marker_detection/\(image.file)")
+    producer.onPhotoDurable(event: eventBytes, record: named)
     producer.onPhotoDurable(event: eventBytes, record: record)
     queue.sync {}
     XCTAssertEqual(sink.messages.count, 2)

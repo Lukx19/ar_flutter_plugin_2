@@ -34,9 +34,9 @@ final class VisibilityGridIngestShell: GridShellControlTarget {
   private var epochForEvents = 0
   private var currentTracking = IngestTrackingState.stopped
   private var lastFrameNsSnapshot: Int64 = 0
-  private(set) var markerDetectionEnabled = false
-  private(set) var markerDetectionHz = 0
-  private(set) var markerSizeMetres: Float = 0
+  private var markerDetectionEnabled = false
+  private var markerDetectionHz = 0
+  private var markerSizeMetres: Float = 0
 
   // Delegate queue state, under [frameLock] (frames and session callbacks
   // arrive on the delegate queue; a source change arrives on its publisher's thread).
@@ -80,6 +80,18 @@ final class VisibilityGridIngestShell: GridShellControlTarget {
   var trackingSnapshot: Int { lock.lock(); defer { lock.unlock() }; return currentTracking }
   var currentConfig: IngestShellConfig? { lock.lock(); defer { lock.unlock() }; return config }
   var currentGroupEpoch: Int { groupEpoch }
+
+  /// Marker detection settings of a started shell as one snapshot under
+  /// [lock] (control writes them on the platform thread; the frame tap and
+  /// the tie point producer read them on their queues), with the group epoch
+  /// of events; nil while stopped.
+  var markerDetectionSettings: MarkerDetectionSettings? {
+    lock.lock(); defer { lock.unlock() }
+    guard started else { return nil }
+    return MarkerDetectionSettings(
+      enabled: markerDetectionEnabled, hz: markerDetectionHz, markerSizeMetres: markerSizeMetres,
+      groupEpoch: epochForEvents)
+  }
 
   // MARK: control (platform thread)
 

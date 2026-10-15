@@ -52,6 +52,9 @@ final class DurableCaptureStoreTests: XCTestCase {
     XCTAssertTrue(exists("\(session)/objects/780001b3ed620e8e96135827fe6961238b262b52ebac89108d43f2dc0036af53.root"))
     XCTAssertEqual(try text("\(session)/root-A.ptr"), "1\n780001b3ed620e8e96135827fe6961238b262b52ebac89108d43f2dc0036af53\ncommit-1\n")
     XCTAssertFalse(exists("\(attempt)/staging"))
+    XCTAssertEqual(
+      store.committedImageURL(terminal)?.path,
+      path("\(session)/assets/e94ebffc90c4bfd8a755f41c8d748d3d834378fc0e076eee9df77e188070bd73/jpeg.5a69598ccc6ebe57596a1a06128c64d10b5ffe498a65d0ad6de6df058a971c87.blob"))
     let receiptValues = DurableStoreEncoding.parseProperties(Array(try text("\(attempt)/receipt.properties").utf8))
     XCTAssertEqual(receiptValues, [
       "kind": "COMMITTED_PICTURE", "requestHash": "80df787568709cd10266c528fadd569048cbf0d7e4b477e7695e304a61917dbf",

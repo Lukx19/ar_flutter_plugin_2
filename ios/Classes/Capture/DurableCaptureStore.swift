@@ -590,6 +590,18 @@ final class DurableCaptureStore {
     throw DurableStoreConflict("Changed replay conflicts with durable terminal identity")
   }
 
+  /// The committed JPEG blob of [terminal] as a file URL, for read-only
+  /// consumers after the durable terminal (marker tie points); nil for
+  /// another terminal kind, a backend without file URLs or a missing blob.
+  func committedImageURL(_ terminal: CaptureTerminal) -> URL? {
+    guard terminal.kind == .committedPicture, let captureId = terminal.captureId,
+          let root = (files.backend as? PosixDurableFileBackend)?.root else { return nil }
+    let assets = sessionRoot + [DurableStoreEncoding.safeName(terminal.identity.lifecycleCut.sessionId), "assets", captureId]
+    guard let name = (try? files.list(assets))?.sorted().first(where: { $0.hasPrefix("jpeg.") && $0.hasSuffix(".blob") }),
+          files.isFile(assets + [name]) else { return nil }
+    return (assets + [name]).reduce(root) { $0.appendingPathComponent($1, isDirectory: false) }
+  }
+
   // MARK: Paths and records
 
   private func location(_ identity: CaptureAttemptIdentity) throws -> [String] {

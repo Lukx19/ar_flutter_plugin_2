@@ -75,6 +75,10 @@ final class NativeCaptureBindingTests: XCTestCase {
     XCTAssertEqual(events.compactMap { $0["kind"] as? String }, ["ready", "accepted", "finalizing", "committed", "health"])
     XCTAssertEqual(photos.count, 1)
     XCTAssertEqual(photos.first?.terminal.captureId, DurableStoreEncoding.safeName(request.accepted.identity.attemptId))
+    // The durable terminal names the committed JPEG for tie points.
+    let image = try XCTUnwrap(photos.first?.imageURL)
+    XCTAssertEqual(image.lastPathComponent.prefix(5), "jpeg.")
+    XCTAssertEqual([UInt8](try Data(contentsOf: image)), CaptureFixture.jpeg)
 
     let health = try complete { binding.health(completion: $0) }.get()
     XCTAssertEqual((health["health"] as? [String: Any])?["committed"] as? Int, 1)

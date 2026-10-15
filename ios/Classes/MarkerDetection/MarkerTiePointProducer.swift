@@ -10,10 +10,11 @@ import ImageIO
 /// batch travels as ingest kind 8 ([TiePointMessageWriter]). Runs on its own
 /// serial queue, one photo at a time, off the capture path.
 ///
-/// The durable photo record does not name its image file yet; [imageURL]
-/// resolves it (the capture layer's seam). A photo whose image cannot be
-/// resolved or decoded still sends a batch, with status
-/// `C3MD_ERROR_ARGUMENT` and no records (as on Android).
+/// The durable photo record names the committed JPEG (the capture layer
+/// resolves it from the durable store at the terminal); [imageURL] reads it
+/// and is replaceable in tests. A photo whose image cannot be resolved or
+/// decoded still sends a batch, with status `C3MD_ERROR_ARGUMENT` and no
+/// records (as on Android).
 final class MarkerTiePointProducer: DurablePhotoListener {
   /// Created on the detection queue at the first photo.
   private let makeDetector: () -> NativeMarkerDetector?
@@ -28,7 +29,7 @@ final class MarkerTiePointProducer: DurablePhotoListener {
   private var appliedSize: Float = 0
 
   /// Resolves the committed image of a durable photo; nil while unknown.
-  var imageURL: (DurablePhotoRecord) -> URL? = { _ in nil }
+  var imageURL: (DurablePhotoRecord) -> URL? = { $0.imageURL }
 
   private let lock = NSLock()
   private(set) var photos = 0

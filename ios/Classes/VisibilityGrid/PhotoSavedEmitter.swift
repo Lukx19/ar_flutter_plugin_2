@@ -21,6 +21,8 @@ struct DurablePhotoRecord {
   var sharpness: Double?
   var automatic: Bool
   var blurRejected: Bool
+  /// The committed JPEG in the durable store; nil when unknown.
+  var imageURL: URL? = nil
 }
 
 /// Receives one call per durable photo after its photo saved event was built.
