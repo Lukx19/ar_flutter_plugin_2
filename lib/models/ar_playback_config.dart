@@ -31,9 +31,10 @@ enum ARPlaybackRestart {
 /// [datasetPath] is an absolute device path or a relative path: on Android
 /// relative to the app's external files directory (`recordings/walk1.mp4`),
 /// on iOS a folder under the app's `Library/Application Support/recordings/`
-/// (`room2-iphone12pro-20261014`; a leading `recordings/` is accepted). [restartGeneration]
-/// counts view restarts; it is part of the creation parameters so a new
-/// generation creates a new platform view and ARCore session.
+/// (`room2-iphone12pro-20261014`; a leading `recordings/` is accepted).
+/// [restartGeneration] counts view restarts; it is part of the creation
+/// parameters so a new generation creates a new platform view and ARCore
+/// session.
 @immutable
 class ARPlaybackConfig {
   const ARPlaybackConfig({
@@ -111,5 +112,6 @@ class ARPlaybackConfig {
 
   @override
   String toString() =>
-      'ARPlaybackConfig($datasetPath, ${restart.wireValue}, $restartGeneration)';
+      'ARPlaybackConfig($datasetPath, ${restart.wireValue}, '
+      '$restartGeneration)';
 }
