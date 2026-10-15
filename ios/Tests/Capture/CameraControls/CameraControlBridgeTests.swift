@@ -171,6 +171,7 @@ final class CameraControlBridgeTests: XCTestCase {
     XCTAssertEqual(try call("setTorchEnabled", ["enabled": false]) as? Bool, true)
     XCTAssertEqual(try call("setTorchEnabled", ["enabled": true]) as? Bool, true, "Android stages off")
     XCTAssertEqual(try call("isFlashAvailable") as? Bool, false)
+    XCTAssertEqual(try call("getSupportedFlashModes") as? [String], ["off"])
     XCTAssertEqual(try map("getCurrentFlashState")["flashStatus"] as? String, "unavailable")
     XCTAssertEqual(device.configurations, 0, "nothing on the device changes")
     try bridge.reset()
@@ -255,6 +256,7 @@ final class CameraControlBridgeTests: XCTestCase {
 
   func testOnlyTheTorchIsAvailableWhileARKitRuns() throws {
     XCTAssertEqual(try call("isFlashAvailable") as? Bool, true)
+    XCTAssertEqual(try call("getSupportedFlashModes") as? [String], ["off", "torch"])
     XCTAssertEqual(try call("setTorchEnabled", ["enabled": true]) as? Bool, true)
     XCTAssertTrue(device.isTorchOn)
     let state = try map("getCurrentFlashState")
@@ -325,8 +327,9 @@ final class CameraControlBridgeTests: XCTestCase {
     XCTAssertTrue(Set(try call("getSupportedFocusModes") as? [String] ?? []).isSubset(of: Set(modes["focus"] ?? [])))
     XCTAssertTrue(Set(try call("getSupportedWhiteBalanceModes") as? [String] ?? []).isSubset(of: Set(modes["whiteBalance"] ?? [])))
     XCTAssertTrue(Set(["off", "torch"]).isSubset(of: Set(modes["flash"] ?? [])))
+    XCTAssertTrue(Set(try call("getSupportedFlashModes") as? [String] ?? []).isSubset(of: Set(modes["flash"] ?? [])))
     XCTAssertEqual(Set(contract["errorCodes"] as? [String] ?? []), [CameraControlError.unsupportedCode, CameraControlError.updateFailedCode])
-    XCTAssertEqual(CameraControlBridge.methods.count, 30)
+    XCTAssertEqual(CameraControlBridge.methods.count, 31, "the 30 Android runtime controls and the iOS flash mode query")
   }
 }
 

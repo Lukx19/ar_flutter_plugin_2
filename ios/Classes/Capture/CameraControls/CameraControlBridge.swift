@@ -106,7 +106,7 @@ final class CameraControlBridge {
     "focusAtPoint", "getCurrentFocusState", "getSupportedFocusModes", "setFocusMode", "setWhiteBalanceMode",
     "setColorTemperature", "getCurrentWhiteBalanceState", "getSupportedColorTemperatureRange", "lockWhiteBalance",
     "unlockWhiteBalance", "setWhiteBalanceFromPoint", "getSupportedWhiteBalanceModes", "setFlashMode",
-    "getCurrentFlashState", "isFlashAvailable", "setTorchEnabled",
+    "getCurrentFlashState", "isFlashAvailable", "setTorchEnabled", "getSupportedFlashModes",
   ]
 
   /// Exposure compensation step reported and applied (EV).
@@ -180,6 +180,7 @@ final class CameraControlBridge {
     case "setFlashMode": return try setFlashMode(try text("mode"))
     case "getCurrentFlashState": return flashState()
     case "isFlashAvailable": return device.hasTorch
+    case "getSupportedFlashModes": return supportedFlashModes()
     case "setTorchEnabled": return try setFlashMode(try flag("enabled") ? "torch" : "off")
     default: throw CameraControlError.unsupported("\(method) is not a camera control")
     }
@@ -463,6 +464,12 @@ final class CameraControlBridge {
   }
 
   static let androidFlashModes: Set<String> = ["off", "auto", "on", "redEyeReduction", "torch"]
+
+  /// Flash modes [setFlashMode] accepts while ARKit runs: `off`, and `torch`
+  /// when the camera has one (iOS only; Android stills take every mode).
+  private func supportedFlashModes() -> [String] {
+    device.hasTorch ? ["off", "torch"] : ["off"]
+  }
 
   // MARK: Reset
 

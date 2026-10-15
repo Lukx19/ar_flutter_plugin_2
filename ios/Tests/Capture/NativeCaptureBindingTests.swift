@@ -360,6 +360,6 @@ final class NativeCaptureBindingTests: XCTestCase {
     let error = CameraControlMethods.unavailable("setISO", reason: "no camera")
     XCTAssertEqual(error.code, "CONTROL_UNSUPPORTED")
     XCTAssertTrue(CameraControlMethods.methods.isSuperset(of: ["setISO", "getSupportedWhiteBalanceModes", "isFlashAvailable", "setFocusMode"]))
-    XCTAssertEqual(CameraControlMethods.methods.count, 30, "every Android runtime camera control")
+    XCTAssertEqual(CameraControlMethods.methods.count, 31, "every Android runtime camera control and the iOS flash mode query")
   }
 }

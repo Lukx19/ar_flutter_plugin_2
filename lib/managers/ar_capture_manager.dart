@@ -304,6 +304,11 @@ enum ARCaptureCloseState { active, closing, retained, disposed }
 class ARCaptureManager {
   @visibleForTesting
   static bool? debugIsSupportedOverride;
+
+  /// Replaces the platform answer of [getSupportedFlashModes] in tests: true
+  /// asks the native camera like iOS, false lists every mode like Android.
+  @visibleForTesting
+  static bool? debugFlashModesQueryOverride;
   static const MethodChannel _nativeCapturePreviewChannel = MethodChannel(
     'ar_flutter_plugin_2/native_capture_preview',
   );
@@ -1731,6 +1736,35 @@ class ARCaptureManager {
       throw _captureExceptionFromPlatformException(
         e,
         operation: 'get scene/flash state',
+      );
+    }
+  }
+
+  /// Flash modes [setFlashMode] accepts on the running camera. iOS asks the
+  /// camera ARKit runs: `off`, plus `torch` when it has one (still flash is
+  /// not available while ARKit runs). Android Camera2 stills take every
+  /// [FlashMode]; whether the device has a flash is [isFlashAvailable].
+  Future<List<FlashMode>> getSupportedFlashModes() async {
+    if (!isEnabled) return const [FlashMode.off];
+    if (!(debugFlashModesQueryOverride ?? Platform.isIOS)) {
+      return FlashMode.values;
+    }
+
+    try {
+      await _ensureRuntimeControlsInitialized();
+      final List<dynamic> result = await _invokeOpenCapture(
+        'getSupportedFlashModes',
+      );
+      final modes = [
+        for (final name in result)
+          for (final mode in FlashMode.values)
+            if (mode.name == name) mode,
+      ];
+      return modes.isEmpty ? const [FlashMode.off] : modes;
+    } on PlatformException catch (e) {
+      throw _captureExceptionFromPlatformException(
+        e,
+        operation: 'get supported flash modes',
       );
     }
   }

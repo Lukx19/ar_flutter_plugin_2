@@ -428,6 +428,8 @@ void main() {
           return true;
         case 'isFlashAvailable':
           return true;
+        case 'getSupportedFlashModes':
+          return <String>['off', 'torch'];
         case 'setTorchEnabled':
           currentFlashModeName =
               (call.arguments as Map<dynamic, dynamic>)['enabled'] as bool
@@ -1682,6 +1684,38 @@ void main() {
     expect(state.isTorchEnabled, isFalse);
     expect(state.isFlashReady, isTrue);
     expect(state.flashStatus, FlashStatus.ready);
+  });
+
+  test(
+      'flash modes come from the camera on iOS and list every mode on Android',
+      () async {
+    final sessionManager = ARSessionManager(
+      42,
+      _FakeBuildContext(),
+      PlaneDetectionConfig.horizontal,
+    );
+    final captureManager = ARCaptureManager(
+      sessionManager,
+      captureConfig,
+      _FakeBuildContext(),
+    );
+    addTearDown(() => ARCaptureManager.debugFlashModesQueryOverride = null);
+
+    ARCaptureManager.debugFlashModesQueryOverride = true;
+    expect(await captureManager.getSupportedFlashModes(), [
+      FlashMode.off,
+      FlashMode.torch,
+    ]);
+    expect(methodCalls.last.method, 'getSupportedFlashModes');
+
+    ARCaptureManager.debugFlashModesQueryOverride = false;
+    final callsBefore = methodCalls.length;
+    expect(await captureManager.getSupportedFlashModes(), FlashMode.values);
+    expect(
+      methodCalls.skip(callsBefore).map((call) => call.method),
+      isNot(contains('getSupportedFlashModes')),
+      reason: 'Android keeps its runtime path: no new channel call',
+    );
   });
 
   test('stages torch through the per-view capture channel', () async {
