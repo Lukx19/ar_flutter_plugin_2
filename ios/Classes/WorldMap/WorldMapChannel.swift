@@ -36,7 +36,9 @@ final class RegistryWorldMapSource: WorldMapSource {
 ///   ([WorldMapRelocalizationMonitor.statusReply]).
 ///
 /// Archive and file work runs on a utility queue; replies go out on the main
-/// thread.
+/// thread. An asynchronous save or load holds the handler until it replied,
+/// so a re-registration or engine detach in flight never leaves a Dart call
+/// without an answer.
 final class WorldMapChannelHandler {
   static let channelName = "ar_flutter_plugin_2/world_map"
 
@@ -94,8 +96,7 @@ final class WorldMapChannelHandler {
       reply(failure(WorldMapError(code: WorldMapFailureCode.invalidPath, message: "invalid world map path"), "save"))
       return
     }
-    let requested = source.currentWorldMap { [weak self] map, error in
-      guard let self = self else { return }
+    let requested = source.currentWorldMap { map, error in
       self.workQueue.async {
         let response: [String: Any]
         do {
@@ -128,8 +129,7 @@ final class WorldMapChannelHandler {
     let directory = args["sessionDirectory"] as? String ?? ""
     let path = args["path"] as? String ?? ""
     let sha = args["sha256"] as? String
-    workQueue.async { [weak self] in
-      guard let self = self else { return }
+    workQueue.async {
       let response: [String: Any]
       do {
         let data = try WorldMapFileStore.read(sessionDirectory: directory, relativePath: path, expectedSha256: sha)

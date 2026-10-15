@@ -32,6 +32,27 @@ final class NativeSessionLogBufferTests: XCTestCase {
     XCTAssertTrue(buffer.drain().isEmpty, "drain empties the buffer and the counts")
   }
 
+  /// `always` budget codes keep every occurrence in full inside the interval
+  /// (a quick second background stay keeps its own `heldMs`).
+  func testAlwaysBudgetCodesAreFullOnEveryOccurrence() {
+    let buffer = makeBuffer()
+    for held in [100, 200] {
+      buffer.record("BACKGROUND_TASK_ENDED", message: "ended", data: ["endReason": "foreground", "heldMs": held],
+                    variant: "foreground", level: .info)
+      now += 1_000_000_000
+    }
+    buffer.record("WORLD_MAP_RELOCALIZED", message: "a", level: .info)
+    buffer.record("WORLD_MAP_RELOCALIZED", message: "b", level: .info)
+    buffer.record("THERMAL_THROTTLING", message: "a")
+    buffer.record("THERMAL_THROTTLING", message: "b")
+    let drained = buffer.drain()
+    XCTAssertEqual(drained.filter { $0[0] as? String == "F" }.map { $0[1] as? String },
+                   ["BACKGROUND_TASK_ENDED", "BACKGROUND_TASK_ENDED", "WORLD_MAP_RELOCALIZED", "WORLD_MAP_RELOCALIZED",
+                    "THERMAL_THROTTLING"])
+    XCTAssertEqual(drained.filter { $0[0] as? String == "F" }.compactMap { ($0[4] as? [String: Any])?["heldMs"] as? Int }, [100, 200])
+    XCTAssertEqual(drained.filter { $0[0] as? String == "C" }.map { $0[1] as? String }, ["THERMAL_THROTTLING"])
+  }
+
   func testAfterTheIntervalAnOccurrenceIsFullAgain() {
     let buffer = makeBuffer()
     buffer.record("THERMAL_THROTTLING", message: "a")

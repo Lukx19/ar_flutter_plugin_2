@@ -42,7 +42,9 @@ final class ApplicationBackgroundTasks: BackgroundTaskRunning {
 ///
 /// Every outcome is one `BACKGROUND_TASK_ENDED` session log record with
 /// `endReason` (`foreground`, `holdElapsed`, `expired`, `detached`) and
-/// `heldMs`.
+/// `heldMs`. The `detached` record never reaches a session log: the
+/// services close the native log window right after it, and Dart cannot
+/// drain once the engine detached.
 /// Callbacks run on the main thread (`UIApplication` notifications and the
 /// expiration handler), so the state needs no lock; [schedule] defers the
 /// hold timeout on the main queue.
@@ -51,7 +53,8 @@ final class BackgroundCheckpointTask {
     case foreground
     case holdElapsed
     case expired
-    /// The plugin detached from the engine while a task was held.
+    /// The plugin detached from the engine while a task was held (written,
+    /// then dropped with the closing log window; never drained).
     case detached
   }
 

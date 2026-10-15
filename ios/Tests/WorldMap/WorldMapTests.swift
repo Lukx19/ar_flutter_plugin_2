@@ -210,6 +210,34 @@ final class WorldMapTests: XCTestCase {
     )
   }
 
+  /// The services re-register (the handler is released) while a save waits
+  /// for the session's world map and while a load reads: both still reply.
+  func testReleasedHandlerStillRepliesToCallsInFlight() {
+    let source = DeferredWorldMapSource()
+    let emitter = NativeSessionLogEmitter()
+    var handler: WorldMapChannelHandler? = WorldMapChannelHandler(
+      source: source, initialMaps: WorldMapInitialMapStore(),
+      monitor: WorldMapRelocalizationMonitor(emitter: emitter), emitter: emitter,
+      workQueue: DispatchQueue(label: "test.world-map"), replyQueue: DispatchQueue(label: "test.reply")
+    )
+    weak var released = handler
+    let saved = expectation(description: "save reply")
+    let loaded = expectation(description: "load reply")
+    var saveReply: [String: Any] = [:]
+    var loadReply: [String: Any] = [:]
+    let dir = sessionDirectory.path
+    handler?.handle(method: "save", arguments: ["sessionDirectory": dir, "path": "groups/g/w"]) { saveReply = $0; saved.fulfill() }
+    handler?.handle(method: "load", arguments: ["sessionDirectory": dir, "path": "missing"]) { loadReply = $0; loaded.fulfill() }
+    handler = nil
+    source.complete(nil, NSError(domain: ARErrorDomain, code: ARError.Code.insufficientFeatures.rawValue))
+    wait(for: [saved, loaded], timeout: 10)
+    XCTAssertEqual(saveReply["code"] as? String, WorldMapFailureCode.notAvailable)
+    XCTAssertEqual(loadReply["code"] as? String, WorldMapFailureCode.readFailed)
+    let deadline = Date().addingTimeInterval(2)
+    while released != nil && Date() < deadline { usleep(10_000) }
+    XCTAssertNil(released, "the handler goes away once the calls replied")
+  }
+
   func testChannelSavesAndStagesTheRecordedMap() throws {
     let map = try WorldMapArchive.decode(try recordedWorldMapData())
     let source = FakeWorldMapSource()
@@ -242,6 +270,22 @@ final class WorldMapTests: XCTestCase {
     XCTAssertEqual(loaded["staged"] as? Bool, true)
     XCTAssertTrue(staging.hasPending)
     XCTAssertEqual(call("status", nil)["staged"] as? Bool, true)
+  }
+}
+
+/// A running session whose world map arrives when the test completes it.
+private final class DeferredWorldMapSource: WorldMapSource {
+  private var pending: ((ARWorldMap?, Error?) -> Void)?
+
+  func currentWorldMap(_ completion: @escaping (ARWorldMap?, Error?) -> Void) -> Bool {
+    pending = completion
+    return true
+  }
+
+  func complete(_ map: ARWorldMap?, _ error: Error?) {
+    let completion = pending
+    pending = nil
+    DispatchQueue.global().async { completion?(map, error) }
   }
 }
 

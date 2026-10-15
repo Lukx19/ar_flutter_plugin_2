@@ -9,8 +9,10 @@ import Foundation
 /// full record; after that a code repeating faster than its interval is only
 /// counted: `minFullIntervalNs` (5 per minute) for anomalies and
 /// `userActionIntervalNs` (30 per minute) for the user-action codes
-/// `CAPTURE_REFUSED_*`, matching the catalogue budgets. Counted occurrences
-/// leave as one `["C", code, count, lastMessage]` record per drain.
+/// `CAPTURE_REFUSED_*`, matching the catalogue budgets. Codes with the
+/// catalogue budget `always` ([alwaysCodes]) are full on every occurrence.
+/// Counted occurrences leave as one `["C", code, count, lastMessage]` record
+/// per drain.
 ///
 /// Records are arrays the Dart side decodes with `SessionLogRecordCodec`:
 /// `["F", code, level, message, data, variant]` (a missing variant is
@@ -19,6 +21,11 @@ final class NativeSessionLogBuffer {
   static let maxVariants = 8
   /// Codes caused by a user action (catalogue budget `userAction`).
   static let userActionPrefix = "CAPTURE_REFUSED_"
+  /// Native codes with the catalogue budget `always`: every occurrence is a
+  /// full record (each one carries its own data, such as `heldMs`).
+  static let alwaysCodes: Set<String> = [
+    NativeSessionLogCodes.backgroundTaskEnded, NativeSessionLogCodes.worldMapRelocalized,
+  ]
   static let eventsDroppedCode = "LOG_EVENTS_DROPPED"
 
   enum Level: String {
@@ -68,7 +75,7 @@ final class NativeSessionLogBuffer {
       state.variants.append(variant)
       newVariant = true
     }
-    if let last = state.lastFullNs, !newVariant, now &- last < state.intervalNs {
+    if let last = state.lastFullNs, !newVariant, !Self.alwaysCodes.contains(code), now &- last < state.intervalNs {
       state.counted += 1
       state.lastMessage = message
       return false
