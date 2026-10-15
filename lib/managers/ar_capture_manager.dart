@@ -344,9 +344,15 @@ class ARCaptureManager {
   Future<void>? _disposeAttempt;
   CaptureInitializationResult? _initializationResult;
 
-  bool get isSupported =>
+  /// Native still capture exists on Android (ARCore Shared Camera) and iOS
+  /// (ARKit high-resolution frames into the same durable store).
+  static bool get platformSupportsCapture =>
       debugIsSupportedOverride ??
-      (Platform.isAndroid || Platform.environment.containsKey('FLUTTER_TEST'));
+      (Platform.isAndroid ||
+          Platform.isIOS ||
+          Platform.environment.containsKey('FLUTTER_TEST'));
+
+  bool get isSupported => platformSupportsCapture;
   bool get isEnabled =>
       _closeState == ARCaptureCloseState.active &&
       isSupported &&

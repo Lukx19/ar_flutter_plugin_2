@@ -21,6 +21,7 @@ public class SwiftArFlutterPlugin: NSObject, FlutterPlugin {
     VisibilityGridShellRegistry.shared.register(messenger: registrar.messenger())
     GridRendererChannels.shared.register(messenger: registrar.messenger())
     SessionLifecycleServices.shared.register(messenger: registrar.messenger())
+    NativeCaptureRegistration.register(with: registrar)
   }
 
   public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
