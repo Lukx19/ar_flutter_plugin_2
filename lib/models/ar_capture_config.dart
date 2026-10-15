@@ -74,7 +74,8 @@ class ARCaptureConfig {
   /// Buffer management strategy
   final BufferStrategy bufferStrategy;
 
-  /// iOS still of a manual shutter; sent only when not [ARStillCaptureMode.single].
+  /// iOS still of a manual shutter; sent only when not
+  /// [ARStillCaptureMode.single].
   final ARStillCaptureMode stillCaptureMode;
 
   /// Images of an iOS burst shot (2-5).
