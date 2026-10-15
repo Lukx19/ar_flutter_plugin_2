@@ -95,8 +95,17 @@ final class CaptureRenderLoop: NSObject, MTKViewDelegate {
     }
     encoder.endEncoding()
     if let drawable = view.currentDrawable { commandBuffer.present(drawable) }
-    let retained = imageTextures
-    commandBuffer.addCompletedHandler { _ in withExtendedLifetime(retained) {} }
+    // The camera textures stay alive until the GPU is done with them, and
+    // their CVMetalTextureCache (owned by `background`) must outlive them:
+    // releasing a texture after its cache was freed (view torn down with a
+    // frame in flight) crashes inside CoreVideo. Drop the textures first,
+    // then let the cache owner go.
+    var inFlightTextures: [CVMetalTexture]? = imageTextures
+    let textureCacheOwner = background
+    commandBuffer.addCompletedHandler { _ in
+      inFlightTextures = nil
+      withExtendedLifetime(textureCacheOwner) {}
+    }
     commandBuffer.commit()
   }
 }
