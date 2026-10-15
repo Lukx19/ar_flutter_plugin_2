@@ -21,7 +21,18 @@ final class MarkerDetectionTests: XCTestCase {
     .deletingLastPathComponent()  // ios
     .deletingLastPathComponent()  // plugin root
 
-  static func asset(_ path: String) -> URL { pluginRoot.appendingPathComponent("test_assets/\(path)") }
+  /// A test asset: from the test bundle (RunnerTests copies the
+  /// `marker_detection` and `visibility_grid` folders; a device cannot read the
+  /// source tree), else from the source tree (host package runs).
+  static func asset(_ path: String) -> URL {
+    let parts = path.split(separator: "/", maxSplits: 1).map(String.init)
+    if parts.count == 2 {
+      for bundle in Bundle.allBundles + [Bundle.main] {
+        if let url = bundle.url(forResource: parts[1], withExtension: nil, subdirectory: parts[0]) { return url }
+      }
+    }
+    return pluginRoot.appendingPathComponent("test_assets/\(path)")
+  }
 
   struct GoldenMarker {
     let id: Int
