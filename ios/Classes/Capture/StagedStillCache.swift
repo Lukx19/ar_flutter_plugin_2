@@ -60,11 +60,15 @@ final class StagedStillCache {
     var message: String
   }
 
-  private let config: StillCaptureConfig
+  private var config: StillCaptureConfig
   private var entries: [String: Entry] = [:]
   private var order: [String] = []
 
   init(config: StillCaptureConfig) { self.config = config }
+
+  /// Applies [config] to stills cached afterwards; staged entries stay. A
+  /// smaller `maxCacheSize` refuses new stills until enough are released.
+  func reconfigure(_ config: StillCaptureConfig) { self.config = config }
 
   func nextImageId(timestampMs: Int64) -> String { "img_\(timestampMs)_\(entries.count + 1)" }
 

@@ -104,9 +104,15 @@ final class NativeCaptureChannel: CaptureChannelExtension {
   private var captureInProgress = false
   private var disposed = false
   private let previewOwner = NativeCapturePreviewOwner()
+  private let openResources: () throws -> NativeCaptureRootResources
 
-  init(context: CaptureChannelContext) {
+  /// [openResources] opens the durable root (tests pass a temporary one).
+  init(context: CaptureChannelContext,
+       openResources: @escaping () throws -> NativeCaptureRootResources = {
+         try NativeCaptureBinding.productionResources()
+       }) {
     self.context = context
+    self.openResources = openResources
   }
 
   func captureViewWillDispose() {
@@ -188,7 +194,14 @@ final class NativeCaptureChannel: CaptureChannelExtension {
       return result(FlutterError(code: "CONFIG_INVALID", message: "burstImageCount must be 2-5 and burstIntervalMs 0-1000", details: nil))
     }
     config = parsed
-    cache = StagedStillCache(config: parsed)
+    // A repeated initialize keeps the staged stills: the new configuration
+    // applies to stills captured afterwards, and each staged one stays
+    // readable, persistable and discardable by its id.
+    if let existing = cache {
+      existing.reconfigure(parsed)
+    } else {
+      cache = StagedStillCache(config: parsed)
+    }
     let frameSource = context.frameSource
     // One exposure per view: the binding keeps the first one, so a repeated
     // initialize only updates its quality.
@@ -210,7 +223,7 @@ final class NativeCaptureChannel: CaptureChannelExtension {
     if binding == nil {
       let channel = context.channel
       let created = NativeCaptureBinding(
-        openResources: { try NativeCaptureBinding.productionResources() },
+        openResources: openResources,
         exposure: exposure,
         events: { [weak self] event in
           let map = NativeCaptureWire.event(event)
