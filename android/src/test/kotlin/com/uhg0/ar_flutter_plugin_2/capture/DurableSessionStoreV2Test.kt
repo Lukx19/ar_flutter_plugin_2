@@ -595,11 +595,10 @@ class DurableSessionStoreV2Test {
         assertEquals(2, projections.size)
         assertEquals(1, logged.size)
         assertTrue(logged.single().contains("canonical-surface:canonical:selector"))
-        val unknownReservation = readAcceptedToken(root, unknown)
-        assertEquals(setOf(unknownReservation, foreign.token), reopenedBudget.liveReservations().map { it.token }.toSet())
-        accepted.forEach { assertEquals(CaptureAttemptPhase.ABANDONED_ATTEMPT, reopened.queryReceipt(it.accepted.identity)?.phase) }
-        assertEquals(CaptureAttemptPhase.COMMITTED_PICTURE, reopened.rebaseSameAttempt(unknown).phase)
+        // The unknown-pointer receipt extends the empty session root exactly: re-published, settled.
         assertEquals(setOf(foreign.token), reopenedBudget.liveReservations().map { it.token }.toSet())
+        assertEquals(CaptureAttemptPhase.COMMITTED_PICTURE, reopened.queryReceipt(unknown.accepted.identity)?.phase)
+        accepted.forEach { assertEquals(CaptureAttemptPhase.ABANDONED_ATTEMPT, reopened.queryReceipt(it.accepted.identity)?.phase) }
         assertEquals(0, reopened.reconcileReservations(log = { logged += it }))
         reopened.close(); reopenedBudget.close()
     }
@@ -633,14 +632,78 @@ class DurableSessionStoreV2Test {
         assertEquals(CaptureAttemptPhase.COMMITTED_PICTURE, restarted.queryReceipt(next.accepted.identity)?.phase)
     }
 
+    @Test fun `unfinished receipt from an in-place write is recovered as abandoned and releases its reservation`() {
+        val root = directory(); val budget = budget(root)
+        val failing = store(root, budget, DurableStoreFaultInjectorV2 {
+            if (it == DurableStoreFaultPointV2.POINTER_SLOT_REPLACE) throw IllegalStateException("pointer cut")
+        })
+        val empty = request("receipt-empty", "receipt-empty-attempt", "a".toByteArray(), "session-empty")
+        val truncated = request("receipt-truncated", "receipt-truncated-attempt", "b".toByteArray(), "session-truncated")
+        listOf(empty to "a", truncated to "b").forEach { (attempt, jpeg) ->
+            failing.acceptCaptureBeforeExposure(attempt)
+            assertThrows(IllegalStateException::class.java) { failing.commitStreamed(attempt, streams(jpeg.toByteArray())) }
+        }
+        failing.close(); budget.close()
+        // Crash states of the earlier in-place receipt write: created but unwritten, and cut short.
+        receiptFile(root, empty).writeBytes(ByteArray(0))
+        val bytes = receiptFile(root, truncated).readBytes()
+        receiptFile(root, truncated).writeBytes(bytes.copyOf(bytes.size / 2))
+
+        val reopenedBudget = budget(root); val reopened = store(root, reopenedBudget)
+        val logged = mutableListOf<String>()
+        val projections = reopened.recoverAtOpen(log = { logged += it })
+
+        assertEquals(emptyList<String>(), logged)
+        assertEquals(setOf(empty.accepted.identity.attemptId, truncated.accepted.identity.attemptId), projections.map { it.attemptId }.toSet())
+        projections.forEach {
+            assertEquals(CaptureTerminalKind.ABANDONED_ATTEMPT, it.kind)
+            assertEquals("recovered-unfinished-receipt", it.reason)
+        }
+        assertEquals(0L, reopenedBudget.reservedBytes())
+        listOf(empty, truncated).forEach { attempt ->
+            assertFalse(hasStagingOrAsset(root, attempt))
+            assertEquals(CaptureAttemptPhase.ABANDONED_ATTEMPT, reopened.queryReceipt(attempt.accepted.identity)?.phase)
+            assertEquals(CaptureAttemptPhase.ABANDONED_ATTEMPT, reopened.abandonCapture(attempt, abandonment(attempt, "late")).phase)
+        }
+        reopened.close(); reopenedBudget.close()
+    }
+
+    @Test fun `durable receipt whose pointer slot was lost is re-published at open before admission`() {
+        val root = directory(); val budget = budget(root)
+        val store = store(root, budget)
+        val prior = request("lost-slot-prior", "lost-slot-prior-attempt", "prior".toByteArray())
+        store.acceptCaptureBeforeExposure(prior)
+        store.commitStreamed(prior, streams("prior".toByteArray()))
+        store.close()
+        val failing = store(root, budget, DurableStoreFaultInjectorV2 {
+            if (it == DurableStoreFaultPointV2.POINTER_SLOT_REPLACE) throw IllegalStateException("slot rename lost")
+        })
+        val lost = request("lost-slot", "lost-slot-attempt", "lost".toByteArray())
+        failing.acceptCaptureBeforeExposure(lost)
+        assertThrows(IllegalStateException::class.java) { failing.commitStreamed(lost, streams("lost".toByteArray())) }
+        failing.close(); budget.close()
+
+        val reopenedBudget = budget(root); val reopened = store(root, reopenedBudget)
+        assertTrue(reopenedBudget.reservedBytes() > 0)
+        val projections = reopened.recoverAtOpen(log = { throw AssertionError(it) })
+
+        val projected = projections.single { it.attemptId == lost.accepted.identity.attemptId }
+        assertEquals(CaptureTerminalKind.COMMITTED_PICTURE, projected.kind)
+        assertEquals(2L, projected.captureRevision)
+        assertEquals(0L, reopenedBudget.reservedBytes())
+        assertFalse(hasStaging(root, lost))
+        reopened.close(); reopenedBudget.close()
+        val restarted = store(root, budget(root))
+        assertEquals(CaptureAttemptPhase.COMMITTED_PICTURE, restarted.queryReceipt(lost.accepted.identity)?.phase)
+        assertEquals(CaptureAttemptPhase.COMMITTED_PICTURE, restarted.queryReceipt(prior.accepted.identity)?.phase)
+    }
+
+    private fun receiptFile(root: File, request: CaptureCommitRequest) = File(acceptedFile(root, request).parentFile, "receipt.properties")
     private fun acceptedFile(root: File, request: CaptureCommitRequest) = File(
         root,
         "store/sessions/${sha256Hex(request.accepted.identity.lifecycleCut.sessionId)}/attempts/" +
             "${sha256Hex(request.accepted.identity.commitId)}/accepted.properties",
     )
-    private fun readAcceptedToken(root: File, request: CaptureCommitRequest): String = java.util.Properties().apply {
-        acceptedFile(root, request).inputStream().use(::load)
-    }.getProperty("reservationToken")
 
     private fun request(commit: String, attempt: String, jpeg: ByteArray, session: String = "session-1", dng: ByteArray? = null): CaptureCommitRequest {
         val identity = CaptureAttemptIdentity(attempt, commit, 1, CaptureLifecycleCut(session, 1, "group-1", 1, "ar-1", "view-1", 1, "binding-1", 1, 1))

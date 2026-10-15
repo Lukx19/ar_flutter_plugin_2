@@ -280,7 +280,7 @@ class DurableSessionStoreV2(
             val committed = CaptureReceipt(request.accepted.identity, CaptureAttemptPhase.COMMITTED_PICTURE, requestHash, receiptHash(requestHash, rootHash), true, terminal)
             // Receipt is durable before, and independently validates, the pointer switch.
             faults.at(DurableStoreFaultPointV2.RECEIPT_WRITE)
-            writePropertiesExclusive(receiptFile(location, request.accepted.identity), receiptProperties(committed, rootHash))
+            writeReceipt(receiptFile(location, request.accepted.identity), receiptProperties(committed, rootHash), DurableStoreFaultPointV2.RECEIPT_WRITE)
             faults.at(DurableStoreFaultPointV2.RECEIPT_FILE_SYNC)
             publishPointer(location, RootPointer(revision, rootHash, request.accepted.identity.commitId), prior)
             budget.settle(reservation, actualBytes)
@@ -386,11 +386,12 @@ class DurableSessionStoreV2(
                 request.qualityAssessment?.let { CaptureQualityAssessmentV1.boundHash(requestHash, it) })
             val committed = CaptureReceipt(identity, CaptureAttemptPhase.COMMITTED_PICTURE, requestHash, receiptHash(requestHash, rootHash), true, terminal)
             faults.at(DurableStoreFaultPointV2.RECEIPT_WRITE)
-            writePropertiesExclusive(
+            writeReceipt(
                 receiptFile(location, identity),
                 receiptProperties(committed, rootHash).apply {
                     setProperty("templateHash", templateHash(template))
                 },
+                DurableStoreFaultPointV2.RECEIPT_WRITE,
             )
             faults.at(DurableStoreFaultPointV2.RECEIPT_FILE_SYNC)
             publishPointer(location, RootPointer(revision, rootHash, identity.commitId), prior)
@@ -482,11 +483,11 @@ class DurableSessionStoreV2(
         val value = CaptureReceipt(terminal.identity, CaptureAttemptPhase.ABANDONED_ATTEMPT, boundHash,
             receiptHash(boundHash, "abandoned"), true, terminal)
         faults.at(DurableStoreFaultPointV2.ABANDONMENT_RECORD)
-        writePropertiesExclusive(receiptFile(location, terminal.identity), receiptProperties(value, "abandoned").apply {
+        writeReceipt(receiptFile(location, terminal.identity), receiptProperties(value, "abandoned").apply {
             setProperty("requestBinding", binding)
             fullRequestHash?.let { setProperty("fullRequestHash", it) }
             templateHash?.let { setProperty("templateHash", it) }
-        })
+        }, DurableStoreFaultPointV2.ABANDONMENT_RECORD)
         accepted?.getProperty("reservationToken")?.let { budget.reservation(it)?.let(budget::release) }
         return value
     }
@@ -508,39 +509,13 @@ class DurableSessionStoreV2(
         faults.at(DurableStoreFaultPointV2.RECOVERY)
         files.list(sessionRoot).filter(File::isDirectory).forEach { session ->
             files.walk(session).filter { it.name == "accepted.properties" }.forEach { accepted ->
-                val attempt = requireNotNull(accepted.parentFile)
-                val receipt = path(attempt, "receipt.properties")
                 val acceptedBytes = files.readBytes(accepted)
                 val acceptedValues = parseProperties(acceptedBytes)
                 // An unfinished acceptance preceded no exposure; reconciliation releases its reservation.
                 if (!isFinishedAcceptedRecord(acceptedBytes, acceptedValues)) return@forEach
-                if (!files.isFile(receipt)) {
-                    val abandoned = Properties().apply {
-                        setProperty("kind", CaptureTerminalKind.ABANDONED_ATTEMPT.name)
-                        setProperty("requestHash", acceptedValues.getProperty("acceptedHash"))
-                        setProperty("receiptHash", receiptHash(acceptedValues.getProperty("acceptedHash"), "abandoned"))
-                        setProperty("rootHash", "abandoned")
-                        setProperty("reason", "recovered-proven-absent")
-                        setProperty("requestBinding", ABANDONMENT_BINDING_RECOVERED)
-                    }
-                    writePropertiesExclusive(receipt, abandoned, DurableStoreFaultPointV2.ABANDONMENT_RECORD)
-                    deleteTree(path(attempt, "staging"), DurableStoreFaultPointV2.ABANDONMENT_CLEANUP)
-                    acceptedValues.getProperty("attemptId")?.let { deleteTree(path(session, "assets", safe(it)), DurableStoreFaultPointV2.ABANDONMENT_CLEANUP) }
-                    acceptedValues.getProperty("reservationToken")?.let { budget.reservation(it)?.let(budget::release) }
-                } else {
-                    val receiptValues = readProperties(receipt)
-                    if (receiptValues.getProperty("kind") == CaptureTerminalKind.COMMITTED_PICTURE.name &&
-                        receiptValues.getProperty("rootHash") in retainedRootHashes(session)) {
-                        acceptedValues.getProperty("reservationToken")?.let { token ->
-                            budget.reservation(token)?.let { reservation ->
-                                budget.settle(reservation, committedComponentBytes(session, receiptValues.getProperty("rootHash")))
-                            }
-                        }
-                        deleteTree(path(attempt, "staging"), DurableStoreFaultPointV2.DELETE_RECLAIM)
-                    }
-                    // A committed receipt outside the retained graph is unknown:
-                    // staging and liability remain for exact query/rebase.
-                }
+                // Same rules as startup projection and reconciliation. A committed receipt outside
+                // the retained graph is unknown: staging and liability remain for exact query/rebase.
+                repairAcceptedCandidate(session, accepted)
             }
         }
     }
@@ -638,8 +613,45 @@ class DurableSessionStoreV2(
     internal fun recoverAtOpen(
         shouldContinue: () -> Boolean = { true },
         log: (String) -> Unit = ::logStoreWarning,
-    ): List<RecoveryProjectionV2> = recoverAndProject(shouldContinue = shouldContinue).also {
-        if (shouldContinue()) reconcileReservations(log)
+    ): List<RecoveryProjectionV2> {
+        if (shouldContinue()) adoptUnpublishedRoots(log)
+        return recoverAndProject(shouldContinue = shouldContinue).also {
+            if (shouldContinue()) reconcileReservations(log)
+        }
+    }
+
+    /**
+     * Pointer re-publication for every live capture reservation whose complete committed receipt
+     * extends the selected root exactly; runs before projection. Never throws.
+     */
+    internal fun adoptUnpublishedRoots(log: (String) -> Unit = ::logStoreWarning): Int = synchronized(mutex) {
+        val live = try { budget.liveReservations() } catch (error: Exception) {
+            log("root adoption skipped: $error")
+            return@synchronized 0
+        }
+        var adopted = 0
+        for (reservation in live) {
+            try {
+                val (session, accepted) = acceptedRecordFor(reservation) ?: continue
+                if (adoptUnpublishedRoot(session, accepted)) adopted++
+            } catch (error: Exception) {
+                log("reservation ${reservation.owner} root not adopted: $error")
+            }
+        }
+        adopted
+    }
+
+    /** The finished accepted record that names [reservation], if any. */
+    private fun acceptedRecordFor(reservation: StorageBudgetReservationV2): Pair<File, File>? {
+        val parts = reservation.owner.split(':')
+        if (parts.size != 3 || parts[0] != "capture" || !parts[1].matches(SAFE_HASH) || !parts[2].matches(SAFE_HASH)) return null
+        val session = files.child("sessions", parts[1])
+        val accepted = path(session, "attempts", parts[2], "accepted.properties")
+        if (!files.isFile(accepted)) return null
+        val bytes = files.readBytes(accepted)
+        val values = parseProperties(bytes)
+        if (!isFinishedAcceptedRecord(bytes, values) || values.getProperty("reservationToken") != reservation.token) return null
+        return session to accepted
     }
 
     /**
@@ -672,14 +684,7 @@ class DurableSessionStoreV2(
         if (parts.size != 3 || parts[0] != "capture" || !parts[1].matches(SAFE_HASH) || !parts[2].matches(SAFE_HASH)) {
             throw DurableStoreConflictV2("Reservation owner is not a capture attempt")
         }
-        val session = files.child("sessions", parts[1])
-        val accepted = path(session, "attempts", parts[2], "accepted.properties")
-        val acceptedBytes = if (files.isFile(accepted)) files.readBytes(accepted) else null
-        val acceptedValues = acceptedBytes?.let(::parseProperties)
-        if (acceptedBytes == null || !isFinishedAcceptedRecord(acceptedBytes, requireNotNull(acceptedValues)) ||
-            acceptedValues.getProperty("reservationToken") != reservation.token) {
-            return budget.release(reservation)
-        }
+        val (session, accepted) = acceptedRecordFor(reservation) ?: return budget.release(reservation)
         repairAcceptedCandidate(session, accepted)
         return budget.reservation(reservation.token) == null
     }
@@ -757,16 +762,20 @@ class DurableSessionStoreV2(
         val attempt = requireNotNull(accepted.parentFile)
         val receipt = path(attempt, "receipt.properties")
         val acceptedValues = readProperties(accepted)
-        if (!files.isFile(receipt)) {
+        val receiptBytes = if (files.isFile(receipt)) files.readBytes(receipt) else null
+        // The pointer is published only after its receipt is durable, so an unfinished receipt
+        // (an earlier in-place write cut short) proves that no pointer names its root.
+        val unfinished = receiptBytes != null && !isFinishedReceipt(receiptBytes)
+        if (receiptBytes == null || unfinished) {
             val abandoned = Properties().apply {
                 setProperty("kind", CaptureTerminalKind.ABANDONED_ATTEMPT.name)
                 setProperty("requestHash", acceptedValues.getProperty("acceptedHash"))
                 setProperty("receiptHash", receiptHash(acceptedValues.getProperty("acceptedHash"), "abandoned"))
                 setProperty("rootHash", "abandoned")
-                setProperty("reason", "recovered-proven-absent")
+                setProperty("reason", if (unfinished) "recovered-unfinished-receipt" else "recovered-proven-absent")
                 setProperty("requestBinding", ABANDONMENT_BINDING_RECOVERED)
             }
-            writePropertiesExclusive(receipt, abandoned, DurableStoreFaultPointV2.ABANDONMENT_RECORD)
+            writeReceipt(receipt, abandoned, DurableStoreFaultPointV2.ABANDONMENT_RECORD, replaceUnfinished = unfinished)
             deleteTree(path(attempt, "staging"), DurableStoreFaultPointV2.ABANDONMENT_CLEANUP)
             acceptedValues.getProperty("attemptId")?.let {
                 deleteTree(path(session, "assets", safe(it)), DurableStoreFaultPointV2.ABANDONMENT_CLEANUP)
@@ -774,7 +783,7 @@ class DurableSessionStoreV2(
             acceptedValues.getProperty("reservationToken")?.let { budget.reservation(it)?.let(budget::release) }
             return
         }
-        val receiptValues = readProperties(receipt)
+        val receiptValues = parseProperties(receiptBytes)
         if (receiptValues.getProperty("kind") == CaptureTerminalKind.COMMITTED_PICTURE.name &&
             receiptValues.getProperty("rootHash") in retainedRootHashes(session)
         ) {
@@ -785,6 +794,31 @@ class DurableSessionStoreV2(
             }
             deleteTree(path(attempt, "staging"), DurableStoreFaultPointV2.DELETE_RECLAIM)
         }
+    }
+
+    /**
+     * Re-publishes the pointer of a complete committed receipt whose pointer slot was lost
+     * (rename not durable before a restart) when its root extends the selected root exactly:
+     * valid root, revision one above the selected one and previous equal to the selected hash.
+     * Any other lineage stays unknown. Returns true when a pointer was published.
+     */
+    private fun adoptUnpublishedRoot(session: File, accepted: File): Boolean {
+        val receipt = path(requireNotNull(accepted.parentFile), "receipt.properties")
+        if (!files.isFile(receipt)) return false
+        val receiptBytes = files.readBytes(receipt)
+        if (!isFinishedReceipt(receiptBytes)) return false
+        val values = parseProperties(receiptBytes)
+        val rootHash = values.getProperty("rootHash")
+        if (values.getProperty("kind") != CaptureTerminalKind.COMMITTED_PICTURE.name ||
+            rootHash in retainedRootHashes(session)) return false
+        val revision = values.getProperty("revision")?.toLongOrNull() ?: return false
+        val commitId = readProperties(accepted).getProperty("commitId") ?: return false
+        if (!validRootHash(session, rootHash, revision, 0)) return false
+        val selected = selectedRoot(session)
+        if (revision != (selected?.revision ?: 0L) + 1L || rootPrevious(session, rootHash) != selected?.rootHash) return false
+        if (values.getProperty("receiptHash") != receiptHash(values.getProperty("requestHash"), rootHash)) return false
+        publishPointer(session, RootPointer(revision, rootHash, commitId), selected)
+        return true
     }
 
     private fun recordRecoveryCandidate(session: File, attempt: File) {
@@ -1116,6 +1150,25 @@ class DurableSessionStoreV2(
     private fun propertiesBytes(properties: Properties) = buildString { properties.stringPropertyNames().sorted().forEach { append(it).append('=').append(properties.getProperty(it)).append('\n') } }.toByteArray()
     private fun writePropertiesExclusive(file: File, properties: Properties, point: DurableStoreFaultPointV2 = DurableStoreFaultPointV2.ACCEPTED_RECORD) = writeExclusive(file, propertiesBytes(properties), point)
     private fun readProperties(file: File) = parseProperties(files.readBytes(file))
+    /**
+     * Receipts are published whole by rename; the final bytes equal the earlier in-place write.
+     * Only recovery replaces an existing (unfinished) receipt.
+     */
+    private fun writeReceipt(
+        file: File,
+        properties: Properties,
+        point: DurableStoreFaultPointV2,
+        replaceUnfinished: Boolean = false,
+    ) {
+        if (files.isFile(file) && !replaceUnfinished) throw DurableStoreConflictV2("Receipt already exists")
+        files.atomicReplace(file, propertiesBytes(properties), point, null)
+    }
+    /** A receipt written whole ends with a newline and carries its four identity keys. */
+    private fun isFinishedReceipt(bytes: ByteArray): Boolean {
+        if (bytes.isEmpty() || bytes.last() != '\n'.code.toByte()) return false
+        val values = parseProperties(bytes)
+        return listOf("kind", "requestHash", "receiptHash", "rootHash").all { values.getProperty(it) != null }
+    }
     private fun parseProperties(bytes: ByteArray) = Properties().apply { bytes.inputStream().use(::load) }
     /**
      * An accepted record is written whole as sorted `key=value` lines, so a finished one ends with

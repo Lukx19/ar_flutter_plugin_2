@@ -63,9 +63,10 @@ class StorageBudgetCoordinatorV2(
     directory: File,
     private val policy: StorageBudgetPolicyV2,
     filesystemBackend: DescriptorFilesystemV2 = AndroidDescriptorFilesystemV2(),
+    faults: DurableStoreFaultInjectorV2 = DurableStoreFaultInjectorV2 { },
     private val freeBytes: () -> Long = { directory.usableSpace },
 ) : AutoCloseable {
-    private val files = SafeFilesystemV2(directory, DurableStoreFaultInjectorV2 { }, filesystemBackend)
+    private val files = SafeFilesystemV2(directory, faults, filesystemBackend)
     private val ledger = files.child("ledger-v2")
     private val reservationsDirectory = files.child("reservations-v2")
     private val reclaimsDirectory = files.child("reclaims-v2")
@@ -89,7 +90,7 @@ class StorageBudgetCoordinatorV2(
 
     fun reserve(owner: String, bytes: Long): StorageBudgetReservationV2? = withAuthority {
         require(owner.matches(OWNER)) { "Storage reservation owner is non-canonical" }
-        if (bytes <= 0 || !canCharge(bytes)) return@withAuthority null
+        if (bytes <= 0 || !canCharge(bytes, streamed = true)) return@withAuthority null
         val token = sha256("$owner:$bytes:${nextTokenLocked()}".toByteArray()).hex()
         val reservation = StorageBudgetReservationV2(token, owner, bytes)
         val allocation = allocationFile(token)
@@ -121,7 +122,7 @@ class StorageBudgetCoordinatorV2(
         require(owner.matches(OWNER) && publicationId.matches(POINTER_PUBLICATION))
         require(slot in 0..1 && listOf(rootBeforeBytes, slotBeforeBytes, selectorBeforeBytes, commitBytes).all { it >= 0L })
         require(commitBytes <= maximumPhysicalBytes && maximumPhysicalBytes > 0L)
-        if (!canCharge(maximumPhysicalBytes)) return@withAuthority null
+        if (!canCharge(maximumPhysicalBytes, streamed = true)) return@withAuthority null
         val token = sha256("$owner:$publicationId:$maximumPhysicalBytes:${nextTokenLocked()}".toByteArray()).hex()
         val reservation = StorageBudgetReservationV2(
             token, owner, maximumPhysicalBytes,
@@ -193,7 +194,7 @@ class StorageBudgetCoordinatorV2(
         require(fileBytes.values.all { it >= 0L } && maximumPhysicalBytes > 0L)
         if (reservations.values.any { it.targetName == targetPath })
             return@withAuthority StorageBudgetCandidateReservationV2.TargetReserved
-        if (!canCharge(maximumPhysicalBytes)) return@withAuthority StorageBudgetCandidateReservationV2.QuotaRefused
+        if (!canCharge(maximumPhysicalBytes, streamed = false)) return@withAuthority StorageBudgetCandidateReservationV2.QuotaRefused
         val token = sha256("$owner:$maximumPhysicalBytes:${nextTokenLocked()}".toByteArray()).hex()
         val reservation = StorageBudgetReservationV2(
             token, owner, maximumPhysicalBytes, stagingPath, targetPath,
@@ -597,15 +598,26 @@ class StorageBudgetCoordinatorV2(
         // canCharge refuses new charges.
     }
 
-    private fun canCharge(bytes: Long): Boolean {
+    /**
+     * Committed bytes and allocations already occupy disk, so the free space need not hold them
+     * again. It must hold the new allocation and the pending write of every streamed reservation:
+     * a streamed (allocation-backed) reservation keeps its allocation until its data, written
+     * beside it, is settled. Candidate reservations allocate their own target files in place and
+     * add no write.
+     */
+    private fun canCharge(bytes: Long, streamed: Boolean): Boolean {
         val reserved = reservedBytesLocked()
         if (committed > Long.MAX_VALUE - reserved || committed + reserved > Long.MAX_VALUE - bytes) return false
         val charged = committed + reserved + bytes
-        // Committed bytes and physically backed reservations already occupy disk: the free space
-        // bounds only the new bytes.
+        val pending = pendingWriteBytesLocked()
+        val newBytes = if (streamed) { if (bytes > Long.MAX_VALUE / 2) return false; 2 * bytes } else bytes
+        if (pending > Long.MAX_VALUE - newBytes) return false
         val free = freeBytes()
-        return bytes <= free - policy.freeSpaceFloorBytes && charged <= quotaLocked(free)
+        return pending + newBytes <= free - policy.freeSpaceFloorBytes && charged <= quotaLocked(free)
     }
+    /** Bytes still to be written beside the allocations of live streamed reservations. */
+    private fun pendingWriteBytesLocked() = reservations.values.filter { it.stagingName == null }
+        .fold(0L) { total, value -> Math.addExact(total, value.bytes) }
     /**
      * Earlier versions wrote reservation metadata in place after its allocation, so a cut left an
      * empty, unterminated or line-truncated record. Such a record never became an authority:
@@ -671,7 +683,7 @@ class StorageBudgetCoordinatorV2(
     }
     /** Reservation metadata is published whole by rename; a cut leaves only its temporary file. */
     private fun writeReservationRecord(metadata: File, record: String) =
-        files.atomicReplace(metadata, record.toByteArray(), null, null)
+        files.atomicReplace(metadata, record.toByteArray(), DurableStoreFaultPointV2.ACCEPTED_RECORD, null)
     private fun deleteReservationLocked(value: StorageBudgetReservationV2) {
         files.delete(metadataFile(value.token), DurableStoreFaultPointV2.DELETE_RECLAIM)
         if (value.stagingName == null) {
