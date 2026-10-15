@@ -683,7 +683,7 @@ class StorageBudgetCoordinatorV2(
     }
     /** Reservation metadata is published whole by rename; a cut leaves only its temporary file. */
     private fun writeReservationRecord(metadata: File, record: String) =
-        files.atomicReplace(metadata, record.toByteArray(), DurableStoreFaultPointV2.ACCEPTED_RECORD, null)
+        files.atomicReplace(metadata, record.toByteArray(), DurableStoreFaultPointV2.RESERVATION_RECORD_REPLACE, null)
     private fun deleteReservationLocked(value: StorageBudgetReservationV2) {
         files.delete(metadataFile(value.token), DurableStoreFaultPointV2.DELETE_RECLAIM)
         if (value.stagingName == null) {

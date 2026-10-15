@@ -192,17 +192,54 @@ class DurableSessionStoreV2Test {
     }
 
     @Test fun `generated durable fault matrix asserts exact classification cleanup release and later success at every cut`() {
-        assertEquals(21, DurableStoreFaultPointV2.entries.size)
+        assertEquals(23, DurableStoreFaultPointV2.entries.size)
         DurableStoreFaultPointV2.entries.forEach { cut ->
             val root = directory()
             var injected = 0
-            val poisoned = store(root, budget(root), DurableStoreFaultInjectorV2 {
+            val injector = DurableStoreFaultInjectorV2 {
                 if (it == cut && injected++ == 0) throw IllegalStateException("injected-$cut")
-            })
+            }
+            val poisoned = store(root, budget(root), injector)
             val request = request("fault-$cut", "attempt-$cut", "jpeg".toByteArray())
             val clean = { store(root, budget(root)) }
 
             when (cut) {
+                DurableStoreFaultPointV2.RESERVATION_RECORD_REPLACE -> {
+                    // The ledger cut leaves only the complete temporary record: no authority, no acceptance.
+                    val poisonedStore = store(root, budget(root, injector))
+                    assertThrows(IllegalStateException::class.java) { poisonedStore.acceptBeforeExposure(request.accepted) }
+                    assertNull(clean().queryReceipt(request.accepted.identity))
+                    assertEquals(0L, budget(root).reservedBytes())
+                    assertTrue(File(root, "budget/reservations-v2").listFiles().orEmpty().isEmpty())
+                }
+                DurableStoreFaultPointV2.RECEIPT_REPLACE -> {
+                    // Committed path: the complete temporary receipt is cut before its rename.
+                    poisoned.acceptBeforeExposure(request.accepted)
+                    assertThrows(IllegalStateException::class.java) {
+                        poisoned.commitStreamed(request, streams("jpeg".toByteArray()))
+                    }
+                    assertTrue(hasReceiptTemporary(root, request))
+                    assertNull(clean().queryReceipt(request.accepted.identity))
+                    // Abandonment path: the same cut on a fresh injection.
+                    val abandoned = request("fault-abandon-$cut", "attempt-abandon-$cut", "jpeg".toByteArray())
+                    var abandonInjected = 0
+                    val poisonedAbandon = store(root, budget(root), DurableStoreFaultInjectorV2 {
+                        if (it == cut && abandonInjected++ == 0) throw IllegalStateException("injected-abandon-$cut")
+                    })
+                    poisonedAbandon.acceptBeforeExposure(abandoned.accepted)
+                    assertThrows(IllegalStateException::class.java) {
+                        poisonedAbandon.abandon(abandonment(abandoned, "injected"))
+                    }
+                    assertTrue(hasReceiptTemporary(root, abandoned))
+                    assertNull(clean().queryReceipt(abandoned.accepted.identity))
+                    assertTrue(budget(root).reservedBytes() > 0)
+                    clean().recover()
+                    listOf(request, abandoned).forEach { attempt ->
+                        assertAbandonedAndReleased(root, attempt)
+                        assertEquals("recovered-proven-absent", clean().queryReceipt(attempt.accepted.identity)?.terminal?.reason)
+                        assertFalse(hasReceiptTemporary(root, attempt))
+                    }
+                }
                 DurableStoreFaultPointV2.ACCEPTED_RECORD -> {
                     assertThrows(IllegalStateException::class.java) { poisoned.acceptBeforeExposure(request.accepted) }
                     assertNull(clean().queryReceipt(request.accepted.identity))
@@ -748,10 +785,12 @@ class DurableSessionStoreV2Test {
         .any { it.name == sha256Hex(request.accepted.identity.attemptId) && it.parentFile?.name == "assets" }
     private fun store(root: File, budget: StorageBudgetCoordinatorV2, faults: DurableStoreFaultInjectorV2 = DurableStoreFaultInjectorV2 { }) =
         DurableSessionStoreV2(File(root, "store"), budget, faults, JvmDescriptorFilesystemV2())
-    private fun budget(root: File) = StorageBudgetCoordinatorV2(
+    private fun budget(root: File, faults: DurableStoreFaultInjectorV2 = DurableStoreFaultInjectorV2 { }) = StorageBudgetCoordinatorV2(
         File(root, "budget"), StorageBudgetPolicyV2(1024 * 1024, 0),
-        JvmDescriptorFilesystemV2(authoritativeAllocationUnit = { 4_096L }),
+        JvmDescriptorFilesystemV2(authoritativeAllocationUnit = { 4_096L }), faults,
     ) { 1024 * 1024 }
+    private fun hasReceiptTemporary(root: File, request: CaptureCommitRequest) =
+        File(acceptedFile(root, request).parentFile, ".receipt.properties.part").exists()
     private fun directory(): File = File.createTempFile("durable-store-v2", "").also { it.delete(); assertTrue(it.mkdirs()); directories += it }
     private fun sha(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes).map { it.toInt() and 0xff }
     private fun digest(value: String) = sha(value.toByteArray())

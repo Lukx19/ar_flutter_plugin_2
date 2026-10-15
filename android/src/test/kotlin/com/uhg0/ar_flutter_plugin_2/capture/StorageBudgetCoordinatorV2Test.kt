@@ -444,7 +444,7 @@ class StorageBudgetCoordinatorV2Test {
         val cut = StorageBudgetCoordinatorV2(
             root, policy, physicalFilesystem(),
             DurableStoreFaultInjectorV2 { point ->
-                if (point == DurableStoreFaultPointV2.ACCEPTED_RECORD) {
+                if (point == DurableStoreFaultPointV2.RESERVATION_RECORD_REPLACE) {
                     val names = reservations.list().orEmpty()
                     val temporary = names.single { it.endsWith(".reservation.part") }
                     assertEquals("capture:session:cut\n4096\n", File(reservations, temporary).readText())

@@ -280,7 +280,7 @@ class DurableSessionStoreV2(
             val committed = CaptureReceipt(request.accepted.identity, CaptureAttemptPhase.COMMITTED_PICTURE, requestHash, receiptHash(requestHash, rootHash), true, terminal)
             // Receipt is durable before, and independently validates, the pointer switch.
             faults.at(DurableStoreFaultPointV2.RECEIPT_WRITE)
-            writeReceipt(receiptFile(location, request.accepted.identity), receiptProperties(committed, rootHash), DurableStoreFaultPointV2.RECEIPT_WRITE)
+            writeReceipt(receiptFile(location, request.accepted.identity), receiptProperties(committed, rootHash), DurableStoreFaultPointV2.RECEIPT_REPLACE)
             faults.at(DurableStoreFaultPointV2.RECEIPT_FILE_SYNC)
             publishPointer(location, RootPointer(revision, rootHash, request.accepted.identity.commitId), prior)
             budget.settle(reservation, actualBytes)
@@ -391,7 +391,7 @@ class DurableSessionStoreV2(
                 receiptProperties(committed, rootHash).apply {
                     setProperty("templateHash", templateHash(template))
                 },
-                DurableStoreFaultPointV2.RECEIPT_WRITE,
+                DurableStoreFaultPointV2.RECEIPT_REPLACE,
             )
             faults.at(DurableStoreFaultPointV2.RECEIPT_FILE_SYNC)
             publishPointer(location, RootPointer(revision, rootHash, identity.commitId), prior)
@@ -487,7 +487,7 @@ class DurableSessionStoreV2(
             setProperty("requestBinding", binding)
             fullRequestHash?.let { setProperty("fullRequestHash", it) }
             templateHash?.let { setProperty("templateHash", it) }
-        }, DurableStoreFaultPointV2.ABANDONMENT_RECORD)
+        }, DurableStoreFaultPointV2.RECEIPT_REPLACE)
         accepted?.getProperty("reservationToken")?.let { budget.reservation(it)?.let(budget::release) }
         return value
     }
@@ -775,7 +775,7 @@ class DurableSessionStoreV2(
                 setProperty("reason", if (unfinished) "recovered-unfinished-receipt" else "recovered-proven-absent")
                 setProperty("requestBinding", ABANDONMENT_BINDING_RECOVERED)
             }
-            writeReceipt(receipt, abandoned, DurableStoreFaultPointV2.ABANDONMENT_RECORD, replaceUnfinished = unfinished)
+            writeReceipt(receipt, abandoned, DurableStoreFaultPointV2.RECEIPT_REPLACE, replaceUnfinished = unfinished)
             deleteTree(path(attempt, "staging"), DurableStoreFaultPointV2.ABANDONMENT_CLEANUP)
             acceptedValues.getProperty("attemptId")?.let {
                 deleteTree(path(session, "assets", safe(it)), DurableStoreFaultPointV2.ABANDONMENT_CLEANUP)
