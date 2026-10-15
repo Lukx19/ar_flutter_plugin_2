@@ -48,7 +48,9 @@ struct StorageBudgetReservation: Hashable {
 /// `reservations-v2/<token>.reservation` names the owner and bytes and
 /// `<token>.allocation` physically backs them, and
 /// `reclaims-v2/verified-<id>.reclaim` records an identity-bound reclaim of
-/// committed bytes (a deleted session). State is reloaded from disk
+/// committed bytes (a deleted session). `reservations-v2/<token>.settled`
+/// (iOS budget layout 2, [NativeStoreFormatVersions.storageBudgetLayout])
+/// marks a settlement in progress until its reservation files are gone. State is reloaded from disk
 /// before every operation, so a crash at any step leaves either the old or the
 /// new authority. Candidate and pointer reservations (canonical surfaces) are
 /// Android-only and not represented here; a reservation file in their format is
@@ -110,9 +112,7 @@ final class StorageBudgetLedger {
       if actualBytes > quota - committed || violatesFreeFloor {
         throw DurableStoreStateError("Committed bytes would violate the global storage budget")
       }
-      committed += actualBytes
-      try deleteReservation(current)
-      try persistLedger()
+      try closeIntoCommitted(current, actualBytes: actualBytes)
     }
   }
 
@@ -124,10 +124,28 @@ final class StorageBudgetLedger {
     try withAuthority {
       let current = try requireReservation(reservation)
       guard actualBytes >= 0, actualBytes <= current.bytes else { throw DurableStoreStateError("Commit exceeds reservation") }
-      committed += actualBytes
-      try deleteReservation(current)
-      try persistLedger()
+      try closeIntoCommitted(current, actualBytes: actualBytes)
     }
+  }
+
+  /// Moves [reservation] into the committed count crash safely: a synced
+  /// settlement marker `<token>.settled` (`SETTLED`, token, charged bytes,
+  /// committed count before) is written first, then the ledger, then the
+  /// reservation files are deleted and last the marker. Recovery finishes a
+  /// marker it finds (charges the bytes when the ledger still holds the
+  /// count before, deletes the reservation files), so a crash between the
+  /// steps neither loses the charge nor charges twice.
+  private func closeIntoCommitted(_ reservation: StorageBudgetReservation, actualBytes: Int64) throws {
+    let previous = committed
+    let (after, overflow) = previous.addingReportingOverflow(actualBytes)
+    guard !overflow else { throw DurableStoreStateError("Committed bytes overflow") }
+    let marker = Self.settlementFile(reservation.token)
+    try files.atomicReplace(
+      marker, Array("SETTLED\n\(reservation.token)\n\(actualBytes)\n\(previous)\n".utf8), replacePoint: .pointerSlotReplace)
+    committed = after
+    try persistLedger()
+    try deleteReservation(reservation)
+    try files.delete(marker, .deleteReclaim)
   }
 
   /// Applies one identity-bound reclaim of committed bytes exactly once
@@ -203,6 +221,7 @@ final class StorageBudgetLedger {
       committed = 0
     }
     try recoverVerifiedReclaims()
+    try recoverSettlements()
     reservations.removeAll()
     let names = try files.list(Self.reservationsDirectory)
     for name in names where name.hasSuffix(".reservation") && name.utf8.count == 64 + 12 {
@@ -266,21 +285,77 @@ final class StorageBudgetLedger {
     }
   }
 
+  /// Finishes the settlements a crash cut ([closeIntoCommitted]): the
+  /// charge is applied once (the ledger holds the count before it, or
+  /// already the count after it), the reservation's files go, then the
+  /// marker; abandoned temporary marker files are dropped. A marker that
+  /// matches neither count is corrupt.
+  private func recoverSettlements() throws {
+    let names = try files.list(Self.reservationsDirectory)
+    for name in names.sorted() where name.hasSuffix(".settled") && name.utf8.count == 64 + 8 {
+      let token = String(name.dropLast(8))
+      guard DurableStoreEncoding.isHash(token) else { continue }
+      let lines = try Self.lines(files.readBytes(Self.reservationsDirectory + [name]))
+      guard lines.count == 4, lines[0] == "SETTLED", lines[1] == token,
+            let bytes = Int64(lines[2]), let previous = Int64(lines[3]), bytes >= 0, previous >= 0 else {
+        throw DurableStoreStateError("Corrupt storage settlement")
+      }
+      let (after, overflow) = previous.addingReportingOverflow(bytes)
+      guard !overflow, committed == previous || committed == after else {
+        throw DurableStoreStateError("Storage settlement does not match the ledger")
+      }
+      if committed == previous && bytes > 0 {
+        committed = after
+        try persistLedger()
+      }
+      for file in [Self.metadataFile(token), Self.allocationFile(token)] where files.isFile(file) {
+        try files.delete(file, .deleteReclaim)
+      }
+      try files.delete(Self.reservationsDirectory + [name], .deleteReclaim)
+    }
+    for name in names where name.hasPrefix(".") && name.hasSuffix(".settled.part") {
+      try files.delete(Self.reservationsDirectory + [name], .deleteReclaim)
+    }
+  }
+
   private static func lines(_ bytes: [UInt8]) -> [String] {
     String(decoding: bytes, as: UTF8.self).split(separator: "\n", omittingEmptySubsequences: false).map(String.init).filter { !$0.isEmpty }
   }
 
+  /// A new reservation needs the quota and room for its photo on disk.
+  /// Every reservation here is a placeholder allocation: the photo streams
+  /// into staging beside it before the allocation goes, so each live
+  /// reservation still has its bytes to write, and a new one needs its own
+  /// allocation plus its write. The free space must hold the pending writes
+  /// of the live reservations plus twice the new bytes; committed photos
+  /// already occupy disk and are not counted there (only in the quota).
   private func canCharge(_ bytes: Int64) -> Bool {
     let reserved = reservedBytes()
     let (sum, overflow) = committed.addingReportingOverflow(reserved)
     guard !overflow else { return false }
     let (charged, overflow2) = sum.addingReportingOverflow(bytes)
     guard !overflow2 else { return false }
-    // Committed photos and physically backed reservations already occupy
-    // disk: the free space bounds only the new bytes.
+    let (doubled, overflow3) = bytes.multipliedReportingOverflow(by: 2)
+    guard !overflow3 else { return false }
+    let (writes, overflow4) = Self.pendingWriteBytes(reservations.values).addingReportingOverflow(doubled)
+    guard !overflow4 else { return false }
     let free = freeBytes()
-    return bytes <= free - policy.freeSpaceFloorBytes
+    let (room, overflow5) = free.subtractingReportingOverflow(policy.freeSpaceFloorBytes)
+    guard !overflow5 else { return false }
+    return writes <= room
       && charged <= policy.quotaBytes(freeBytes: free, committed: committed, reserved: reserved)
+  }
+
+  /// Bytes the live reservations still write beside their allocations
+  /// (all of them: none allocates its target in place).
+  static func pendingWriteBytes<S: Sequence>(_ live: S) -> Int64 where S.Element == StorageBudgetReservation {
+    var total: Int64 = 0
+    for reservation in live {
+      let (next, overflow) = total.addingReportingOverflow(reservation.bytes)
+      if overflow { return Int64.max }
+      total = next
+    }
+    return total
   }
 
   private func reservedBytes() -> Int64 { reservations.values.reduce(0) { $0 + $1.bytes } }
@@ -303,6 +378,7 @@ final class StorageBudgetLedger {
 
   private static func metadataFile(_ token: String) -> [String] { reservationsDirectory + ["\(token).reservation"] }
   private static func allocationFile(_ token: String) -> [String] { reservationsDirectory + ["\(token).allocation"] }
+  private static func settlementFile(_ token: String) -> [String] { reservationsDirectory + ["\(token).settled"] }
   private static func verifiedReclaimFile(_ id: String) -> [String] { reclaimsDirectory + ["verified-\(id).reclaim"] }
 
   /// `[A-Za-z0-9._:-]{1,160}`

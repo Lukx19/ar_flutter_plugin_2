@@ -24,6 +24,12 @@ enum NativeStoreFormatVersions {
   static let photoRootSchemasReadable = [photoRootSchemaPlain, photoRootSchemaShot]
   /// Layout of `capture-v2-previews` (512 px and 1024 px previews, delete markers).
   static let previewCacheLayout = 1
+  /// Layout of `capture-v2-native/budget` (ledger, reservations, verified
+  /// reclaims). 2: a settlement writes `reservations-v2/<token>.settled`
+  /// before the ledger moves and deletes it after the reservation files, so
+  /// a crash between them is finished by recovery; Android does not report
+  /// this component.
+  static let storageBudgetLayout = 2
 
   static func report() -> [String: Any] {
     [
@@ -32,6 +38,7 @@ enum NativeStoreFormatVersions {
       "nativePhotoRootSchemasReadable": photoRootSchemasReadable,
       "nativePhotoShotRootSchema": photoRootSchemaShot,
       "nativePreviewCache": previewCacheLayout,
+      "nativeStorageBudget": storageBudgetLayout,
     ]
   }
 

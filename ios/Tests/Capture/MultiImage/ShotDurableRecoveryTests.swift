@@ -153,7 +153,10 @@ final class ShotDurableRecoveryTests: XCTestCase {
   }
 
   func testBudgetSettlementFaultKeepsTheShotAndChargesItOnceAtRestart() throws {
-    let fault = PersistentFault(.deleteReclaim)
+    // The settlement is cut before its marker is durable (its rename):
+    // the reservation stays live. A cut after the marker is finished by the
+    // ledger itself (StorageBudgetLedgerTests).
+    let fault = PersistentFault(.pointerSlotReplace)
     fault.armed = false
     let (store, budget) = try CaptureFixture.store(root, budgetFault: fault.injector())
     let owner = owner(store)

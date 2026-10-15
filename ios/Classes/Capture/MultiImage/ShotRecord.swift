@@ -61,4 +61,123 @@ enum ShotRecord {
     if flags.contains(.videoFrameFallback) { names.append("videoFrameFallback") }
     return names
   }
+
+  /// Capture id of image [index] (1...) of the shot whose first image has
+  /// [captureId]: SHA-256 hex of `<captureId>#<index>`. The session
+  /// manifest, the preview reader and the photo saved event name the image
+  /// by it, so each image is its own photo.
+  static func imageCaptureId(_ captureId: String, index: Int) -> String {
+    DurableStoreEncoding.hex(DurableStoreEncoding.sha256("\(captureId)#\(index)"))
+  }
+
+  /// One image of a decoded record.
+  struct DecodedImage: Equatable {
+    var index: Int
+    var width: Int
+    var height: Int
+    var byteLength: Int64
+    var sha256: String
+    var exposureTimestampNs: Int64
+    var trackingNormal: Bool
+    var flags: ShotImageFlags
+    /// ARKit camera-to-world, column-major; nil when the frame had none.
+    var cameraToWorld: [Double]?
+    /// fx, fy, cx, cy at the image size; nil when unknown.
+    var intrinsics: [Double]?
+  }
+
+  struct Decoded: Equatable {
+    var shotId: String
+    var mode: String
+    var images: [DecodedImage]
+  }
+
+  /// The record written by [encode]; nil for anything else (unknown
+  /// schema, missing or mistyped field, unknown flag, image indices that
+  /// are not 0...n-1 in order).
+  static func decode(_ bytes: [UInt8]) -> Decoded? {
+    guard let root = (try? JSONSerialization.jsonObject(with: Data(bytes))) as? [String: Any],
+          root["schema"] as? String == schema, let shotId = root["shotId"] as? String,
+          let uuid = UUID(uuidString: shotId), uuid.uuidString.lowercased() == shotId,
+          let mode = root["mode"] as? String, ["single", "burst", "quality"].contains(mode),
+          let list = root["images"] as? [Any], !list.isEmpty else { return nil }
+    func integer(_ value: Any?) -> Int64? { NativeCaptureWire.integer(value) }
+    func number(_ value: Any?) -> Double? {
+      guard let n = value as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID(), n.doubleValue.isFinite else { return nil }
+      return n.doubleValue
+    }
+    var images: [DecodedImage] = []
+    for (position, entry) in list.enumerated() {
+      guard let image = entry as? [String: Any], let index = integer(image["index"]), index == Int64(position),
+            let width = integer(image["width"]), width > 0, let height = integer(image["height"]), height > 0,
+            let length = integer(image["byteLength"]), length > 0,
+            let sha = image["sha256"] as? String, DurableStoreEncoding.isHash(sha),
+            let exposure = integer(image["exposureTimestampNs"]), exposure >= 0,
+            let tracking = image["trackingNormal"] as? NSNumber, CFGetTypeID(tracking) == CFBooleanGetTypeID(),
+            let flagNames = image["flags"] as? [Any] else { return nil }
+      var flags: ShotImageFlags = []
+      for name in flagNames {
+        switch name as? String {
+        case "trackingNotNormal": flags.insert(.trackingNotNormal)
+        case "videoFrameFallback": flags.insert(.videoFrameFallback)
+        default: return nil
+        }
+      }
+      var pose: [Double]?
+      if let value = image["cameraToWorld"] {
+        guard let values = value as? [Any], values.count == 16 else { return nil }
+        let parsed = values.compactMap(number)
+        guard parsed.count == 16 else { return nil }
+        pose = parsed
+      }
+      var intrinsics: [Double]?
+      if let value = image["intrinsics"] {
+        guard let map = value as? [String: Any], let fx = number(map["fx"]), let fy = number(map["fy"]),
+              let cx = number(map["cx"]), let cy = number(map["cy"]), fx > 0, fy > 0 else { return nil }
+        intrinsics = [fx, fy, cx, cy]
+      }
+      images.append(DecodedImage(
+        index: Int(index), width: Int(width), height: Int(height), byteLength: length, sha256: sha,
+        exposureTimestampNs: exposure, trackingNormal: tracking.boolValue, flags: flags, cameraToWorld: pose,
+        intrinsics: intrinsics))
+    }
+    return Decoded(shotId: shotId, mode: mode, images: images)
+  }
+}
+
+/// One image after the first one of a committed burst shot, as the
+/// committed terminal reports it: its own capture id, size, exposure time,
+/// frame pose and intrinsics, read from the verified shot record.
+struct CommittedShotImage: Hashable {
+  var index: Int
+  /// [ShotRecord.imageCaptureId] of the shot's first capture id.
+  var captureId: String
+  var jpegSizeBytes: Int64
+  var exposureTimestampNs: Int64
+  var width: Int
+  var height: Int
+  var trackingNormal: Bool
+  /// [ShotImageFlags] raw bits.
+  var flags: Int
+  /// ARKit camera-to-world, column-major; nil when the frame had none.
+  var cameraToWorld: [Double]?
+  /// fx, fy, cx, cy at the image size; nil when unknown.
+  var intrinsics: [Double]?
+
+  /// Photo credit and the session's picture delivery may use this image.
+  var creditable: Bool { trackingNormal && cameraToWorld != nil }
+}
+
+/// The burst shot of a committed terminal: every image after the first
+/// one (the attempt's JPEG), all committed by the same shot root.
+struct CommittedShot: Hashable {
+  var shotId: String
+  /// [StillShotMode.storedName].
+  var mode: String
+  /// Images of the shot including the first one.
+  var imageCount: Int
+  /// Exposure time of the first image (the frame clock of every image's
+  /// [CommittedShotImage.exposureTimestampNs]).
+  var firstExposureTimestampNs: Int64
+  var images: [CommittedShotImage]
 }

@@ -493,6 +493,7 @@ final class ARNativeCaptureEventV2 {
     this.recoveryContext,
     this.qualityAssessment,
     this.qualityAssessmentHash,
+    this.shot,
   });
 
   factory ARNativeCaptureEventV2.fromMap(Map<String, dynamic> map,
@@ -560,6 +561,7 @@ final class ARNativeCaptureEventV2 {
           if (map.containsKey('dngSizeBytes')) 'dngSizeBytes',
           'reason',
           'recoveryContext',
+          if (!assessed && map.containsKey('shot')) 'shot',
           if (assessed) 'qualityDisposition',
           if (assessed) 'qualityAssessmentHash',
           if (assessed) 'qualityAssessment',
@@ -588,10 +590,22 @@ final class ARNativeCaptureEventV2 {
         if (dngSizeBytes != null && jpegSizeBytes == null) {
           throw const FormatException('DNG component requires its JPEG size.');
         }
+        final shotValue = map['shot'];
+        if (shotValue != null && shotValue is! Map) {
+          throw const FormatException('Shot must be a map.');
+        }
+        final captureId = _nonEmptyString(map, 'captureId');
+        final shot = shotValue == null
+            ? null
+            : ARNativeCaptureShotV2.fromMap(
+                Map<String, dynamic>.from(shotValue as Map),
+                captureId: captureId,
+              );
         return ARNativeCaptureEventV2(
           kind: kind,
           attemptId: _nonEmptyString(map, 'attemptId'),
-          captureId: _nonEmptyString(map, 'captureId'),
+          captureId: captureId,
+          shot: shot,
           captureRevision: _integer(map, 'captureRevision'),
           manifestId: _nonEmptyString(map, 'manifestId'),
           jpegSizeBytes: jpegSizeBytes,
@@ -648,11 +662,182 @@ final class ARNativeCaptureEventV2 {
   final ARNativeCaptureQualityAssessmentV1? qualityAssessment;
   final String? qualityAssessmentHash;
 
+  /// The images after the first one of a committed iOS burst shot; null
+  /// for a single-image commit (and always on Android).
+  final ARNativeCaptureShotV2? shot;
+
   ARNativeCaptureQualityDispositionV1? get qualityDisposition => qualityAssessment?.disposition;
 
   bool get isTerminal =>
       kind == ARNativeCaptureEventKindV2.committed ||
       kind == ARNativeCaptureEventKindV2.abandoned;
+}
+
+/// One image after the first one of a committed iOS burst shot: its own
+/// durable capture id (SHA-256 hex of `<first capture id>#<index>`, the id
+/// the session manifest and the photo saved event use), JPEG size, exposure
+/// time, size and, when the frame had them, its ARKit camera-to-world
+/// (column-major, GL camera axes) and fx, fy, cx, cy at the image size.
+final class ARNativeCaptureShotImageV2 {
+  ARNativeCaptureShotImageV2({
+    required this.index,
+    required this.captureId,
+    required this.jpegSizeBytes,
+    required this.exposureTimestampNs,
+    required this.width,
+    required this.height,
+    required this.trackingNormal,
+    required this.flags,
+    List<double>? cameraToWorld,
+    List<double>? intrinsics,
+  })  : cameraToWorld =
+            cameraToWorld == null ? null : List.unmodifiable(cameraToWorld),
+        intrinsics = intrinsics == null ? null : List.unmodifiable(intrinsics);
+
+  factory ARNativeCaptureShotImageV2.fromMap(Map<String, dynamic> map) {
+    _requireExactKeys(map, {
+      'index',
+      'captureId',
+      'jpegSizeBytes',
+      'exposureTimestampNs',
+      'width',
+      'height',
+      'trackingNormal',
+      'flags',
+      if (map.containsKey('cameraToWorld')) 'cameraToWorld',
+      if (map.containsKey('intrinsics')) 'intrinsics',
+    });
+    List<double>? numbers(String key, int count) {
+      if (!map.containsKey(key)) return null;
+      final value = map[key];
+      if (value is! List ||
+          value.length != count ||
+          value.any((item) => item is! num || !item.toDouble().isFinite)) {
+        throw FormatException('$key must be $count finite numbers.');
+      }
+      return value.cast<num>().map((item) => item.toDouble()).toList();
+    }
+
+    final captureId = _nonEmptyString(map, 'captureId');
+    final trackingNormal = map['trackingNormal'];
+    final intrinsics = numbers('intrinsics', 4);
+    if (!RegExp(r'^[0-9a-f]{64}$').hasMatch(captureId) ||
+        trackingNormal is! bool ||
+        (intrinsics != null && (intrinsics[0] <= 0 || intrinsics[1] <= 0))) {
+      throw const FormatException('Malformed shot image.');
+    }
+    final flags = _integer(map, 'flags');
+    if (flags > 3) throw const FormatException('Unknown shot image flags.');
+    return ARNativeCaptureShotImageV2(
+      index: _positiveInteger(map, 'index'),
+      captureId: captureId,
+      jpegSizeBytes: _positiveInteger(map, 'jpegSizeBytes'),
+      exposureTimestampNs: _integer(map, 'exposureTimestampNs'),
+      width: _positiveInteger(map, 'width'),
+      height: _positiveInteger(map, 'height'),
+      trackingNormal: trackingNormal,
+      flags: flags,
+      cameraToWorld: numbers('cameraToWorld', 16),
+      intrinsics: intrinsics,
+    );
+  }
+
+  /// Flag bit: tracking was not normal at this image's frame.
+  static const int flagTrackingNotNormal = 1;
+
+  /// Flag bit: the high-resolution frame failed; the video frame was used.
+  static const int flagVideoFrameFallback = 2;
+
+  final int index;
+  final String captureId;
+  final int jpegSizeBytes;
+  final int exposureTimestampNs;
+  final int width;
+  final int height;
+  final bool trackingNormal;
+  final int flags;
+  final List<double>? cameraToWorld;
+  final List<double>? intrinsics;
+
+  /// Photo credit and picture delivery may use this image: its frame was
+  /// tracking normally and has a pose.
+  bool get creditable => trackingNormal && cameraToWorld != null;
+}
+
+/// The images after the first one of a committed iOS burst shot. The first
+/// image is the terminal's own capture.
+final class ARNativeCaptureShotV2 {
+  ARNativeCaptureShotV2({
+    required this.shotId,
+    required this.mode,
+    required this.imageCount,
+    required this.firstExposureTimestampNs,
+    required List<ARNativeCaptureShotImageV2> images,
+  }) : images = List.unmodifiable(images);
+
+  /// Decodes the `shot` map of the committed terminal whose first image is
+  /// [captureId]: image indices are 1 to [imageCount] - 1 at most, strictly
+  /// increasing, and each capture id differs from the first one's.
+  factory ARNativeCaptureShotV2.fromMap(
+    Map<String, dynamic> map, {
+    required String captureId,
+  }) {
+    _requireExactKeys(map, const {
+      'shotId',
+      'mode',
+      'imageCount',
+      'firstExposureTimestampNs',
+      'images',
+    });
+    final shotId = _nonEmptyString(map, 'shotId');
+    final firstExposureTimestampNs = _integer(map, 'firstExposureTimestampNs');
+    final mode = _nonEmptyString(map, 'mode');
+    final imageCount = _positiveInteger(map, 'imageCount');
+    final list = map['images'];
+    if (list is! List ||
+        list.isEmpty ||
+        list.any((item) => item is! Map) ||
+        !RegExp(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+            .hasMatch(shotId) ||
+        mode != 'burst' ||
+        imageCount > 5 ||
+        list.length != imageCount - 1) {
+      throw const FormatException('Malformed shot.');
+    }
+    final images = [
+      for (final item in list)
+        ARNativeCaptureShotImageV2.fromMap(
+          Map<String, dynamic>.from(item as Map),
+        ),
+    ];
+    for (var i = 0; i < images.length; i++) {
+      final image = images[i];
+      if (image.index >= imageCount ||
+          (i > 0 && image.index <= images[i - 1].index) ||
+          image.captureId == captureId ||
+          images.take(i).any((other) => other.captureId == image.captureId)) {
+        throw const FormatException('Shot images are not consistent.');
+      }
+    }
+    return ARNativeCaptureShotV2(
+      shotId: shotId,
+      mode: mode,
+      imageCount: imageCount,
+      firstExposureTimestampNs: firstExposureTimestampNs,
+      images: images,
+    );
+  }
+
+  final String shotId;
+  final String mode;
+
+  /// Images of the shot including the first one.
+  final int imageCount;
+
+  /// Exposure time of the first image, on the clock of every image's
+  /// [ARNativeCaptureShotImageV2.exposureTimestampNs].
+  final int firstExposureTimestampNs;
+  final List<ARNativeCaptureShotImageV2> images;
 }
 
 Map<String, Object?> _acceptedToMap(CaptureAcceptedAttempt value) => {

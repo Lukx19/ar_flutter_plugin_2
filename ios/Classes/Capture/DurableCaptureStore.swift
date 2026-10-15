@@ -38,6 +38,7 @@ final class DurableCaptureStore {
     var recoveryContext: NativeCaptureRecoveryContext?
     var jpegSizeBytes: Int64?
     var dngSizeBytes: Int64?
+    var shot: CommittedShot? = nil
   }
 
   static let bindingFullRequest = "full-request-v1"
@@ -184,6 +185,8 @@ final class DurableCaptureStore {
     }
     let reservation = try accepted["reservationToken"].flatMap { try budget.reservation(token: $0) }
     guard let reservation = reservation else { throw DurableStoreStateError("Accepted attempt has no live reservation") }
+    // Never chain a new root while a slot holds an uncertain one.
+    try resolveUncertainPointers(location)
     let staging = try attemptDirectory(location, identity) + ["staging"]
     try files.ensureDirectory(staging)
     let receiptPath = try receiptFile(location, identity)
@@ -263,7 +266,8 @@ final class DurableCaptureStore {
       let dngSize = request.components.first { $0.kind == .dng }?.byteLength
       let terminal = CaptureTerminal(
         kind: .committedPicture, identity: identity, canonicalTerminalHash: requestHash, reason: "committed",
-        captureId: captureId, captureRevision: revision, manifestId: rootHash, jpegSizeBytes: jpegSize, dngSizeBytes: dngSize)
+        captureId: captureId, captureRevision: revision, manifestId: rootHash, jpegSizeBytes: jpegSize, dngSizeBytes: dngSize,
+        shot: committedShot(location, captureId: captureId, rootHash: rootHash))
       let committed = CaptureReceipt(
         identity: identity, phase: .committedPicture, requestHash: requestHash,
         receiptHash: DurableStoreEncoding.receiptHash(requestHash: requestHash, rootHash: rootHash), durable: true, terminal: terminal)
@@ -318,6 +322,8 @@ final class DurableCaptureStore {
   private func rebaseCommittedReceipt(_ location: [String], commitId: String, _ values: [String: String]) throws -> Bool {
     guard let rootHash = values["rootHash"], let revision = values["revision"].flatMap(Int64.init),
           try validRootHash(location, rootHash, revision, 0) else { return false }
+    if try retainedRootHashes(location).contains(rootHash) { return true }
+    try resolveUncertainPointers(location)
     if try retainedRootHashes(location).contains(rootHash) { return true }
     let selected = try selectedRoot(location)
     guard revision == (selected?.revision ?? 0) + 1, try rootPrevious(location, rootHash) == selected?.hash,
@@ -586,7 +592,8 @@ final class DurableCaptureStore {
         result.append(RecoveryProjection(
           attemptId: attemptId, kind: .committedPicture, captureId: verified.captureId, captureRevision: verified.revision,
           manifestId: rootHash, reason: "recovered-committed", recoveryContext: context,
-          jpegSizeBytes: verified.jpegSizeBytes, dngSizeBytes: verified.dngSizeBytes))
+          jpegSizeBytes: verified.jpegSizeBytes, dngSizeBytes: verified.dngSizeBytes,
+          shot: verified.captureId.flatMap { committedShot(session, captureId: $0, rootHash: rootHash) }))
       } else if value["kind"] == CaptureTerminalKind.abandonedAttempt.storedName {
         result.append(RecoveryProjection(
           attemptId: attemptId, kind: .abandonedAttempt, reason: value["reason"] ?? "recovered-abandoned", recoveryContext: context))
@@ -729,7 +736,8 @@ final class DurableCaptureStore {
       terminal = CaptureTerminal(
         kind: .committedPicture, identity: identity, canonicalTerminalHash: value["requestHash"] ?? "", reason: "committed",
         captureId: verified.captureId, captureRevision: verified.revision, manifestId: rootHash,
-        jpegSizeBytes: verified.jpegSizeBytes, dngSizeBytes: verified.dngSizeBytes)
+        jpegSizeBytes: verified.jpegSizeBytes, dngSizeBytes: verified.dngSizeBytes,
+        shot: verified.captureId.flatMap { committedShot(location, captureId: $0, rootHash: rootHash) })
     } else {
       terminal = CaptureTerminal(
         kind: .abandonedAttempt, identity: identity, canonicalTerminalHash: value["requestHash"] ?? "",
@@ -811,6 +819,46 @@ final class DurableCaptureStore {
     return true
   }
 
+  /// A pointer slot whose rename happened but whose directory sync failed
+  /// ([publishPointer]) holds an uncertain root: [selectedRoot] skips it, so
+  /// a new commit or rebase would compute the same revision and overwrite
+  /// that slot, losing a root whose receipt is durable. Before either, the
+  /// session directory is synced again: on success the uncertain roots are
+  /// durable and selected again (their attempts' reservations are settled);
+  /// on failure the commit or rebase is refused and the slot stays.
+  private func resolveUncertainPointers(_ location: [String]) throws {
+    var uncertain: [CaptureRootPointer] = []
+    for slot in ["A", "B"] {
+      let file = location + ["root-\(slot).ptr"]
+      guard files.isFile(file), let pointer = CaptureRootRecords.parsePointer(try files.readBytes(file)),
+            uncertainRootHashes.contains(pointer.hash) else { continue }
+      uncertain.append(pointer)
+    }
+    guard !uncertain.isEmpty else { return }
+    do {
+      try files.at(.pointerDirectorySync)
+      try files.backend.syncDirectory(location)
+    } catch {
+      throw DurableStoreStateError("Session has an uncertain root pointer; directory sync failed again: \(error)")
+    }
+    for pointer in uncertain {
+      uncertainRootHashes.remove(pointer.hash)
+      // The attempt that published this root lost its settlement with the
+      // failed sync; charge its reservation now. A failure here leaves the
+      // reservation to the reconciliation at the next binding open.
+      let attempt = location + ["attempts", DurableStoreEncoding.safeName(pointer.commit)]
+      let accepted = attempt + ["accepted.properties"], receipt = attempt + ["receipt.properties"]
+      guard files.isFile(accepted), files.isFile(receipt),
+            (try? readProperties(receipt))?["rootHash"] == pointer.hash,
+            let values = try? readProperties(accepted) else { continue }
+      do {
+        try settleCommitted(location, attempt: attempt, accepted: values, rootHash: pointer.hash)
+      } catch {
+        NSLog("capture3d store: settlement of resolved root %@ deferred: %@", pointer.hash, "\(error)")
+      }
+    }
+  }
+
   private func publishPointer(_ location: [String], _ pointer: CaptureRootPointer) throws {
     let old = try selectedRoot(location)
     let target = location + [old?.slot == "A" ? "root-B.ptr" : "root-A.ptr"]
@@ -862,6 +910,46 @@ final class DurableCaptureStore {
     }
     if prior.requestHash == DurableStoreEncoding.requestHash(request) { return prior }
     throw DurableStoreConflict("Changed replay conflicts with durable terminal identity")
+  }
+
+  /// The images after the first one of the shot root [rootHash], from its
+  /// shot record: the record blob must have the rooted length and digest,
+  /// name the root's shot id, and list every rooted image with the rooted
+  /// length and digest. Nil for a plain root; nil (logged) for a record that
+  /// does not verify: its images stay committed in the store but are not
+  /// reported. Live terminals, receipt queries and restart recovery read
+  /// this same projection, so a replay equals the live terminal.
+  private func committedShot(_ location: [String], captureId: String, rootHash: String) -> CommittedShot? {
+    guard let metadata = try? readRootMetadata(location, rootHash), let shot = metadata.shot else { return nil }
+    func refused(_ reason: String) -> CommittedShot? {
+      NSLog("capture3d store: shot root %@ not reported: %@", rootHash, reason)
+      return nil
+    }
+    guard RootedDurableFiles.isValidSegment(captureId) else { return refused("invalid capture id") }
+    let recordPath = location + ["assets", captureId, Self.shotRecordBlobName(hash: shot.record.hash)]
+    guard files.isFile(recordPath), let bytes = try? files.readBytes(recordPath) else { return refused("record missing") }
+    guard Int64(bytes.count) == shot.record.length,
+          DurableStoreEncoding.hex(DurableStoreEncoding.sha256(bytes)) == shot.record.hash else {
+      return refused("record digest")
+    }
+    guard let decoded = ShotRecord.decode(bytes), decoded.shotId == shot.shotId,
+          decoded.images.count == shot.images.count + 1 else { return refused("record content") }
+    var images: [CommittedShotImage] = []
+    for rooted in shot.images {
+      guard rooted.index < decoded.images.count else { return refused("image \(rooted.index) not recorded") }
+      let image = decoded.images[rooted.index]
+      guard image.byteLength == rooted.length, image.sha256 == rooted.hash else {
+        return refused("image \(rooted.index) differs from its root line")
+      }
+      images.append(CommittedShotImage(
+        index: rooted.index, captureId: ShotRecord.imageCaptureId(captureId, index: rooted.index),
+        jpegSizeBytes: rooted.length, exposureTimestampNs: image.exposureTimestampNs, width: image.width,
+        height: image.height, trackingNormal: image.trackingNormal, flags: image.flags.rawValue,
+        cameraToWorld: image.cameraToWorld, intrinsics: image.intrinsics))
+    }
+    return CommittedShot(
+      shotId: shot.shotId, mode: decoded.mode, imageCount: decoded.images.count,
+      firstExposureTimestampNs: decoded.images[0].exposureTimestampNs, images: images)
   }
 
   /// The committed JPEG blob of [terminal] as a file URL, for read-only

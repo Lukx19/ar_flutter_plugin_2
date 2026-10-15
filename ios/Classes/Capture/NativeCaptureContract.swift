@@ -229,6 +229,9 @@ struct CaptureTerminal: Hashable {
   var manifestId: String?
   var jpegSizeBytes: Int64?
   var dngSizeBytes: Int64?
+  /// The images after the first one of a committed burst shot (shot root,
+  /// schema 7); nil for a single-image commit.
+  var shot: CommittedShot? = nil
 }
 
 struct CaptureReceipt: Hashable {

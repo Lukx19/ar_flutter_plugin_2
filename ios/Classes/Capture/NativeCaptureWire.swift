@@ -28,11 +28,13 @@ struct NativeCaptureEvent: Hashable {
   var reason: String?
   var resources: CaptureResourceSnapshot?
   var recoveryContext: NativeCaptureRecoveryContext?
+  /// The images after the first one of a committed burst shot.
+  var shot: CommittedShot? = nil
 
   /// Fields that must not change between a live terminal and its replay.
   var terminalIdentity: [AnyHashable?] {
     [kind, captureId, captureRevision, manifestId, jpegSizeBytes, dngSizeBytes, recoveryContext,
-     kind == .abandoned ? reason : nil]
+     kind == .abandoned ? reason : nil, shot]
   }
 
   var isTerminal: Bool { kind == .committed || kind == .abandoned }
@@ -190,6 +192,7 @@ enum NativeCaptureWire {
     if let v = value.dngSizeBytes { map["dngSizeBytes"] = Int(v) }
     if let v = value.reason { map["reason"] = v }
     if let v = value.recoveryContext { map["recoveryContext"] = recoveryContextMap(v) }
+    if let v = value.shot { map["shot"] = shotMap(v) }
     if let r = value.resources {
       map["health"] = [
         "exposures": Int(r.exposures), "lateCallbacks": Int(r.lateCallbacks), "closedComponents": Int(r.closedComponents),
@@ -210,13 +213,36 @@ enum NativeCaptureWire {
     ]
   }
 
+  /// The `shot` map of a committed burst terminal (iOS only; Android never
+  /// sends it): shot id, mode, image count including the first image, the
+  /// first image's exposure time, and
+  /// per image after the first one its index, capture id, JPEG size,
+  /// exposure time, size, tracking, flag bits and, when known, its
+  /// column-major ARKit camera-to-world and fx, fy, cx, cy.
+  static func shotMap(_ value: CommittedShot) -> [String: Any] {
+    [
+      "shotId": value.shotId, "mode": value.mode, "imageCount": value.imageCount,
+      "firstExposureTimestampNs": Int(value.firstExposureTimestampNs),
+      "images": value.images.map { image -> [String: Any] in
+        var map: [String: Any] = [
+          "index": image.index, "captureId": image.captureId, "jpegSizeBytes": Int(image.jpegSizeBytes),
+          "exposureTimestampNs": Int(image.exposureTimestampNs), "width": image.width, "height": image.height,
+          "trackingNormal": image.trackingNormal, "flags": image.flags,
+        ]
+        if let pose = image.cameraToWorld { map["cameraToWorld"] = pose }
+        if let k = image.intrinsics { map["intrinsics"] = k }
+        return map
+      },
+    ]
+  }
+
   /// Terminal event of a durable receipt (committed or abandoned).
   static func terminalEvent(_ terminal: CaptureTerminal, recoveryContext: NativeCaptureRecoveryContext?) -> NativeCaptureEvent {
     NativeCaptureEvent(
       kind: terminal.kind == .committedPicture ? .committed : .abandoned, attemptId: terminal.identity.attemptId,
       captureId: terminal.captureId, captureRevision: terminal.captureRevision, manifestId: terminal.manifestId,
       jpegSizeBytes: terminal.jpegSizeBytes, dngSizeBytes: terminal.dngSizeBytes, reason: terminal.reason,
-      recoveryContext: recoveryContext)
+      recoveryContext: recoveryContext, shot: terminal.shot)
   }
 
   /// Reply of `admitNativeCaptureV2`; `terminal` is present as null when the

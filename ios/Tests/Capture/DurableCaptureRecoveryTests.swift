@@ -124,8 +124,53 @@ final class DurableCaptureRecoveryTests: XCTestCase {
     }
   }
 
+  /// A pointer rename whose directory sync failed leaves an uncertain root
+  /// in its slot. While the sync keeps failing, a later commit is refused
+  /// and never overwrites that slot; once the sync succeeds the uncertain
+  /// root is selected again, its reservation is settled, and the later
+  /// commit chains after it. Both survive a restart.
+  func testAnUncertainRootPointerIsNeverOverwrittenByALaterCommit() throws {
+    var failing = true
+    let (store, budget) = try CaptureFixture.store(root, fault: { point in
+      if failing && point == .pointerDirectorySync { throw DurableStoreStateError("injected-directory-sync") }
+    })
+    let first = CaptureFixture.request()
+    _ = try store.acceptCaptureBeforeExposure(first)
+    XCTAssertThrowsError(try store.commitStreamedFinalized(first.template, exposureTimestampNanoseconds: 1,
+                                                           components: [(.jpeg, CaptureFixture.jpeg)]))
+    XCTAssertThrowsError(try store.rebaseSameAttempt(first), "the retried sync fails too")
+    let slotA = root.appendingPathComponent("\(session())/root-A.ptr")
+    let uncertain = try Data(contentsOf: slotA)
+
+    let second = CaptureFixture.request(attemptId: "6f1c2d3e-0000-4000-8000-000000000002", commitId: "commit-2", ordinal: 2)
+    let secondJpeg: [UInt8] = [0xff, 0xd8, 2, 2, 0xff, 0xd9]
+    _ = try store.acceptCaptureBeforeExposure(second)
+    XCTAssertThrowsError(try store.commitStreamedFinalized(second.template, exposureTimestampNanoseconds: 2,
+                                                           components: [(.jpeg, secondJpeg)]),
+                         "a commit is refused while the uncertain root cannot be made durable")
+    XCTAssertEqual(try Data(contentsOf: slotA), uncertain, "the uncertain slot is never overwritten")
+    XCTAssertFalse(exists("\(attempt(second))/receipt.properties"))
+
+    failing = false
+    let committed = try store.commitStreamedFinalized(second.template, exposureTimestampNanoseconds: 2,
+                                                      components: [(.jpeg, secondJpeg)])
+    XCTAssertEqual(committed.terminal?.captureRevision, 2, "the later commit chains after the uncertain root")
+    let firstReceipt = try XCTUnwrap(try store.queryReceipt(first.accepted.identity)?.terminal)
+    XCTAssertEqual(firstReceipt.kind, .committedPicture)
+    XCTAssertEqual(firstReceipt.captureRevision, 1)
+    XCTAssertEqual(try budget.reservedBytesTotal(), 0, "the resolved root's reservation is settled")
+    XCTAssertEqual(try budget.committedBytes(), jpegBytes + Int64(secondJpeg.count), "each photo charged once")
+
+    let (reopened, reopenedBudget) = try CaptureFixture.store(root)
+    XCTAssertEqual(try reopened.recoverAndProject().compactMap { $0.captureRevision }.sorted(), [1, 2])
+    XCTAssertEqual(try reopenedBudget.committedBytes(), jpegBytes + Int64(secondJpeg.count))
+  }
+
   func testBudgetSettlementFaultKeepsTheCommittedPhotoAndSettlesOnceAtRestart() throws {
-    let fault = PersistentFault(.deleteReclaim)
+    // The settlement is cut before its marker is durable (its rename):
+    // the reservation stays live. A cut after the marker is finished by the
+    // ledger itself (StorageBudgetLedgerTests).
+    let fault = PersistentFault(.pointerSlotReplace)
     fault.armed = false
     let (store, budget) = try CaptureFixture.store(root, budgetFault: fault.injector())
     let owner = owner(store)

@@ -170,11 +170,12 @@ final class ShotDurableCommitTests: XCTestCase {
     XCTAssertGreaterThanOrEqual(cuts, 30)
   }
 
-  func testTheAdmissionOwnerCommitsTheShotAndReportsOnlyTheFirstImage() throws {
+  func testTheAdmissionOwnerCommitsTheShotAndReportsEveryImage() throws {
     let (store, _) = try CaptureFixture.store(root)
     let camera = FakeStillExposure()
     var photos: [DurableTerminalPhoto] = []
-    let owner = NativeCaptureAdmissionOwner(store: store, exposure: camera, nowMs: { 1_000 }, events: { _ in },
+    var events: [NativeCaptureEvent] = []
+    let owner = NativeCaptureAdmissionOwner(store: store, exposure: camera, nowMs: { 1_000 }, events: { events.append($0) },
                                             durableTerminal: { photos.append($0) })
     let request = CaptureFixture.request()
     _ = try owner.admit(request)
@@ -184,20 +185,30 @@ final class ShotDurableCommitTests: XCTestCase {
       qualifier: qualifier, components: [(.jpeg, shot.first.jpeg)], metadata: shot.first.metadata, shot: shot)))
     let photo = try XCTUnwrap(photos.first)
     XCTAssertEqual(photo.terminal.kind, .committedPicture)
-    XCTAssertEqual(photo.shotImageURLs.keys.sorted(), [1, 2], "images 1... stay durably committed")
+    XCTAssertEqual(photo.shotImageURLs.keys.sorted(), [1, 2], "images 1... are durably committed")
     try assertCompleteShot(store, photo.terminal)
-    // The session manifest holds only the first image: the grid credits only it.
+    let captureId = try XCTUnwrap(photo.terminal.captureId)
+    // The committed terminal reports images 1... to the session manifest.
+    let committed = try XCTUnwrap(events.first { $0.kind == .committed })
+    XCTAssertEqual(committed.shot, photo.terminal.shot)
+    XCTAssertEqual(committed.shot?.images.map { $0.captureId },
+                   [1, 2].map { ShotRecord.imageCaptureId(captureId, index: $0) })
+    // The grid credits every image the session holds, each with its own frame.
     let records = NativeCaptureChannel.photoSavedRecords(photo)
-    XCTAssertEqual(records.count, 1)
-    XCTAssertEqual(records[0].captureId, photo.terminal.captureId, "the first image keeps the capture id")
-    XCTAssertEqual(records[0].shotImage?.index, 0)
+    XCTAssertEqual(records.count, 3)
+    XCTAssertEqual(records.map { $0.captureId }, [captureId] + [1, 2].map { ShotRecord.imageCaptureId(captureId, index: $0) },
+                   "the first image keeps the capture id")
+    XCTAssertEqual(records.map { $0.shotImage?.index }, [0, 1, 2])
     XCTAssertEqual(records[0].shotImage?.mode, PhotoShotImageLayout.modeBurst)
-    XCTAssertEqual(records[0].shotImage?.count, 3)
+    XCTAssertEqual(records.map { $0.shotImage?.count }, [3, 3, 3])
     XCTAssertEqual(records[0].shotImage?.flags, 0)
-    XCTAssertEqual(records[0].exposureTimestampNs, shot.images[0].metadata.exposureTimestampNs)
-    XCTAssertEqual(records[0].cameraToWorld, shot.images[0].metadata.cameraToWorld, "its own frame's pose")
+    XCTAssertEqual(records.map { $0.exposureTimestampNs }, shot.images.map { $0.metadata.exposureTimestampNs })
+    XCTAssertEqual(records[1].cameraToWorld, shot.images[1].metadata.cameraToWorld, "its own frame's pose")
+    XCTAssertNil(records[2].cameraToWorld, "an image taken while tracking was limited is never credited")
+    XCTAssertEqual(records[2].shotImage?.flags, ShotImageFlags.trackingNotNormal.rawValue)
     XCTAssertEqual(records[0].sharpness, 100)
     XCTAssertEqual(records[0].imageURL, photo.imageURL)
+    XCTAssertEqual(records[1].imageURL, photo.shotImageURLs[1])
     XCTAssertFalse(records[0].automatic)
 
     // A quality shot is one image: a plain commit that still reports its mode.
@@ -247,7 +258,8 @@ final class ShotDurableCommitTests: XCTestCase {
     XCTAssertEqual([UInt8](try Data(contentsOf: image)), shot.first.jpeg)
     XCTAssertEqual(try budget.reservedBytesTotal(), 0, "the reservation is settled")
     XCTAssertEqual(try budget.committedBytes(), Int64(shot.first.jpeg.count), "and charged once with image 0")
-    XCTAssertEqual(NativeCaptureChannel.photoSavedRecords(photo).count, 1)
+    XCTAssertNil(photo.terminal.shot, "a plain commit reports no shot images")
+    XCTAssertEqual(NativeCaptureChannel.photoSavedRecords(photo).count, 1, "only the committed image is credited")
   }
 
   func testTrailingImagesThatDoNotFitTheReservationAreDropped() throws {
@@ -262,6 +274,11 @@ final class ShotDurableCommitTests: XCTestCase {
     XCTAssertEqual([UInt8](try Data(contentsOf: files.record)), record, "the record lists only the kept images")
     XCTAssertEqual(try budget.reservedBytesTotal(), 0)
     XCTAssertEqual(try budget.committedBytes(), Int64(shot.images[0].jpeg.count + shot.images[1].jpeg.count + record.count))
+    XCTAssertEqual(photo.terminal.shot?.images.map { $0.index }, [1], "the terminal reports only the kept image")
+    XCTAssertEqual(photo.terminal.shot?.imageCount, 2)
+    let records = NativeCaptureChannel.photoSavedRecords(photo)
+    XCTAssertEqual(records.map { $0.shotImage?.index }, [0, 1], "the dropped image is never credited")
+    XCTAssertEqual(records.map { $0.shotImage?.count }, [2, 2])
   }
 
   /// Image 1 of the shared golden (`ingest_photo_saved_shot_image.bin`,

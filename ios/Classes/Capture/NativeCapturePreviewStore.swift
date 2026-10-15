@@ -72,29 +72,51 @@ final class NativeCapturePreviewReader {
       if cancelled() { return false }
       let session = sessions.appendingPathComponent(name, isDirectory: true)
       guard Self.isPlainDirectory(session), !FileManager.default.fileExists(atPath: session.appendingPathComponent("tombstone").path),
-            let jpeg = committedRoot(session, manifestId, captureId, cancelled)?.components.first(where: { $0.kind == "JPEG" }) else { continue }
-      let source = session.appendingPathComponent("assets/\(captureId)/jpeg.\(jpeg.hash).blob")
-      guard Self.isPlainFile(source), Self.fileSize(source) == jpeg.length else { continue }
+            let image = committedImage(session, manifestId, captureId, cancelled) else { continue }
+      let source = image.source
+      guard Self.isPlainFile(source), Self.fileSize(source) == image.length else { continue }
       try? FileManager.default.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
       if CapturePreviewThumbnail.valid(target, edge: edge) { return true }
       let partial = target.deletingLastPathComponent().appendingPathComponent(target.lastPathComponent + ".part")
       defer { try? FileManager.default.removeItem(at: partial) }
       guard !cancelled(), let bytes = try? Data(contentsOf: source),
-            DurableStoreEncoding.hex(DurableStoreEncoding.sha256([UInt8](bytes))) == jpeg.hash,
+            DurableStoreEncoding.hex(DurableStoreEncoding.sha256([UInt8](bytes))) == image.hash,
             CapturePreviewThumbnail.write(source: source, target: partial, edge: edge, cancelled: cancelled), !cancelled() else { return false }
       return rename(partial.path, target.path) == 0
     }
     return false
   }
 
-  private func committedRoot(_ session: URL, _ wanted: String, _ captureId: String, _ cancelled: () -> Bool) -> CaptureRootMetadata? {
+  /// The committed JPEG [captureId] of the published root [manifestId]: the
+  /// attempt's JPEG when the root's bound committed receipt names
+  /// [captureId], or image k of a burst shot root when [captureId] is
+  /// [ShotRecord.imageCaptureId] of the receipt's capture id and k.
+  private func committedImage(_ session: URL, _ manifestId: String, _ captureId: String, _ cancelled: () -> Bool)
+    -> (source: URL, length: Int64, hash: String)? {
+    guard let root = committedRoot(session, manifestId, cancelled),
+          let bound = boundReceiptCaptureId(session, manifestId, root, cancelled),
+          RootedDurableFiles.isValidSegment(bound) else { return nil }
+    let assets = session.appendingPathComponent("assets/\(bound)", isDirectory: true)
+    if bound == captureId {
+      guard let jpeg = root.components.first(where: { $0.kind == "JPEG" }) else { return nil }
+      return (assets.appendingPathComponent("jpeg.\(jpeg.hash).blob"), jpeg.length, jpeg.hash)
+    }
+    guard let image = root.shot?.images.first(where: { ShotRecord.imageCaptureId(bound, index: $0.index) == captureId }) else {
+      return nil
+    }
+    return (assets.appendingPathComponent(DurableCaptureStore.shotImageBlobName(index: image.index, hash: image.hash)),
+            image.length, image.hash)
+  }
+
+  /// The root [wanted] when it is reachable from the selected pointer.
+  private func committedRoot(_ session: URL, _ wanted: String, _ cancelled: () -> Bool) -> CaptureRootMetadata? {
     guard let selected = selectedRoot(session) else { return nil }
     var hash = selected.hash
     var revision = selected.revision
     while revision > 0 && !cancelled() {
       guard let root = readRoot(session, hash), root.revision == revision, DurableStoreEncoding.isHash(root.request) else { return nil }
       if revision == 1 && (root.previous != "-" || root.secondPrevious != "-") { return nil }
-      if hash == wanted { return boundReceipt(session, hash, captureId, root, cancelled) ? root : nil }
+      if hash == wanted { return root }
       guard let previous = root.previous, DurableStoreEncoding.isHash(previous) else { return nil }
       hash = previous
       revision -= 1
@@ -130,28 +152,29 @@ final class NativeCapturePreviewReader {
   }
 
   /// The root alone cannot authorize another capture with equal JPEG bytes:
-  /// a committed receipt must name this manifest and capture.
-  private func boundReceipt(_ session: URL, _ manifestId: String, _ captureId: String, _ root: CaptureRootMetadata, _ cancelled: () -> Bool) -> Bool {
+  /// the committed receipt that names this manifest binds it to its capture
+  /// id. Nil when no valid committed receipt names [manifestId].
+  private func boundReceiptCaptureId(_ session: URL, _ manifestId: String, _ root: CaptureRootMetadata, _ cancelled: () -> Bool) -> String? {
     let attempts = session.appendingPathComponent("attempts", isDirectory: true)
-    guard Self.isPlainDirectory(attempts), let entries = try? FileManager.default.contentsOfDirectory(atPath: attempts.path) else { return false }
+    guard Self.isPlainDirectory(attempts), let entries = try? FileManager.default.contentsOfDirectory(atPath: attempts.path) else { return nil }
     for name in entries.sorted() {
-      if cancelled() { return false }
+      if cancelled() { return nil }
       let file = attempts.appendingPathComponent(name).appendingPathComponent("receipt.properties")
       guard Self.isPlainFile(file), let size = Self.fileSize(file), size <= Int64(Self.maxReceiptBytes),
             let data = try? Data(contentsOf: file) else { continue }
       let values = DurableStoreEncoding.parseProperties([UInt8](data))
       guard values["kind"] == CaptureTerminalKind.committedPicture.storedName, values["rootHash"] == manifestId,
-            values["captureId"] == captureId else { continue }
+            let captureId = values["captureId"], DurableStoreEncoding.isHash(captureId) else { continue }
       guard values["requestHash"] == root.request, values["revision"].flatMap(Int64.init) == root.revision,
             values["receiptHash"] == DurableStoreEncoding.receiptHash(requestHash: root.request ?? "", rootHash: manifestId),
-            let jpeg = root.components.first(where: { $0.kind == "JPEG" }) else { return false }
+            let jpeg = root.components.first(where: { $0.kind == "JPEG" }) else { return nil }
       let dng = root.components.first { $0.kind == "DNG" }
-      if values.keys.contains(where: { $0.hasPrefix("quality") }) { return false }
-      if let text = values["jpegSizeBytes"], Int64(text) != jpeg.length { return false }
-      if let text = values["dngSizeBytes"], Int64(text) != dng?.length { return false }
-      return true
+      if values.keys.contains(where: { $0.hasPrefix("quality") }) { return nil }
+      if let text = values["jpegSizeBytes"], Int64(text) != jpeg.length { return nil }
+      if let text = values["dngSizeBytes"], Int64(text) != dng?.length { return nil }
+      return captureId
     }
-    return false
+    return nil
   }
 
   private func readRoot(_ session: URL, _ hash: String) -> CaptureRootMetadata? {

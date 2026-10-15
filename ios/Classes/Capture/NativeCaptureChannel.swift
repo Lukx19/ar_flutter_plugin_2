@@ -253,24 +253,26 @@ final class NativeCaptureChannel: CaptureChannelExtension {
     result(reply)
   }
 
-  /// One call per committed durable photo, after its durable terminal.
+  /// One call per committed durable photo, after its durable terminal; a
+  /// burst shot reports every committed image with its own frame.
   static func reportPhotoSaved(_ photo: DurableTerminalPhoto) {
     guard let emitter = VisibilityGridShellRegistry.shared.photoSavedEmitter else { return }
     photoSavedRecords(photo).forEach { emitter.onDurableTerminal($0) }
   }
 
-  /// The photo saved records of [photo]: exactly one, for the capture id the
-  /// session manifest holds. A burst or quality shot reports only its first
-  /// image (index 0, with that image's own pose, intrinsics and exposure
-  /// time): images 1... stay durably committed in the shot root but do not
-  /// reach the session manifest or export yet, so the grid credits only what
-  /// the session holds. An image whose frame was not tracking normally
+  /// The photo saved records of [photo]: one, or one per committed image of
+  /// a burst shot, each with that image's own pose, intrinsics and exposure
+  /// time and the capture id the session manifest holds for it (image 0
+  /// keeps the attempt's capture id; image k gets
+  /// [ShotRecord.imageCaptureId]). Only images the committed terminal
+  /// reports ([CaptureTerminal.shot]) are sent, so the grid credits exactly
+  /// what the session holds. An image whose frame was not tracking normally
   /// carries no pose (no credit).
   static func photoSavedRecords(_ photo: DurableTerminalPhoto) -> [DurablePhotoRecord] {
     guard photo.terminal.kind == .committedPicture, let captureId = photo.terminal.captureId else { return [] }
     let automatic = photo.request.accepted.lane == .automatic
     let attemptId = photo.terminal.identity.attemptId
-    guard let shot = photo.shot, let image = shot.images.first else {
+    guard let shot = photo.shot, !shot.images.isEmpty else {
       let metadata = photo.metadata
       return [DurablePhotoRecord(
         captureId: captureId, attemptId: attemptId,
@@ -279,15 +281,20 @@ final class NativeCaptureChannel: CaptureChannelExtension {
         sharpness: metadata?.sharpness, automatic: automatic, blurRejected: false,
         imageURL: photo.imageURL)]
     }
-    let m = image.metadata
-    return [DurablePhotoRecord(
-      captureId: captureId, attemptId: attemptId, exposureTimestampNs: m.exposureTimestampNs,
-      cameraToWorld: image.creditable ? m.cameraToWorld : nil, intrinsics: m.intrinsics,
-      width: m.width, height: m.height, sharpness: m.sharpness, automatic: automatic,
-      blurRejected: false, imageURL: photo.imageURL,
-      shotImage: ShotImageRecord(
-        shotId: shot.shotId, index: image.index, count: shot.images.count, mode: shot.mode.rawValue,
-        flags: image.flags.rawValue))]
+    let committed = Set(photo.terminal.shot?.images.map { $0.index } ?? [])
+    let reported = shot.images.filter { $0.index == 0 || committed.contains($0.index) }
+    return reported.map { image in
+      let m = image.metadata
+      return DurablePhotoRecord(
+        captureId: image.index == 0 ? captureId : ShotRecord.imageCaptureId(captureId, index: image.index),
+        attemptId: attemptId, exposureTimestampNs: m.exposureTimestampNs,
+        cameraToWorld: image.creditable ? m.cameraToWorld : nil, intrinsics: m.intrinsics,
+        width: m.width, height: m.height, sharpness: m.sharpness, automatic: automatic,
+        blurRejected: false, imageURL: image.index == 0 ? photo.imageURL : photo.shotImageURLs[image.index],
+        shotImage: ShotImageRecord(
+          shotId: shot.shotId, index: image.index, count: reported.count, mode: shot.mode.rawValue,
+          flags: image.flags.rawValue))
+    }
   }
 
   // MARK: Durable previews
