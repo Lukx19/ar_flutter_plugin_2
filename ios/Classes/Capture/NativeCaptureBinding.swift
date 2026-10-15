@@ -13,11 +13,20 @@ final class NativeCaptureRootLease {
   private init(key: String) { self.key = key }
 
   static func acquire(_ root: URL) throws -> NativeCaptureRootLease {
-    let key = root.standardizedFileURL.resolvingSymlinksInPath().path
+    let key = leaseKey(root)
     lock.lock(); defer { lock.unlock() }
     guard !active.contains(key) else { throw NativeCaptureOwnerError.rootPending }
     active.insert(key)
     return NativeCaptureRootLease(key: key)
+  }
+
+  /// Canonical path of [root]. Symlinks resolve only for existing paths
+  /// (on a device the app container is under `/var` -> `/private/var`), so
+  /// the root is created first; otherwise a lease taken before the root
+  /// existed would key differently from one taken after.
+  static func leaseKey(_ root: URL) -> String {
+    try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    return root.standardizedFileURL.resolvingSymlinksInPath().path
   }
 
   func release() {

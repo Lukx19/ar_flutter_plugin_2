@@ -76,7 +76,16 @@ enum GridRendererFixtures {
   /// written by `renderer_delta_exporter_test.dart`: a 1.6 x 1.2 x 1.2 m
   /// room, 864 surfaces, nearest-K 64) split into messages.
   static func roomExportStream(file: StaticString = #filePath) throws -> [Data] {
-    let data = try Data(contentsOf: pluginRoot(file).appendingPathComponent("test_assets/grid_renderer/room_export_stream.bin"))
+    // The test bundle carries test_assets/grid_renderer (needed on a device,
+    // which cannot read the source tree); host runs fall back to the tree.
+    var url = pluginRoot(file).appendingPathComponent("test_assets/grid_renderer/room_export_stream.bin")
+    for bundle in Bundle.allBundles + [Bundle.main] {
+      if let bundled = bundle.url(forResource: "room_export_stream.bin", withExtension: nil, subdirectory: "grid_renderer") {
+        url = bundled
+        break
+      }
+    }
+    let data = try Data(contentsOf: url)
     var messages: [Data] = []
     var at = 0
     while at < data.count {

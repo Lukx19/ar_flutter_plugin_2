@@ -95,6 +95,16 @@ final class NativeCaptureBindingTests: XCTestCase {
     XCTAssertTrue(camera.requests.isEmpty)
   }
 
+  func testLeaseKeyIsTheSameBeforeAndAfterTheRootExists() {
+    let parent = CaptureFixture.temporaryDirectory("lease-key")
+    defer { try? FileManager.default.removeItem(at: parent) }
+    let root = parent.appendingPathComponent("not-yet/native", isDirectory: true)
+    let before = NativeCaptureRootLease.leaseKey(root)
+    let after = NativeCaptureRootLease.leaseKey(root)
+    XCTAssertEqual(before, after)
+    XCTAssertTrue(FileManager.default.fileExists(atPath: root.path))
+  }
+
   func testRootIsExclusiveUntilTheOwnerCloses() throws {
     let first = binding()
     _ = try complete { first.replay(completion: $0) }.get()
