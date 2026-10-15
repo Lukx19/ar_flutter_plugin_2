@@ -8,11 +8,13 @@ struct PluginEngineServices {
   var gridRenderer: GridRendererChannels = .shared
   var sessionLifecycle: SessionLifecycleServices = .shared
   var capture: NativeCaptureRegistration = .shared
+  var markerDetection: GridMarkerDetection = .shared
 
-  /// Grid shell, grid renderer channels, session log, world map and
-  /// background task services, still capture channels.
+  /// Grid shell with marker detection, grid renderer channels, session log,
+  /// world map and background task services, still capture channels.
   func register(messenger: FlutterBinaryMessenger) {
     gridShell.register(messenger: messenger)
+    markerDetection.install(registry: gridShell)
     gridRenderer.register(messenger: messenger)
     sessionLifecycle.register(messenger: messenger)
     capture.register(messenger: messenger)
@@ -22,6 +24,7 @@ struct PluginEngineServices {
   /// registrations stay.
   func unregister(messenger: FlutterBinaryMessenger) {
     gridShell.unregister(messenger: messenger)
+    if gridShell.activeShell == nil { markerDetection.uninstall() }
     gridRenderer.unregister(messenger: messenger)
     sessionLifecycle.unregister(messenger: messenger)
     capture.unregister(messenger: messenger)
@@ -69,7 +72,7 @@ public class SwiftArFlutterPlugin: NSObject, FlutterPlugin {
   }
 
   /// The engine went away: release the grid shell (channels, frame
-  /// observer, parked pull), the grid renderer channels, the session log,
+  /// observer, parked pull) and its marker detection, the grid renderer channels, the session log,
   /// world map and background task services and the still capture channels
   /// it owns, unless a later engine registered since. Uses the messenger kept
   /// from registration, never `registrar.messenger()` (nil while the engine

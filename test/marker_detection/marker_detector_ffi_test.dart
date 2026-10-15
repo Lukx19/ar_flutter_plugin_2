@@ -8,10 +8,24 @@
 //   CAPTURE3D_MARKER_DETECTOR_LIBRARY=<dir>/capture3d_marker_detector.dll \
 //     flutter test test/marker_detection/marker_detector_ffi_test.dart
 //
+// The AprilTag build (the iOS backend) also decodes the committed golden
+// image; build it with the AprilTag sources and defines:
+//
+//   clang -O2 -c -w -Inative/marker_detector/third_party/apriltag \
+//     -Inative/marker_detector/src <third_party/apriltag/*.c, common/*.c,
+//     src/aruco_mip_36h12_family.c>
+//   clang++ -std=c++17 -O2 -shared -DC3MD_WITH_APRILTAG=1 <the include and
+//     src flags above, -Inative/marker_detector/third_party/apriltag>
+//     src/marker_geometry.cpp src/marker_pose.cpp src/marker_apriltag.cpp
+//     src/marker_detector.cpp <the C objects> -o <dir>/libmarker.dylib
+//
 // Without the variable the tests are skipped.
+import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io';
 import 'dart:math' as math;
+import 'dart:typed_data';
+import 'dart:ui' as ui;
 
 import 'package:ar_flutter_plugin_2/marker_detection/marker_detector_ffi.dart';
 import 'package:ar_flutter_plugin_2/visibility_grid_contract/visibility_grid_contract.dart';
@@ -115,4 +129,58 @@ void main() {
     expect(lib.viewingAngleDeg(rvec, tvec), closeTo(60, 1e-3));
     d.dispose();
   }, skip: skip);
+
+  // AprilTag build (the iOS backend) only: a library without a detection
+  // backend reports unavailable and the test returns early.
+  test('detection build decodes the committed golden image', () async {
+    final lib = MarkerDetectorLibrary.open(path);
+    final d =
+        MarkerDetector.create(lib, MarkerDetectorDictionary.arucoMip36h12)!;
+    if (!d.available) {
+      d.dispose();
+      return;
+    }
+    expect(MarkerDetector.create(lib, MarkerDetectorDictionary.aruco4x4_50),
+        isNull,
+        reason: 'AprilTag decodes no 4X4 dictionary');
+    final goldens = jsonDecode(
+            File('test_assets/marker_detection/marker_goldens.json')
+                .readAsStringSync()) as Map<String, dynamic>;
+    final camera = goldens['camera'] as Map<String, dynamic>;
+    final image = (goldens['images'] as List).first as Map<String, dynamic>;
+    final png = File('test_assets/marker_detection/${image['file']}')
+        .readAsBytesSync();
+    final rgba = await decodeRgba(png);
+    final width = camera['width'] as int, height = camera['height'] as int;
+    final grey = d.imageBuffer(width * height);
+    for (var i = 0; i < width * height; i++) {
+      grey[i] = rgba[4 * i];
+    }
+    d.setCamera((camera['fx'] as num).toDouble(),
+        (camera['fy'] as num).toDouble(), (camera['cx'] as num).toDouble(),
+        (camera['cy'] as num).toDouble());
+    d.setMarkerSize((image['markerSizeMetres'] as num).toDouble());
+    final markers = image['markers'] as List;
+    expect(d.detect(width, height, width), markers.length);
+    expect(d.estimatePose(), markers.length);
+    for (var i = 0; i < markers.length; i++) {
+      final m = markers[i] as Map<String, dynamic>;
+      expect(d.records.getUint16(64 * i, Endian.little), m['id']);
+      final truth = (m['truth'] as List).cast<num>();
+      for (var k = 0; k < 8; k++) {
+        expect(d.records.getFloat32(64 * i + 4 + 4 * k, Endian.little),
+            closeTo(truth[k].toDouble(), 0.5));
+      }
+    }
+    d.dispose();
+  }, skip: skip);
+}
+
+/// RGBA bytes of an encoded image (grey PNG: R = G = B = grey).
+Future<Uint8List> decodeRgba(Uint8List encoded) async {
+  final codec = await ui.instantiateImageCodec(encoded);
+  final frame = await codec.getNextFrame();
+  final data =
+      await frame.image.toByteData(format: ui.ImageByteFormat.rawRgba);
+  return data!.buffer.asUint8List();
 }

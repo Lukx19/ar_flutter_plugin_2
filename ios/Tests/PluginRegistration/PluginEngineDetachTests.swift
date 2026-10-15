@@ -20,7 +20,14 @@ final class PluginEngineDetachTests: XCTestCase {
       gridShell: VisibilityGridShellRegistry(),
       gridRenderer: GridRendererChannels(),
       sessionLifecycle: SessionLifecycleServices(),
-      capture: NativeCaptureRegistration())
+      capture: NativeCaptureRegistration(),
+      markerDetection: GridMarkerDetection(detectorAvailable: { true }))
+  }
+
+  /// Marker detection follows the grid shell: installed with it (control
+  /// accepts set marker detection on), removed once no engine owns it.
+  private func markersInstalled(_ services: PluginEngineServices) -> [Bool] {
+    [services.markerDetection.isInstalled(in: services.gridShell), services.gridShell.markerDetectorAvailable()]
   }
 
   private func registered(_ services: PluginEngineServices, _ messenger: FlutterBinaryMessenger) -> [Bool] {
@@ -39,10 +46,12 @@ final class PluginEngineDetachTests: XCTestCase {
     services.register(messenger: messenger)
     XCTAssertEqual(messenger.handledChannels, Self.channels)
     XCTAssertEqual(registered(services, messenger), [true, true, true, true])
+    XCTAssertEqual(markersInstalled(services), [true, true])
 
     plugin.detach()
     XCTAssertEqual(registered(services, messenger), [false, false, false, false])
     XCTAssertTrue(messenger.handledChannels.isEmpty)
+    XCTAssertEqual(markersInstalled(services), [false, false])
 
     // A second engine registered after the detach keeps its services when
     // the first plugin instance is detached again.
@@ -67,10 +76,12 @@ final class PluginEngineDetachTests: XCTestCase {
     firstPlugin.detach()
     XCTAssertEqual(registered(services, second), [true, true, true, true])
     XCTAssertEqual(second.handledChannels, Self.channels)
+    XCTAssertEqual(markersInstalled(services), [true, true], "the newer engine keeps marker detection")
 
     secondPlugin.detach()
     XCTAssertEqual(registered(services, second), [false, false, false, false])
     XCTAssertTrue(second.handledChannels.isEmpty)
+    XCTAssertEqual(markersInstalled(services), [false, false])
   }
 }
 
