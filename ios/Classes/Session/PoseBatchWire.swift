@@ -208,7 +208,11 @@ final class PoseBatchSink {
     self.dispatcher = dispatcher
   }
 
-  func open() { isOpen = true }
+  /// Idempotent: opening an open sink keeps its queue and in-flight batch.
+  func open() {
+    guard !isOpen else { return }
+    isOpen = true
+  }
 
   func close() {
     isOpen = false

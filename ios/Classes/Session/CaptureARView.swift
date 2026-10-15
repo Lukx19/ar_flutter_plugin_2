@@ -61,9 +61,16 @@ final class CaptureARView: NSObject, FlutterPlatformView {
   private var captureExtension: CaptureChannelExtension?
   private var disposed = false
 
-  init(frame: CGRect, viewIdentifier viewId: Int64, arguments: Any?, binaryMessenger messenger: FlutterBinaryMessenger) {
+  convenience init(frame: CGRect, viewIdentifier viewId: Int64, arguments: Any?, binaryMessenger messenger: FlutterBinaryMessenger) {
+    self.init(frame: frame, viewIdentifier: viewId,
+              source: CaptureARView.makeSource(creationParams: arguments), binaryMessenger: messenger)
+  }
+
+  /// [source] is the frame source the view drives (tests pass a fake).
+  init(frame: CGRect, viewIdentifier viewId: Int64, source: CaptureSessionSource,
+       binaryMessenger messenger: FlutterBinaryMessenger) {
     self.viewId = viewId
-    source = CaptureARView.makeSource(creationParams: arguments)
+    self.source = source
     sessionChannel = FlutterMethodChannel(name: "arsession_\(viewId)", binaryMessenger: messenger)
     captureChannel = FlutterMethodChannel(name: "arcapture_\(viewId)", binaryMessenger: messenger)
     objectChannel = FlutterMethodChannel(name: "arobjects_\(viewId)", binaryMessenger: messenger)
@@ -216,7 +223,9 @@ final class CaptureARView: NSObject, FlutterPlatformView {
       let config = call.arguments as? [String: Any] ?? [:]
       poseSink.open()
       if config["enablePoseStream"] as? Bool ?? true {
-        poseStream.enable()
+        // A repeated initialize keeps the running stream: its sequence and
+        // rate window continue, so Dart never sees a sequence go backwards.
+        if !poseStream.isEnabled { poseStream.enable() }
       } else {
         poseStream.disable()
       }
