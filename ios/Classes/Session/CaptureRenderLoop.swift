@@ -50,10 +50,23 @@ final class CaptureRenderLoop: NSObject, MTKViewDelegate {
 
   func draw(in view: MTKView) {
     guard let pass = view.currentRenderPassDescriptor,
-          let commandBuffer = commandQueue.makeCommandBuffer(),
-          let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass)
+          let commandBuffer = commandQueue.makeCommandBuffer()
     else { return }
     commandBuffer.label = "capture view frame"
+    let overlay = overlays.overlay
+    if let overlay = overlay, preparedOverlayRevision != overlays.revision {
+      overlay.prepare(
+        device: background.device,
+        colorPixelFormat: CaptureRenderLoop.colorPixelFormat,
+        depthPixelFormat: CaptureRenderLoop.depthPixelFormat)
+      preparedOverlayRevision = overlays.revision
+    }
+    (overlay as? GridOverlayFrameUploader)?.encodeFrameUploads(into: commandBuffer)
+    guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else {
+      // Uploads already encoded must still run.
+      commandBuffer.commit()
+      return
+    }
     var imageTextures: [CVMetalTexture] = []
     let viewport = view.bounds.size
     if let source = source, source.lifecycleState == .running,
@@ -63,14 +76,7 @@ final class CaptureRenderLoop: NSObject, MTKViewDelegate {
       let displayTransform = frame.displayTransform(for: orientation, viewportSize: viewport)
       imageTextures = background.encode(
         capturedImage: frame.capturedImage, displayTransform: displayTransform, into: encoder) ?? []
-      if let overlay = overlays.overlay {
-        if preparedOverlayRevision != overlays.revision {
-          overlay.prepare(
-            device: background.device,
-            colorPixelFormat: CaptureRenderLoop.colorPixelFormat,
-            depthPixelFormat: CaptureRenderLoop.depthPixelFormat)
-          preparedOverlayRevision = overlays.revision
-        }
+      if let overlay = overlay {
         let context = GridOverlayFrameContext(
           viewMatrix: frame.viewMatrix(for: orientation),
           projectionMatrix: frame.projectionMatrix(

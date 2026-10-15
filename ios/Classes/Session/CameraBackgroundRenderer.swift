@@ -132,6 +132,16 @@ protocol GridOverlayRenderer: AnyObject {
   func encodeOverlay(into encoder: MTLRenderCommandEncoder, context: GridOverlayFrameContext)
 }
 
+/// Optional upload step of a [GridOverlayRenderer]: GPU copies into the
+/// overlay's persistent buffers, encoded into the frame's command buffer
+/// before its render pass (no encoder is open), so Metal orders the pass's
+/// reads after them and the overlay can fence its staging memory on the
+/// command buffer. Called on the main thread for every drawn frame, after
+/// `prepare` and before `encodeOverlay`.
+protocol GridOverlayFrameUploader: AnyObject {
+  func encodeFrameUploads(into commandBuffer: MTLCommandBuffer)
+}
+
 /// Process-wide overlay slot read by the active capture view each frame, so
 /// an overlay owned by another component (the grid renderer) can attach
 /// before or after the view exists. Set and read on the main thread.
