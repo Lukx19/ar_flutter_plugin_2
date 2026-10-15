@@ -1,7 +1,7 @@
 # AprilTag 3 (vendored subset)
 
 Marker detection backend of `native/marker_detector` (`C3MD_WITH_APRILTAG`,
-the iOS path). Unmodified files from the official repository.
+Android and iOS). Unmodified files from the official repository.
 
 | Item | Value |
 |---|---|

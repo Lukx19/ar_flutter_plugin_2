@@ -2,17 +2,13 @@
  * C ABI of the shared marker detector library (Android through JNI and
  * dart:ffi, iOS through Swift and dart:ffi).
  *
- * Detection has two build-time backends with the same records:
- * - C3MD_WITH_APRILTAG (iOS): AprilTag 3 decoding ARUCO_MIP_36h12 (a
- *   generated AprilTag family) and APRILTAG_36h11; 4X4_50 and 6X6_250 are
- *   not decoded (c3md_create returns NULL for them). Poses come from an
- *   OpenCV-free IPPE plus Levenberg-Marquardt solver; both pose methods take
- *   that path.
- * - C3MD_WITH_OPENCV (Android): aruco_nano on OpenCV (core, imgproc,
- *   calib3d, objdetect).
- * The corner refinement, sharpness, viewing angle, distortion, record
- * encoding and c3md_solve_points are plain C++ (OpenCV's solvePnP in the
- * OpenCV build), so a host build without a backend runs their tests; there
+ * Detection backend (C3MD_WITH_APRILTAG, Android and iOS): AprilTag 3
+ * decoding ARUCO_MIP_36h12 (a generated AprilTag family) and
+ * APRILTAG_36h11; 4X4_50 and 6X6_250 are not decoded (c3md_create returns
+ * NULL for them). Poses come from an IPPE plus Levenberg-Marquardt solver;
+ * both pose methods take that path. The corner refinement, sharpness,
+ * viewing angle, distortion, record encoding and c3md_solve_points are plain
+ * C++, so a host build without the backend runs their tests; there
  * `c3md_detect`, `c3md_estimate_pose` and `c3md_detect_tiepoints` return
  * C3MD_ERROR_UNAVAILABLE.
  *
@@ -21,7 +17,7 @@
  * detector is not thread-safe, use one per thread.
  *
  * Coordinates: image pixels with the centre of the top-left pixel at (0, 0).
- * Poses are camera-from-marker in the OpenCV camera frame (x right, y down,
+ * Poses are camera-from-marker in the OpenCV camera convention (x right, y down,
  * z forward); the marker frame is aruco's (x right, y up, z out of the
  * printed face), corners in aruco order (top-left, top-right, bottom-right,
  * bottom-left of the printed face).
@@ -111,8 +107,8 @@ typedef struct C3MarkerDetector C3MarkerDetector;
 
 C3MD_API int32_t c3md_abi_version(void);
 
-/* 1 when the library was built with a detection backend (AprilTag or
- * OpenCV) and can detect markers. */
+/* 1 when the library was built with the AprilTag detection backend and can
+ * detect markers. */
 C3MD_API int32_t c3md_detector_available(void);
 
 /* Creates a detector for one dictionary (C3MD_DICTIONARY_*). Returns NULL
@@ -162,19 +158,17 @@ C3MD_API int32_t c3md_record_count(const C3MarkerDetector* detector);
 
 /* One PnP over n >= 4 object (x, y, z, metres) to image (x, y, px)
  * correspondences with the camera of c3md_set_camera (image points are
- * undistorted first when distortion is set). OpenCV build: method
- * C3MD_POSE_SQPNP, or C3MD_POSE_IPPE_SQUARE meaning SQPNP refined by
- * Levenberg-Marquardt. Other builds (both methods): IPPE for coplanar points
- * or a DLT for non-planar ones (n >= 6, n <= 512), refined by
- * Levenberg-Marquardt on the distorted pixel error.
+ * undistorted first when distortion is set). Both methods: IPPE for
+ * coplanar points or a DLT for non-planar ones (n >= 6, n <= 512), refined
+ * by Levenberg-Marquardt on the distorted pixel error.
  * out7: rvec[3], tvec[3], RMS reprojection error px. */
 C3MD_API int32_t c3md_solve_points(C3MarkerDetector* detector, int32_t n, const double* object_xyz,
                                    const float* image_xy, int32_t method, double* out7);
 
-/* Full-resolution tie points: detection on the image (area-downscaled by
- * search_downscale >= 1 first; on AprilTag only the quad search is
- * decimated), corner refinement at full resolution (C3MD_REFINE_*; on
- * AprilTag C3MD_REFINE_CORNER_SUBPIX keeps AprilTag's edge-refined corners),
+/* Full-resolution tie points: detection on the image (only the quad search
+ * is decimated by search_downscale >= 1), corner refinement at full
+ * resolution (C3MD_REFINE_*; C3MD_REFINE_CORNER_SUBPIX keeps AprilTag's
+ * edge-refined corners),
  * centre, residual and sharpness. Returns the count; the results stay in
  * c3md_tiepoints until the next call. */
 C3MD_API int32_t c3md_detect_tiepoints(C3MarkerDetector* detector, const uint8_t* grey, int32_t width,
@@ -185,7 +179,7 @@ C3MD_API const C3MarkerTiePoint* c3md_tiepoints(const C3MarkerDetector* detector
 /* Last detect, pose and refine times in milliseconds (3 doubles). */
 C3MD_API const double* c3md_timings(const C3MarkerDetector* detector);
 
-/* ---- Geometry helpers (no OpenCV) ---------------------------------- */
+/* ---- Geometry helpers (no detection backend needed) ---------------- */
 
 /* Edge-line refinement of one quadrilateral: each edge is sampled across its
  * middle 76 %, the steepest step along the normal located to sub-pixel, a
@@ -207,7 +201,8 @@ C3MD_API float c3md_edge_sharpness(const uint8_t* grey, int32_t width, int32_t h
                                    const float* corners8);
 
 /* Angle (degrees, 0..180) between the marker normal and the direction from
- * the marker to the camera, from an OpenCV rvec and tvec. */
+ * the marker to the camera, from an rvec and tvec in the OpenCV camera
+ * convention. */
 C3MD_API float c3md_viewing_angle_deg(const double* rvec3, const double* tvec3);
 
 /* IEEE 754 binary16 conversion used by the records (round to nearest even). */

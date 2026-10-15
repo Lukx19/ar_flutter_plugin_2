@@ -1,14 +1,16 @@
-// Runs against a host build of the marker detector library (no OpenCV):
+// Runs against a host build of the marker detector library (geometry only,
+// no detection backend):
 //
-//   clang++ -std=c++17 -O2 -shared -DC3MD_WITH_OPENCV=0 \
+//   clang++ -std=c++17 -O2 -shared \
 //     -Inative/marker_detector/include -Inative/marker_detector/src \
 //     native/marker_detector/src/marker_geometry.cpp \
+//     native/marker_detector/src/marker_pose.cpp \
 //     native/marker_detector/src/marker_detector.cpp \
 //     -o <dir>/capture3d_marker_detector.dll
 //   CAPTURE3D_MARKER_DETECTOR_LIBRARY=<dir>/capture3d_marker_detector.dll \
 //     flutter test test/marker_detection/marker_detector_ffi_test.dart
 //
-// The AprilTag build (the iOS backend) also decodes the committed golden
+// The AprilTag build (the Android and iOS backend) also decodes the committed golden
 // image; build it with the AprilTag sources and defines:
 //
 //   clang -O2 -c -w -Inative/marker_detector/third_party/apriltag \
@@ -130,8 +132,8 @@ void main() {
     d.dispose();
   }, skip: skip);
 
-  // AprilTag build (the iOS backend) only: a library without a detection
-  // backend reports unavailable and the test returns early.
+  // AprilTag build (the Android and iOS backend) only: a library without a
+  // detection backend reports unavailable and the test returns early.
   test('detection build decodes the committed golden image', () async {
     final lib = MarkerDetectorLibrary.open(path);
     final d =

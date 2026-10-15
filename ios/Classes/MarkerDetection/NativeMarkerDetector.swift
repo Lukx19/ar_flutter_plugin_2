@@ -39,6 +39,12 @@ final class NativeMarkerDetector {
   @discardableResult
   func setMarkerSize(_ metres: Double) -> Int32 { c3md_set_marker_size(handle, metres) }
 
+  /// Printed size of one marker id (0 clears it back to the default size).
+  @discardableResult
+  func setMarkerSize(_ metres: Double, forId markerId: Int) -> Int32 {
+    c3md_set_marker_size_for_id(handle, Int32(markerId), metres)
+  }
+
   @discardableResult
   func setQuality(minSidePx: Float = 16, minSharpness: Float = 0.12, maxViewingAngleDeg: Float = 75) -> Int32 {
     var params = C3MarkerQualityParams(
