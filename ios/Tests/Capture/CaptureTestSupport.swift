@@ -91,12 +91,18 @@ enum CaptureFixture {
   }
 
   /// A store and budget under [root] (the `capture-v2-native` folder).
-  static func store(_ root: URL, fault: @escaping DurableStoreFaultInjector = { _ in }, quota: Int64 = 4 * 1024 * 1024 * 1024) throws -> (DurableCaptureStore, StorageBudgetLedger) {
+  /// [fault] cuts store steps, [budgetFault] ledger steps; [storeBackend]
+  /// wraps the store's POSIX backend (partial writes).
+  static func store(
+    _ root: URL, fault: @escaping DurableStoreFaultInjector = { _ in }, quota: Int64 = 4 * 1024 * 1024 * 1024,
+    budgetFault: @escaping DurableStoreFaultInjector = { _ in },
+    storeBackend: (DurableFileBackend) -> DurableFileBackend = { $0 }
+  ) throws -> (DurableCaptureStore, StorageBudgetLedger) {
     let budget = try StorageBudgetLedger(
-      files: RootedDurableFiles(backend: try PosixDurableFileBackend(root: root.appendingPathComponent("budget"))),
+      files: RootedDurableFiles(backend: try PosixDurableFileBackend(root: root.appendingPathComponent("budget")), fault: budgetFault),
       policy: StorageBudgetPolicy(quotaBytes: quota, freeSpaceFloorBytes: 0), freeBytes: { Int64.max / 4 })
     let store = try DurableCaptureStore(
-      files: RootedDurableFiles(backend: try PosixDurableFileBackend(root: root.appendingPathComponent("store")), fault: fault),
+      files: RootedDurableFiles(backend: storeBackend(try PosixDurableFileBackend(root: root.appendingPathComponent("store"))), fault: fault),
       budget: budget)
     return (store, budget)
   }
@@ -152,4 +158,78 @@ final class FaultPlan {
       }
     }
   }
+}
+
+/// Failure seam that keeps failing: every visit of [point] throws while armed.
+final class PersistentFault {
+  let point: DurableStoreFaultPoint
+  var armed = true
+  private(set) var injected = 0
+
+  init(_ point: DurableStoreFaultPoint) { self.point = point }
+
+  func injector() -> DurableStoreFaultInjector {
+    { [self] visited in
+      guard armed, visited == point else { return }
+      injected += 1
+      throw DurableStoreStateError("injected-persistent-\(point.rawValue)")
+    }
+  }
+}
+
+/// Failure seam that throws at the [nth] visit (1-based) of [point] only.
+final class NthVisitFault {
+  let point: DurableStoreFaultPoint
+  let nth: Int
+  private(set) var visits = 0
+
+  init(_ point: DurableStoreFaultPoint, nth: Int) {
+    self.point = point
+    self.nth = nth
+  }
+
+  func injector() -> DurableStoreFaultInjector {
+    { [self] visited in
+      guard visited == point else { return }
+      visits += 1
+      if visits == nth { throw DurableStoreStateError("injected-\(point.rawValue)-\(nth)") }
+    }
+  }
+}
+
+/// Store backend whose creation of a file named [name] writes only the first
+/// half of its bytes and then fails (out of space mid-write), while armed.
+final class PartialWriteBackend: DurableFileBackend {
+  let inner: DurableFileBackend
+  let name: String
+  var armed = true
+  private(set) var partialWrites = 0
+
+  init(_ inner: DurableFileBackend, name: String) {
+    self.inner = inner
+    self.name = name
+  }
+
+  func ensureDirectory(_ path: [String]) throws { try inner.ensureDirectory(path) }
+  func isRegularFile(_ path: [String]) -> Bool { inner.isRegularFile(path) }
+  func isDirectory(_ path: [String]) -> Bool { inner.isDirectory(path) }
+  func size(_ path: [String]) throws -> Int64 { try inner.size(path) }
+  func readAll(_ path: [String]) throws -> [UInt8] { try inner.readAll(path) }
+  func createExclusive(_ path: [String], chunks: [ArraySlice<UInt8>], beforeChunk: () throws -> Void, beforeSync: () throws -> Void) throws {
+    guard armed, path.last == name else {
+      return try inner.createExclusive(path, chunks: chunks, beforeChunk: beforeChunk, beforeSync: beforeSync)
+    }
+    let bytes = chunks.flatMap { Array($0) }
+    try inner.createExclusive(path, chunks: [bytes[0..<(bytes.count / 2)]], beforeChunk: {}, beforeSync: {})
+    partialWrites += 1
+    throw DurableFileError(operation: "write", code: ENOSPC)
+  }
+  func allocateExclusive(_ path: [String], bytes: Int64) throws { try inner.allocateExclusive(path, bytes: bytes) }
+  func atomicReplace(parent: [String], from: String, to: String) throws { try inner.atomicReplace(parent: parent, from: from, to: to) }
+  func atomicMove(fromParent: [String], from: String, toParent: [String], to: String) throws {
+    try inner.atomicMove(fromParent: fromParent, from: from, toParent: toParent, to: to)
+  }
+  func delete(_ path: [String]) throws { try inner.delete(path) }
+  func list(_ path: [String]) throws -> [String] { try inner.list(path) }
+  func syncDirectory(_ path: [String]) throws { try inner.syncDirectory(path) }
 }

@@ -334,20 +334,34 @@ final class NativeCaptureAdmissionOwner {
 
   // MARK: Terminal paths
 
+  /// The store did not report a terminal: a durable committed receipt is
+  /// rebased (its pointer switch retried, its reservation settled once), an
+  /// abandoned one is finished, and only an attempt without any receipt is
+  /// abandoned. When abandonment refuses (a receipt with an unknown pointer
+  /// cut) or fails, the attempt goes to restart recovery with every file
+  /// kept instead of being retried on each deadline tick.
   private func queryOrAbandon(_ value: Work, _ reason: String) {
     let identity = value.request.accepted.identity
     emit(NativeCaptureEvent(kind: .recovering, attemptId: identity.attemptId, reason: reason, recoveryContext: value.request.recoveryContext))
     unknownAttempts.insert(identity)
-    if let receipt = try? store.queryReceipt(identity), receipt.terminal != nil {
-      if work[identity] === value { finish(value, receipt) }
-      return
-    }
     if let rebased = try? store.rebaseSameAttempt(value.request) {
       if work[identity] === value { finish(value, rebased) }
       return
     }
+    if let receipt = try? store.queryReceipt(identity), receipt.terminal != nil {
+      if work[identity] === value { finish(value, receipt) }
+      return
+    }
     guard work[identity] === value else { return }
-    _ = try? abandon(value.request, reason: reason)
+    do {
+      try abandon(value.request, reason: reason)
+    } catch {
+      guard work[identity] === value else { return }
+      work[identity] = nil
+      release(identity)
+      exposure.cancelExposure(value.qualifier)
+      startRunningIfReady()
+    }
   }
 
   private func presentUnknown(_ value: Work, _ reason: String) {
@@ -531,6 +545,8 @@ final class NativeCaptureRecoveryReplay {
 /// Admission errors with their `arcapture` error codes.
 enum NativeCaptureOwnerError: Error {
   case recoveryPending, recoveryFailed, recoveryClosed, rootPending, closed
+  /// The storage budget refuses a new reservation (quota or free space).
+  case storageFull
 
   var code: String {
     switch self {
@@ -538,6 +554,7 @@ enum NativeCaptureOwnerError: Error {
     case .recoveryFailed: return "NATIVE_CAPTURE_V2_RECOVERY_FAILED"
     case .recoveryClosed, .closed: return "NATIVE_CAPTURE_V2_RECOVERY_CLOSED"
     case .rootPending: return "NATIVE_CAPTURE_V2_ROOT_PENDING"
+    case .storageFull: return "NATIVE_CAPTURE_V2_STORAGE_FULL"
     }
   }
 
@@ -548,6 +565,7 @@ enum NativeCaptureOwnerError: Error {
     case .recoveryClosed: return "Native capture recovery is closed."
     case .rootPending: return "The previous capture view still owns the durable root; retry after its shutdown completes."
     case .closed: return "Native capture binding is closed."
+    case .storageFull: return "The storage budget refuses a new photo reservation; free space or delete sessions."
     }
   }
 }

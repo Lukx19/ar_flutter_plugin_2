@@ -216,7 +216,7 @@ final class NativeCaptureChannel: CaptureChannelExtension {
     let highResolution = ARCameraCapabilities.of(frameSource).supportsHighResolutionFrameCapture
     var reply: [String: Any] = ["mode": highResolution ? "sharedCamera" : "previewFallback"]
     if !highResolution {
-      reply["warning"] = "High-resolution ARKit frames are unavailable; stills use the video frame."
+      reply["warning"] = CaptureViewMessageCode.stillCaptureUnavailable
     }
     result(reply)
   }
@@ -517,8 +517,10 @@ final class SessionPauseObserver: ARFrameObserver {
 }
 
 /// `ar_flutter_plugin_2/native_capture_preview`: History and detail previews
-/// of committed durable photos without a live view, plus the two-phase
-/// preview deletion used when the app deletes captures.
+/// of committed durable photos without a live view, the two-phase preview
+/// deletion used when the app deletes captures, and the durable photo
+/// deletion of a deleted session (`deleteNativeCaptureSession`, replies the
+/// reclaimed bytes).
 enum NativeCapturePreviewChannel {
   static let name = "ar_flutter_plugin_2/native_capture_preview"
   private static let queue = DispatchQueue(label: "capture3d.native-capture.preview", qos: .utility)
@@ -539,7 +541,7 @@ enum NativeCapturePreviewChannel {
       }
       let known: Set<String> = ["materializeNativeCapturePreview", "beginNativeCapturePreviewDeletion",
                                 "commitNativeCapturePreviewDeletion", "rollbackNativeCapturePreviewDeletion",
-                                "reconcileNativeCapturePreviews"]
+                                "reconcileNativeCapturePreviews", "deleteNativeCaptureSession"]
       guard known.contains(call.method) else { return result(FlutterMethodNotImplemented) }
       queue.async {
         let cancelled: () -> Bool = {
@@ -559,6 +561,8 @@ enum NativeCapturePreviewChannel {
             }
             value = try owner.materialize(manifestId: manifestId, captureId: captureId,
                                           edge: arguments["detailed"] as? Bool == true ? 1024 : 512, cancelled: cancelled) ?? NSNull()
+          case "deleteNativeCaptureSession":
+            value = Int(try NativeCaptureSessionDeletion.delete(sessionId: arguments["sessionId"] as? String ?? ""))
           case "beginNativeCapturePreviewDeletion":
             value = try owner.beginDeletion(references: arguments["references"] as? [String] ?? [])
           case "commitNativeCapturePreviewDeletion":

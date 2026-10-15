@@ -7,7 +7,7 @@ import Foundation
 final class NativeCaptureRootLease {
   private static let lock = NSLock()
   private static var active = Set<String>()
-  private let key: String
+  let key: String
   private var released = false
 
   private init(key: String) { self.key = key }
@@ -179,6 +179,25 @@ final class NativeCaptureBinding {
     }
   }
 
+  // MARK: Open owners
+
+  private final class WeakBinding { weak var value: NativeCaptureBinding?; init(_ value: NativeCaptureBinding) { self.value = value } }
+  private static let openLock = NSLock()
+  private static var openOwners: [String: WeakBinding] = [:]
+
+  /// Runs [body] on the durable queue of the binding that holds the root
+  /// lease [key] open; nil when no open binding holds it.
+  static func withOpenStore<T>(leaseKey key: String, _ body: (DurableCaptureStore) throws -> T) throws -> T? {
+    openLock.lock()
+    let binding = openOwners[key]?.value
+    openLock.unlock()
+    guard let owner = binding else { return nil }
+    return try owner.queue.sync { () throws -> T? in
+      guard !owner.closed, let store = owner.resources?.store else { return nil }
+      return try body(store)
+    }
+  }
+
   // MARK: Owner queue
 
   private func perform<T>(_ completion: @escaping Completion<T>, _ body: @escaping (NativeCaptureAdmissionOwner, NativeCaptureRecoveryReplay) throws -> T) {
@@ -213,6 +232,9 @@ final class NativeCaptureBinding {
     }
     let opened = resourcesOpened!
     resources = opened
+    Self.openLock.lock()
+    Self.openOwners[opened.lease.key] = WeakBinding(self)
+    Self.openLock.unlock()
     let replay = NativeCaptureRecoveryReplay(events: { [weak self] event in self?.events(event) })
     recovery = replay
     let created = NativeCaptureAdmissionOwner(
@@ -260,7 +282,42 @@ final class NativeCaptureBinding {
     closed = true
     owner = nil
     recovery = nil
+    if let key = resources?.lease.key {
+      Self.openLock.lock()
+      if Self.openOwners[key]?.value === self { Self.openOwners[key] = nil }
+      Self.openLock.unlock()
+    }
     resources?.lease.release()
     resources = nil
+  }
+}
+
+/// Deletes the durable photos of a session the app deleted
+/// (`DurableCaptureStore.deleteSession`): through the open view's binding
+/// when one owns the root, otherwise by opening the root briefly.
+enum NativeCaptureSessionDeletion {
+  static let attempts = 50
+
+  @discardableResult
+  static func delete(
+    sessionId: String,
+    openResources: () throws -> NativeCaptureRootResources = { try NativeCaptureBinding.productionResources() },
+    leaseKey: String = NativeCaptureRootLease.leaseKey(NativeCaptureStorePaths.nativeRoot())
+  ) throws -> Int64 {
+    guard !sessionId.isEmpty else { throw NativeCaptureWireError.invalid("sessionId is required") }
+    for _ in 0..<attempts {
+      do {
+        let resources = try openResources()
+        defer { resources.lease.release() }
+        return try resources.store.deleteSession(sessionId)
+      } catch NativeCaptureOwnerError.rootPending {
+        if let reclaimed = try NativeCaptureBinding.withOpenStore(leaseKey: leaseKey, { try $0.deleteSession(sessionId) }) {
+          return reclaimed
+        }
+        // The owner is between closing and releasing its lease.
+        usleep(NativeCaptureBinding.rootLeaseWaitMicros)
+      }
+    }
+    throw NativeCaptureOwnerError.rootPending
   }
 }

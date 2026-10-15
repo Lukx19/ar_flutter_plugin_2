@@ -1,5 +1,14 @@
 import Foundation
 
+/// A receipt exists but does not resolve to a terminal: its pointer cut is
+/// unknown, or the record is partial or unreadable. Nothing of the attempt
+/// may be deleted or re-receipted; restart recovery owns it.
+struct DurableReceiptUnknown: Error, CustomStringConvertible {
+  let message: String
+  init(_ message: String) { self.message = message }
+  var description: String { "Unknown pointer cut: \(message)" }
+}
+
 /// The native durable photo store, byte compatible with the Android
 /// `DurableSessionStoreV2` (layout `capture-v2-native/store`, root schema 5).
 ///
@@ -77,7 +86,7 @@ final class DurableCaptureStore {
     }
     guard let reservation = try budget.reserve(
       owner: DurableStoreEncoding.reservationOwner(attempt.identity), bytes: attempt.reservation.totalStoreLiability)
-    else { throw DurableStoreStateError("Storage reservation refused before exposure") }
+    else { throw NativeCaptureOwnerError.storageFull }
     do {
       var data: [String: String] = [
         "acceptedHash": DurableStoreEncoding.acceptedHash(attempt),
@@ -204,7 +213,7 @@ final class DurableCaptureStore {
       try writePropertiesExclusive(receiptPath, properties)
       try files.at(.receiptFileSync)
       try publishPointer(location, CaptureRootPointer(revision: revision, hash: rootHash, commit: identity.commitId))
-      try budget.commit(reservation, actualBytes: actualBytes)
+      try budget.settle(reservation, actualBytes: actualBytes)
       try files.deleteTree(staging, .deleteReclaim)
       return committed
     } catch {
@@ -216,34 +225,86 @@ final class DurableCaptureStore {
   }
 
   /// Re-publishes an already received attempt after an unknown pointer cut.
+  /// [request] is the exact finalized request or the admission template of
+  /// the same attempt: the receipt binds both (`requestHash`, `templateHash`).
+  /// The selected cut must be the receipt root's predecessor and every blob
+  /// of the root must verify; the reservation is then charged with the
+  /// root's bytes exactly once.
   func rebaseSameAttempt(_ request: CaptureCommitRequest) throws -> CaptureReceipt {
     let identity = request.accepted.identity
     let location = try self.location(identity)
+    if tombstone(location) { throw DurableStoreConflict("Session is tombstoned") }
     let file = try receiptFile(location, identity)
     guard files.isFile(file) else { throw DurableStoreStateError("No durable receipt to rebase") }
-    let values = try readProperties(file)
-    guard values["kind"] == CaptureTerminalKind.committedPicture.storedName,
-          values["requestHash"] == DurableStoreEncoding.requestHash(request) else {
+    guard let values = try completeCommittedReceipt(file) else {
+      throw DurableReceiptUnknown("Receipt is not a complete committed record")
+    }
+    guard values["requestHash"] == DurableStoreEncoding.requestHash(request)
+            || values["templateHash"] == DurableStoreEncoding.templateHash(request.template) else {
       throw DurableStoreStateError("Changed attempt cannot rebase")
     }
-    guard let rootHash = values["rootHash"], let revision = values["revision"].flatMap(Int64.init),
-          try validRootHash(location, rootHash, revision, 0) else {
-      throw DurableStoreStateError("Receipt root is incomplete")
-    }
-    let selected = try selectedRoot(location)
-    if !(try retainedRootHashes(location)).contains(rootHash) {
-      guard revision == (selected?.revision ?? 0) + 1, try rootPrevious(location, rootHash) == selected?.hash else {
-        throw DurableStoreStateError("Unknown receipt cannot rebase over a different root cut")
-      }
-      try publishPointer(location, CaptureRootPointer(revision: revision, hash: rootHash, commit: identity.commitId))
-    }
     let accepted = try readProperties(try acceptedFile(location, identity))
-    if let token = accepted["reservationToken"], let reservation = try budget.reservation(token: token) {
-      try budget.commit(reservation, actualBytes: request.components.reduce(0) { $0 + $1.byteLength })
+    guard try rebaseCommittedReceipt(location, commitId: identity.commitId, values) else {
+      throw DurableStoreStateError("Unknown receipt cannot rebase over a different root cut")
     }
-    try files.deleteTree(try attemptDirectory(location, identity) + ["staging"], .deleteReclaim)
+    try settleCommitted(location, attempt: try attemptDirectory(location, identity), accepted: accepted, rootHash: values["rootHash"]!)
     guard let result = try receipt(location, identity) else { throw DurableStoreStateError("Rebased receipt is missing") }
     return result
+  }
+
+  /// Makes the root of a durable committed receipt selected when it is not
+  /// retained yet: only when its revision and previous root continue the
+  /// selected cut and its blobs verify. True when the root is retained.
+  private func rebaseCommittedReceipt(_ location: [String], commitId: String, _ values: [String: String]) throws -> Bool {
+    guard let rootHash = values["rootHash"], let revision = values["revision"].flatMap(Int64.init),
+          try validRootHash(location, rootHash, revision, 0) else { return false }
+    if try retainedRootHashes(location).contains(rootHash) { return true }
+    let selected = try selectedRoot(location)
+    guard revision == (selected?.revision ?? 0) + 1, try rootPrevious(location, rootHash) == selected?.hash,
+          let captureId = values["captureId"], try verifiedAssets(location, captureId: captureId, rootHash: rootHash) else {
+      return false
+    }
+    try publishPointer(location, CaptureRootPointer(revision: revision, hash: rootHash, commit: commitId))
+    return true
+  }
+
+  /// The values of a fully written committed receipt of this writer: the
+  /// record ends with its line terminator, its receipt hash binds its request
+  /// and root, and it carries the template binding (its last key). Nil for a
+  /// partial, foreign or abandoned record.
+  private func completeCommittedReceipt(_ path: [String]) throws -> [String: String]? {
+    let bytes = try files.readBytes(path)
+    guard bytes.last == UInt8(ascii: "\n") else { return nil }
+    let values = DurableStoreEncoding.parseProperties(bytes)
+    guard values["kind"] == CaptureTerminalKind.committedPicture.storedName,
+          let requestHash = values["requestHash"], DurableStoreEncoding.isHash(requestHash),
+          let rootHash = values["rootHash"], DurableStoreEncoding.isHash(rootHash),
+          values["receiptHash"] == DurableStoreEncoding.receiptHash(requestHash: requestHash, rootHash: rootHash),
+          let templateHash = values["templateHash"], DurableStoreEncoding.isHash(templateHash),
+          values["captureId"] != nil, values["revision"].flatMap(Int64.init) != nil else { return nil }
+    return values
+  }
+
+  /// Every component blob of [rootHash] exists with its rooted length and digest.
+  private func verifiedAssets(_ location: [String], captureId: String, rootHash: String) throws -> Bool {
+    guard RootedDurableFiles.isValidSegment(captureId), let metadata = try readRootMetadata(location, rootHash),
+          !metadata.components.isEmpty else { return false }
+    for component in metadata.components {
+      let blob = location + ["assets", captureId, "\(component.kind.lowercased()).\(component.hash).blob"]
+      guard files.isFile(blob) else { return false }
+      let (length, digest) = try files.digestAndLength(blob)
+      guard length == component.length, DurableStoreEncoding.hex(digest) == component.hash else { return false }
+    }
+    return true
+  }
+
+  /// Charges a retained committed root's bytes to the attempt's live
+  /// reservation (once: the reservation closes) and removes its staging.
+  private func settleCommitted(_ location: [String], attempt: [String], accepted: [String: String], rootHash: String) throws {
+    if let token = accepted["reservationToken"], let reservation = try budget.reservation(token: token) {
+      try budget.settle(reservation, actualBytes: try committedComponentBytes(location, rootHash))
+    }
+    try files.deleteTree(attempt + ["staging"], .deleteReclaim)
   }
 
   func queryReceipt(_ identity: CaptureAttemptIdentity) throws -> CaptureReceipt? {
@@ -267,7 +328,12 @@ final class DurableCaptureStore {
   private func abandon(_ terminal: CaptureTerminal, fullRequestHash: String?, binding: String, templateHash: String?) throws -> CaptureReceipt {
     guard terminal.kind == .abandonedAttempt else { throw DurableStoreStateError("Abandonment requires an abandoned terminal") }
     let location = try self.location(terminal.identity)
-    if let prior = try receipt(location, terminal.identity) { return prior }
+    if files.isFile(try receiptFile(location, terminal.identity)) {
+      // Receipt persistence began: the pointer cut is unknown. Staging,
+      // assets and the reservation stay for restart recovery.
+      if let prior = try? receipt(location, terminal.identity) { return prior }
+      throw DurableReceiptUnknown("Receipt exists without a resolved terminal")
+    }
     let acceptedPath = try acceptedFile(location, terminal.identity)
     let accepted = files.isFile(acceptedPath) ? try readProperties(acceptedPath) : nil
     try files.at(.abandonmentCleanup)
@@ -289,18 +355,92 @@ final class DurableCaptureStore {
     return value
   }
 
-  /// Tombstone-first whole-session deletion fence; it wins over later callbacks.
+  /// Tombstone-first whole-session deletion fence; it wins over later
+  /// callbacks. Every live reservation of the session then closes: an
+  /// attempt whose committed root is published (reachable from the selected
+  /// pointer) charges that root's bytes, so the session reclaim covers it;
+  /// any other reservation is released (its data was never charged).
+  /// Idempotent: an existing tombstone is kept. The session directory is
+  /// synced first, so a pointer switch of unknown durability becomes known.
   func tombstoneSession(_ sessionId: String) throws {
     let directory = sessionRoot + [DurableStoreEncoding.safeName(sessionId)]
     try files.ensureDirectory(directory)
     try files.at(.tombstoneRecord)
-    try files.writeExclusive(directory + ["tombstone"], Array("deleted\n".utf8), .tombstoneRecord)
+    if !files.isFile(directory + ["tombstone"]) {
+      try files.writeExclusive(directory + ["tombstone"], Array("deleted\n".utf8), .tombstoneRecord)
+    }
     try files.at(.tombstoneDirectorySync)
+    try files.backend.syncDirectory(directory)
+    for slot in ["A", "B"] {
+      let pointer = directory + ["root-\(slot).ptr"]
+      if files.isFile(pointer), let value = CaptureRootRecords.parsePointer(try files.readBytes(pointer)) {
+        uncertainRootHashes.remove(value.hash)
+      }
+    }
+    let published = try publishedRootHashes(directory)
     for path in try files.walk(directory) where path.last == "accepted.properties" {
-      if let token = try readProperties(path)["reservationToken"], let reservation = try budget.reservation(token: token) {
+      guard let token = try readProperties(path)["reservationToken"], let reservation = try budget.reservation(token: token) else { continue }
+      if let bytes = try publishedRecordBytes(directory, attempt: Array(path.dropLast()), published: published) {
+        try budget.settle(reservation, actualBytes: min(bytes, reservation.bytes))
+      } else {
         try budget.release(reservation)
       }
     }
+  }
+
+  /// Deletes one session's photos after the app deleted the session: the
+  /// tombstone fence, then the bytes of the session's published commits
+  /// leave the ledger exactly once (verified reclaim `verified-<id>.reclaim`,
+  /// id bound to the session), then its attempts, roots, pointers and blobs
+  /// are removed. The tombstone and the reclaim marker stay, so a repeated
+  /// call after a crash at any step finishes the same deletion and never
+  /// reclaims twice. Returns the bytes reclaimed by this call.
+  @discardableResult
+  func deleteSession(_ sessionId: String) throws -> Int64 {
+    try tombstoneSession(sessionId)
+    let directory = sessionRoot + [DurableStoreEncoding.safeName(sessionId)]
+    let reclaimId = Self.sessionReclaimId(sessionId)
+    var reclaimed: Int64 = 0
+    if !(try budget.hasVerifiedReclaim(reclaimId)) {
+      let published = try publishedRootHashes(directory)
+      var total: Int64 = 0
+      for path in try files.walk(directory) where path.last == "accepted.properties" {
+        total += try publishedRecordBytes(directory, attempt: Array(path.dropLast()), published: published) ?? 0
+      }
+      reclaimed = min(total, try budget.committedBytes())
+      if reclaimed > 0 { try budget.reclaimVerifiedOnce(reclaimId: reclaimId, bytes: reclaimed) }
+    }
+    for name in try files.list(directory) where name != "tombstone" {
+      try files.deleteTree(directory + [name], .deleteReclaim)
+    }
+    return reclaimed
+  }
+
+  /// Reclaim identity of one deleted session.
+  static func sessionReclaimId(_ sessionId: String) -> String {
+    DurableStoreEncoding.hex(DurableStoreEncoding.sha256("native-capture-session-reclaim|\(sessionId)"))
+  }
+
+  /// Every root reachable from the selected pointer through `previous`.
+  private func publishedRootHashes(_ location: [String]) throws -> Set<String> {
+    var out = Set<String>()
+    var hash = try selectedRoot(location)?.hash
+    while let current = hash, !out.contains(current) {
+      out.insert(current)
+      hash = try rootPrevious(location, current)
+    }
+    return out
+  }
+
+  /// Bytes of the published root an attempt's committed record names (the
+  /// charge of a committed attempt); nil without one.
+  private func publishedRecordBytes(_ location: [String], attempt: [String], published: Set<String>) throws -> Int64? {
+    let receipt = attempt + ["receipt.properties"]
+    guard files.isFile(receipt), let values = try? readProperties(receipt),
+          values["kind"] == CaptureTerminalKind.committedPicture.storedName,
+          let rootHash = values["rootHash"], published.contains(rootHash),
+          let metadata = try readRootMetadata(location, rootHash) else { return nil }
+    return metadata.components.reduce(0) { $0 + $1.length }
   }
 
   // MARK: Recovery
@@ -350,7 +490,10 @@ final class DurableCaptureStore {
         result.append(RecoveryProjection(attemptId: attemptId, kind: nil, reason: "recovered-accepted-unknown", recoveryContext: context))
         continue
       }
-      let value = try readProperties(receiptPath)
+      guard let value = try? readProperties(receiptPath) else {
+        result.append(RecoveryProjection(attemptId: attemptId, kind: nil, reason: "recovered-receipt-unknown", recoveryContext: context))
+        continue
+      }
       if value["kind"] == CaptureTerminalKind.committedPicture.storedName,
          let rootHash = value["rootHash"], try retainedRootHashes(session).contains(rootHash) {
         if let identity = try Self.exactIdentity(acceptedValues),
@@ -400,16 +543,21 @@ final class DurableCaptureStore {
       }
       return
     }
-    let receiptValues = try readProperties(receipt)
-    if receiptValues["kind"] == CaptureTerminalKind.committedPicture.storedName,
-       let rootHash = receiptValues["rootHash"], try retainedRootHashes(session).contains(rootHash) {
-      if let token = acceptedValues["reservationToken"], let reservation = try budget.reservation(token: token) {
-        try budget.commit(reservation, actualBytes: try committedComponentBytes(session, rootHash))
+    // A partial, unreadable or foreign receipt is unknown: every file and
+    // the liability stay, and recovery goes on with the next attempt.
+    guard let receiptValues = try? completeCommittedReceipt(receipt), let rootHash = receiptValues["rootHash"] else {
+      if let values = try? readProperties(receipt), values["kind"] == CaptureTerminalKind.committedPicture.storedName,
+         let rootHash = values["rootHash"], (try? retainedRootHashes(session).contains(rootHash)) == true {
+        try settleCommitted(session, attempt: attempt, accepted: acceptedValues, rootHash: rootHash)
       }
-      try files.deleteTree(attempt + ["staging"], .deleteReclaim)
+      return
     }
-    // A committed receipt outside the retained graph stays unknown: staging
-    // and liability remain for an exact query or rebase.
+    // A committed receipt outside the retained graph is rebased when the
+    // selected cut is its predecessor (the pointer switch was lost);
+    // otherwise it stays unknown with its staging and liability.
+    guard !tombstone(session), let commitId = acceptedValues["commitId"],
+          (try? rebaseCommittedReceipt(session, commitId: commitId, receiptValues)) == true else { return }
+    try settleCommitted(session, attempt: attempt, accepted: acceptedValues, rootHash: rootHash)
   }
 
   private func recordRecoveryCandidate(session: String, attempt: String) throws {

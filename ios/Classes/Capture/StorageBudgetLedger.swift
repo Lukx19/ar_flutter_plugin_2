@@ -14,7 +14,9 @@ struct StorageBudgetReservation: Hashable {
 /// The plain-reservation part of the Android `StorageBudgetCoordinatorV2`
 /// with its on-disk format: `ledger-v2` holds the committed byte count,
 /// `reservations-v2/<token>.reservation` names the owner and bytes and
-/// `<token>.allocation` physically backs them. State is reloaded from disk
+/// `<token>.allocation` physically backs them, and
+/// `reclaims-v2/verified-<id>.reclaim` records an identity-bound reclaim of
+/// committed bytes (a deleted session). State is reloaded from disk
 /// before every operation, so a crash at any step leaves either the old or the
 /// new authority. Candidate and pointer reservations (canonical surfaces) are
 /// Android-only and not represented here; a reservation file in their format is
@@ -79,6 +81,51 @@ final class StorageBudgetLedger {
     }
   }
 
+  /// Closes [reservation] into committed bytes after its data is durable.
+  /// The reservation already counted against the quota when it was made, so
+  /// no budget check applies: a quota that shrank since (it follows free
+  /// space) never strands a durable commit. Throws for a stale token.
+  func settle(_ reservation: StorageBudgetReservation, actualBytes: Int64) throws {
+    try withAuthority {
+      let current = try requireReservation(reservation)
+      guard actualBytes >= 0, actualBytes <= current.bytes else { throw DurableStoreStateError("Commit exceeds reservation") }
+      committed += actualBytes
+      try deleteReservation(current)
+      try persistLedger()
+    }
+  }
+
+  /// Applies one identity-bound reclaim of committed bytes exactly once
+  /// (Android `reclaimVerifiedOnce`, same `reclaims-v2/verified-<id>.reclaim`
+  /// record): a PENDING marker holds the previous count before the ledger
+  /// moves, DONE after; recovery finishes a PENDING one. A repeated call with
+  /// a DONE marker is a no-op.
+  func reclaimVerifiedOnce(reclaimId: String, bytes: Int64) throws {
+    try withAuthority {
+      guard DurableStoreEncoding.isHash(reclaimId), bytes > 0 else { throw DurableStoreStateError("Invalid verified reclaim") }
+      let marker = Self.verifiedReclaimFile(reclaimId)
+      if files.isFile(marker) {
+        let lines = try Self.lines(files.readBytes(marker))
+        guard lines.count == 4, lines[0] == "DONE", lines[1] == reclaimId, Int64(lines[2]) == bytes else {
+          throw DurableStoreStateError("Verified reclaim conflicts with its marker")
+        }
+        return
+      }
+      guard bytes <= committed else { throw DurableStoreStateError("Verified reclaim exceeds committed bytes") }
+      let previous = committed
+      try files.atomicReplace(marker, Array("PENDING\n\(reclaimId)\n\(bytes)\n\(previous)\n".utf8), replacePoint: .pointerSlotReplace)
+      committed = previous - bytes
+      try persistLedger()
+      try files.atomicReplace(marker, Array("DONE\n\(reclaimId)\n\(bytes)\n\(previous)\n".utf8), replacePoint: .pointerSlotReplace)
+    }
+  }
+
+  /// True when a reclaim marker (PENDING or DONE) exists for [reclaimId];
+  /// recovery has already finished a PENDING one when this returns.
+  func hasVerifiedReclaim(_ reclaimId: String) throws -> Bool {
+    try withAuthority { DurableStoreEncoding.isHash(reclaimId) && files.isFile(Self.verifiedReclaimFile(reclaimId)) }
+  }
+
   @discardableResult
   func release(_ reservation: StorageBudgetReservation) throws -> Bool {
     try withAuthority {
@@ -115,6 +162,7 @@ final class StorageBudgetLedger {
     } else {
       committed = 0
     }
+    try recoverVerifiedReclaims()
     reservations.removeAll()
     let names = try files.list(Self.reservationsDirectory)
     for name in names where name.hasSuffix(".reservation") && name.utf8.count == 64 + 12 {
@@ -138,9 +186,40 @@ final class StorageBudgetLedger {
         try files.delete(Self.reservationsDirectory + [name], .deleteReclaim)
       }
     }
-    if committed > policy.quotaBytes || policy.freeSpaceFloorBytes > freeBytes() {
-      throw DurableStoreStateError("Storage budget cannot open within its physical quota/floor")
+    // Committed bytes above the quota (the quota follows free space) or a
+    // free space below the floor do not block opening: recovery, queries,
+    // settlement and reclaims go on, and canCharge refuses new charges.
+  }
+
+  /// Finishes PENDING verified reclaims (Android `recoverLocked`) and drops
+  /// their abandoned temporary files.
+  private func recoverVerifiedReclaims() throws {
+    let names = try files.list(Self.reclaimsDirectory)
+    for name in names.sorted() where name.hasPrefix("verified-") && name.hasSuffix(".reclaim") {
+      let id = String(name.dropFirst(9).dropLast(8))
+      guard DurableStoreEncoding.isHash(id) else { continue }
+      let lines = try Self.lines(files.readBytes(Self.reclaimsDirectory + [name]))
+      guard lines.count == 4, lines[0] == "PENDING" || lines[0] == "DONE", lines[1] == id,
+            let bytes = Int64(lines[2]), let previous = Int64(lines[3]), bytes > 0, previous >= bytes else {
+        throw DurableStoreStateError("Corrupt verified reclaim")
+      }
+      guard lines[0] == "PENDING" else { continue }
+      guard committed == previous || committed == previous - bytes else {
+        throw DurableStoreStateError("Verified reclaim does not match the ledger")
+      }
+      if committed == previous {
+        committed = previous - bytes
+        try persistLedger()
+      }
+      try files.atomicReplace(Self.reclaimsDirectory + [name], Array("DONE\n\(id)\n\(bytes)\n\(previous)\n".utf8), replacePoint: .pointerSlotReplace)
     }
+    for name in names where name.hasPrefix(".verified-") && name.hasSuffix(".reclaim.part") {
+      try files.delete(Self.reclaimsDirectory + [name], .deleteReclaim)
+    }
+  }
+
+  private static func lines(_ bytes: [UInt8]) -> [String] {
+    String(decoding: bytes, as: UTF8.self).split(separator: "\n", omittingEmptySubsequences: false).map(String.init).filter { !$0.isEmpty }
   }
 
   private func canCharge(_ bytes: Int64) -> Bool {
@@ -172,6 +251,7 @@ final class StorageBudgetLedger {
 
   private static func metadataFile(_ token: String) -> [String] { reservationsDirectory + ["\(token).reservation"] }
   private static func allocationFile(_ token: String) -> [String] { reservationsDirectory + ["\(token).allocation"] }
+  private static func verifiedReclaimFile(_ id: String) -> [String] { reclaimsDirectory + ["verified-\(id).reclaim"] }
 
   /// `[A-Za-z0-9._:-]{1,160}`
   static func isOwner(_ owner: String) -> Bool {

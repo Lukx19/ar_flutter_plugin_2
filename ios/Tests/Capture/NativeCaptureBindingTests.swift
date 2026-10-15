@@ -88,6 +88,43 @@ final class NativeCaptureBindingTests: XCTestCase {
     XCTAssertEqual(try complete { binding.replay(completion: $0) }.get().first?["kind"] as? String, "ready")
   }
 
+  /// Session deletion runs on the open view's durable queue while a view
+  /// owns the root and opens the root itself once the view closed.
+  func testSessionDeletionReachesTheStoreWithAndWithoutAnOpenView() throws {
+    let files = appFiles!
+    let nativeRoot = NativeCaptureStorePaths.nativeRoot(files)
+    let open: () throws -> NativeCaptureRootResources = {
+      let lease = try NativeCaptureRootLease.acquire(nativeRoot)
+      let (store, _) = try CaptureFixture.store(nativeRoot)
+      return NativeCaptureRootResources(lease: lease, store: store)
+    }
+    func delete(_ session: String) throws -> Int64 {
+      let done = expectation(description: "deleted")
+      var outcome: Result<Int64, Error>!
+      DispatchQueue.global().async {
+        outcome = Result { try NativeCaptureSessionDeletion.delete(
+          sessionId: session, openResources: open, leaseKey: NativeCaptureRootLease.leaseKey(nativeRoot)) }
+        done.fulfill()
+      }
+      wait(for: [done], timeout: 10)
+      return try outcome.get()
+    }
+    let binding = binding()
+    _ = try complete { binding.admit(CaptureFixture.admissionMap(CaptureFixture.request()), completion: $0) }.get()
+    camera.deliverJpeg()
+    drain(binding)
+    XCTAssertEqual(photos.count, 1)
+    XCTAssertEqual(try delete("session-ios"), Int64(CaptureFixture.jpeg.count), "through the open view")
+    let closed = expectation(description: "closed")
+    binding.close { closed.fulfill() }
+    wait(for: [closed], timeout: 10)
+    XCTAssertEqual(try delete("session-ios"), 0, "the root opened briefly; nothing left to reclaim")
+    let (store, budget) = try CaptureFixture.store(nativeRoot)
+    XCTAssertEqual(try budget.committedBytes(), 0)
+    XCTAssertNil(try store.queryReceipt(CaptureFixture.request().accepted.identity))
+    XCTAssertThrowsError(try delete(""))
+  }
+
   func testMalformedAdmissionAndUnknownLifecycleAreRefused() {
     let binding = binding()
     var map = CaptureFixture.admissionMap(CaptureFixture.request())

@@ -192,12 +192,16 @@ final class DurableCaptureStoreTests: XCTestCase {
           XCTAssertEqual(try clean().1.reservedBytesTotal(), 0, "\(point)")
         case .receiptFileSync, .pointerSlotReplace:
           // The receipt is durable but the pointer cut is unknown: no terminal
-          // is visible, the liability stays for an exact query or rebase.
+          // is visible until restart recovery rebases the receipt's root over
+          // its predecessor and charges the bytes once; never abandoned.
           XCTAssertNil(try clean().0.queryReceipt(request.accepted.identity), "\(point)")
           XCTAssertGreaterThan(try clean().1.reservedBytesTotal(), 0, "\(point)")
           try clean().0.recover()
-          XCTAssertNil(try clean().0.queryReceipt(request.accepted.identity), "\(point) stays unknown, never abandoned")
-          XCTAssertTrue(exists("store/sessions/\(DurableStoreEncoding.safeName("session-ios"))/attempts/\(DurableStoreEncoding.safeName(request.accepted.identity.commitId))/receipt.properties"))
+          XCTAssertEqual(try clean().0.queryReceipt(request.accepted.identity)?.phase, .committedPicture, "\(point) rebased")
+          XCTAssertEqual(try clean().1.reservedBytesTotal(), 0, "\(point)")
+          XCTAssertEqual(try clean().1.committedBytes(), Int64(CaptureFixture.jpeg.count), "\(point) charged once")
+          try clean().0.recover()
+          XCTAssertEqual(try clean().1.committedBytes(), Int64(CaptureFixture.jpeg.count), "\(point) charged once")
         case .deleteReclaim:
           XCTAssertEqual(try clean().0.queryReceipt(request.accepted.identity)?.phase, .committedPicture, "\(point)")
           try clean().0.recover()
