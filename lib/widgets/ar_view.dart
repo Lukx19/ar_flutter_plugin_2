@@ -180,19 +180,25 @@ class IosARView implements PlatformARView {
     _context = context;
     _arViewCreatedCallback = arViewCreatedCallback;
     _planeDetectionConfig = planeDetectionConfig;
-    // ARCore playback is Android only; iOS ignores [playback].
     // Assessed-original production is unsupported on iOS. Reader capability is
     // independent; do not advertise a producer mode this platform cannot honor.
     _captureConfig = captureConfig?.copyWith(retainAssessedOriginals: false);
     // The capture route runs the ARKit capture view on a Metal host; every
     // other route keeps the legacy view.
     final String viewType = iosViewType(captureView);
+    // Debug/profile playback: the capture view replays a recorded ARKit
+    // session (a folder under Application Support/recordings/); the legacy
+    // view ignores [playback].
+    final ARPlaybackConfig? viewPlayback =
+        captureView == null ? null : playback;
     final Map<String, dynamic> creationParams = <String, dynamic>{
       ...?captureView?.toCreationParams(),
+      ...?viewPlayback?.toCreationParams(),
     };
 
     return UiKitView(
-      key: ValueKey<ARCaptureViewConfig?>(captureView),
+      key: ValueKey<(ARCaptureViewConfig?, ARPlaybackConfig?)>(
+          (captureView, viewPlayback)),
       viewType: viewType,
       layoutDirection: TextDirection.ltr,
       creationParams: creationParams,
@@ -235,8 +241,10 @@ class ARView extends StatefulWidget {
   /// safely hot-swap cameras.
   final String? rearCameraId;
 
-  /// Debug/profile ARCore playback test mode (Android only). Null in release
-  /// builds; changes rebuild the native platform view.
+  /// Debug/profile playback test mode: an ARCore Recording & Playback
+  /// dataset on Android, a recorded ARKit session on the iOS capture view
+  /// (the legacy iOS view ignores it). Null in release builds; changes
+  /// rebuild the native platform view.
   final ARPlaybackConfig? playback;
 
   /// iOS capture view configuration; set only by the capture route. Null

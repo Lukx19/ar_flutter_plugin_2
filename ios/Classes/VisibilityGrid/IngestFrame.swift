@@ -47,11 +47,11 @@ enum IngestDepthMode {
   static let raw = 2
 }
 
-/// What the ingest shell reads from one AR frame; the ARKit implementation
-/// wraps an `ARFrame` for the duration of one observer call and never
-/// retains it.
+/// What the ingest shell reads from one AR frame; the implementation
+/// (`CaptureIngestFrame`) wraps a live or recorded `CaptureFrame` for the
+/// duration of one observer call and never retains it.
 protocol IngestFrame {
-  /// `ARFrame.timestamp` in nanoseconds (`CLOCK_UPTIME_RAW` base).
+  /// Frame timestamp in nanoseconds (`CLOCK_UPTIME_RAW` base).
   var timestampNs: Int64 { get }
   /// One of [IngestTrackingState].
   var trackingState: Int { get }

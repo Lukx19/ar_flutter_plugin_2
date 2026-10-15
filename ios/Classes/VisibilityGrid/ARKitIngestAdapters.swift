@@ -28,13 +28,15 @@ func ingestTrackingFailureReason(_ state: ARCamera.TrackingState) -> Int {
   }
 }
 
-/// Depth mode of a configuration: raw `sceneDepth` preferred over
+/// Depth mode of a run: raw `sceneDepth` preferred over
 /// `smoothedSceneDepth`; disabled without either or without LiDAR depth.
-func ingestDepthMode(_ configuration: ARConfiguration?, deliversSceneDepth: Bool) -> Int {
-  guard deliversSceneDepth, let semantics = configuration?.frameSemantics else { return IngestDepthMode.disabled }
-  if semantics.contains(.sceneDepth) { return IngestDepthMode.raw }
-  if semantics.contains(.smoothedSceneDepth) { return IngestDepthMode.smoothed }
-  return IngestDepthMode.disabled
+func ingestDepthMode(_ configuration: CaptureRunConfiguration?, deliversSceneDepth: Bool) -> Int {
+  guard deliversSceneDepth, let depth = configuration?.depth else { return IngestDepthMode.disabled }
+  switch depth {
+  case .raw: return IngestDepthMode.raw
+  case .smoothed: return IngestDepthMode.smoothed
+  case .none: return IngestDepthMode.disabled
+  }
 }
 
 /// t xyz, q xyzw of a rigid transform.
@@ -44,26 +46,27 @@ func writeTq(_ m: simd_float4x4, _ out: UnsafeMutablePointer<Float>) {
   out[3] = q.imag.x; out[4] = q.imag.y; out[5] = q.imag.z; out[6] = q.real
 }
 
-/// One `ARFrame` for the duration of an observer call; never stored.
-struct ARKitIngestFrame: IngestFrame {
-  let frame: ARFrame
+/// One [CaptureFrame] (live or recorded) for the duration of an observer
+/// call; never stored.
+struct CaptureIngestFrame: IngestFrame {
+  let frame: CaptureFrame
 
   var timestampNs: Int64 { Int64((frame.timestamp * 1e9).rounded()) }
-  var trackingState: Int { ingestTrackingState(frame.camera.trackingState) }
-  var trackingFailureReason: Int { ingestTrackingFailureReason(frame.camera.trackingState) }
-  var cameraToWorld: simd_float4x4 { frame.camera.transform }
+  var trackingState: Int { ingestTrackingState(frame.trackingState) }
+  var trackingFailureReason: Int { ingestTrackingFailureReason(frame.trackingState) }
+  var cameraToWorld: simd_float4x4 { frame.cameraTransform }
   var intrinsics: simd_float4 {
-    let k = frame.camera.intrinsics
+    let k = frame.intrinsics
     return simd_float4(k[0][0], k[1][1], k[2][0], k[2][1])
   }
-  var imageWidth: Int { Int(frame.camera.imageResolution.width) }
-  var imageHeight: Int { Int(frame.camera.imageResolution.height) }
+  var imageWidth: Int { Int(frame.imageResolution.width) }
+  var imageHeight: Int { Int(frame.imageResolution.height) }
 
   func withDepth(mode: Int, _ body: (DepthPlanes) -> Void) -> Bool {
-    let data: ARDepthData?
+    let data: CaptureDepthData?
     switch mode {
-    case IngestDepthMode.raw: data = frame.sceneDepth ?? frame.smoothedSceneDepth
-    case IngestDepthMode.smoothed: data = frame.smoothedSceneDepth ?? frame.sceneDepth
+    case IngestDepthMode.raw: data = frame.depthData(.raw)
+    case IngestDepthMode.smoothed: data = frame.depthData(.smoothed)
     default: data = nil
     }
     guard let depth = data else { return false }
@@ -88,7 +91,7 @@ struct ARKitIngestFrame: IngestFrame {
   }
 
   func withFeaturePoints(_ body: (UnsafeBufferPointer<simd_float3>, UnsafeBufferPointer<UInt64>) -> Void) -> Bool {
-    guard let cloud = frame.rawFeaturePoints else { return false }
+    guard let cloud = frame.featurePoints else { return false }
     let points = cloud.points
     let ids = cloud.identifiers
     points.withUnsafeBufferPointer { p in ids.withUnsafeBufferPointer { body(p, $0) } }
@@ -96,8 +99,9 @@ struct ARKitIngestFrame: IngestFrame {
   }
 }
 
-/// [AnchorBackend] over ARKit: `ARAnchor` added to and removed from the
-/// session, keyed by its identifier (ARKit hands out a new anchor object per
+/// [AnchorBackend] over ARKit anchors: `ARAnchor` added to and removed from
+/// the frame source's [CaptureAnchorHost] (the live `ARSession` or a
+/// recorded session's anchor store), keyed by its identifier (ARKit hands out a new anchor object per
 /// frame). Plain anchors have no tracking state of their own, so they report
 /// the camera's state of the current frame.
 final class ARKitAnchorBackend: AnchorBackend {
@@ -107,7 +111,7 @@ final class ARKitAnchorBackend: AnchorBackend {
   var cameraTracking = AnchorTracking.stopped
 
   func create(session: AnyObject, tq: UnsafePointer<Float>) -> AnyObject? {
-    guard let s = session as? ARSession else { return nil }
+    guard let s = session as? CaptureAnchorHost else { return nil }
     let q = simd_quatf(ix: tq[3], iy: tq[4], iz: tq[5], r: tq[6])
     guard q.length > 0.5 else { return nil }
     var m = simd_float4x4(simd_normalize(q))
@@ -118,7 +122,7 @@ final class ARKitAnchorBackend: AnchorBackend {
   }
 
   func detach(_ anchor: AnyObject, session: AnyObject?) {
-    guard let a = anchor as? ARAnchor, let s = session as? ARSession else { return }
+    guard let a = anchor as? ARAnchor, let s = session as? CaptureAnchorHost else { return }
     s.remove(anchor: a)
   }
 
@@ -137,17 +141,17 @@ final class ARKitAnchorBackend: AnchorBackend {
   }
 }
 
-/// [AnchorFrame] over one `ARFrame`; the frame's anchors are read once per call.
-final class ARKitAnchorFrame: AnchorFrame {
-  private let frame: ARFrame
+/// [AnchorFrame] over one [CaptureFrame]; the frame's anchors are read once per call.
+final class CaptureAnchorFrame: AnchorFrame {
+  private let frame: CaptureFrame
   private var anchors: [ARAnchor] = []
 
-  init(_ frame: ARFrame) { self.frame = frame }
+  init(_ frame: CaptureFrame) { self.frame = frame }
 
   var timestampNs: Int64 { Int64((frame.timestamp * 1e9).rounded()) }
-  var cameraTracking: Int { ingestTrackingState(frame.camera.trackingState) }
+  var cameraTracking: Int { ingestTrackingState(frame.trackingState) }
 
-  func readCameraPose(into out: UnsafeMutablePointer<Float>) { writeTq(frame.camera.transform, out) }
+  func readCameraPose(into out: UnsafeMutablePointer<Float>) { writeTq(frame.cameraTransform, out) }
 
   func loadUpdatedAnchors() -> Int {
     anchors = frame.anchors

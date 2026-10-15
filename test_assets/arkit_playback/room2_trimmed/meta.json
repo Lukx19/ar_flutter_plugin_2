@@ -1,0 +1,51 @@
+{
+  "benchmark" : "visibility_grid arcore suite",
+  "depthBytes" : 161780,
+  "depthEncoding" : "u16 mm + u8 confidence (0 low, 1 medium, 2 high), LZFSE",
+  "depthHz" : 15,
+  "depthMaps" : 6,
+  "device" : "iPhone13,3",
+  "firstTimestamp" : 40368.430217458001,
+  "fixture" : {
+    "firstFrame" : 104,
+    "frameCount" : 24,
+    "generator" : "scripts\/ios\/make_recorded_session_fixture.swift",
+    "source" : "room2-iphone12pro-20261014",
+    "stills" : [
+      0,
+      1
+    ],
+    "videoAndStillScale" : "1\/8"
+  },
+  "format" : "capture3d-arkit-recording",
+  "frameRecordBytes" : 256,
+  "frames" : 24,
+  "lastTimestamp" : 40368.813747957996,
+  "pointClouds" : 18,
+  "seconds" : 0.38353049999568611,
+  "stills" : 2,
+  "stillSeconds" : 3,
+  "system" : "27.0.1",
+  "timestampClock" : "ARFrame.timestamp (seconds, CLOCK_UPTIME_RAW base)",
+  "transformLayout" : "column-major camera-to-world, ARKit camera axes (+x right, +y up, -z forward in landscape-right sensor frame)",
+  "version" : 1,
+  "videoCodec" : "hevc",
+  "videoCopyFailures" : 0,
+  "videoDropped" : 0,
+  "videoFps" : 30,
+  "videoFrames" : 12,
+  "videoSegments" : [
+    {
+      "error" : null,
+      "file" : "video_000.mov",
+      "firstVideoIndex" : 0,
+      "frames" : 12,
+      "status" : 2
+    }
+  ],
+  "videoSize" : [
+    240,
+    180
+  ],
+  "worldMap" : null
+}

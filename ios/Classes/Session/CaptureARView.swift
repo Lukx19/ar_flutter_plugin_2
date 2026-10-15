@@ -28,13 +28,17 @@ final class CaptureChannelExtensionRegistry {
 }
 
 /// The capture route's platform view on iOS: one `ARSession` ([ARSessionHost])
-/// drawn by a plain Metal `MTKView` ([CaptureRenderLoop]). Serves the per-view
+/// drawn by a plain Metal `MTKView` ([CaptureRenderLoop]). In debug and
+/// profile builds the creation parameters can select a recorded session
+/// ([RecordedFrameSource], [RecordedPlaybackSelector]) that replays in place
+/// of the camera; every consumer sees it as the frame source. Serves the per-view
 /// channels the capture route uses on Android with the same method names and
 /// reply shapes:
 ///
 /// - `arsession_<id>`: `init`, `showPlanes`, `getCameraPose`, `pauseSession` /
 ///   `disableCamera`, `resumeSession` / `enableCamera`, `dispose`; sends
-///   `onError`.
+///   `onError` and, when a replayed recording ends in `view` restart mode,
+///   `onArPlaybackFinished` (path, restart, restarts).
 /// - `arcapture_<id>`: `initializeCapture`, `dispose`, and the host replies in
 ///   [CaptureChannelHostReplies] (`replayNativeCaptureRecoveryV2`); sends
 ///   `onPoseBatch` (`pose_batch_v2`, 30 Hz, one batch in flight, none while
@@ -45,7 +49,7 @@ final class CaptureChannelExtensionRegistry {
 /// Every other method replies `FlutterMethodNotImplemented`, never nil.
 final class CaptureARView: NSObject, FlutterPlatformView {
   let viewId: Int64
-  let host: ARSessionHost
+  let source: CaptureSessionSource
   private let metalView: MTKView
   private let renderLoop: CaptureRenderLoop?
   private let sessionChannel: FlutterMethodChannel
@@ -59,10 +63,7 @@ final class CaptureARView: NSObject, FlutterPlatformView {
 
   init(frame: CGRect, viewIdentifier viewId: Int64, arguments: Any?, binaryMessenger messenger: FlutterBinaryMessenger) {
     self.viewId = viewId
-    let plan = ARSessionConfigurationPlan(
-      options: ARSessionOptions(creationParams: arguments),
-      capabilities: ARCameraCapabilities.current())
-    host = ARSessionHost(plan: plan)
+    source = CaptureARView.makeSource(creationParams: arguments)
     sessionChannel = FlutterMethodChannel(name: "arsession_\(viewId)", binaryMessenger: messenger)
     captureChannel = FlutterMethodChannel(name: "arcapture_\(viewId)", binaryMessenger: messenger)
     objectChannel = FlutterMethodChannel(name: "arobjects_\(viewId)", binaryMessenger: messenger)
@@ -84,21 +85,21 @@ final class CaptureARView: NSObject, FlutterPlatformView {
     metalView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
     metalView.backgroundColor = .black
     if let device = device {
-      renderLoop = try? CaptureRenderLoop(device: device, host: host)
+      renderLoop = try? CaptureRenderLoop(device: device, source: source)
     } else {
       renderLoop = nil
     }
     super.init()
 
     renderLoop?.configure(metalView)
-    host.addFrameObserver(poseStream)
-    host.onSessionFailure = { [weak self] error in
+    source.addFrameObserver(poseStream)
+    source.onSessionFailure = { [weak self] error in
       NSLog("[CaptureARView] ARKit session failed: %@", error.localizedDescription)
       self?.sessionChannel.invokeMethod("onError", arguments: [CaptureViewMessageCode.sessionFailure(error)])
     }
     if let makeExtension = CaptureChannelExtensionRegistry.shared.makeExtension {
       captureExtension = makeExtension(
-        CaptureChannelContext(viewId: viewId, channel: captureChannel, frameSource: host))
+        CaptureChannelContext(viewId: viewId, channel: captureChannel, frameSource: source))
     }
     sessionChannel.setMethodCallHandler { [weak self] call, result in
       guard let self = self else { return result(FlutterMethodNotImplemented) }
@@ -119,7 +120,31 @@ final class CaptureARView: NSObject, FlutterPlatformView {
         self?.sessionChannel.invokeMethod("onError", arguments: [CaptureViewMessageCode.metalUnavailable])
       }
     }
-    host.start()
+    if let recorded = source as? RecordedFrameSource {
+      recorded.onPlaybackFinished = { [weak self] event in
+        guard let self = self, !self.disposed else { return }
+        self.sessionChannel.invokeMethod("onArPlaybackFinished", arguments: event)
+      }
+    }
+    source.start()
+  }
+
+  /// The live session host, or a recorded session when the creation
+  /// parameters select one that opens (debug and profile builds only).
+  static func makeSource(creationParams: Any?) -> CaptureSessionSource {
+    let options = ARSessionOptions(creationParams: creationParams)
+    let selection = RecordedPlaybackSelector.select(creationParams: creationParams)
+    if let line = RecordedPlaybackSelector.describe(selection) { RecordedPlaybackLog.write(line) }
+    if case .enabled(let config) = selection {
+      do {
+        let session = try RecordedSession(directory: config.directory)
+        return RecordedFrameSource(session: session, config: config, options: options)
+      } catch {
+        RecordedPlaybackLog.write("refused path=\(config.directory.path) reason=open-failed error=\(error) (live camera)")
+      }
+    }
+    let plan = ARSessionConfigurationPlan(options: options, capabilities: ARCameraCapabilities.current())
+    return ARSessionHost(plan: plan)
   }
 
   deinit {
@@ -143,13 +168,13 @@ final class CaptureARView: NSObject, FlutterPlatformView {
     switch call.method {
     case "init":
       // Android semantics: configuration only; a paused session stays paused.
-      if !disposed { host.initialize() }
+      if !disposed { source.initialize() }
       result(nil)
     case "showPlanes":
       result(nil)
     case "getCameraPose":
-      guard !disposed, let camera = host.session.currentFrame?.camera else { return result(nil) }
-      result(CaptureARView.columnMajor(camera.transform))
+      guard !disposed, let frame = source.currentFrame else { return result(nil) }
+      result(CaptureARView.columnMajor(frame.cameraTransform))
     case "pauseSession", "disableCamera":
       pauseSession()
       result(nil)
@@ -171,13 +196,13 @@ final class CaptureARView: NSObject, FlutterPlatformView {
     guard !disposed else { return }
     metalView.isPaused = true
     poseSink.pause()
-    host.pause()
+    source.pause()
   }
 
   private func resumeSession() {
     metalView.isPaused = false
     poseSink.resume()
-    host.resume()
+    source.resume()
   }
 
   // MARK: arcapture_<id>
@@ -223,11 +248,12 @@ final class CaptureARView: NSObject, FlutterPlatformView {
     disposed = true
     poseStream.disable()
     poseSink.close()
-    host.removeFrameObserver(poseStream)
-    host.onSessionFailure = nil
+    source.removeFrameObserver(poseStream)
+    source.onSessionFailure = nil
+    (source as? RecordedFrameSource)?.onPlaybackFinished = nil
     captureExtension?.captureViewWillDispose()
     captureExtension = nil
-    host.dispose()
+    source.dispose()
     metalView.isPaused = true
     metalView.delegate = nil
     sessionChannel.setMethodCallHandler(nil)

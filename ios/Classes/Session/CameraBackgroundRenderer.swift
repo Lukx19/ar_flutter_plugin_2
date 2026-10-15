@@ -4,10 +4,10 @@ import Metal
 import simd
 import UIKit
 
-/// Draws `ARFrame.capturedImage` (bi-planar full-range YCbCr) as the camera
+/// Draws `CaptureFrame.capturedImage` (bi-planar full-range YCbCr) as the camera
 /// background: Y and CbCr planes become Metal textures through a
 /// `CVMetalTextureCache` without a copy, are converted with full-range BT.601
-/// and placed with `ARFrame.displayTransform` (view orientation, aspect fill).
+/// and placed with `CaptureFrame.displayTransform` (view orientation, aspect fill).
 ///
 /// Shaders are compiled at run time from [CaptureMetalShaders.source]. The
 /// plugin is a static CocoaPods framework (and an SPM target later): a
@@ -116,7 +116,7 @@ struct GridOverlayFrameContext {
   let viewportSize: CGSize
   let drawableSize: CGSize
   let orientation: UIInterfaceOrientation
-  /// `ARFrame.timestamp` of the drawn camera image, seconds.
+  /// `CaptureFrame.timestamp` of the drawn camera image, seconds.
   let frameTimestamp: TimeInterval
   let trackingState: ARCamera.TrackingState
 }

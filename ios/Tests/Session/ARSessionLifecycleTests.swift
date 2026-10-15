@@ -107,8 +107,8 @@ final class ARSessionHostTests: XCTestCase {
 
   private final class RecordingObserver: ARFrameObserver {
     var events: [String] = []
-    func frameSource(_ source: ARFrameSource, didUpdate frame: ARFrame) { events.append("frame") }
-    func frameSource(_ source: ARFrameSource, didStart configuration: ARConfiguration, epoch: Int) {
+    func frameSource(_ source: ARFrameSource, didUpdate frame: CaptureFrame) { events.append("frame") }
+    func frameSource(_ source: ARFrameSource, didStart configuration: CaptureRunConfiguration, epoch: Int) {
       events.append("start \(epoch)")
     }
     func frameSourceDidStop(_ source: ARFrameSource) { events.append("stop") }

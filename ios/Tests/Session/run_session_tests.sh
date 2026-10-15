@@ -11,7 +11,7 @@ here=${0:A:h}
 classes=${here:h:h}/Classes/Session
 work=$(mktemp -d "${TMPDIR:-/tmp}/session-host-tests.XXXXXX")
 mkdir -p "$work/Sources/ar_flutter_plugin_2" "$work/Tests/SessionTests"
-for f in ARFrameObserver ARSessionLifecycle ARSessionHost ARCameraCapabilities \
+for f in ARFrameObserver CaptureFrame ARSessionLifecycle ARSessionHost ARCameraCapabilities \
          PoseBatchWire PoseStreamObserver CameraBackgroundRenderer \
          CaptureChannelHostReplies; do
   ln -s "$classes/$f.swift" "$work/Sources/ar_flutter_plugin_2/$f.swift"

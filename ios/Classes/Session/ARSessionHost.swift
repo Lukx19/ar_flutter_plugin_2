@@ -40,7 +40,7 @@ extension ARSession: ARSessionDriving {}
 /// refuses callbacks that ARKit queued before a pause or dispose, and frames
 /// of an earlier run delivered after a resume. Frames are passed through, never
 /// stored: ARKit stops delivering frames when too many are retained.
-final class ARSessionHost: NSObject, ARFrameSource, ARSessionDelegate {
+final class ARSessionHost: NSObject, CaptureSessionSource, ARSessionDelegate {
   let session: ARSession
   let delegateQueue: DispatchQueue
   let plan: ARSessionConfigurationPlan
@@ -55,8 +55,8 @@ final class ARSessionHost: NSObject, ARFrameSource, ARSessionDelegate {
   private let clock: () -> TimeInterval
   private let lock = NSLock()
   private var lifecycle = ARSessionLifecycle()
-  private var currentConfiguration: ARConfiguration?
-  private var observers: [FrameObserverEntry] = []
+  private var currentConfiguration: CaptureRunConfiguration?
+  private var observers = FrameObserverSet()
 
   /// - Parameters:
   ///   - driver: receives `run`/`pause`; defaults to [session].
@@ -97,6 +97,14 @@ final class ARSessionHost: NSObject, ARFrameSource, ARSessionDelegate {
 
   // MARK: ARFrameSource
 
+  var anchorHost: CaptureAnchorHost { session }
+  var currentFrame: CaptureFrame? { session.currentFrame.map(ARKitCaptureFrame.init) }
+
+  var runConfiguration: CaptureRunConfiguration? {
+    lock.lock(); defer { lock.unlock() }
+    return currentConfiguration
+  }
+
   var deliversSceneDepth: Bool { plan.deliversSceneDepth }
   var depthOutputSize: ARDepthOutputSize { plan.depthOutputSize }
 
@@ -114,8 +122,7 @@ final class ARSessionHost: NSObject, ARFrameSource, ARSessionDelegate {
   /// run before its first frame.
   func addFrameObserver(_ observer: ARFrameObserver) {
     lock.lock()
-    observers.removeAll { $0.observer == nil || $0.observer === observer }
-    observers.append(FrameObserverEntry(observer))
+    observers.add(observer)
     let replay = lifecycle.isRunning ? currentConfiguration : nil
     let epoch = lifecycle.epoch
     lock.unlock()
@@ -129,8 +136,18 @@ final class ARSessionHost: NSObject, ARFrameSource, ARSessionDelegate {
 
   func removeFrameObserver(_ observer: ARFrameObserver) {
     lock.lock()
-    observers.removeAll { $0.observer == nil || $0.observer === observer }
+    observers.remove(observer)
     lock.unlock()
+  }
+
+  func captureHighResolutionFrame(completion: @escaping (CaptureFrame?, Error?) -> Void) {
+    session.captureHighResolutionFrame { frame, error in
+      completion(frame.map(ARKitCaptureFrame.init), error)
+    }
+  }
+
+  func getCurrentWorldMap(completion: @escaping (ARWorldMap?, Error?) -> Void) {
+    session.getCurrentWorldMap(completionHandler: completion)
   }
 
   // MARK: Control (main thread)
@@ -182,7 +199,8 @@ final class ARSessionHost: NSObject, ARFrameSource, ARSessionDelegate {
     case .none:
       return
     case .run(let resetTracking):
-      let configuration = makeConfiguration()
+      let arConfiguration = makeConfiguration()
+      let configuration = CaptureRunConfiguration(arConfiguration)
       lock.lock()
       currentConfiguration = configuration
       lock.unlock()
@@ -196,7 +214,7 @@ final class ARSessionHost: NSObject, ARFrameSource, ARSessionDelegate {
         self.markStarted(started)
         started.forEach { $0.frameSource(self, didStart: configuration, epoch: epoch) }
       }
-      driver.run(configuration, options: resetTracking ? [.resetTracking, .removeExistingAnchors] : [])
+      driver.run(arConfiguration, options: resetTracking ? [.resetTracking, .removeExistingAnchors] : [])
     case .pause:
       driver.pause()
       let targets = liveObservers()
@@ -209,31 +227,29 @@ final class ARSessionHost: NSObject, ARFrameSource, ARSessionDelegate {
 
   private func liveObservers() -> [ARFrameObserver] {
     lock.lock(); defer { lock.unlock() }
-    return observers.compactMap { $0.observer }
+    return observers.live
   }
 
   private func stillObserving(_ targets: [ARFrameObserver]) -> [ARFrameObserver] {
-    let current = liveObservers()
-    return targets.filter { target in current.contains { $0 === target } }
+    lock.lock(); defer { lock.unlock() }
+    return observers.stillObserving(targets)
   }
 
   /// Observers that received `didStart` of a run; only they get frames, so
   /// no observer sees a frame before its start.
   private func startedObservers() -> [ARFrameObserver] {
     lock.lock(); defer { lock.unlock() }
-    return observers.filter { $0.started }.compactMap { $0.observer }
+    return observers.started
   }
 
   private func markStarted(_ started: [ARFrameObserver]) {
     lock.lock(); defer { lock.unlock() }
-    for entry in observers where started.contains(where: { $0 === entry.observer }) {
-      entry.started = true
-    }
+    observers.markStarted(started)
   }
 
   private func isObserving(_ observer: ARFrameObserver) -> Bool {
     lock.lock(); defer { lock.unlock() }
-    return observers.contains { $0.observer === observer }
+    return observers.contains(observer)
   }
 
   private var admitsSessionCallbacks: Bool {
@@ -245,14 +261,16 @@ final class ARSessionHost: NSObject, ARFrameSource, ARSessionDelegate {
 
   func session(_ session: ARSession, didUpdate frame: ARFrame) {
     guard admitFrame(timestamp: frame.timestamp) else { return }
+    let captureFrame = ARKitCaptureFrame(frame)
     for observer in startedObservers() {
-      observer.frameSource(self, didUpdate: frame)
+      observer.frameSource(self, didUpdate: captureFrame)
     }
   }
 
   func session(_ session: ARSession, cameraDidChangeTrackingState camera: ARCamera) {
     guard admitsSessionCallbacks else { return }
-    startedObservers().forEach { $0.frameSource(self, trackingChanged: camera) }
+    let state = camera.trackingState
+    startedObservers().forEach { $0.frameSource(self, trackingChanged: state) }
   }
 
   func sessionWasInterrupted(_ session: ARSession) {
@@ -275,11 +293,4 @@ final class ARSessionHost: NSObject, ARFrameSource, ARSessionDelegate {
       self.onSessionFailure?(error)
     }
   }
-}
-
-private final class FrameObserverEntry {
-  weak var observer: ARFrameObserver?
-  /// Set on the delegate queue when the observer received `didStart`.
-  var started = false
-  init(_ observer: ARFrameObserver) { self.observer = observer }
 }
