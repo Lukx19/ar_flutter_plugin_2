@@ -3,6 +3,34 @@ import 'camera_resolution.dart';
 import '../datatypes/image_format.dart';
 import '../datatypes/buffer_strategy.dart';
 
+/// The still a manual shutter takes on iOS (`initializeCapture`
+/// `stillCaptureMode`). Automatic captures always take [single]; Android
+/// ignores the setting. Every mode runs inside the running AR session: the
+/// session is never paused for a still, and the other cameras (ultra-wide,
+/// telephoto) are not available while ARKit runs.
+enum ARStillCaptureMode {
+  /// One ARKit high-resolution frame (about 100 ms on the iPhone 12 Pro).
+  single('single'),
+
+  /// [ARCaptureConfig.burstImageCount] high-resolution frames in sequence,
+  /// each with its own frame's pose, intrinsics and exposure time.
+  burst('burst'),
+
+  /// One frame with ARKit multi-frame processing (balanced photo quality,
+  /// about 490 ms; iOS 26 and later, else a plain frame) and video HDR on
+  /// formats that support it: the in-AR HDR.
+  inArQuality('inArQuality');
+
+  const ARStillCaptureMode(this.wireValue);
+
+  final String wireValue;
+
+  static ARStillCaptureMode fromWire(Object? value) => values.firstWhere(
+        (mode) => mode.wireValue == value,
+        orElse: () => ARStillCaptureMode.single,
+      );
+}
+
 /// Complete configuration for AR capture functionality
 /// Contains all parameters needed for capture system initialization
 class ARCaptureConfig {
@@ -46,6 +74,19 @@ class ARCaptureConfig {
   /// Buffer management strategy
   final BufferStrategy bufferStrategy;
 
+  /// iOS still of a manual shutter; sent only when not [ARStillCaptureMode.single].
+  final ARStillCaptureMode stillCaptureMode;
+
+  /// Images of an iOS burst shot (2-5).
+  final int burstImageCount;
+
+  /// Wait between burst images (0-1000 ms); a little hand motion over it
+  /// gives extra viewpoints.
+  final int burstIntervalMs;
+
+  static const int defaultBurstImageCount = 3;
+  static const int defaultBurstIntervalMs = 150;
+
   const ARCaptureConfig({
     this.enableHighResCapture = false,
     this.retainAssessedOriginals = false,
@@ -60,6 +101,9 @@ class ARCaptureConfig {
     this.defaultExposureTime,
     this.enablePoseStream = true,
     this.bufferStrategy = BufferStrategy.balanced,
+    this.stillCaptureMode = ARStillCaptureMode.single,
+    this.burstImageCount = defaultBurstImageCount,
+    this.burstIntervalMs = defaultBurstIntervalMs,
   });
 
   /// Create from platform channel data
@@ -84,6 +128,11 @@ class ARCaptureConfig {
         (s) => s.name == map['bufferStrategy'] as String?,
         orElse: () => BufferStrategy.balanced,
       ),
+      stillCaptureMode: ARStillCaptureMode.fromWire(map['stillCaptureMode']),
+      burstImageCount:
+          map['burstImageCount'] as int? ?? defaultBurstImageCount,
+      burstIntervalMs:
+          map['burstIntervalMs'] as int? ?? defaultBurstIntervalMs,
     );
   }
 
@@ -103,6 +152,12 @@ class ARCaptureConfig {
       'defaultExposureTime': defaultExposureTime?.inMicroseconds,
       'enablePoseStream': enablePoseStream,
       'bufferStrategy': bufferStrategy.name,
+      if (stillCaptureMode != ARStillCaptureMode.single)
+        'stillCaptureMode': stillCaptureMode.wireValue,
+      if (stillCaptureMode == ARStillCaptureMode.burst) ...{
+        'burstImageCount': burstImageCount,
+        'burstIntervalMs': burstIntervalMs,
+      },
     };
   }
 
@@ -189,6 +244,8 @@ class ARCaptureConfig {
     if (captureIntervalMs > 3600000) return false;
     if (maxCacheSize <= 0 || maxCacheSize > 100) return false;
     if (jpegQuality < 10 || jpegQuality > 100) return false;
+    if (burstImageCount < 2 || burstImageCount > 5) return false;
+    if (burstIntervalMs < 0 || burstIntervalMs > 1000) return false;
     if (defaultISO != null && (defaultISO! <= 0 || defaultISO! > 25600))
       return false;
 
@@ -242,6 +299,9 @@ class ARCaptureConfig {
     Duration? defaultExposureTime,
     bool? enablePoseStream,
     BufferStrategy? bufferStrategy,
+    ARStillCaptureMode? stillCaptureMode,
+    int? burstImageCount,
+    int? burstIntervalMs,
   }) {
     return ARCaptureConfig(
       enableHighResCapture: enableHighResCapture ?? this.enableHighResCapture,
@@ -257,6 +317,9 @@ class ARCaptureConfig {
       defaultExposureTime: defaultExposureTime ?? this.defaultExposureTime,
       enablePoseStream: enablePoseStream ?? this.enablePoseStream,
       bufferStrategy: bufferStrategy ?? this.bufferStrategy,
+      stillCaptureMode: stillCaptureMode ?? this.stillCaptureMode,
+      burstImageCount: burstImageCount ?? this.burstImageCount,
+      burstIntervalMs: burstIntervalMs ?? this.burstIntervalMs,
     );
   }
 
@@ -296,7 +359,10 @@ class ARCaptureConfig {
         other.defaultISO == defaultISO &&
         other.defaultExposureTime == defaultExposureTime &&
         other.enablePoseStream == enablePoseStream &&
-        other.bufferStrategy == bufferStrategy;
+        other.bufferStrategy == bufferStrategy &&
+        other.stillCaptureMode == stillCaptureMode &&
+        other.burstImageCount == burstImageCount &&
+        other.burstIntervalMs == burstIntervalMs;
   }
 
   @override
@@ -313,7 +379,10 @@ class ARCaptureConfig {
         defaultISO.hashCode ^
         defaultExposureTime.hashCode ^
         enablePoseStream.hashCode ^
-        bufferStrategy.hashCode;
+        bufferStrategy.hashCode ^
+        stillCaptureMode.hashCode ^
+        burstImageCount.hashCode ^
+        burstIntervalMs.hashCode;
   }
 
   @override

@@ -267,6 +267,14 @@ final class RecordedFrameSource: CaptureSessionSource {
     }
   }
 
+  /// Every quality answers with the recorded still: the recording has no
+  /// camera to process more frames.
+  func captureHighResolutionFrame(quality: StillFrameQuality, completion: @escaping (CaptureFrame?, Error?) -> Void) {
+    captureHighResolutionFrame(completion: completion)
+  }
+
+  var replaysRecordedStills: Bool { true }
+
   /// The world map the recorder saved at the end of the recording.
   func getCurrentWorldMap(completion: @escaping (ARWorldMap?, Error?) -> Void) {
     guard let url = session.worldMapURL else {

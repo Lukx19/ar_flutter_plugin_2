@@ -177,11 +177,14 @@ final class PersistentFault {
   }
 }
 
-/// Failure seam that throws at the [nth] visit (1-based) of [point] only.
+/// Failure seam that throws at the [nth] visit (1-based) of [point] only,
+/// counting visits while [armed] (armed from creation unless cleared).
 final class NthVisitFault {
   let point: DurableStoreFaultPoint
   let nth: Int
+  var armed = true
   private(set) var visits = 0
+  private(set) var injected = false
 
   init(_ point: DurableStoreFaultPoint, nth: Int) {
     self.point = point
@@ -190,9 +193,12 @@ final class NthVisitFault {
 
   func injector() -> DurableStoreFaultInjector {
     { [self] visited in
-      guard visited == point else { return }
+      guard armed, visited == point else { return }
       visits += 1
-      if visits == nth { throw DurableStoreStateError("injected-\(point.rawValue)-\(nth)") }
+      if visits == nth {
+        injected = true
+        throw DurableStoreStateError("injected-\(point.rawValue)-\(nth)")
+      }
     }
   }
 }

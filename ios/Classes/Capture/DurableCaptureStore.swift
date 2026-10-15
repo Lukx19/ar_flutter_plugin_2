@@ -143,9 +143,15 @@ final class DurableCaptureStore {
   /// The direct exposure path: the accepted identity and reservation exist;
   /// each component is streamed once into staging while its descriptor is
   /// computed, then moved, rooted, receipted and selected.
+  ///
+  /// A burst [shot] streams its other images and its record into the
+  /// same staging and asset folder and writes a shot root (schema 7) that
+  /// lists them: the single pointer swap commits every image of the shot or
+  /// none, and recovery of an unreceipted attempt removes them with the
+  /// assets.
   func commitStreamedFinalized(
     _ template: CapturePostOutputTemplate, exposureTimestampNanoseconds: Int64,
-    components: [(CaptureComponentKind, [UInt8])]
+    components: [(CaptureComponentKind, [UInt8])], shot: DurableShotPayload? = nil
   ) throws -> CaptureReceipt {
     let identity = template.accepted.identity
     let location = try self.location(identity)
@@ -177,6 +183,30 @@ final class DurableCaptureStore {
         let hex = DurableStoreEncoding.hex(digest)
         staged.append((kind, file, DurableComponentDescriptor(kind: kind, byteLength: length, sha256: digest, durableObjectId: hex)))
       }
+      var stagedShot: (images: [(DurableShotPayload.Image, [String], DurableComponentDescriptor)], record: ([String], DurableComponentDescriptor))?
+      if let shot = shot {
+        guard shot.images.allSatisfy({ $0.index > 0 && ShotRecord.roles.contains($0.role) }),
+              Set(shot.images.map { $0.index }).count == shot.images.count else {
+          throw DurableStoreStateError("Shot images are malformed")
+        }
+        var images: [(DurableShotPayload.Image, [String], DurableComponentDescriptor)] = []
+        for image in shot.images.sorted(by: { $0.index < $1.index }) {
+          let file = staging + ["shot-image-\(image.index).part"]
+          try files.at(.componentOpen)
+          let (length, digest) = try files.streamExclusive(file, image.bytes)
+          try files.at(.lengthCheck)
+          actualBytes += length
+          images.append((image, file, DurableComponentDescriptor(kind: .jpeg, byteLength: length, sha256: digest,
+                                                                 durableObjectId: DurableStoreEncoding.hex(digest))))
+        }
+        let recordFile = staging + ["shot-record.part"]
+        try files.at(.componentOpen)
+        let (length, digest) = try files.streamExclusive(recordFile, shot.record)
+        try files.at(.lengthCheck)
+        actualBytes += length
+        stagedShot = (images, (recordFile, DurableComponentDescriptor(kind: .sidecar, byteLength: length, sha256: digest,
+                                                                      durableObjectId: DurableStoreEncoding.hex(digest))))
+      }
       guard actualBytes <= reservation.bytes, actualBytes <= template.accepted.profile.maximumComponentBytes else {
         throw DurableStoreStateError("Component bytes exceed accepted reservation")
       }
@@ -192,9 +222,23 @@ final class DurableCaptureStore {
       for (kind, file, descriptor) in staged {
         try moveImmutable(file, assets + ["\(kind.storedName.lowercased()).\(descriptor.durableObjectId).blob"], descriptor)
       }
+      var shotLines: CaptureRootShot?
+      if let shot = shot, let stagedShot = stagedShot {
+        for (image, file, descriptor) in stagedShot.images {
+          try moveImmutable(file, assets + [Self.shotImageBlobName(index: image.index, hash: descriptor.durableObjectId)], descriptor)
+        }
+        let (recordFile, recordDescriptor) = stagedShot.record
+        try moveImmutable(recordFile, assets + [Self.shotRecordBlobName(hash: recordDescriptor.durableObjectId)], recordDescriptor)
+        shotLines = CaptureRootShot(
+          shotId: shot.shotId.uuidString.lowercased(),
+          images: stagedShot.images.map {
+            CaptureRootShotImage(index: $0.0.index, role: $0.0.role, length: $0.2.byteLength, hash: $0.2.durableObjectId)
+          },
+          record: CaptureRootComponent(kind: "RECORD", length: recordDescriptor.byteLength, hash: recordDescriptor.durableObjectId))
+      }
       let prior = try selectedRoot(location)
       let revision = (prior?.revision ?? 0) + 1
-      let rootBytes = Self.rootRecord(requestHash: requestHash, revision: revision, components: staged.map { $0.2 }, prior: prior)
+      let rootBytes = Self.rootRecord(requestHash: requestHash, revision: revision, components: staged.map { $0.2 }, prior: prior, shot: shotLines)
       let rootHash = DurableStoreEncoding.hex(DurableStoreEncoding.sha256(rootBytes))
       try files.at(.rootWrite)
       try files.writeImmutable(location + ["objects", "\(rootHash).root"], rootBytes, .rootWrite)
@@ -285,17 +329,34 @@ final class DurableCaptureStore {
     return values
   }
 
-  /// Every component blob of [rootHash] exists with its rooted length and digest.
+  /// Every blob of [rootHash] exists with its rooted length and digest: the
+  /// components and, for a shot root, every shot image and the shot record.
   private func verifiedAssets(_ location: [String], captureId: String, rootHash: String) throws -> Bool {
     guard RootedDurableFiles.isValidSegment(captureId), let metadata = try readRootMetadata(location, rootHash),
           !metadata.components.isEmpty else { return false }
-    for component in metadata.components {
-      let blob = location + ["assets", captureId, "\(component.kind.lowercased()).\(component.hash).blob"]
+    for (name, expectedLength, expectedHash) in Self.rootBlobs(metadata) {
+      let blob = location + ["assets", captureId, name]
       guard files.isFile(blob) else { return false }
       let (length, digest) = try files.digestAndLength(blob)
-      guard length == component.length, DurableStoreEncoding.hex(digest) == component.hash else { return false }
+      guard length == expectedLength, DurableStoreEncoding.hex(digest) == expectedHash else { return false }
     }
     return true
+  }
+
+  /// Asset file name, length and digest of every blob a root commits.
+  static func rootBlobs(_ metadata: CaptureRootMetadata) -> [(name: String, length: Int64, hash: String)] {
+    var blobs = metadata.components.map { ("\($0.kind.lowercased()).\($0.hash).blob", $0.length, $0.hash) }
+    if let shot = metadata.shot {
+      blobs += shot.images.map { (shotImageBlobName(index: $0.index, hash: $0.hash), $0.length, $0.hash) }
+      blobs.append((shotRecordBlobName(hash: shot.record.hash), shot.record.length, shot.record.hash))
+    }
+    return blobs
+  }
+
+  /// The charge of a committed root: its components and, for a shot root,
+  /// every shot image and the shot record, so a shot is charged once whole.
+  static func rootChargeBytes(_ metadata: CaptureRootMetadata) -> Int64 {
+    rootBlobs(metadata).reduce(0) { $0 + $1.length }
   }
 
   /// Charges a retained committed root's bytes to the attempt's live
@@ -440,7 +501,7 @@ final class DurableCaptureStore {
           values["kind"] == CaptureTerminalKind.committedPicture.storedName,
           let rootHash = values["rootHash"], published.contains(rootHash),
           let metadata = try readRootMetadata(location, rootHash) else { return nil }
-    return metadata.components.reduce(0) { $0 + $1.length }
+    return Self.rootChargeBytes(metadata)
   }
 
   // MARK: Recovery
@@ -711,7 +772,7 @@ final class DurableCaptureStore {
 
   private func committedComponentBytes(_ location: [String], _ rootHash: String) throws -> Int64 {
     guard let metadata = try readRootMetadata(location, rootHash) else { throw DurableStoreConflict("Committed root is invalid") }
-    return metadata.components.reduce(0) { $0 + $1.length }
+    return Self.rootChargeBytes(metadata)
   }
 
   private func moveImmutable(_ from: [String], _ target: [String], _ descriptor: DurableComponentDescriptor) throws {
@@ -748,6 +809,28 @@ final class DurableCaptureStore {
     guard let name = (try? files.list(assets))?.sorted().first(where: { $0.hasPrefix("jpeg.") && $0.hasSuffix(".blob") }),
           files.isFile(assets + [name]) else { return nil }
     return (assets + [name]).reduce(root) { $0.appendingPathComponent($1, isDirectory: false) }
+  }
+
+  /// The committed files of a burst shot: image index (1...) to
+  /// its JPEG and the shot record, read from the verified shot root; nil
+  /// for a single-image commit or an unverifiable root.
+  func committedShotFiles(_ terminal: CaptureTerminal) -> (images: [Int: URL], record: URL)? {
+    guard terminal.kind == .committedPicture, let captureId = terminal.captureId, let rootHash = terminal.manifestId,
+          let root = (files.backend as? PosixDurableFileBackend)?.root else { return nil }
+    let location = sessionRoot + [DurableStoreEncoding.safeName(terminal.identity.lifecycleCut.sessionId)]
+    guard let metadata = try? readRootMetadata(location, rootHash), let shot = metadata.shot else { return nil }
+    let assets = location + ["assets", captureId]
+    func url(_ name: String) -> URL? {
+      guard files.isFile(assets + [name]) else { return nil }
+      return (assets + [name]).reduce(root) { $0.appendingPathComponent($1, isDirectory: false) }
+    }
+    var images: [Int: URL] = [:]
+    for image in shot.images {
+      guard let file = url(Self.shotImageBlobName(index: image.index, hash: image.hash)) else { return nil }
+      images[image.index] = file
+    }
+    guard let record = url(Self.shotRecordBlobName(hash: shot.record.hash)) else { return nil }
+    return (images, record)
   }
 
   // MARK: Paths and records
@@ -791,19 +874,39 @@ final class DurableCaptureStore {
     try files.writeExclusive(path, DurableStoreEncoding.propertiesBytes(values), point)
   }
 
-  static func rootRecord(requestHash: String, revision: Int64, components: [DurableComponentDescriptor], prior: CaptureRootPointer?, priorPrevious: String?) -> [UInt8] {
-    var text = "schema=\(NativeStoreFormatVersions.photoRootSchemaPlain)\nrevision=\(revision)\nrequest=\(requestHash)\nprevious=\(prior?.hash ?? "-")\nsecondPrevious=\(priorPrevious ?? "-")\n"
+  /// A plain root (schema 5), or with [shot] a shot root (schema 7): the
+  /// same lines plus `shot=<id>`, one `shotImage=<index>:<ROLE>:<length>:<sha>`
+  /// per image after the first one and `shotRecord=<length>:<sha>`.
+  static func rootRecord(
+    requestHash: String, revision: Int64, components: [DurableComponentDescriptor], prior: CaptureRootPointer?,
+    priorPrevious: String?, shot: CaptureRootShot? = nil
+  ) -> [UInt8] {
+    let schema = shot == nil ? NativeStoreFormatVersions.photoRootSchemaPlain : NativeStoreFormatVersions.photoRootSchemaShot
+    var text = "schema=\(schema)\nrevision=\(revision)\nrequest=\(requestHash)\nprevious=\(prior?.hash ?? "-")\nsecondPrevious=\(priorPrevious ?? "-")\n"
     for component in components.sorted(by: { $0.kind < $1.kind }) {
       text += "component=\(component.kind.storedName):\(component.byteLength):\(DurableStoreEncoding.hex(component.sha256))\n"
+    }
+    if let shot = shot {
+      text += "shot=\(shot.shotId)\n"
+      for image in shot.images.sorted(by: { $0.index < $1.index }) {
+        text += "shotImage=\(image.index):\(image.role):\(image.length):\(image.hash)\n"
+      }
+      text += "shotRecord=\(shot.record.length):\(shot.record.hash)\n"
     }
     return Array(text.utf8)
   }
 
-  private static func rootRecord(requestHash: String, revision: Int64, components: [DurableComponentDescriptor], prior: SelectedPointer?) -> [UInt8] {
+  private static func rootRecord(
+    requestHash: String, revision: Int64, components: [DurableComponentDescriptor], prior: SelectedPointer?, shot: CaptureRootShot?
+  ) -> [UInt8] {
     rootRecord(
       requestHash: requestHash, revision: revision, components: components,
-      prior: prior.map { CaptureRootPointer(revision: $0.revision, hash: $0.hash, commit: "") }, priorPrevious: prior?.previousHash)
+      prior: prior.map { CaptureRootPointer(revision: $0.revision, hash: $0.hash, commit: "") }, priorPrevious: prior?.previousHash,
+      shot: shot)
   }
+
+  static func shotImageBlobName(index: Int, hash: String) -> String { "shot-image-\(index).\(hash).blob" }
+  static func shotRecordBlobName(hash: String) -> String { "shot-record.\(hash).blob" }
 
   static func receiptProperties(_ receipt: CaptureReceipt, rootHash: String) -> [String: String] {
     let terminal = receipt.terminal!

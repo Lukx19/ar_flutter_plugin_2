@@ -6,16 +6,23 @@ import simd
 protocol NativeCaptureStorePort: AnyObject {
   func replayFenceBeforeExposure(_ request: CaptureCommitRequest) throws -> CaptureReceipt?
   func acceptBeforeExposure(_ request: CaptureCommitRequest) throws -> CaptureReceipt
-  func commit(_ request: CaptureCommitRequest, exposureTimestampNanoseconds: Int64, components: [(CaptureComponentKind, [UInt8])]) throws -> CaptureReceipt
+  /// [shot]: the other images and the record of a burst shot,
+  /// committed with the components or not at all.
+  func commit(_ request: CaptureCommitRequest, exposureTimestampNanoseconds: Int64, components: [(CaptureComponentKind, [UInt8])],
+              shot: DurableShotPayload?) throws -> CaptureReceipt
   func queryReceipt(_ identity: CaptureAttemptIdentity) throws -> CaptureReceipt?
   func rebaseSameAttempt(_ request: CaptureCommitRequest) throws -> CaptureReceipt
   func abandon(_ request: CaptureCommitRequest, terminal: CaptureTerminal) throws -> CaptureReceipt
   /// File of the committed JPEG of [terminal]; nil when unknown.
   func committedImageURL(_ terminal: CaptureTerminal) -> URL?
+  /// Files of a committed burst shot (images after the first one by
+  /// index, and the shot record); nil for a single image or when unknown.
+  func committedShotFiles(_ terminal: CaptureTerminal) -> (images: [Int: URL], record: URL)?
 }
 
 extension NativeCaptureStorePort {
   func committedImageURL(_ terminal: CaptureTerminal) -> URL? { nil }
+  func committedShotFiles(_ terminal: CaptureTerminal) -> (images: [Int: URL], record: URL)? { nil }
 }
 
 extension DurableCaptureStore: NativeCaptureStorePort {
@@ -25,8 +32,9 @@ extension DurableCaptureStore: NativeCaptureStorePort {
   func acceptBeforeExposure(_ request: CaptureCommitRequest) throws -> CaptureReceipt {
     try acceptCaptureBeforeExposure(request)
   }
-  func commit(_ request: CaptureCommitRequest, exposureTimestampNanoseconds: Int64, components: [(CaptureComponentKind, [UInt8])]) throws -> CaptureReceipt {
-    try commitStreamedFinalized(request.template, exposureTimestampNanoseconds: exposureTimestampNanoseconds, components: components)
+  func commit(_ request: CaptureCommitRequest, exposureTimestampNanoseconds: Int64, components: [(CaptureComponentKind, [UInt8])],
+              shot: DurableShotPayload?) throws -> CaptureReceipt {
+    try commitStreamedFinalized(request.template, exposureTimestampNanoseconds: exposureTimestampNanoseconds, components: components, shot: shot)
   }
   func abandon(_ request: CaptureCommitRequest, terminal: CaptureTerminal) throws -> CaptureReceipt {
     try abandonTemplate(request.template, terminal: terminal)
@@ -55,10 +63,13 @@ struct StillExposureMetadata {
 }
 
 /// One complete still: every required component, read once by the store.
+/// A shot (burst or quality) carries its first image as the JPEG component
+/// and all its images, each with its own frame, in [shot].
 struct StillComponentSet {
   var qualifier: CaptureAttemptQualifier
   var components: [(CaptureComponentKind, [UInt8])]
   var metadata: StillExposureMetadata
+  var shot: CapturedShot? = nil
 }
 
 enum StillExposureOutcome {
@@ -71,7 +82,19 @@ enum StillExposureOutcome {
 protocol StillExposurePort: AnyObject {
   func requestExposure(_ qualifier: CaptureAttemptQualifier, required: Set<CaptureComponentKind>,
                        callback: @escaping (StillExposureOutcome) -> Void) -> Bool
+  /// The same request with the attempt's lane: a camera may take a
+  /// different still for a manual shutter (a burst or quality shot) than for
+  /// Auto. Defaults to the lane-free request.
+  func requestExposure(_ qualifier: CaptureAttemptQualifier, required: Set<CaptureComponentKind>, lane: CaptureLane,
+                       callback: @escaping (StillExposureOutcome) -> Void) -> Bool
   func cancelExposure(_ qualifier: CaptureAttemptQualifier)
+}
+
+extension StillExposurePort {
+  func requestExposure(_ qualifier: CaptureAttemptQualifier, required: Set<CaptureComponentKind>, lane: CaptureLane,
+                       callback: @escaping (StillExposureOutcome) -> Void) -> Bool {
+    requestExposure(qualifier, required: required, callback: callback)
+  }
 }
 
 /// One committed durable photo for the visibility grid photo saved event.
@@ -81,6 +104,10 @@ struct DurableTerminalPhoto {
   var metadata: StillExposureMetadata?
   /// The committed JPEG in the durable store (read only; for tie points).
   var imageURL: URL? = nil
+  /// The burst or quality shot of this photo, when it was one.
+  var shot: CapturedShot? = nil
+  /// Committed files of the shot's images after the first one, by index.
+  var shotImageURLs: [Int: URL] = [:]
 }
 
 /// The per-view native admission owner (Android `NativeCaptureAdapterV2`):
@@ -109,6 +136,7 @@ final class NativeCaptureAdmissionOwner {
     var tenSecondPresented = false
     var pendingLifecycleReason: String?
     var metadata: StillExposureMetadata?
+    var shot: CapturedShot?
 
     init(request: CaptureCommitRequest, acceptedReceipt: CaptureReceipt, acceptedAtMs: Int64, qualifier: CaptureAttemptQualifier) {
       self.request = request
@@ -278,7 +306,9 @@ final class NativeCaptureAdmissionOwner {
     guard !closed, !value.exposureRequested, running == value.request.accepted.identity else { return }
     value.exposureRequested = true
     let qualifier = value.qualifier
-    let requested = exposure.requestExposure(qualifier, required: value.request.accepted.profile.requiredComponents) { [weak self] outcome in
+    let requested = exposure.requestExposure(
+      qualifier, required: value.request.accepted.profile.requiredComponents, lane: value.request.accepted.lane
+    ) { [weak self] outcome in
       guard let self = self else { return }
       self.deliver { self.handle(outcome) }
     }
@@ -312,6 +342,7 @@ final class NativeCaptureAdmissionOwner {
       value.componentsClaimed = true
       countExposure(value)
       value.metadata = set.metadata
+      value.shot = set.shot
       let kinds = set.components.map { $0.0 }
       guard kinds.count == Set(kinds).count, Set(kinds) == value.request.accepted.profile.requiredComponents else {
         counters.closedComponents += Int64(set.components.count)
@@ -321,7 +352,8 @@ final class NativeCaptureAdmissionOwner {
       emit(NativeCaptureEvent(kind: .finalizing, attemptId: value.request.accepted.identity.attemptId))
       let receipt: CaptureReceipt?
       do {
-        receipt = try store.commit(value.request, exposureTimestampNanoseconds: set.metadata.exposureTimestampNs, components: set.components)
+        receipt = try store.commit(value.request, exposureTimestampNanoseconds: set.metadata.exposureTimestampNs,
+                                   components: set.components, shot: set.shot?.payload)
       } catch {
         receipt = nil
       }
@@ -432,7 +464,8 @@ final class NativeCaptureAdmissionOwner {
     if let value = value, terminal.kind == .committedPicture {
       durableTerminal(DurableTerminalPhoto(
         request: value.request, terminal: terminal, metadata: value.metadata,
-        imageURL: store.committedImageURL(terminal)))
+        imageURL: store.committedImageURL(terminal), shot: value.shot,
+        shotImageURLs: value.shot == nil ? [:] : store.committedShotFiles(terminal)?.images ?? [:]))
     }
     if !lifecycleDrain { startRunningIfReady() }
   }

@@ -62,6 +62,31 @@ protocol ARFrameSource: AnyObject {
   /// The session's world map (`ARSession.getCurrentWorldMap`; a recorded
   /// session answers with the recording's map). [completion] runs once.
   func getCurrentWorldMap(completion: @escaping (ARWorldMap?, Error?) -> Void)
+  /// A still at [quality]: `.balanced` asks ARKit for multi-frame
+  /// processing (iOS 26 `captureHighResolutionFrame(using:)` with
+  /// `photoQualityPrioritization = .balanced`) and falls back to the plain
+  /// high-resolution frame where that is refused. A recorded session
+  /// answers with its recorded still for every quality. [completion] runs once.
+  func captureHighResolutionFrame(quality: StillFrameQuality, completion: @escaping (CaptureFrame?, Error?) -> Void)
+  /// True when stills are recorded ones (playback): every request answers
+  /// with the recorded still nearest to it.
+  var replaysRecordedStills: Bool { get }
+}
+
+/// Quality of an in-AR still.
+enum StillFrameQuality: Equatable {
+  /// `captureHighResolutionFrame` (about 100 ms on the iPhone 12 Pro).
+  case fast
+  /// Multi-frame processing (`.balanced` prioritization, about 490 ms).
+  case balanced
+}
+
+extension ARFrameSource {
+  func captureHighResolutionFrame(quality: StillFrameQuality, completion: @escaping (CaptureFrame?, Error?) -> Void) {
+    captureHighResolutionFrame(completion: completion)
+  }
+
+  var replaysRecordedStills: Bool { false }
 }
 
 /// A frame source the capture view drives: the live session host or a

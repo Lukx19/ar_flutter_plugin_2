@@ -45,7 +45,8 @@ final class IngestPullHandler: IngestMessageSink {
   static let idleAfterNs: Int64 = 500_000_000
   static let photoQueue = 32
   static let sessionQueue = 64
-  static let photoMessageBytes = IngestMessageLayout.headerBytes + PhotoSavedLayout.bytes
+  /// A photo saved message, with room for the shot image extension.
+  static let photoMessageBytes = IngestMessageLayout.headerBytes + PhotoSavedLayout.bytes + PhotoShotImageLayout.bytes
   static let sessionMessageBytes = IngestMessageLayout.headerBytes + IngestMessageLayout.sessionEventBytes
   /// Photo tie point batches waiting (one per saved photo).
   static let tiePointQueue = 8

@@ -24,6 +24,7 @@ final class ContractGoldenFileTests: XCTestCase {
     "ingest_points.bin": Expectation(tag: "C3VI", bytes: 224, kind: 2),
     "ingest_voxels.bin": Expectation(tag: "C3VI", bytes: 220, kind: 3),
     "ingest_photo_saved.bin": Expectation(tag: "C3VI", bytes: 288, kind: 4),
+    "ingest_photo_saved_shot_image.bin": Expectation(tag: "C3VI", bytes: 320, kind: 4),
     "ingest_markers.bin": Expectation(tag: "C3VI", bytes: 296, kind: 5),
     "ingest_session_event.bin": Expectation(tag: "C3VI", bytes: 176, kind: 6),
     "ingest_pull_request.bin": Expectation(tag: "C3VP", bytes: 8, kind: nil),
@@ -157,7 +158,8 @@ final class ContractGoldenFileTests: XCTestCase {
     case 3:
       XCTAssertEqual(payload, 4 + 28 * message.u32(header), "\(name) voxel payload")
     case 4:
-      XCTAssertEqual(payload, 128, "\(name) photo saved payload")
+      // 128 B, or 160 B with the shot image extension (2.16 row 23).
+      XCTAssertTrue([128, 160].contains(payload), "\(name) photo saved payload")
     case 5:
       XCTAssertEqual(payload, 8 + 64 * message.u16(header), "\(name) marker payload")
     case 6:
