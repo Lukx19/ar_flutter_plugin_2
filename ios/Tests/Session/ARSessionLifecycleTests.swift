@@ -244,7 +244,13 @@ final class ARSessionHostTests: XCTestCase {
     let driver = FakeSessionDriver()
     var host: ARSessionHost? = makeHost(driver)
     host?.start()
+    // The start posts an observer block to the delegate queue that holds
+    // the host while it runs; drain it so the release below is the last
+    // reference and `deinit` runs here, not later on that queue.
+    host?.delegateQueue.sync {}
+    weak var released = host
     host = nil
+    XCTAssertNil(released, "nothing else keeps a running host alive")
     XCTAssertEqual(driver.calls, [.run(resetTracking: true), .pause])
   }
 }
