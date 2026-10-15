@@ -73,6 +73,23 @@ struct CapturedShot {
       images: images.dropFirst().map { DurableShotPayload.Image(index: $0.index, role: ShotRecord.burstRole, bytes: $0.jpeg) },
       record: ShotRecord.encode(self))
   }
+
+  /// This shot with trailing images dropped until it fits [byteLimit]
+  /// together with [componentBytes] (the first image's components) and its
+  /// record allowance (the encoded shot record of the kept images). The
+  /// first image always stays: when no image after it fits, the shot keeps
+  /// only the first image and commits as a plain photo (schema 5 root).
+  func fitting(byteLimit: Int64, componentBytes: Int64) -> CapturedShot {
+    var count = images.count
+    while count > 1 {
+      let candidate = CapturedShot(shotId: shotId, mode: mode, images: Array(images.prefix(count)))
+      let imageBytes = candidate.images.dropFirst().reduce(Int64(0)) { $0 + Int64($1.jpeg.count) }
+      let recordAllowance = Int64(ShotRecord.encode(candidate).count)
+      if componentBytes + imageBytes + recordAllowance <= byteLimit { return candidate }
+      count -= 1
+    }
+    return CapturedShot(shotId: shotId, mode: mode, images: Array(images.prefix(1)))
+  }
 }
 
 /// Burst settings of the `initializeCapture` configuration.

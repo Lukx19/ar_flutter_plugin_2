@@ -140,6 +140,22 @@ final class DurableCaptureStore {
 
   // MARK: Commit
 
+  /// Bytes the accepted attempt of [template] may commit: the smaller of its
+  /// live reservation and its profile's component maximum (the commit guard
+  /// of [commitStreamedFinalized]); nil when the attempt has no accepted
+  /// record or live reservation.
+  func committableBytes(_ template: CapturePostOutputTemplate) throws -> Int64? {
+    let identity = template.accepted.identity
+    let location = try self.location(identity)
+    let acceptedPath = try acceptedFile(location, identity)
+    guard files.isFile(acceptedPath) else { return nil }
+    let accepted = try readProperties(acceptedPath)
+    guard accepted["acceptedHash"] == DurableStoreEncoding.acceptedHash(template.accepted),
+          let reservation = try accepted["reservationToken"].flatMap({ try budget.reservation(token: $0) })
+    else { return nil }
+    return min(reservation.bytes, template.accepted.profile.maximumComponentBytes)
+  }
+
   /// The direct exposure path: the accepted identity and reservation exist;
   /// each component is streamed once into staging while its descriptor is
   /// computed, then moved, rooted, receipted and selected.

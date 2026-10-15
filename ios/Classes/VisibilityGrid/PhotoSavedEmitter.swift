@@ -171,13 +171,6 @@ final class PhotoSavedEmitter {
     PhotoSavedLayout.bytes + (record.shotImage == nil ? 0 : PhotoShotImageLayout.bytes)
   }
 
-  /// Capture id of image [index] (1...) of the shot whose first image is
-  /// [captureId]: SHA-256 hex of `<captureId>#<index>`, so each image is
-  /// its own photo in the credit ledger.
-  static func shotImageCaptureId(_ captureId: String, index: Int) -> String {
-    SHA256.hash(data: Data("\(captureId)#\(index)".utf8)).map { String(format: "%02x", $0) }.joined()
-  }
-
   /// Writes the shot image extension of [shot] at [base] of [e].
   static func fillShotImage(_ e: IngestMessageBuffer, _ shot: ShotImageRecord, base: Int = PhotoSavedLayout.bytes) {
     let L = PhotoShotImageLayout.self

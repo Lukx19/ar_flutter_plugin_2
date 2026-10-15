@@ -10,6 +10,9 @@ protocol NativeCaptureStorePort: AnyObject {
   /// committed with the components or not at all.
   func commit(_ request: CaptureCommitRequest, exposureTimestampNanoseconds: Int64, components: [(CaptureComponentKind, [UInt8])],
               shot: DurableShotPayload?) throws -> CaptureReceipt
+  /// Bytes the accepted attempt of [request] may commit: the smaller of its
+  /// live reservation and its profile's component maximum; nil when unknown.
+  func committableBytes(_ request: CaptureCommitRequest) throws -> Int64?
   func queryReceipt(_ identity: CaptureAttemptIdentity) throws -> CaptureReceipt?
   func rebaseSameAttempt(_ request: CaptureCommitRequest) throws -> CaptureReceipt
   func abandon(_ request: CaptureCommitRequest, terminal: CaptureTerminal) throws -> CaptureReceipt
@@ -21,6 +24,7 @@ protocol NativeCaptureStorePort: AnyObject {
 }
 
 extension NativeCaptureStorePort {
+  func committableBytes(_ request: CaptureCommitRequest) throws -> Int64? { nil }
   func committedImageURL(_ terminal: CaptureTerminal) -> URL? { nil }
   func committedShotFiles(_ terminal: CaptureTerminal) -> (images: [Int: URL], record: URL)? { nil }
 }
@@ -38,6 +42,9 @@ extension DurableCaptureStore: NativeCaptureStorePort {
   }
   func abandon(_ request: CaptureCommitRequest, terminal: CaptureTerminal) throws -> CaptureReceipt {
     try abandonTemplate(request.template, terminal: terminal)
+  }
+  func committableBytes(_ request: CaptureCommitRequest) throws -> Int64? {
+    try committableBytes(request.template)
   }
 }
 
@@ -342,18 +349,25 @@ final class NativeCaptureAdmissionOwner {
       value.componentsClaimed = true
       countExposure(value)
       value.metadata = set.metadata
-      value.shot = set.shot
       let kinds = set.components.map { $0.0 }
       guard kinds.count == Set(kinds).count, Set(kinds) == value.request.accepted.profile.requiredComponents else {
         counters.closedComponents += Int64(set.components.count)
         _ = try? abandon(value.request, reason: "malformed-component-set")
         return
       }
+      // The first image always commits: trailing shot images that do not fit
+      // the attempt's committable bytes are dropped before the commit.
+      let componentBytes = set.components.reduce(Int64(0)) { $0 + Int64($1.1.count) }
+      if let shot = set.shot, let limit = try? store.committableBytes(value.request) {
+        value.shot = shot.fitting(byteLimit: limit, componentBytes: componentBytes)
+      } else {
+        value.shot = set.shot
+      }
       emit(NativeCaptureEvent(kind: .finalizing, attemptId: value.request.accepted.identity.attemptId))
       let receipt: CaptureReceipt?
       do {
         receipt = try store.commit(value.request, exposureTimestampNanoseconds: set.metadata.exposureTimestampNs,
-                                   components: set.components, shot: set.shot?.payload)
+                                   components: set.components, shot: value.shot?.payload)
       } catch {
         receipt = nil
       }
