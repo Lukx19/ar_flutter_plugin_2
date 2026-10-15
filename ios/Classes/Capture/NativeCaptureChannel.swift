@@ -5,16 +5,49 @@ import simd
 
 /// Registers native still capture with the plugin: the `arcapture_<id>`
 /// extension of every capture view, the app-wide preview channel and the
-/// store format versions channel. Called once from `SwiftArFlutterPlugin.register`.
-enum NativeCaptureRegistration {
-  private static var channels: [FlutterMethodChannel] = []
+/// store format versions channel. `SwiftArFlutterPlugin` registers each
+/// engine's messenger and unregisters it on that engine's detach; the latest
+/// engine owns the channels.
+final class NativeCaptureRegistration {
+  static let shared = NativeCaptureRegistration()
 
-  static func register(with registrar: FlutterPluginRegistrar) {
+  private let lock = NSLock()
+  private var channels: [FlutterMethodChannel] = []
+  private weak var owner: FlutterBinaryMessenger?
+
+  func register(messenger: FlutterBinaryMessenger) {
     CaptureChannelExtensionRegistry.shared.makeExtension = { NativeCaptureChannel(context: $0) }
-    channels = [
-      NativeCapturePreviewChannel.register(messenger: registrar.messenger()),
-      NativeStoreFormatVersions.register(messenger: registrar.messenger()),
+    let created = [
+      NativeCapturePreviewChannel.register(messenger: messenger),
+      NativeStoreFormatVersions.register(messenger: messenger),
     ]
+    lock.lock()
+    let replaced = channels
+    channels = created
+    owner = messenger
+    lock.unlock()
+    replaced.forEach { $0.setMethodCallHandler(nil) }
+  }
+
+  /// The engine of [messenger] detached: removes its channel handlers; a
+  /// later engine's registration stays. Capture views close their own
+  /// `arcapture_<id>` channels on dispose.
+  func unregister(messenger: FlutterBinaryMessenger) {
+    lock.lock()
+    guard let current = owner, current === messenger else {
+      lock.unlock()
+      return
+    }
+    let removed = channels
+    channels = []
+    owner = nil
+    lock.unlock()
+    removed.forEach { $0.setMethodCallHandler(nil) }
+  }
+
+  func isRegistered(messenger: FlutterBinaryMessenger) -> Bool {
+    lock.lock(); defer { lock.unlock() }
+    return owner === messenger && !channels.isEmpty
   }
 }
 
