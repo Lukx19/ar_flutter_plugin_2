@@ -157,11 +157,14 @@ final class RecordingFrameObserver: ARFrameObserver {
   private let lock = NSLock()
   private var collected: [Event] = []
   private var collectedFrames: [CaptureFrame] = []
+  private var collectedAnchorUpdates: [[ARAnchor]] = []
   /// Called on the delegate queue after every event.
   var onEvent: (() -> Void)?
 
   var events: [Event] { lock.lock(); defer { lock.unlock() }; return collected }
   var frames: [CaptureFrame] { lock.lock(); defer { lock.unlock() }; return collectedFrames }
+  /// Every `didUpdateAnchors` report in order (not part of [events]).
+  var anchorUpdates: [[ARAnchor]] { lock.lock(); defer { lock.unlock() }; return collectedAnchorUpdates }
 
   private func append(_ event: Event, frame: CaptureFrame? = nil) {
     lock.lock()
@@ -172,6 +175,11 @@ final class RecordingFrameObserver: ARFrameObserver {
   }
 
   func frameSource(_ source: ARFrameSource, didUpdate frame: CaptureFrame) { append(.frame, frame: frame) }
+  func frameSource(_ source: ARFrameSource, didUpdateAnchors anchors: [ARAnchor]) {
+    lock.lock()
+    collectedAnchorUpdates.append(anchors)
+    lock.unlock()
+  }
   func frameSource(_ source: ARFrameSource, didStart configuration: CaptureRunConfiguration, epoch: Int) {
     append(.start(epoch: epoch))
   }

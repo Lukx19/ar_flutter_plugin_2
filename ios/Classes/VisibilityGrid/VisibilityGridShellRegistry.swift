@@ -70,7 +70,11 @@ final class VisibilityGridShellRegistry {
     let control = FlutterBasicMessageChannel(name: VisibilityGridChannels.control, binaryMessenger: messenger, codec: codec)
     let controlHandler = GridShellControlHandler(
       shell: { [weak created] in created },
-      markerDetectorAvailable: { [weak self] in self?.markerDetectorAvailable() ?? false }
+      markerDetectorAvailable: { [weak self] in self?.markerDetectorAvailable() ?? false },
+      onStopped: {
+        // The stopped session's grid never shows in the next session.
+        DispatchQueue.main.async { GridRendererRegistry.shared.host?.gridShellStopped() }
+      }
     )
     control.setMessageHandler { message, reply in
       controlHandler.onMessage(message as? Data) { reply($0) }
@@ -229,6 +233,7 @@ private final class GridFrameObserver: ARFrameObserver {
   private let shell: VisibilityGridIngestShell
   private let poseTracking: AnchorPoseUpdateProducer
   private let backend: ARKitAnchorBackend
+  private let anchorFrame = UpdatedAnchorFrame()
 
   init(shell: VisibilityGridIngestShell, poseTracking: AnchorPoseUpdateProducer, backend: ARKitAnchorBackend) {
     self.shell = shell
@@ -238,12 +243,23 @@ private final class GridFrameObserver: ARFrameObserver {
 
   func frameSource(_ source: ARFrameSource, didUpdate frame: CaptureFrame) {
     shell.process(CaptureIngestFrame(frame: frame))
-    guard poseTracking.tracker.armed else { return }
+    guard poseTracking.tracker.armed else {
+      anchorFrame.reset()
+      return
+    }
     backend.cameraTracking = anchorTracking(frame.trackingState)
-    poseTracking.onFrame(session: source.anchorHost, frame: CaptureAnchorFrame(frame))
+    anchorFrame.bind(frame)
+    poseTracking.onFrame(session: source.anchorHost, frame: anchorFrame)
+    anchorFrame.clear()
+  }
+
+  func frameSource(_ source: ARFrameSource, didUpdateAnchors anchors: [ARAnchor]) {
+    guard poseTracking.tracker.armed else { return }
+    anchorFrame.noteUpdated(anchors)
   }
 
   func frameSource(_ source: ARFrameSource, didStart configuration: CaptureRunConfiguration, epoch: Int) {
+    anchorFrame.reset()
     poseTracking.tracker.onSessionStarted(epoch: epoch)
     shell.onSessionStarted(
       sourceEpoch: epoch, depthMode: ingestDepthMode(configuration, deliversSceneDepth: source.deliversSceneDepth),

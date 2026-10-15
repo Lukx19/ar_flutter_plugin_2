@@ -256,6 +256,7 @@ final class CaptureARView: NSObject, FlutterPlatformView {
     source.dispose()
     metalView.isPaused = true
     metalView.delegate = nil
+    renderLoop?.detach()
     sessionChannel.setMethodCallHandler(nil)
     captureChannel.setMethodCallHandler(nil)
     objectChannel.setMethodCallHandler(nil)

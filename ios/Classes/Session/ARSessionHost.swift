@@ -267,6 +267,16 @@ final class ARSessionHost: NSObject, CaptureSessionSource, ARSessionDelegate {
     }
   }
 
+  func session(_ session: ARSession, didAdd anchors: [ARAnchor]) {
+    guard admitsSessionCallbacks else { return }
+    startedObservers().forEach { $0.frameSource(self, didUpdateAnchors: anchors) }
+  }
+
+  func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) {
+    guard admitsSessionCallbacks else { return }
+    startedObservers().forEach { $0.frameSource(self, didUpdateAnchors: anchors) }
+  }
+
   func session(_ session: ARSession, cameraDidChangeTrackingState camera: ARCamera) {
     guard admitsSessionCallbacks else { return }
     let state = camera.trackingState

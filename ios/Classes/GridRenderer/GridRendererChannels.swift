@@ -144,12 +144,20 @@ final class GridRendererOverlay: GridOverlayRenderer, GridOverlayFrameUploader {
   }
 
   func prepare(device: MTLDevice, colorPixelFormat: MTLPixelFormat, depthPixelFormat: MTLPixelFormat) {
+    prepare(owner: self, device: device, colorPixelFormat: colorPixelFormat, depthPixelFormat: depthPixelFormat)
+  }
+
+  func prepare(owner: AnyObject, device: MTLDevice, colorPixelFormat: MTLPixelFormat, depthPixelFormat: MTLPixelFormat) {
     host.beginView()
     guard device === host.device else {
       NSLog("[GridRenderer] capture view uses another Metal device; grid not drawn")
       return
     }
-    host.prepare(colorPixelFormat: colorPixelFormat, depthPixelFormat: depthPixelFormat)
+    host.prepare(colorPixelFormat: colorPixelFormat, depthPixelFormat: depthPixelFormat, owner: owner)
+  }
+
+  func detach(owner: AnyObject) {
+    host.detachView(owner)
   }
 
   func encodeFrameUploads(into commandBuffer: MTLCommandBuffer) {

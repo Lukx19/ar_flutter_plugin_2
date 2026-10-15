@@ -16,6 +16,10 @@ protocol ARFrameObserver: AnyObject {
   /// recorded session), so poses of different epochs never mix.
   func frameSource(_ source: ARFrameSource, didStart configuration: CaptureRunConfiguration, epoch: Int)
   func frameSource(_ source: ARFrameSource, trackingChanged state: ARCamera.TrackingState)
+  /// Anchors added or changed since the previous callback (ARKit
+  /// `session(_:didAdd:)` and `session(_:didUpdate:)`, the counterpart of
+  /// ARCore `Frame.getUpdatedAnchors`), on the delegate queue.
+  func frameSource(_ source: ARFrameSource, didUpdateAnchors anchors: [ARAnchor])
   func frameSourceWasInterrupted(_ source: ARFrameSource)
   func frameSourceInterruptionEnded(_ source: ARFrameSource)
   /// The session was paused or the view disposed; no frames follow until the next start.
@@ -25,6 +29,7 @@ protocol ARFrameObserver: AnyObject {
 extension ARFrameObserver {
   func frameSource(_ source: ARFrameSource, didStart configuration: CaptureRunConfiguration, epoch: Int) {}
   func frameSource(_ source: ARFrameSource, trackingChanged state: ARCamera.TrackingState) {}
+  func frameSource(_ source: ARFrameSource, didUpdateAnchors anchors: [ARAnchor]) {}
   func frameSourceWasInterrupted(_ source: ARFrameSource) {}
   func frameSourceInterruptionEnded(_ source: ARFrameSource) {}
   func frameSourceDidStop(_ source: ARFrameSource) {}

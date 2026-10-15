@@ -141,24 +141,56 @@ final class ARKitAnchorBackend: AnchorBackend {
   }
 }
 
-/// [AnchorFrame] over one [CaptureFrame]; the frame's anchors are read once per call.
-final class CaptureAnchorFrame: AnchorFrame {
-  private let frame: CaptureFrame
-  private var anchors: [ARAnchor] = []
+/// [AnchorFrame] over the current [CaptureFrame] and the anchors the source
+/// reported as added or updated since the previous frame (ARKit
+/// `didUpdate anchors`, the twin of ARCore `getUpdatedAnchors`), not every
+/// anchor of the session. A change of the camera tracking state reaches
+/// every anchor once (plain anchors take their tracking from the camera).
+/// One instance is reused for every frame; the update buffer keeps its
+/// capacity, so an unchanged frame allocates nothing.
+final class UpdatedAnchorFrame: AnchorFrame {
+  private var frame: CaptureFrame?
+  private var updated: [ARAnchor] = []
+  private var lastCameraTracking: Int?
 
-  init(_ frame: CaptureFrame) { self.frame = frame }
+  /// Collects anchors the source reported (delegate queue).
+  func noteUpdated(_ anchors: [ARAnchor]) { updated.append(contentsOf: anchors) }
 
-  var timestampNs: Int64 { Int64((frame.timestamp * 1e9).rounded()) }
-  var cameraTracking: Int { ingestTrackingState(frame.trackingState) }
-
-  func readCameraPose(into out: UnsafeMutablePointer<Float>) { writeTq(frame.cameraTransform, out) }
-
-  func loadUpdatedAnchors() -> Int {
-    anchors = frame.anchors
-    return anchors.count
+  /// Binds the next frame; a camera tracking change selects every anchor.
+  func bind(_ frame: CaptureFrame) {
+    self.frame = frame
+    let tracking = anchorTracking(frame.trackingState)
+    if tracking != lastCameraTracking {
+      lastCameraTracking = tracking
+      updated.removeAll(keepingCapacity: true)
+      updated.append(contentsOf: frame.anchors)
+    }
   }
 
-  func updatedAnchor(_ index: Int) -> AnyObject { anchors[index] }
+  /// Forgets the reported anchors after the tracker read them (or while it is unarmed).
+  func clear() {
+    frame = nil
+    updated.removeAll(keepingCapacity: true)
+  }
+
+  /// Forgets the camera tracking state (a new session run).
+  func reset() {
+    clear()
+    lastCameraTracking = nil
+  }
+
+  var pendingCount: Int { updated.count }
+
+  var timestampNs: Int64 { frame.map { Int64(($0.timestamp * 1e9).rounded()) } ?? 0 }
+  var cameraTracking: Int { frame.map { ingestTrackingState($0.trackingState) } ?? IngestTrackingState.stopped }
+
+  func readCameraPose(into out: UnsafeMutablePointer<Float>) {
+    if let frame = frame { writeTq(frame.cameraTransform, out) }
+  }
+
+  func loadUpdatedAnchors() -> Int { updated.count }
+
+  func updatedAnchor(_ index: Int) -> AnyObject { updated[index] }
 }
 
 /// Anchor tracking byte of the camera state.

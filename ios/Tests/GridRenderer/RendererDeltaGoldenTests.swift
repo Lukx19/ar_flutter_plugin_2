@@ -57,6 +57,23 @@ final class RendererDeltaGoldenTests: XCTestCase {
     reader(Data(version)) { XCTAssertEqual($0.validate(), .badVersion) }
   }
 
+  /// A slice with first slot -1 is rejected before it reaches the slice
+  /// tables (a negative first would trap when the draw packs it).
+  func testNegativeFirstSlotIsRejectedAndLeavesTheTables() throws {
+    let store = InstanceBufferStore(target: ByteArrayGpuTarget())
+    XCTAssertEqual(try store.apply(GridRendererFixtures.golden("render_reset.bin")), .ok)
+    for name in ["render_surface_slice.bin", "render_compact_voxels.bin"] {
+      var bad = [UInt8](try GridRendererFixtures.golden(name))
+      for i in 0..<4 { bad[RendererDeltaLayout.firstSlot + i] = 0xFF }
+      reader(Data(bad)) { XCTAssertEqual($0.validate(), .badSlot, name) }
+      let rejected = store.counters.rejected
+      XCTAssertEqual(try store.apply(Data(bad)), .badSlot, name)
+      XCTAssertEqual(store.counters.rejected, rejected + 1, name)
+      XCTAssertEqual(Data(bad).withUnsafeBytes { store.uploadBytes($0) }, 0, name)
+    }
+    XCTAssertLessThan(store.surfaceSlices.find(0x0000_1234_0000_5678), 0, "nothing recorded")
+  }
+
   /// Each delta kind applied to the buffers equals the golden's record bytes.
   func testEachGoldenKindLandsInItsBuffer() throws {
     let target = ByteArrayGpuTarget()

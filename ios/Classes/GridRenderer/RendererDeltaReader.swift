@@ -3,6 +3,8 @@ import Foundation
 /// Outcome of validating one renderer delta message.
 enum DeltaStatus: Equatable {
   case ok, tooShort, badMagic, badVersion, badKind, badLength, tooLarge
+  /// A negative first slot index (never a valid buffer position).
+  case badSlot
 }
 
 /// Reusable cursor over one renderer delta message (contract section 2.7)
@@ -27,6 +29,7 @@ struct RendererDeltaReader {
     let total = RendererDeltaLayout.headerBytes + count * size
     if total > RendererDeltaLayout.maxMessageBytes { return .tooLarge }
     if total != bytes.count { return .badLength }
+    if firstSlot < 0 { return .badSlot }
     return .ok
   }
 

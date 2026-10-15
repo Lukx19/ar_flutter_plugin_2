@@ -11,10 +11,13 @@ import simd
 /// the main thread, the capture view calls [encodeUploads] with the frame's
 /// command buffer before its render pass (queued deltas within the 64 KiB
 /// budget, colour tables) and then [encode] inside the pass after the camera
-/// background. Instance buffers belong to the Metal device, not to a view,
-/// so a replaced capture view keeps them; only a failure releases them and
-/// requires the grid's full resynchronisation (the first message after a
-/// working [prepare] is answered 1, resync required).
+/// background. Like the Android host that lives with its view, the grid
+/// belongs to one capture view and one grid session: until a view prepares
+/// it, render messages are answered 3 (no renderer attached); when that
+/// view goes away ([detachView]) or the grid shell stops ([gridShellStopped])
+/// the instance buffers, line overlays and display mode are dropped and the
+/// next session starts from a full resynchronisation (the first non-reset
+/// message is answered 1). A failure releases the buffers too.
 final class GridRendererHost {
   let device: MTLDevice
   let core: GridRendererCore
@@ -27,6 +30,13 @@ final class GridRendererHost {
   private let stateLock = NSLock()
   private var failed = false
   private var failures = 0
+  /// A capture view prepared the renderer and has not gone away (state lock).
+  private var viewAttached = false
+  /// The render loop that prepared last; only it detaches the view.
+  private var attachedOwner: ObjectIdentifier?
+  /// Messages were refused while no view was attached (state lock): the
+  /// grid must resend everything once one prepares.
+  private var resyncOnAttach = false
 
   /// Guided-capture quests; drawn only after their first overlay message.
   let questOverlay = QuestLineOverlay()
@@ -61,8 +71,30 @@ final class GridRendererHost {
   /// Render channel: returns the 4 B status (0 queued, 1 resync required,
   /// 2 malformed, 4 renderer failed). Channel queue.
   func onRenderMessage(_ message: UnsafeRawBufferPointer) -> Int32 {
-    if rendererFailed { return DeltaIntake.rendererFailed.rawValue }
+    stateLock.lock()
+    if failed {
+      stateLock.unlock()
+      return DeltaIntake.rendererFailed.rawValue
+    }
+    if !viewAttached {
+      stateLock.unlock()
+      let count = message.count
+      if count < RendererDeltaLayout.headerBytes || count > RendererDeltaLayout.maxMessageBytes {
+        return DeltaIntake.malformed.rawValue
+      }
+      stateLock.lock()
+      resyncOnAttach = true
+      stateLock.unlock()
+      return GridRendererStatus.noRenderer
+    }
+    stateLock.unlock()
     return core.onRenderMessage(message).rawValue
+  }
+
+  /// True while a capture view has the renderer prepared.
+  var hasAttachedView: Bool {
+    stateLock.lock(); defer { stateLock.unlock() }
+    return viewAttached
   }
 
   /// Display channel: the message is handled or ignored (reply always 0). Channel queue.
@@ -76,7 +108,8 @@ final class GridRendererHost {
   /// built (the renderer failed); a working prepare after a failure accepts
   /// render messages again, starting with a resynchronisation.
   @discardableResult
-  func prepare(colorPixelFormat: MTLPixelFormat, depthPixelFormat: MTLPixelFormat) -> Bool {
+  func prepare(colorPixelFormat: MTLPixelFormat, depthPixelFormat: MTLPixelFormat, owner: AnyObject? = nil) -> Bool {
+    attach(owner)
     if let formats = preparedFormats, formats == (colorPixelFormat, depthPixelFormat), draws != nil {
       recoverIfFailed()
       return true
@@ -147,6 +180,45 @@ final class GridRendererHost {
     target.releaseBuffers()
     core.store.forgetGpuBuffers()
     core.scheduler.requireReset()
+  }
+
+  /// The capture view of [owner] goes away (main thread): when it is the
+  /// view that prepared last, the renderer drops the session's buffers,
+  /// overlays and display mode and answers 3 until the next view prepares.
+  /// A replaced view detaching after its successor prepared changes nothing.
+  func detachView(_ owner: AnyObject) {
+    stateLock.lock()
+    guard attachedOwner == ObjectIdentifier(owner) else {
+      stateLock.unlock()
+      return
+    }
+    attachedOwner = nil
+    viewAttached = false
+    resyncOnAttach = true
+    stateLock.unlock()
+    clearSession()
+  }
+
+  /// The grid shell stopped (main thread): the stopped session's buffers,
+  /// overlays and display mode are dropped; the next session's first
+  /// non-reset message is answered 1.
+  func gridShellStopped() {
+    clearSession()
+  }
+
+  private func clearSession() {
+    releaseBuffers()
+    core.display.reset()
+  }
+
+  private func attach(_ owner: AnyObject?) {
+    stateLock.lock()
+    let resync = !viewAttached && resyncOnAttach
+    viewAttached = true
+    resyncOnAttach = false
+    if let owner = owner { attachedOwner = ObjectIdentifier(owner) }
+    stateLock.unlock()
+    if resync { core.scheduler.requireReset() }
   }
 
   /// The renderer failed (pipelines or a buffer allocation): buffers are

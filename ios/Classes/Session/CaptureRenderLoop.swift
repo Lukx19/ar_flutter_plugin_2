@@ -18,6 +18,8 @@ final class CaptureRenderLoop: NSObject, MTKViewDelegate {
   private let commandQueue: MTLCommandQueue
   private let overlays: GridOverlayRegistry
   private var preparedOverlayRevision = -1
+  /// The overlay this loop prepared; told once when the loop goes away.
+  private weak var preparedOverlay: GridOverlayRenderer?
 
   init(device: MTLDevice, source: ARFrameSource, overlays: GridOverlayRegistry = .shared) throws {
     guard let queue = device.makeCommandQueue() else { throw CaptureRenderError.metalUnavailable }
@@ -48,6 +50,14 @@ final class CaptureRenderLoop: NSObject, MTKViewDelegate {
 
   func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
 
+  /// The capture view goes away (main thread, idempotent): the overlay it
+  /// prepared drops the view's grid (a successor view keeps its own).
+  func detach() {
+    preparedOverlay?.detach(owner: self)
+    preparedOverlay = nil
+    preparedOverlayRevision = -1
+  }
+
   func draw(in view: MTKView) {
     guard let pass = view.currentRenderPassDescriptor,
           let commandBuffer = commandQueue.makeCommandBuffer()
@@ -56,10 +66,12 @@ final class CaptureRenderLoop: NSObject, MTKViewDelegate {
     let overlay = overlays.overlay
     if let overlay = overlay, preparedOverlayRevision != overlays.revision {
       overlay.prepare(
+        owner: self,
         device: background.device,
         colorPixelFormat: CaptureRenderLoop.colorPixelFormat,
         depthPixelFormat: CaptureRenderLoop.depthPixelFormat)
       preparedOverlayRevision = overlays.revision
+      preparedOverlay = overlay
     }
     (overlay as? GridOverlayFrameUploader)?.encodeFrameUploads(into: commandBuffer)
     guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else {

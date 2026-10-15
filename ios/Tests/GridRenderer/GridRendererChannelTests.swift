@@ -58,7 +58,11 @@ final class GridRendererChannelTests: XCTestCase {
     guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("no Metal device") }
     let host = try GridRendererHost(device: device)
     writer.begin(RendererDeltaLayout.kindSurfaceSlice, firstSlot: 0, records: 1, capacity: 64, brickKey: 1)
-    XCTAssertEqual(GridRendererChannels.renderStatus(writer.message, host: host), GridRendererStatus.resyncRequired)
+    let slice = writer.message
+    XCTAssertEqual(GridRendererChannels.renderStatus(reset, host: host), GridRendererStatus.noRenderer,
+                   "no capture view prepared the renderer")
+    XCTAssertTrue(host.prepare(colorPixelFormat: .bgra8Unorm, depthPixelFormat: .depth32Float))
+    XCTAssertEqual(GridRendererChannels.renderStatus(slice, host: host), GridRendererStatus.resyncRequired)
     XCTAssertEqual(GridRendererChannels.renderStatus(reset, host: host), GridRendererStatus.ok)
     XCTAssertEqual(GridRendererChannels.renderStatus(Data(count: 3), host: host), GridRendererStatus.malformed)
     host.rendererDidFail("test")
@@ -94,6 +98,70 @@ final class GridRendererChannelTests: XCTestCase {
     XCTAssertEqual(probe.resets, 2, "a new capture view starts without the previous overlay frames")
     host.releaseBuffers()
     XCTAssertEqual(probe.resets, 3)
+  }
+
+  /// The grid belongs to one capture view and one grid session: when the
+  /// view that prepared last goes away, or the grid shell stops, buffers,
+  /// overlays and display mode are dropped; without a view messages are
+  /// answered 3, and the next view's first non-reset message is answered 1.
+  /// A replaced view detaching after its successor prepared changes nothing.
+  func testViewTeardownAndShellStopDropTheSessionGrid() throws {
+    guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("no Metal device") }
+    let host = try GridRendererHost(device: device)
+    let probe = ResetCountingOverlay()
+    host.core.addLineOverlay(probe)
+    let overlay = GridRendererOverlay(host: host)
+    let firstView = NSObject(), secondView = NSObject()
+    writer.begin(RendererDeltaLayout.kindReset, firstSlot: 0, records: 0, capacity: 64, brickKey: 0)
+    let reset = writer.message
+    writer.begin(RendererDeltaLayout.kindSurfaceSlice, firstSlot: 0, records: 1, capacity: 64, brickKey: 1)
+    let slice = writer.message
+    func status(_ message: Data) -> Int32 { GridRendererChannels.renderStatus(message, host: host) }
+    let queue = try XCTUnwrap(device.makeCommandQueue())
+    func applyQueued() {
+      guard let commands = queue.makeCommandBuffer() else { return XCTFail("no command buffer") }
+      host.encodeUploads(into: commands)
+      commands.commit()
+      commands.waitUntilCompleted()
+    }
+
+    overlay.prepare(owner: firstView, device: device, colorPixelFormat: .bgra8Unorm, depthPixelFormat: .depth32Float)
+    XCTAssertTrue(host.hasAttachedView)
+    XCTAssertEqual(status(reset), GridRendererStatus.ok)
+    XCTAssertEqual(status(slice), GridRendererStatus.ok)
+    applyQueued()
+    XCTAssertGreaterThanOrEqual(host.core.store.surfaceSlices.find(1), 0)
+    var mode = GridDisplayState()
+    _ = host.core.display.snapshotMode(into: &mode, knownVersion: -1)
+    let versionBefore = mode.modeVersion
+
+    // A successor view prepares; the replaced view's late teardown keeps it.
+    overlay.prepare(owner: secondView, device: device, colorPixelFormat: .bgra8Unorm, depthPixelFormat: .depth32Float)
+    overlay.detach(owner: firstView)
+    XCTAssertTrue(host.hasAttachedView)
+    XCTAssertGreaterThanOrEqual(host.core.store.surfaceSlices.find(1), 0)
+
+    let resetsBefore = probe.resets
+    overlay.detach(owner: secondView)
+    XCTAssertFalse(host.hasAttachedView)
+    XCTAssertLessThan(host.core.store.surfaceSlices.find(1), 0, "the session's slices are gone")
+    XCTAssertGreaterThan(probe.resets, resetsBefore)
+    XCTAssertTrue(host.core.display.snapshotMode(into: &mode, knownVersion: versionBefore), "display mode reset")
+    XCTAssertEqual(mode.baseLayer, GridDisplayState().baseLayer)
+    XCTAssertEqual(status(slice), GridRendererStatus.noRenderer)
+
+    overlay.prepare(owner: firstView, device: device, colorPixelFormat: .bgra8Unorm, depthPixelFormat: .depth32Float)
+    XCTAssertEqual(status(slice), GridRendererStatus.resyncRequired, "the next view starts from a reset")
+    XCTAssertEqual(status(reset), GridRendererStatus.ok)
+    XCTAssertEqual(status(slice), GridRendererStatus.ok)
+    applyQueued()
+    XCTAssertGreaterThanOrEqual(host.core.store.surfaceSlices.find(1), 0)
+
+    host.gridShellStopped()
+    XCTAssertLessThan(host.core.store.surfaceSlices.find(1), 0, "a stopped grid session leaves nothing")
+    XCTAssertTrue(host.hasAttachedView)
+    XCTAssertEqual(status(slice), GridRendererStatus.resyncRequired)
+    XCTAssertEqual(status(reset), GridRendererStatus.ok)
   }
 
   private final class ResetCountingOverlay: GridLineOverlay {

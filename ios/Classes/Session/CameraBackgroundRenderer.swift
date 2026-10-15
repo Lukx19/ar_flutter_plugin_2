@@ -130,6 +130,17 @@ protocol GridOverlayRenderer: AnyObject {
   func prepare(device: MTLDevice, colorPixelFormat: MTLPixelFormat, depthPixelFormat: MTLPixelFormat)
   /// Called on the main thread for every drawn frame after the background.
   func encodeOverlay(into encoder: MTLRenderCommandEncoder, context: GridOverlayFrameContext)
+  /// [prepare] on behalf of the render host [owner] (the capture view's render loop).
+  func prepare(owner: AnyObject, device: MTLDevice, colorPixelFormat: MTLPixelFormat, depthPixelFormat: MTLPixelFormat)
+  /// The render host [owner] goes away (main thread); called once.
+  func detach(owner: AnyObject)
+}
+
+extension GridOverlayRenderer {
+  func prepare(owner: AnyObject, device: MTLDevice, colorPixelFormat: MTLPixelFormat, depthPixelFormat: MTLPixelFormat) {
+    prepare(device: device, colorPixelFormat: colorPixelFormat, depthPixelFormat: depthPixelFormat)
+  }
+  func detach(owner: AnyObject) {}
 }
 
 /// Optional upload step of a [GridOverlayRenderer]: GPU copies into the

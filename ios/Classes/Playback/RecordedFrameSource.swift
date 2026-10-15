@@ -22,11 +22,24 @@ struct RecordedPlaybackClock: Equatable {
 final class RecordedAnchorStore: CaptureAnchorHost {
   private let lock = NSLock()
   private var anchors: [ARAnchor] = []
+  /// Anchors added since the last delivered frame: the only anchor updates
+  /// of a replay (a recording moves no anchor).
+  private var added: [ARAnchor] = []
 
   func add(anchor: ARAnchor) {
     lock.lock(); defer { lock.unlock() }
     anchors.removeAll { $0.identifier == anchor.identifier }
     anchors.append(anchor)
+    added.append(anchor)
+  }
+
+  /// Takes the anchors added since the previous call.
+  func takeAdded() -> [ARAnchor] {
+    lock.lock(); defer { lock.unlock() }
+    guard !added.isEmpty else { return [] }
+    let out = added
+    added.removeAll(keepingCapacity: true)
+    return out
   }
 
   func remove(anchor: ARAnchor) {
@@ -37,6 +50,7 @@ final class RecordedAnchorStore: CaptureAnchorHost {
   func removeAll() {
     lock.lock(); defer { lock.unlock() }
     anchors.removeAll()
+    added.removeAll()
   }
 
   var snapshot: [ARAnchor] {
@@ -563,6 +577,8 @@ final class RecordedFrameSource: CaptureSessionSource {
         self.lastDeliveredTracking = frame.trackingState
         started.forEach { $0.frameSource(self, trackingChanged: frame.trackingState) }
       }
+      let added = self.anchors.takeAdded()
+      if !added.isEmpty { started.forEach { $0.frameSource(self, didUpdateAnchors: added) } }
       started.forEach { $0.frameSource(self, didUpdate: frame) }
     }
   }

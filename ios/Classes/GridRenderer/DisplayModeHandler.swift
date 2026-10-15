@@ -56,6 +56,19 @@ final class DisplayModeHandler {
 
   var rejected: Int { locked { rejectedCount } }
 
+  /// Back to the default display mode without planner targets (a new grid
+  /// session); the render thread picks it up as a new mode version. The
+  /// colour tables stay until the next session sends its own.
+  func reset() {
+    locked {
+      let version = pending.modeVersion + 1
+      pending = GridDisplayState()
+      pending.modeVersion = version
+      targetCount = 0
+      targetsVersion += 1
+    }
+  }
+
   func onMessage(_ message: Data) -> DisplayIntake {
     message.withUnsafeBytes { onMessage($0) }
   }

@@ -34,9 +34,13 @@ protocol GridShellControlTarget: AnyObject {
 final class GridShellControlHandler {
   private let shell: () -> GridShellControlTarget?
   private let markerDetectorAvailable: () -> Bool
+  /// Runs after the shell stopped (the grid renderer drops the session).
+  private let onStopped: () -> Void
 
-  init(shell: @escaping () -> GridShellControlTarget?, markerDetectorAvailable: @escaping () -> Bool) {
+  init(shell: @escaping () -> GridShellControlTarget?, markerDetectorAvailable: @escaping () -> Bool,
+       onStopped: @escaping () -> Void = {}) {
     self.shell = shell
+    self.onStopped = onStopped
     self.markerDetectorAvailable = markerDetectorAvailable
   }
 
@@ -78,6 +82,7 @@ final class GridShellControlHandler {
     case ShellControlLayout.kindStop:
       _ = target.setRecording(false)
       target.stop()
+      onStopped()
       return .ok
     case ShellControlLayout.kindSetMarkerDetection:
       if markersRequested && !markerDetectorAvailable() { return .markerDetectorUnavailable }
