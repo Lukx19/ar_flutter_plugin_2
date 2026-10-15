@@ -240,11 +240,12 @@ final class NativeCaptureBindingTests: XCTestCase {
     XCTAssertFalse(reader.materialize(manifestId: receipt.terminal!.manifestId!, captureId: receipt.terminal!.captureId!, target: target, edge: 512, cancelled: { false }))
   }
 
-  func testStoreVersionsReportThePlainRootSchema() {
+  func testStoreVersionsReportThePlainAndShotRootSchemas() {
     let report = NativeStoreFormatVersions.report()
-    XCTAssertEqual(report["nativePhotoStore"] as? Int, 2)
+    XCTAssertEqual(report["nativePhotoStore"] as? Int, 3)
     XCTAssertEqual(report["nativePhotoRootSchema"] as? Int, 5)
-    XCTAssertEqual(report["nativePhotoRootSchemasReadable"] as? [Int], [5])
+    XCTAssertEqual(report["nativePhotoShotRootSchema"] as? Int, 7)
+    XCTAssertEqual(report["nativePhotoRootSchemasReadable"] as? [Int], [5, 7])
     XCTAssertEqual(report["nativePreviewCache"] as? Int, 1)
   }
 

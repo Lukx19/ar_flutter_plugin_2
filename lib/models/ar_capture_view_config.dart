@@ -8,6 +8,7 @@ abstract final class ARCaptureViewParameter {
   static const String depthHeight = 'depthHeight';
   static const String highResolutionFrameCapture =
       'highResolutionFrameCapture';
+  static const String videoHdr = 'videoHdr';
 }
 
 /// Creation configuration of the iOS capture view (`capture3d/capture_ar_view`):
@@ -22,6 +23,7 @@ class ARCaptureViewConfig {
     this.depthWidth = defaultDepthWidth,
     this.depthHeight = defaultDepthHeight,
     this.highResolutionFrameCapture = false,
+    this.videoHdr = false,
   });
 
   /// Platform view type the iOS session host registers.
@@ -41,6 +43,19 @@ class ARCaptureViewConfig {
   /// Choose the video format recommended for high-resolution frame capture.
   final bool highResolutionFrameCapture;
 
+  /// Allow ARKit video HDR on a video format that supports it (the iOS
+  /// quality still mode); sent only when true.
+  final bool videoHdr;
+
+  /// This configuration with [videoHdr] replaced.
+  ARCaptureViewConfig withVideoHdr(bool videoHdr) => ARCaptureViewConfig(
+        sceneDepth: sceneDepth,
+        depthWidth: depthWidth,
+        depthHeight: depthHeight,
+        highResolutionFrameCapture: highResolutionFrameCapture,
+        videoHdr: videoHdr,
+      );
+
   /// Creation parameters for the platform view ([ARCaptureViewParameter]
   /// keys; the Swift host reads the same names in `ARSessionOptions`).
   Map<String, Object> toCreationParams() => <String, Object>{
@@ -49,6 +64,7 @@ class ARCaptureViewConfig {
         ARCaptureViewParameter.depthHeight: depthHeight,
         ARCaptureViewParameter.highResolutionFrameCapture:
             highResolutionFrameCapture,
+        if (videoHdr) ARCaptureViewParameter.videoHdr: true,
       };
 
   @override
@@ -57,14 +73,16 @@ class ARCaptureViewConfig {
       other.sceneDepth == sceneDepth &&
       other.depthWidth == depthWidth &&
       other.depthHeight == depthHeight &&
-      other.highResolutionFrameCapture == highResolutionFrameCapture;
+      other.highResolutionFrameCapture == highResolutionFrameCapture &&
+      other.videoHdr == videoHdr;
 
   @override
-  int get hashCode => Object.hash(
-      sceneDepth, depthWidth, depthHeight, highResolutionFrameCapture);
+  int get hashCode => Object.hash(sceneDepth, depthWidth, depthHeight,
+      highResolutionFrameCapture, videoHdr);
 
   @override
   String toString() => 'ARCaptureViewConfig(sceneDepth: $sceneDepth, '
       'depth: ${depthWidth}x$depthHeight, '
-      'highResolutionFrameCapture: $highResolutionFrameCapture)';
+      'highResolutionFrameCapture: $highResolutionFrameCapture, '
+      'videoHdr: $videoHdr)';
 }

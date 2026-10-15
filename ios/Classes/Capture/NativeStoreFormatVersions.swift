@@ -4,18 +4,24 @@ import Foundation
 /// Versions of the on-disk formats the iOS native stores write and read,
 /// reported over `ar_flutter_plugin_2/store_versions` to the app's session
 /// store descriptor, with the Android constants (`NativeStoreFormatVersions.kt`).
-/// iOS writes the plain photo root (schema 5) only; assessed roots (schema 6)
-/// are an Android debug producer and are neither written nor read here.
+/// iOS writes the plain photo root (schema 5) and, for a burst shot,
+/// the shot root (schema 7); assessed roots (schema 6) are an Android debug
+/// producer and are neither written nor read here.
 enum NativeStoreFormatVersions {
   static let channelName = "ar_flutter_plugin_2/store_versions"
   static let method = "getStoreFormatVersions"
 
-  /// Layout of `capture-v2-native/store` (sessions, attempts, assets, A/B root pointers).
-  static let photoStoreLayout = 2
+  /// Layout of `capture-v2-native/store` (sessions, attempts, assets, A/B
+  /// root pointers). 3: an asset folder may also hold the images after the
+  /// first one of a burst shot (`shot-image-<index>.<sha>.blob`) and
+  /// its record (`shot-record.<sha>.blob`); Android writes layout 2.
+  static let photoStoreLayout = 3
   /// Root record schema written without a quality assessment.
   static let photoRootSchemaPlain = 5
+  /// Root record schema of a burst shot (schema 5 plus shot lines).
+  static let photoRootSchemaShot = 7
   /// Root record schemas this platform reads.
-  static let photoRootSchemasReadable = [photoRootSchemaPlain]
+  static let photoRootSchemasReadable = [photoRootSchemaPlain, photoRootSchemaShot]
   /// Layout of `capture-v2-previews` (512 px and 1024 px previews, delete markers).
   static let previewCacheLayout = 1
 
@@ -24,6 +30,7 @@ enum NativeStoreFormatVersions {
       "nativePhotoStore": photoStoreLayout,
       "nativePhotoRootSchema": photoRootSchemaPlain,
       "nativePhotoRootSchemasReadable": photoRootSchemasReadable,
+      "nativePhotoShotRootSchema": photoRootSchemaShot,
       "nativePreviewCache": previewCacheLayout,
     ]
   }

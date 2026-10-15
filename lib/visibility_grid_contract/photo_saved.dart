@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'binary_support.dart';
 
 /// Photo saved event: the 128 B payload of ingest kind 4, sent once per photo
@@ -86,4 +88,104 @@ final class PhotoSavedView extends ContractRecordView {
 
   bool get automatic => flags & PhotoSavedLayout.flagAutomatic != 0;
   bool get blurRejected => flags & PhotoSavedLayout.flagBlurRejected != 0;
+
+  /// The event carries a camera (pose, intrinsics and size); a photo whose
+  /// pose is unknown, or a shot image taken while tracking was not normal,
+  /// has none.
+  bool get hasCamera => fx > 0 && fy > 0 && widthDiv8 > 0 && heightDiv8 > 0;
+}
+
+/// Shot image extension of the photo saved event (amendment 2026-10-15):
+/// 32 B right after the 128 B event when the photo is one image of an iOS
+/// burst or quality shot (kind 4 payload of 160 B). Every image arrives as
+/// its own event with its own photo id and its own frame's pose, intrinsics
+/// and exposure time. Readers of the 128 B event ignore it; Android never
+/// writes it.
+abstract final class PhotoShotImageLayout {
+  static final int magic = contractMagic('C3SI');
+  static const int version = 1;
+  static const int bytes = 32;
+
+  /// Kind 4 payload with the extension.
+  static const int payloadBytes = PhotoSavedLayout.bytes + bytes;
+
+  static const int magicOffset = 0; // u32
+  static const int versionOffset = 4; // u16
+  static const int extensionBytesOffset = 6; // u16, 32
+  static const int shotIdOffset = 8; // u8 x16 UUID
+  static const int shotIdBytes = 16;
+  static const int imageIndexOffset = 24; // u8, 0 = the attempt's JPEG
+  static const int imageCountOffset = 25; // u8
+  static const int shotModeOffset = 26; // u8
+  static const int flagsOffset = 28; // u16
+
+  static const int modeSingle = 0;
+  static const int modeBurst = 1;
+
+  /// One frame with ARKit multi-frame processing (in-AR HDR).
+  static const int modeQuality = 2;
+
+  /// Tracking was not normal at this image's frame: kept, no credit (its
+  /// 128 B event then carries no pose).
+  static const int flagTrackingNotNormal = 1;
+
+  /// The high-resolution frame failed; the video frame was used.
+  static const int flagVideoFrameFallback = 2;
+}
+
+/// Reusable view over the shot image extension; attach it at the payload
+/// offset plus [PhotoSavedLayout.bytes].
+final class PhotoShotImageView extends ContractRecordView {
+  @override
+  int get recordBytes => PhotoShotImageLayout.bytes;
+
+  /// True when a kind 4 payload of [payloadBytes] at [payloadOffset] of
+  /// [data] carries a valid shot image extension.
+  static bool present(ByteData data, int payloadOffset, int payloadBytes) =>
+      payloadBytes >= PhotoShotImageLayout.payloadBytes &&
+      validateMagicAndVersion(
+            data,
+            payloadOffset + PhotoSavedLayout.bytes,
+            payloadBytes - PhotoSavedLayout.bytes,
+            PhotoShotImageLayout.bytes,
+            PhotoShotImageLayout.magic,
+            PhotoShotImageLayout.version,
+          ) ==
+          ContractStatus.ok;
+
+  /// Writes magic, version and size and zeroes every other byte.
+  void begin() {
+    for (var i = 0; i < PhotoShotImageLayout.bytes; i++) {
+      setU8(i, 0);
+    }
+    setU32(PhotoShotImageLayout.magicOffset, PhotoShotImageLayout.magic);
+    setU16(PhotoShotImageLayout.versionOffset, PhotoShotImageLayout.version);
+    setU16(
+        PhotoShotImageLayout.extensionBytesOffset, PhotoShotImageLayout.bytes);
+  }
+
+  void readShotId(List<int> out, [int outOffset = 0]) => readBytes(
+      PhotoShotImageLayout.shotIdOffset,
+      PhotoShotImageLayout.shotIdBytes,
+      out,
+      outOffset);
+  void writeShotId(List<int> id, [int idOffset = 0]) => writeBytes(
+      PhotoShotImageLayout.shotIdOffset,
+      PhotoShotImageLayout.shotIdBytes,
+      id,
+      idOffset);
+
+  int get imageIndex => u8(PhotoShotImageLayout.imageIndexOffset);
+  set imageIndex(int v) => setU8(PhotoShotImageLayout.imageIndexOffset, v);
+  int get imageCount => u8(PhotoShotImageLayout.imageCountOffset);
+  set imageCount(int v) => setU8(PhotoShotImageLayout.imageCountOffset, v);
+  int get shotMode => u8(PhotoShotImageLayout.shotModeOffset);
+  set shotMode(int v) => setU8(PhotoShotImageLayout.shotModeOffset, v);
+  int get flags => u16(PhotoShotImageLayout.flagsOffset);
+  set flags(int v) => setU16(PhotoShotImageLayout.flagsOffset, v);
+
+  bool get trackingNotNormal =>
+      flags & PhotoShotImageLayout.flagTrackingNotNormal != 0;
+  bool get videoFrameFallback =>
+      flags & PhotoShotImageLayout.flagVideoFrameFallback != 0;
 }

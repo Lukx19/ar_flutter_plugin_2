@@ -143,6 +143,40 @@ Uint8List buildPhotoSavedMessage() {
   return bytes;
 }
 
+final PhotoShotImageView _shotImage = PhotoShotImageView();
+
+/// Kind 4 with the shot image extension (160 B payload): image 1 of a
+/// burst of 3, manual, 4032 x 3024, its own pose and exposure time, tracking
+/// normal. Not in [ingestGoldens], so the recording golden keeps its
+/// messages; the Swift `ShotDurableCommitTests` write the same bytes.
+Uint8List buildPhotoSavedShotImageMessage() {
+  const payload = PhotoShotImageLayout.payloadBytes;
+  final bytes = Uint8List(IngestHeaderLayout.bytes + payload);
+  final data = ByteData.sublistView(bytes);
+  final h = _header..attach(data);
+  _writeCommonHeader(h, IngestKind.photoSaved, 0, payload);
+  final p = _photo..attach(data, h.payloadOffset);
+  p.writePhotoId(List<int>.generate(32, (i) => 32 + i));
+  p.writeAttemptUuid(List<int>.generate(16, (i) => 0xa0 + i));
+  p.exposureTimestampNs = 1234567990123;
+  p.writeCameraToWorldRows(const [1, 0, 0, 0.11, 0, 1, 0, 0.2, 0, 0, 1, 0.3]);
+  p.setIntrinsics(2940, 2940, 2016, 1512);
+  p.widthDiv8 = 504;
+  p.heightDiv8 = 378;
+  p.sharpness = 640;
+  p.flags = 0;
+  p.groupEpochLow = fixtureGroupEpoch;
+  final s = _shotImage
+    ..attach(data, h.payloadOffset + PhotoSavedLayout.bytes)
+    ..begin();
+  s.writeShotId(List<int>.generate(16, (i) => 0x10 + i));
+  s.imageIndex = 1;
+  s.imageCount = 3;
+  s.shotMode = PhotoShotImageLayout.modeBurst;
+  s.flags = 0;
+  return bytes;
+}
+
 final MarkerDetectionRecordView _marker = MarkerDetectionRecordView();
 
 /// Kind 5: two marker detections on a 640 x 480 grey image.

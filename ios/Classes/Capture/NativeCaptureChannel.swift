@@ -180,6 +180,13 @@ final class NativeCaptureChannel: CaptureChannelExtension {
     } catch {
       return result(FlutterError(code: "CONFIG_INVALID", message: "\(error)", details: nil))
     }
+    let map = arguments as? [String: Any] ?? [:]
+    guard let requestedMode = StillCaptureMode.parse(map["stillCaptureMode"]) else {
+      return result(FlutterError(code: "CONFIG_INVALID", message: "Unknown stillCaptureMode", details: nil))
+    }
+    guard let burst = BurstSettings.parse(map) else {
+      return result(FlutterError(code: "CONFIG_INVALID", message: "burstImageCount must be 2-5 and burstIntervalMs 0-1000", details: nil))
+    }
     config = parsed
     cache = StagedStillCache(config: parsed)
     let frameSource = context.frameSource
@@ -193,6 +200,13 @@ final class NativeCaptureChannel: CaptureChannelExtension {
       exposure = HighResolutionStillExposure(frameSource: { [weak frameSource] in frameSource }, jpegQuality: parsed.jpegQuality)
       stills = exposure
     }
+    // A recording without stills has nothing to burst or process: its
+    // stills are video frames, so the shot stays single.
+    let highResolution = ARCameraCapabilities.of(frameSource).supportsHighResolutionFrameCapture
+    let (effectiveMode, refusal) = StillCaptureMode.effective(
+      requestedMode, replaysRecordedStills: frameSource.replaysRecordedStills, highResolution: highResolution)
+    exposure.mode = effectiveMode
+    exposure.burst = burst
     if binding == nil {
       let channel = context.channel
       let created = NativeCaptureBinding(
@@ -213,25 +227,55 @@ final class NativeCaptureChannel: CaptureChannelExtension {
       created.start()
     }
     // A replayed recording takes its recorded stills: the recorded device's capabilities apply.
-    let highResolution = ARCameraCapabilities.of(frameSource).supportsHighResolutionFrameCapture
-    var reply: [String: Any] = ["mode": highResolution ? "sharedCamera" : "previewFallback"]
+    var reply: [String: Any] = [
+      "mode": highResolution ? "sharedCamera" : "previewFallback", "stillCaptureMode": effectiveMode.rawValue,
+    ]
     if !highResolution {
       reply["warning"] = "High-resolution ARKit frames are unavailable; stills use the video frame."
+    }
+    if let refusal = refusal {
+      reply["stillCaptureModeUnsupported"] = requestedMode.rawValue
+      reply["stillCaptureModeUnsupportedReason"] = refusal
     }
     result(reply)
   }
 
-  /// One call per committed durable photo, after its durable terminal.
+  /// One call per committed durable photo, after its durable terminal; a
+  /// burst or quality shot reports every image with its own frame.
   static func reportPhotoSaved(_ photo: DurableTerminalPhoto) {
-    guard photo.terminal.kind == .committedPicture, let captureId = photo.terminal.captureId,
-          let emitter = VisibilityGridShellRegistry.shared.photoSavedEmitter else { return }
-    let metadata = photo.metadata
-    emitter.onDurableTerminal(DurablePhotoRecord(
-      captureId: captureId, attemptId: photo.terminal.identity.attemptId,
-      exposureTimestampNs: metadata?.exposureTimestampNs ?? 0, cameraToWorld: metadata?.cameraToWorld,
-      intrinsics: metadata?.intrinsics, width: metadata?.width ?? 0, height: metadata?.height ?? 0,
-      sharpness: metadata?.sharpness, automatic: photo.request.accepted.lane == .automatic, blurRejected: false,
-      imageURL: photo.imageURL))
+    guard let emitter = VisibilityGridShellRegistry.shared.photoSavedEmitter else { return }
+    photoSavedRecords(photo).forEach { emitter.onDurableTerminal($0) }
+  }
+
+  /// The photo saved records of [photo]: one, or one per shot image with
+  /// that image's own pose, intrinsics and exposure time (the first image
+  /// keeps the capture id; the others get [PhotoSavedEmitter.shotImageCaptureId]).
+  /// An image whose frame was not tracking normally carries no pose (no credit).
+  static func photoSavedRecords(_ photo: DurableTerminalPhoto) -> [DurablePhotoRecord] {
+    guard photo.terminal.kind == .committedPicture, let captureId = photo.terminal.captureId else { return [] }
+    let automatic = photo.request.accepted.lane == .automatic
+    let attemptId = photo.terminal.identity.attemptId
+    guard let shot = photo.shot else {
+      let metadata = photo.metadata
+      return [DurablePhotoRecord(
+        captureId: captureId, attemptId: attemptId,
+        exposureTimestampNs: metadata?.exposureTimestampNs ?? 0, cameraToWorld: metadata?.cameraToWorld,
+        intrinsics: metadata?.intrinsics, width: metadata?.width ?? 0, height: metadata?.height ?? 0,
+        sharpness: metadata?.sharpness, automatic: automatic, blurRejected: false,
+        imageURL: photo.imageURL)]
+    }
+    return shot.images.map { image in
+      let m = image.metadata
+      return DurablePhotoRecord(
+        captureId: image.index == 0 ? captureId : PhotoSavedEmitter.shotImageCaptureId(captureId, index: image.index),
+        attemptId: attemptId, exposureTimestampNs: m.exposureTimestampNs,
+        cameraToWorld: image.creditable ? m.cameraToWorld : nil, intrinsics: m.intrinsics,
+        width: m.width, height: m.height, sharpness: m.sharpness, automatic: automatic,
+        blurRejected: false, imageURL: image.index == 0 ? photo.imageURL : photo.shotImageURLs[image.index],
+        shotImage: ShotImageRecord(
+          shotId: shot.shotId, index: image.index, count: shot.images.count, mode: shot.mode.rawValue,
+          flags: image.flags.rawValue))
+    }
   }
 
   // MARK: Durable previews

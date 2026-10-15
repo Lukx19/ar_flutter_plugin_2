@@ -23,6 +23,20 @@ struct DurablePhotoRecord {
   var blurRejected: Bool
   /// The committed JPEG in the durable store; nil when unknown.
   var imageURL: URL? = nil
+  /// Set when the photo is one image of a burst or quality shot.
+  var shotImage: ShotImageRecord? = nil
+}
+
+/// One image of a burst or quality shot in the photo saved shot extension
+/// ([PhotoShotImageLayout]); contract bytes, no capture types.
+struct ShotImageRecord: Equatable {
+  var shotId: UUID
+  var index: Int
+  var count: Int
+  /// [PhotoShotImageLayout] shot mode byte: 1 burst, 2 quality.
+  var mode: Int
+  /// [PhotoShotImageLayout] flag bits.
+  var flags: Int
 }
 
 /// Receives one call per durable photo after its photo saved event was built.
@@ -46,8 +60,8 @@ final class PhotoSavedEmitter {
   private let sink: IngestMessageSink
   private let clock: IngestClock
   private let lock = NSLock()
-  private let message = IngestMessageBuffer(capacity: IngestMessageLayout.headerBytes + PhotoSavedLayout.bytes)
-  private let event = IngestMessageBuffer(capacity: PhotoSavedLayout.bytes)
+  private let message = IngestMessageBuffer(capacity: IngestMessageLayout.headerBytes + PhotoSavedLayout.bytes + PhotoShotImageLayout.bytes)
+  private let event = IngestMessageBuffer(capacity: PhotoSavedLayout.bytes + PhotoShotImageLayout.bytes)
   private var recentIds = [String?](repeating: nil, count: PhotoSavedEmitter.recent)
   private var recentNext = 0
 
@@ -119,7 +133,7 @@ final class PhotoSavedEmitter {
     if record.cameraToWorld == nil { poseMissing += 1 }
     emitted += 1
     if offersToIngest() { offerLocked(record, epoch: epoch) }
-    let bytes = [UInt8](UnsafeRawBufferPointer(start: event.bytes, count: PhotoSavedLayout.bytes))
+    let bytes = [UInt8](UnsafeRawBufferPointer(start: event.bytes, count: Self.payloadBytes(record)))
     lock.unlock()
     for listener in durableListeners() { listener.onPhotoDurable(event: bytes, record: record) }
     return true
@@ -129,8 +143,9 @@ final class PhotoSavedEmitter {
   /// (column-major), still intrinsics and size, then the 128 B event.
   private func offerLocked(_ record: DurablePhotoRecord, epoch: Int) {
     let b = message
+    let payload = Self.payloadBytes(record)
     IngestMessageWriter.begin(b, kind: IngestMessageLayout.kindPhotoSaved)
-    IngestMessageWriter.payloadBytes(b, PhotoSavedLayout.bytes)
+    IngestMessageWriter.payloadBytes(b, payload)
     let ns = record.exposureTimestampNs
     IngestMessageWriter.timing(b, sampleNs: ns, frameNs: ns, acquireNs: clock.nowNs())
     let posed = record.cameraToWorld != nil
@@ -147,8 +162,35 @@ final class PhotoSavedEmitter {
       b, width: event.readU16(PhotoSavedLayout.widthDiv8) * 8, height: event.readU16(PhotoSavedLayout.heightDiv8) * 8,
       rowStrideBytes: 0, depthUnit: IngestMessageLayout.depthUnitU16Mm, confidenceFormat: IngestMessageLayout.confidenceNone
     )
-    (b.bytes + IngestMessageLayout.headerBytes).copyMemory(from: event.bytes, byteCount: PhotoSavedLayout.bytes)
-    if sink.offer(b, length: IngestMessageLayout.headerBytes + PhotoSavedLayout.bytes) { offered += 1 }
+    (b.bytes + IngestMessageLayout.headerBytes).copyMemory(from: event.bytes, byteCount: payload)
+    if sink.offer(b, length: IngestMessageLayout.headerBytes + payload) { offered += 1 }
+  }
+
+  /// 128 B, or 160 B with the shot image extension.
+  static func payloadBytes(_ record: DurablePhotoRecord) -> Int {
+    PhotoSavedLayout.bytes + (record.shotImage == nil ? 0 : PhotoShotImageLayout.bytes)
+  }
+
+  /// Capture id of image [index] (1...) of the shot whose first image is
+  /// [captureId]: SHA-256 hex of `<captureId>#<index>`, so each image is
+  /// its own photo in the credit ledger.
+  static func shotImageCaptureId(_ captureId: String, index: Int) -> String {
+    SHA256.hash(data: Data("\(captureId)#\(index)".utf8)).map { String(format: "%02x", $0) }.joined()
+  }
+
+  /// Writes the shot image extension of [shot] at [base] of [e].
+  static func fillShotImage(_ e: IngestMessageBuffer, _ shot: ShotImageRecord, base: Int = PhotoSavedLayout.bytes) {
+    let L = PhotoShotImageLayout.self
+    e.zero(base, L.bytes)
+    e.u32(base, L.magic)
+    e.u16(base + 4, L.version)
+    e.u16(base + 6, L.bytes)
+    let uuid = withUnsafeBytes(of: shot.shotId.uuid) { Array($0) }
+    for i in 0..<16 { e.u8(base + L.shotId + i, Int(uuid[i])) }
+    e.u8(base + L.imageIndex, shot.index)
+    e.u8(base + L.imageCount, shot.count)
+    e.u8(base + L.shotMode, shot.mode)
+    e.u16(base + L.flags, shot.flags)
   }
 
   /// Writes the 128 B event of [record] into [e].
@@ -181,6 +223,9 @@ final class PhotoSavedEmitter {
     if record.blurRejected { flags |= PhotoSavedLayout.flagBlurRejected }
     e.u8(PhotoSavedLayout.flags, flags)
     e.u8(PhotoSavedLayout.groupEpochLow, groupEpoch & 0xff)
+    if let shot = record.shotImage, e.capacity >= PhotoSavedLayout.bytes + PhotoShotImageLayout.bytes {
+      fillShotImage(e, shot)
+    }
   }
 
   /// The durable store's capture id is SHA-256 hex; anything else is hashed.

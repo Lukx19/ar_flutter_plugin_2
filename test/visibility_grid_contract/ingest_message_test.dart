@@ -101,6 +101,53 @@ void main() {
     expect(p.groupEpochLow, fixtureGroupEpoch);
   });
 
+  test('photo saved shot image golden decodes the event and its extension',
+      () {
+    expectGoldenBytes(
+        'ingest_photo_saved_shot_image.bin', buildPhotoSavedShotImageMessage());
+    final data = readGolden('ingest_photo_saved_shot_image.bin');
+    final h = IngestMessageView()..attach(data);
+    expect(h.validate(data.lengthInBytes), ContractStatus.ok);
+    expect(h.payloadBytes, PhotoShotImageLayout.payloadBytes);
+    final p = PhotoSavedView()..attach(data, h.payloadOffset);
+    final id = Uint8List(32);
+    p.readPhotoId(id);
+    expect(id, List<int>.generate(32, (i) => 32 + i));
+    expect(p.cameraToWorld(0, 3), closeTo(0.11, 1e-7));
+    expect([p.fx, p.fy, p.cx, p.cy], [2940, 2940, 2016, 1512]);
+    expect([p.widthDiv8, p.heightDiv8, p.sharpness], [504, 378, 640]);
+    expect(p.automatic, isFalse);
+    expect(p.hasCamera, isTrue);
+    expect(
+        PhotoShotImageView.present(data, h.payloadOffset, h.payloadBytes),
+        isTrue);
+    final s = PhotoShotImageView()
+      ..attach(data, h.payloadOffset + PhotoSavedLayout.bytes);
+    final shotId = Uint8List(16);
+    s.readShotId(shotId);
+    expect(shotId, List<int>.generate(16, (i) => 0x10 + i));
+    expect([s.imageIndex, s.imageCount], [1, 3]);
+    expect(s.shotMode, PhotoShotImageLayout.modeBurst);
+    expect(s.trackingNotNormal, isFalse);
+    expect(s.videoFrameFallback, isFalse);
+    expect(p.exposureTimestampNs, 1234567990123);
+  });
+
+  test('a 128 B photo saved event has no shot image extension', () {
+    final data = readGolden('ingest_photo_saved.bin');
+    final h = IngestMessageView()..attach(data);
+    expect(
+        PhotoShotImageView.present(data, h.payloadOffset, h.payloadBytes),
+        isFalse);
+    // A 224 B payload with another magic is not an extension either.
+    final shot = buildPhotoSavedShotImageMessage();
+    final view = ByteData.sublistView(shot);
+    final sh = IngestMessageView()..attach(view);
+    view.setUint32(sh.payloadOffset + PhotoSavedLayout.bytes, 0);
+    expect(PhotoShotImageView.present(view, sh.payloadOffset, sh.payloadBytes),
+        isFalse);
+  });
+
   test('marker golden decodes two 64 B records', () {
     final data = readGolden('ingest_markers.bin');
     final h = IngestMessageView()..attach(data);

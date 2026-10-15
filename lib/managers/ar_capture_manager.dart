@@ -64,6 +64,9 @@ class CaptureInitializationResult {
   const CaptureInitializationResult({
     required this.mode,
     this.warning,
+    this.stillCaptureMode = ARStillCaptureMode.single,
+    this.unsupportedStillCaptureMode,
+    this.unsupportedStillCaptureModeReason,
   });
 
   factory CaptureInitializationResult.fromPlatformValue(dynamic value) {
@@ -74,9 +77,17 @@ class CaptureInitializationResult {
         (candidate) => candidate.name == modeName,
         orElse: () => CaptureInitializationMode.sharedCamera,
       );
+      final unsupported = map['stillCaptureModeUnsupported'];
       return CaptureInitializationResult(
         mode: mode,
         warning: map['warning'] as String?,
+        stillCaptureMode:
+            ARStillCaptureMode.fromWire(map['stillCaptureMode']),
+        unsupportedStillCaptureMode: unsupported == null
+            ? null
+            : ARStillCaptureMode.fromWire(unsupported),
+        unsupportedStillCaptureModeReason:
+            map['stillCaptureModeUnsupportedReason'] as String?,
       );
     }
 
@@ -87,6 +98,17 @@ class CaptureInitializationResult {
 
   final CaptureInitializationMode mode;
   final String? warning;
+
+  /// The still a manual shutter takes (iOS); Android always answers single.
+  final ARStillCaptureMode stillCaptureMode;
+
+  /// The requested still mode this view cannot take (burst or quality while
+  /// a recording without stills replays); [stillCaptureMode] is used instead.
+  final ARStillCaptureMode? unsupportedStillCaptureMode;
+
+  /// Stable reason code of [unsupportedStillCaptureMode]
+  /// (`recordedPlaybackWithoutStills`).
+  final String? unsupportedStillCaptureModeReason;
 
   bool get isSharedCamera => mode == CaptureInitializationMode.sharedCamera;
   bool get isPreviewFallback =>
@@ -366,6 +388,22 @@ class ARCaptureManager {
 
   CaptureInitializationResult? get initializationResult =>
       _initializationResult;
+
+  /// The initialization result once a started `initializeCapture` finished;
+  /// the current result (null) when none started; null when it failed.
+  /// Never starts initialization itself.
+  Future<CaptureInitializationResult?> initializationOutcome() async {
+    final pending = _initializationFuture;
+    if (pending == null) {
+      return _initializationResult;
+    }
+    try {
+      await pending;
+    } on Object {
+      return null;
+    }
+    return _initializationResult;
+  }
 
   void _requireNativeOwner() {
     if (isDisposed) {

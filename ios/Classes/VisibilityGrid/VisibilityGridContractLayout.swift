@@ -122,6 +122,27 @@ enum PhotoSavedLayout {
   static let flagBlurRejected = 2
 }
 
+/// Shot image extension of the photo saved event (amendment 2026-10-15):
+/// 32 B appended to the 128 B event in a kind 4 payload of 160 B when the
+/// photo is one image of an iOS burst or quality shot. Each image's 128 B
+/// event carries its own frame's pose, intrinsics and exposure time.
+/// Readers of the 128 B event ignore it; Android never writes it.
+enum PhotoShotImageLayout {
+  static let magic = contractMagic("C3SI")
+  static let version = 1
+  static let bytes = 32
+  static let shotId = 8
+  static let imageIndex = 24
+  static let imageCount = 25
+  static let shotMode = 26
+  static let flags = 28
+  static let modeSingle = 0
+  static let modeBurst = 1
+  static let modeQuality = 2
+  static let flagTrackingNotNormal = 1
+  static let flagVideoFrameFallback = 2
+}
+
 enum ShellControlLayout {
   static let magic = contractMagic("C3GC")
   static let version = 1

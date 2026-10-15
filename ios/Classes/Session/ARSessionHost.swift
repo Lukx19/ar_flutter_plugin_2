@@ -1,4 +1,5 @@
 import ARKit
+import AVFoundation
 import Foundation
 
 /// Stable codes the capture view sends to Dart in place of English text
@@ -148,6 +149,25 @@ final class ARSessionHost: NSObject, CaptureSessionSource, ARSessionDelegate {
 
   func getCurrentWorldMap(completion: @escaping (ARWorldMap?, Error?) -> Void) {
     session.getCurrentWorldMap(completionHandler: completion)
+  }
+
+  /// `.balanced` uses the running video format's default photo settings
+  /// with balanced prioritization (iOS 26); ARKit refuses `.quality` and
+  /// exposure brackets, so a refusal falls back to the plain frame once.
+  func captureHighResolutionFrame(quality: StillFrameQuality, completion: @escaping (CaptureFrame?, Error?) -> Void) {
+    guard quality == .balanced else { return captureHighResolutionFrame(completion: completion) }
+    if #available(iOS 26.0, *), let format = session.configuration?.videoFormat {
+      let settings = AVCapturePhotoSettings(from: format.defaultPhotoSettings)
+      settings.photoQualityPrioritization = .balanced
+      session.captureHighResolutionFrame(using: settings) { [weak self] frame, error in
+        if let frame = frame { return completion(ARKitCaptureFrame(frame), nil) }
+        NSLog("capture3d still: balanced frame refused (%@); plain high-resolution frame", String(describing: error))
+        guard let self = self else { return completion(nil, error) }
+        self.captureHighResolutionFrame(completion: completion)
+      }
+      return
+    }
+    captureHighResolutionFrame(completion: completion)
   }
 
   // MARK: Control (main thread)
