@@ -178,9 +178,9 @@ internal class PointCloudIngestProducer(
         if (!session.history.readyToMatch(timestampNs, 0)) deferred++
     }
 
-    fun publishStaged(newFrame: Boolean) {
+    fun publishStaged(newPose: Boolean) {
         if (!staged) return
-        if (newFrame) stagedWaited++
+        if (newPose) stagedWaited++
         val history = session.history
         if (!history.readyToMatch(stagedNs, stagedWaited)) return
         if (stagedNs > history.newestNs) deferTimeouts++

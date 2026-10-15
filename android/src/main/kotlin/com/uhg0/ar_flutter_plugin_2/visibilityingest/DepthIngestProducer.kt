@@ -243,10 +243,10 @@ internal class DepthIngestProducer(
         if (!session.history.readyToMatch(imageTimestampNs, 0)) deferred++
     }
 
-    /** Matches and offers the staged image once its pose is available; [newFrame] counts waited frames. */
-    fun publishStaged(newFrame: Boolean) {
+    /** Matches and offers the staged image once its pose is available; [newPose] counts waited frames that added a pose. */
+    fun publishStaged(newPose: Boolean) {
         if (!staged) return
-        if (newFrame) stagedWaited++
+        if (newPose) stagedWaited++
         val history = session.history
         if (!history.readyToMatch(stagedImageNs, stagedWaited)) return
         if (stagedImageNs > history.newestNs) deferTimeouts++

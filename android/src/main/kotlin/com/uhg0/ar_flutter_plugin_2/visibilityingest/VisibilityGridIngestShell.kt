@@ -301,10 +301,12 @@ internal class VisibilityGridIngestShell(
         if (tracking != IngestTrackingState.TRACKING) return
 
         source.readPose(tq)
-        session.history.pushTq(ts, tq)
+        // A repeated frame (same timestamp, seen under ARCore playback) adds no
+        // pose, so it does not count toward a staged sample's deferral.
+        val newPose = session.history.pushTq(ts, tq)
         photoEmitter.recordFramePose(source.androidCameraTimestampNs, tq)
-        depth.publishStaged(true)
-        points.publishStaged(true)
+        depth.publishStaged(newPose)
+        points.publishStaged(newPose)
         depth.onFrame(source, mode)
         watchDepthRefusals(ts, tracking)
         if (mode != IngestFrameSource.DEPTH_MODE_DISABLED) watchDepthStall()

@@ -40,7 +40,7 @@ internal class DepthPoseHistory(private val capacity: Int = DEFAULT_CAPACITY) {
         /** Interpolation across a wider frame gap is not trusted (the still-capture bracket limit). */
         const val MAX_INTERPOLATION_SPAN_NS = 300_000_000L
 
-        /** A sample newer than the newest pose waits at most this many frames for its pose. */
+        /** A sample newer than the newest pose waits at most this many new frame poses (a repeated frame timestamp does not count). */
         const val MAX_DEFER_FRAMES = 6
 
         /** Depth images older than this relative to their frame are dropped at the source. */
