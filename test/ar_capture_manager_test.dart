@@ -812,6 +812,56 @@ void main() {
     );
   });
 
+  test(
+      'still settings apply to the same view with a repeated '
+      'initializeCapture', () async {
+    final sessionManager = ARSessionManager(
+      42,
+      _FakeBuildContext(),
+      PlaneDetectionConfig.horizontal,
+    );
+    final captureManager = ARCaptureManager(
+      sessionManager,
+      captureConfig,
+      _FakeBuildContext(),
+    );
+    List<MethodCall> initializations() => methodCalls
+        .where((call) => call.method == 'initializeCapture')
+        .toList();
+
+    await captureManager.applyStillCaptureSettings(
+      captureConfig.copyWith(stillCaptureMode: ARStillCaptureMode.burst),
+    );
+    expect(initializations(), isEmpty,
+        reason: 'before initialization only the configuration changes');
+    expect(captureManager.config.stillCaptureMode, ARStillCaptureMode.burst);
+
+    await captureManager.getCaptureCapacity();
+    expect(initializations(), hasLength(1));
+    expect(
+      (initializations().single.arguments as Map)['stillCaptureMode'],
+      'burst',
+    );
+
+    final result = await captureManager.applyStillCaptureSettings(
+      captureConfig.copyWith(
+        stillCaptureMode: ARStillCaptureMode.single,
+        jpegQuality: 50,
+      ),
+    );
+    expect(initializations(), hasLength(2));
+    final repeated = initializations().last.arguments as Map;
+    expect(repeated.containsKey('stillCaptureMode'), isFalse);
+    expect(repeated['jpegQuality'], 95,
+        reason: 'only the still settings change');
+    expect(result?.mode, CaptureInitializationMode.sharedCamera);
+    expect(captureManager.config, captureConfig);
+
+    await captureManager.applyStillCaptureSettings(captureConfig);
+    expect(initializations(), hasLength(2),
+        reason: 'unchanged still settings send nothing');
+  });
+
   test('records preview-fallback initialization warnings from native setup',
       () async {
     initializeCaptureResponse = <String, dynamic>{

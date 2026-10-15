@@ -360,8 +360,9 @@ class ARCaptureManager {
   static const int _nativeCaptureV2TerminalLedgerCapacity = 8;
   static const String _profilesKey = 'ar_capture_profiles';
   static const String _profileNotFoundCode = 'PROFILE_NOT_FOUND';
-  final ARCaptureConfig _config;
+  ARCaptureConfig _config;
   Future<void>? _initializationFuture;
+  Future<void>? _stillSettingsUpdate;
   ARCaptureCloseState _closeState = ARCaptureCloseState.active;
   Future<void>? _disposeAttempt;
   CaptureInitializationResult? _initializationResult;
@@ -495,6 +496,60 @@ class ARCaptureManager {
         rethrow;
       }
       throw ARCaptureException('Failed to initialize capture manager: $e');
+    }
+  }
+
+  /// Applies the still settings of [settings] (`stillCaptureMode`,
+  /// `burstImageCount`, `burstIntervalMs`) to this view without replacing
+  /// it: once `initializeCapture` ran, a repeated `initializeCapture` on the
+  /// same view sends the updated configuration; before that, the first
+  /// initialization sends it. Every other configuration field is kept.
+  /// Settings fixed when the view is created (iOS video HDR of the quality
+  /// mode) need a new view. Updates run in call order.
+  Future<CaptureInitializationResult?> applyStillCaptureSettings(
+    ARCaptureConfig settings,
+  ) {
+    _requireOpenCapture();
+    final update = (_stillSettingsUpdate ?? Future<void>.value())
+        .catchError((Object _) {})
+        .then((_) => _applyStillCaptureSettings(settings));
+    _stillSettingsUpdate = update;
+    return update.then((_) => _initializationResult);
+  }
+
+  Future<void> _applyStillCaptureSettings(ARCaptureConfig settings) async {
+    final next = _config.copyWith(
+      stillCaptureMode: settings.stillCaptureMode,
+      burstImageCount: settings.burstImageCount,
+      burstIntervalMs: settings.burstIntervalMs,
+    );
+    if (next == _config) {
+      return;
+    }
+    _config = next;
+    final pending = _initializationFuture;
+    if (pending == null) {
+      return;
+    }
+    try {
+      await pending;
+    } on Object {
+      // A failed initialization stays failed; the next view starts anew.
+      return;
+    }
+    try {
+      final result = await _invokeOpenCapture<dynamic>(
+        'initializeCapture',
+        _config.toMap(),
+      );
+      _initializationResult = CaptureInitializationResult.fromPlatformValue(
+        result,
+      );
+    } on PlatformException catch (e) {
+      throw _captureExceptionFromPlatformException(
+        e,
+        operation: 'apply still capture settings',
+      );
     }
   }
 
