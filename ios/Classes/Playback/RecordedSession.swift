@@ -189,6 +189,14 @@ struct RecordedSessionMeta: Equatable {
   /// segment list).
   var videoSegments: [RecordedVideoSegment]
   var worldMapFile: String?
+  /// Hardware model identifier of the recording iPhone (`device`, for
+  /// example `iPhone13,3`); nil when the recorder did not write it.
+  var deviceModel: String?
+  /// Recorded camera image size (`videoSize`); nil when absent.
+  var videoWidth: Int?
+  var videoHeight: Int?
+  /// Recorded video frame rate (`videoFps`); 0 when absent.
+  var videoFramesPerSecond = 0
 
   init(json: [String: Any]) throws {
     guard json["format"] as? String == Self.format else {
@@ -214,6 +222,14 @@ struct RecordedSessionMeta: Equatable {
       return RecordedVideoSegment(file: file, firstVideoIndex: UInt32(first), frames: frames)
     }
     worldMapFile = (json["worldMap"] as? [String: Any])?["file"] as? String
+    if let device = (json["device"] as? String)?.trimmingCharacters(in: .whitespaces), !device.isEmpty {
+      deviceModel = device
+    }
+    if let size = json["videoSize"] as? [Int], size.count == 2, size[0] > 0, size[1] > 0 {
+      videoWidth = size[0]
+      videoHeight = size[1]
+    }
+    videoFramesPerSecond = max(0, json["videoFps"] as? Int ?? 0)
   }
 }
 

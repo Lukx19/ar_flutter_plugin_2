@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:ar_flutter_plugin_2/capabilities/arkit_capabilities.dart';
 import 'package:ar_flutter_plugin_2/models/ar_capture_view_config.dart';
+import 'package:ar_flutter_plugin_2/models/ar_playback_config.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -47,6 +48,43 @@ void main() {
             reply[ARKitCapabilityReplyKey.modelIdentifier]! as String,
       ),
     );
+  });
+
+  test('during playback the query sends the recording and parses the '
+      'recorded device reply', () async {
+    final playback = query['recordedPlayback']! as Map<String, Object?>;
+    final reply = playback['reply']! as Map<String, Object?>;
+    final arguments = playback['arguments']! as Map<String, Object?>;
+    final messenger =
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+    final channel = MethodChannel(query['channel']! as String);
+    final sent = <Object?>[];
+    messenger.setMockMethodCallHandler(channel, (call) async {
+      sent.add(call.arguments);
+      return call.arguments == null ? query['reply'] : reply;
+    });
+    addTearDown(() => messenger.setMockMethodCallHandler(channel, null));
+    final recorded = await const ARKitCapabilityQuery().query(
+      playback: ARPlaybackConfig(
+        datasetPath: arguments['arcorePlaybackDataset']! as String,
+      ),
+    );
+    expect(sent.single, arguments);
+    expect(
+      recorded,
+      ARKitCapabilities(
+        sceneDepth: reply[ARKitCapabilityReplyKey.sceneDepth]! as bool,
+        highResolutionFrameCapture:
+            reply[ARKitCapabilityReplyKey.highResolutionFrameCapture]! as bool,
+        worldMap: reply[ARKitCapabilityReplyKey.worldMap]! as bool,
+        modelIdentifier:
+            reply[ARKitCapabilityReplyKey.modelIdentifier]! as String,
+        recordedPlayback: true,
+      ),
+    );
+    expect((await const ARKitCapabilityQuery().query())?.recordedPlayback,
+        isFalse);
+    expect(sent.last, isNull, reason: 'no playback sends no arguments');
   });
 
   test('capture view creation parameters match the shared cases', () {

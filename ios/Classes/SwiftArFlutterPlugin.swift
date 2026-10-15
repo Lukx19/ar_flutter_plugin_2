@@ -99,7 +99,8 @@ private final class CameraCapabilitiesHandler: NSObject, FlutterPlugin {
   func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
     switch call.method {
     case ARKitCapabilityChannel.method:
-      result(ARCameraCapabilities.current().channelMap)
+      // During recorded playback Dart sends the playback creation parameters.
+      result(ARCameraCapabilities.forQuery(call.arguments).channelMap)
     case "getDeviceCapabilityProfile":
       result([
         "presetVersion": 11,

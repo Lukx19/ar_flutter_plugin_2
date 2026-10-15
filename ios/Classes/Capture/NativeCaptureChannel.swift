@@ -212,8 +212,10 @@ final class NativeCaptureChannel: CaptureChannelExtension {
       frameSource.addFrameObserver(observer)
       created.start()
     }
-    var reply: [String: Any] = ["mode": ARCameraCapabilities.current().supportsHighResolutionFrameCapture ? "sharedCamera" : "previewFallback"]
-    if !ARCameraCapabilities.current().supportsHighResolutionFrameCapture {
+    // A replayed recording takes its recorded stills: the recorded device's capabilities apply.
+    let highResolution = ARCameraCapabilities.of(frameSource).supportsHighResolutionFrameCapture
+    var reply: [String: Any] = ["mode": highResolution ? "sharedCamera" : "previewFallback"]
+    if !highResolution {
       reply["warning"] = "High-resolution ARKit frames are unavailable; stills use the video frame."
     }
     result(reply)

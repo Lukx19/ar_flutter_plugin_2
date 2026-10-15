@@ -20,6 +20,26 @@
       "lidarDepth": true,
       "highResolutionFrameCapture": true,
       "worldMap": true
+    },
+    "recordedPlayback": {
+      "arguments": {
+        "arcorePlaybackDataset": "room2_trimmed",
+        "arcorePlaybackRestart": "view",
+        "arcorePlaybackRestartGeneration": 0
+      },
+      "recording": "arkit_playback/room2_trimmed",
+      "reply": {
+        "platform": "ios",
+        "modelIdentifier": "iPhone13,3",
+        "worldTracking": true,
+        "sceneDepth": true,
+        "smoothedSceneDepth": false,
+        "sceneReconstruction": false,
+        "lidarDepth": true,
+        "highResolutionFrameCapture": true,
+        "worldMap": true,
+        "recordedPlayback": true
+      }
     }
   },
   "captureView": {

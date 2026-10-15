@@ -63,6 +63,8 @@ enum ARKitCapabilityChannel {
     static let worldMap = "worldMap"
     static let videoFormats = "videoFormats"
     static let highResolutionFrameCaptureFormat = "highResolutionFrameCaptureFormat"
+    /// True when the reply describes the recorded device of a playback.
+    static let recordedPlayback = "recordedPlayback"
   }
 }
 
@@ -98,6 +100,8 @@ struct ARCameraCapabilities: Equatable {
   var videoFormats: [ARVideoFormatDescription]
   /// `recommendedVideoFormatForHighResolutionFrameCapturing`, when any.
   var highResolutionFrameCaptureFormat: ARVideoFormatDescription?
+  /// The values describe the device of a replayed recording, not this one.
+  var recordedPlayback = false
 
   /// LiDAR-class depth: `sceneDepth` frame semantics (sets source flag bit 2).
   var hasLiDARDepth: Bool { sceneDepthSupported }
@@ -135,6 +139,7 @@ struct ARCameraCapabilities: Equatable {
     if let format = highResolutionFrameCaptureFormat {
       map[Key.highResolutionFrameCaptureFormat] = format.channelMap
     }
+    if recordedPlayback { map[Key.recordedPlayback] = true }
     return map
   }
 
