@@ -1,0 +1,6 @@
+// Clang module of the marker detector C ABI for Swift (the iOS pod and its
+// XCTest package import it as CMarkerDetector).
+module CMarkerDetector {
+  header "marker_detector.h"
+  export *
+}

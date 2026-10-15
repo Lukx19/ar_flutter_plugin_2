@@ -25,7 +25,22 @@ A Flutter plugin for shared AR experiences supporting Android and iOS.
   s.platform = :ios, '18.0'
 
 
+  # Marker detector (native/marker_detector, shared with Android): the C ABI,
+  # its AprilTag backend and the generated ARUCO_MIP_36h12 family compile
+  # into this pod through the forwarding sources in
+  # Classes/MarkerDetection/Native; Swift imports the ABI as the clang module
+  # CMarkerDetector (native/marker_detector/include/module.modulemap).
+  s.library = 'c++'
+  marker_detector = '"${PODS_TARGET_SRCROOT}/../native/marker_detector'
+
   # Flutter.framework does not contain a i386 slice.
-  s.pod_target_xcconfig = { 'DEFINES_MODULE' => 'YES', 'EXCLUDED_ARCHS[sdk=iphonesimulator*]' => 'i386' }
+  s.pod_target_xcconfig = {
+    'DEFINES_MODULE' => 'YES',
+    'EXCLUDED_ARCHS[sdk=iphonesimulator*]' => 'i386',
+    'CLANG_CXX_LANGUAGE_STANDARD' => 'c++17',
+    'HEADER_SEARCH_PATHS' => "$(inherited) #{marker_detector}/include\" #{marker_detector}/src\" " \
+                             "#{marker_detector}/third_party/apriltag\"",
+    'SWIFT_INCLUDE_PATHS' => "$(inherited) #{marker_detector}/include\"",
+  }
   s.swift_version = '5.0'
 end
