@@ -40,20 +40,6 @@ class MarkerSceneRecordsInstrumentedTest {
     }
 
     @Test
-    fun refusesDictionariesAprilTagDoesNotDecode() {
-        assumeTrue("marker detector library not packaged", MarkerDetectorNative.available)
-        for ((dictionary, decoded) in listOf(0 to true, 1 to true, 2 to false, 3 to false)) {
-            val handle = MarkerDetectorNative.nativeCreate(dictionary)
-            if (decoded) {
-                assertNotEquals("dictionary $dictionary", 0L, handle)
-                MarkerDetectorNative.nativeDestroy(handle)
-            } else {
-                assertEquals("dictionary $dictionary", 0L, handle)
-            }
-        }
-    }
-
-    @Test
     fun writesSceneRecordsThroughTheJniPath() {
         assumeTrue("marker detector library not packaged", MarkerDetectorNative.available)
         val instrumentation = InstrumentationRegistry.getInstrumentation()

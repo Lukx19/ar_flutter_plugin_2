@@ -11,6 +11,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.uhg0.ar_flutter_plugin_2.visibilitycontract.IngestMessageLayout
 import com.uhg0.ar_flutter_plugin_2.visibilitycontract.MarkerDetectionLayout
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
 import org.junit.Test
@@ -22,7 +23,8 @@ import kotlin.math.hypot
 /**
  * Marker detection on rendered ARUCO_MIP_36h12 bitmaps through the JNI
  * library: live detection messages at 640x480 and 1920x1080 and full
- * resolution tie points at 4128x3096. Logs detection times under the tag
+ * resolution tie points at 4128x3096; the AprilTag backend refuses the
+ * dictionaries it does not decode. Logs detection times under the tag
  * `MarkerDetectorTest`. Needs `libcapture3d_marker_detector.so` (built with
  * CAPTURE3D_GRID_MARKERS); skipped by assumption otherwise.
  */
@@ -139,6 +141,20 @@ class MarkerDetectorInstrumentedTest {
             assertEquals(0, b.get(at + MarkerDetectionLayout.FLAGS).toInt())
         }
         producer.close()
+    }
+
+    @Test
+    fun refusesDictionariesAprilTagDoesNotDecode() {
+        assumeTrue("marker detector library not packaged", MarkerDetectorNative.available)
+        for ((dictionary, decoded) in listOf(0 to true, 1 to true, 2 to false, 3 to false)) {
+            val handle = MarkerDetectorNative.nativeCreate(dictionary)
+            if (decoded) {
+                assertNotEquals("dictionary $dictionary", 0L, handle)
+                MarkerDetectorNative.nativeDestroy(handle)
+            } else {
+                assertEquals("dictionary $dictionary", 0L, handle)
+            }
+        }
     }
 
     @Test
