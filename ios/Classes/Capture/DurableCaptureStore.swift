@@ -556,12 +556,14 @@ final class DurableCaptureStore {
       let accepted = session + ["attempts", attemptHash, "accepted.properties"]
       guard files.isFile(accepted) else { continue }
       try repairAcceptedCandidate(session: session, accepted: accepted)
-      let acceptedValues = try readProperties(accepted)
+      let acceptedBytes = try files.readBytes(accepted)
+      let acceptedValues = DurableStoreEncoding.parseProperties(acceptedBytes)
       // The accepted record is created under its final name and then
-      // written, after its index entry: without an attempt identity it is an
-      // acceptance that never finished (no exposure can precede it). Repair
-      // proved it absent; it is neither projected nor kept in the index.
-      guard let attemptId = acceptedValues["attemptId"] else { continue }
+      // written, after its index entry: a record cut short is an acceptance
+      // that never finished (no exposure can precede it). Repair proved it
+      // absent; it is neither projected nor kept in the index.
+      guard Self.isFinishedAcceptedRecord(acceptedBytes, acceptedValues),
+            let attemptId = acceptedValues["attemptId"] else { continue }
       validEntries.append((sessionHash, attemptHash))
       let context = try Self.recoveryContext(acceptedValues)
       let receiptPath = Array(accepted.dropLast()) + ["receipt.properties"]
@@ -999,6 +1001,13 @@ final class DurableCaptureStore {
     data["recovery.projectionMatrix"] = DurableStoreEncoding.javaDoubles(value.projectionMatrix)
     data["recovery.groupFromWorld"] = DurableStoreEncoding.javaDoubles(value.groupFromWorld)
     data["recovery.worldFromGroup"] = DurableStoreEncoding.javaDoubles(value.worldFromGroup)
+  }
+
+  /// An accepted record is written whole as sorted `key=value\n` lines, so
+  /// a finished one ends with a newline and carries `session`, its last key;
+  /// anything else is a write cut short.
+  static func isFinishedAcceptedRecord(_ bytes: [UInt8], _ values: [String: String]) -> Bool {
+    bytes.last == UInt8(ascii: "\n") && values["session"] != nil
   }
 
   static func recoveryContext(_ values: [String: String]) throws -> NativeCaptureRecoveryContext? {

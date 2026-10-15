@@ -58,7 +58,7 @@ final class DurableCaptureReconciliationTests: XCTestCase {
   // MARK: Unfinished acceptance
 
   func testUnfinishedAcceptedRecordIsDroppedAndCaptureContinues() throws {
-    for variant in ["empty", "partial"] {
+    for variant in ["empty", "partial", "recovery"] {
       try? FileManager.default.removeItem(at: root)
       root = CaptureFixture.temporaryDirectory("durable-reconciliation")
       let (store, _) = try CaptureFixture.store(root)
@@ -68,7 +68,18 @@ final class DurableCaptureReconciliationTests: XCTestCase {
       // the crash came before (or while) its bytes were written.
       let record = url("\(attempt(crashed))/accepted.properties")
       let written = try String(contentsOf: record, encoding: .utf8)
-      let cut = variant == "empty" ? "" : String(written[..<written.range(of: "attemptId=")!.lowerBound])
+      let cut: String
+      switch variant {
+      case "empty": cut = ""
+      case "partial": cut = String(written[..<written.range(of: "attemptId=")!.lowerBound])
+      default:
+        // Cut inside the last recovery value: the attempt identity and the
+        // context session are present, the context is short and `session`
+        // is never reached.
+        let value = written.range(of: "recovery.worldFromGroup=")!.upperBound
+        cut = String(written[..<written.index(value, offsetBy: 5)])
+        XCTAssertTrue(cut.contains("attemptId=") && cut.contains("recovery.sessionId="))
+      }
       try Data(cut.utf8).write(to: record)
 
       let (restarted, budget) = try CaptureFixture.store(root)
@@ -90,6 +101,21 @@ final class DurableCaptureReconciliationTests: XCTestCase {
       let (again, _) = try CaptureFixture.store(root)
       XCTAssertEqual(try again.recoverAndProject().map { $0.attemptId }, [next.accepted.identity.attemptId], variant)
     }
+  }
+
+  /// A finished record with a malformed recovery context is not an
+  /// unfinished write: recovery still fails instead of dropping it.
+  func testFinishedAcceptedRecordWithMalformedContextStillFailsRecovery() throws {
+    let (store, _) = try CaptureFixture.store(root)
+    let accepted = request(1)
+    _ = try store.acceptCaptureBeforeExposure(accepted)
+    let record = url("\(attempt(accepted))/accepted.properties")
+    var values = DurableStoreEncoding.parseProperties(Array(try Data(contentsOf: record)))
+    values["recovery.position"] = "1,2"
+    try Data(DurableStoreEncoding.propertiesBytes(values)).write(to: record)
+
+    let (restarted, _) = try CaptureFixture.store(root)
+    XCTAssertThrowsError(try restarted.recoverAndProject())
   }
 
   // MARK: Reservation reconciliation
