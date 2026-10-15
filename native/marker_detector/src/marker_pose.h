@@ -1,8 +1,8 @@
-// Perspective-n-point without OpenCV: IPPE (infinitesimal plane-based pose,
+// Perspective-n-point: IPPE (infinitesimal plane-based pose,
 // Collins and Bartoli 2014) for planar points, a normalised DLT for
 // non-planar points, both refined by Levenberg-Marquardt on the pixel
 // reprojection error with the camera's lens distortion. Poses are
-// camera-from-object in the OpenCV camera frame, rotations as rvecs.
+// camera-from-object in the OpenCV camera convention, rotations as rvecs.
 #ifndef CAPTURE3D_MARKER_POSE_H
 #define CAPTURE3D_MARKER_POSE_H
 

@@ -201,10 +201,10 @@ if (!['true', 'false'].any { it.equalsIgnoreCase(normalizedDenseCurrentFrameExpe
 }
 def denseCurrentFrameExperiment = normalizedDenseCurrentFrameExperiment.toBoolean()
 
-// Marker detector (visibility grid markers): the native library and the
-// OpenCV prefab are built only with CAPTURE3D_GRID_MARKERS=true (or
-// -PgridMarkers=true for standalone plugin builds), so the default APK does
-// not grow.
+// Marker detector (visibility grid markers): the native library (shared C
+// library with its AprilTag backend, native/marker_detector) is built only
+// with CAPTURE3D_GRID_MARKERS=true (or -PgridMarkers=true for standalone
+// plugin builds), so the default APK does not grow.
 def gridMarkersProperty = project.findProperty('gridMarkers')?.toString()
 def gridMarkersPrefix = 'CAPTURE3D_GRID_MARKERS='
 def gridMarkersValues = encodedDartDefines?.split(',')?.collect { encoded ->
@@ -250,8 +250,7 @@ android {
             cmake {
                 cppFlags "-std=c++17"
                 if (gridMarkers) {
-                    // OpenCV's prefab package links against the shared C++ runtime.
-                    arguments '-DCAPTURE3D_GRID_MARKERS=ON', '-DANDROID_STL=c++_shared'
+                    arguments '-DCAPTURE3D_GRID_MARKERS=ON'
                 }
             }
         }
@@ -263,25 +262,17 @@ android {
 
     sourceSets {
         androidTest.java.srcDirs += 'src/androidTest/kotlin'
+        // Synthetic marker scene (images and ground truth) of the parent
+        // repository, read as assets `marker_scene/` by the marker detector test.
+        androidTest.assets.srcDirs += '../../../benchmarks/marker_detection/synthetic_scene/bundle'
     }
 
     testOptions {
         unitTests.returnDefaultValues = true
     }
 
-    if (gridMarkers) {
-        // The marker detector and the OpenCV prefab both ship the shared C++
-        // runtime; the instrumented test APK keeps one copy.
-        packagingOptions {
-            jniLibs {
-                pickFirsts += ['**/libc++_shared.so']
-            }
-        }
-    }
-
     buildFeatures {
         compose true
-        prefab gridMarkers
         // The renderer selection experiment is selected at APK build time so
         // matched tablet control/candidate runs can use the same source.
         buildConfig true
@@ -320,10 +311,6 @@ dependencies {
     testImplementation 'org.openjdk.jol:jol-core:0.17'
     androidTestImplementation 'androidx.test:runner:1.6.2'
     androidTestImplementation 'androidx.test.ext:junit:1.2.1'
-    if (gridMarkers) {
-        // Marker detector: OpenCV 4.12.0 (Apache-2.0) native libraries and headers via prefab.
-        implementation 'org.opencv:opencv:4.12.0'
-    }
 }
 
 // T5's receipt lock is execution provenance, not a bundled fixture. Forward

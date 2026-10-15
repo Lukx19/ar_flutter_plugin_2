@@ -1,6 +1,5 @@
 // Compiles native/marker_detector/src/marker_detector.cpp into the pod (the marker detector sources stay in
 // native/marker_detector, shared with Android). Do not add code here.
-#define C3MD_WITH_OPENCV 0
 #define C3MD_WITH_APRILTAG 1
 #include "../../../../native/marker_detector/src/marker_detector.cpp"
 

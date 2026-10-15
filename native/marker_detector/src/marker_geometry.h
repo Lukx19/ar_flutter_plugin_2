@@ -1,4 +1,4 @@
-// Internal geometry of the marker detector (no OpenCV).
+// Internal geometry of the marker detector (no detection backend).
 #ifndef CAPTURE3D_MARKER_GEOMETRY_H
 #define CAPTURE3D_MARKER_GEOMETRY_H
 

@@ -40,7 +40,7 @@ cat > "$work/Package.swift" <<'PKG'
 import PackageDescription
 
 let defines: [CSetting] = [
-  .define("C3MD_WITH_OPENCV", to: "0"), .define("C3MD_WITH_APRILTAG", to: "1"),
+  .define("C3MD_WITH_APRILTAG", to: "1"),
   .headerSearchPath("src"), .headerSearchPath("third_party/apriltag"), .unsafeFlags(["-w"]),
 ]
 let package = Package(
@@ -52,7 +52,7 @@ let package = Package(
       exclude: ["src/marker_detector_jni.cpp", "third_party/apriltag/README.md", "third_party/apriltag/LICENSE.md"],
       publicHeadersPath: "include", cSettings: defines,
       cxxSettings: [
-        .define("C3MD_WITH_OPENCV", to: "0"), .define("C3MD_WITH_APRILTAG", to: "1"),
+        .define("C3MD_WITH_APRILTAG", to: "1"),
         .headerSearchPath("src"), .headerSearchPath("third_party/apriltag"),
       ]),
     .target(name: "ar_flutter_plugin_2", dependencies: ["CMarkerDetector"], path: "Sources/ar_flutter_plugin_2"),

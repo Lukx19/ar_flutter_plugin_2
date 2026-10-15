@@ -33,7 +33,7 @@ internal object MarkerDetectorNative {
         }
     }
 
-    /** True when the library is present and was built with OpenCV. */
+    /** True when the library is present and was built with its AprilTag backend. */
     val available: Boolean by lazy { loaded && nativeAvailable() == 1 }
 
     @JvmStatic external fun nativeAvailable(): Int

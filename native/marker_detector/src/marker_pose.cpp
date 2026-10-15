@@ -1,4 +1,4 @@
-// OpenCV-free perspective-n-point of the marker detector (see marker_pose.h).
+// Perspective-n-point of the marker detector (see marker_pose.h).
 // Everything works on fixed-size stack buffers; nothing is allocated.
 
 #include "marker_pose.h"

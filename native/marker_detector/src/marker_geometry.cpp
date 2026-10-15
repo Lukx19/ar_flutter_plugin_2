@@ -1,4 +1,4 @@
-// Geometry helpers of the marker detector that need no OpenCV: edge-line
+// Geometry helpers of the marker detector (no detection backend): edge-line
 // corner refinement, diagonal centre, edge sharpness, viewing angle, lens
 // distortion, half floats and record encoding. Ported from the measured
 // benchmark (benchmarks/visibility_grid, `aruco_range` suite).

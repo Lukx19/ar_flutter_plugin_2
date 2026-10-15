@@ -1,5 +1,5 @@
 #!/bin/bash
-# Builds and runs the marker detector host tests (macOS or Linux, no OpenCV):
+# Builds and runs the marker detector host tests (macOS or Linux):
 # the geometry test without a detection backend, the same test on AprilTag,
 # and the AprilTag accuracy test on the printed sheets of the parent
 # repository (benchmarks/marker_detection/print).
@@ -34,7 +34,7 @@ run() {
   perl -e 'alarm 840; exec @ARGV' "$@"
 }
 
-run cmake -S "$source_dir" -B "$build" -DC3MD_WITH_OPENCV=OFF -DC3MD_WITH_APRILTAG=ON \
+run cmake -S "$source_dir" -B "$build" -DC3MD_WITH_APRILTAG=ON \
   -DC3MD_BUILD_HOST_TEST=ON -DCMAKE_BUILD_TYPE=Release > "$build.configure.log" 2>&1 \
   || { tail -20 "$build.configure.log"; exit 1; }
 run cmake --build "$build" -j 8 > "$build.build.log" 2>&1 || { grep -E "error" "$build.build.log" | head -20; exit 1; }

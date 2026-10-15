@@ -1,5 +1,5 @@
 // Accuracy test of the AprilTag detection path (C3MD_WITH_APRILTAG) on the
-// host, without OpenCV:
+// host:
 //
 // - printed sheets: every marker of the SVG sheets in
 //   benchmarks/marker_detection/print is drawn from aruco_mip_36h12.json
@@ -622,7 +622,7 @@ void testTiePoints(const std::vector<uint64_t>& codes) {
   c3md_destroy(d);
 }
 
-/// c3md_solve_points without OpenCV: a tape of eight 55 mm markers (32
+/// c3md_solve_points: a tape of eight 55 mm markers (32
 /// coplanar corners) and a non-planar point set, 0.2 px image noise, with
 /// lens distortion.
 void testSolvePoints() {

@@ -1,9 +1,9 @@
-// Host test of the marker detector C ABI without OpenCV: record encoding
+// Host test of the marker detector C ABI without a detection backend: record encoding
 // against the shared golden, half floats, diagonal centre, viewing angle,
 // distortion round trip, edge sharpness, and edge-line corner refinement on
 // rendered marker images with known corners (pinhole and distorted).
 //
-//   clang++ -std=c++17 -O2 -DC3MD_WITH_OPENCV=0 -I../include -I../src \
+//   clang++ -std=c++17 -O2 -I../include -I../src \
 //     ../src/marker_geometry.cpp ../src/marker_detector.cpp marker_detector_host_test.cpp
 //   ./a.out ../../../test_assets/visibility_grid/ingest_markers.bin
 //
