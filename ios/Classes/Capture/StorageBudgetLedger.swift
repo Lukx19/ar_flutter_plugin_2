@@ -1,8 +1,40 @@
 import Foundation
 
 struct StorageBudgetPolicy {
-  var quotaBytes: Int64
+  enum Quota {
+    /// A constant quota.
+    case fixed(Int64)
+    /// Half of the capture capacity, at least [minimumBytes]: the capacity is
+    /// the free space plus the bytes the ledger already holds, since
+    /// committed photos and physically backed reservations occupy disk and
+    /// are no longer part of the free space.
+    case captureShare(minimumBytes: Int64)
+  }
+
+  var quota: Quota
   var freeSpaceFloorBytes: Int64
+
+  init(quotaBytes: Int64, freeSpaceFloorBytes: Int64) {
+    quota = .fixed(quotaBytes)
+    self.freeSpaceFloorBytes = freeSpaceFloorBytes
+  }
+
+  init(captureShareMinimumBytes: Int64, freeSpaceFloorBytes: Int64) {
+    quota = .captureShare(minimumBytes: captureShareMinimumBytes)
+    self.freeSpaceFloorBytes = freeSpaceFloorBytes
+  }
+
+  /// The quota at one check, for the current free space and ledger totals.
+  func quotaBytes(freeBytes: Int64, committed: Int64, reserved: Int64) -> Int64 {
+    switch quota {
+    case .fixed(let bytes):
+      return bytes
+    case .captureShare(let minimumBytes):
+      let (held, overflow) = committed.addingReportingOverflow(reserved)
+      let (capacity, overflow2) = max(freeBytes, 0).addingReportingOverflow(held)
+      return overflow || overflow2 ? Int64.max : max(capacity / 2, minimumBytes)
+    }
+  }
 }
 
 struct StorageBudgetReservation: Hashable {
@@ -70,9 +102,12 @@ final class StorageBudgetLedger {
     try withAuthority {
       let current = try requireReservation(reservation)
       guard actualBytes >= 0, actualBytes <= current.bytes else { throw DurableStoreStateError("Commit exceeds reservation") }
-      let other = reservedBytes() - current.bytes
-      let violatesFreeFloor = actualBytes > freeBytes() - policy.freeSpaceFloorBytes - other
-      if actualBytes > policy.quotaBytes - committed || violatesFreeFloor {
+      let free = freeBytes()
+      let quota = policy.quotaBytes(freeBytes: free, committed: committed, reserved: reservedBytes())
+      // Reservations are physically backed, so the free space already
+      // excludes every other reservation.
+      let violatesFreeFloor = actualBytes > free - policy.freeSpaceFloorBytes
+      if actualBytes > quota - committed || violatesFreeFloor {
         throw DurableStoreStateError("Committed bytes would violate the global storage budget")
       }
       committed += actualBytes
@@ -141,6 +176,11 @@ final class StorageBudgetLedger {
     try withAuthority { reservations[token] }
   }
 
+  /// Every live reservation, for reconciliation against accepted records.
+  func liveReservations() throws -> [StorageBudgetReservation] {
+    try withAuthority { reservations.values.sorted { $0.token < $1.token } }
+  }
+
   func committedBytes() throws -> Int64 { try withAuthority { committed } }
   func reservedBytesTotal() throws -> Int64 { try withAuthority { reservedBytes() } }
 
@@ -168,8 +208,16 @@ final class StorageBudgetLedger {
     for name in names where name.hasSuffix(".reservation") && name.utf8.count == 64 + 12 {
       let token = String(name.dropLast(12))
       guard DurableStoreEncoding.isHash(token) else { continue }
-      let lines = String(decoding: try files.readBytes(Self.reservationsDirectory + [name]), as: UTF8.self)
-        .split(separator: "\n", omittingEmptySubsequences: false).map(String.init).filter { !$0.isEmpty }
+      let metadata = try files.readBytes(Self.reservationsDirectory + [name])
+      let lines = Self.lines(metadata)
+      // The metadata is written in place after its allocation: an empty or
+      // unterminated file, or one with fewer than two lines, is a reserve
+      // that never returned. It is an orphan; it and its allocation go.
+      guard metadata.last == UInt8(ascii: "\n"), lines.count >= 2 else {
+        try files.delete(Self.reservationsDirectory + [name], .deleteReclaim)
+        try files.delete(Self.allocationFile(token), .deleteReclaim)
+        continue
+      }
       guard lines.count == 2, Self.isOwner(lines[0]), let bytes = Int64(lines[1]), bytes > 0 else {
         throw DurableStoreStateError("Corrupt storage reservation")
       }
@@ -228,7 +276,11 @@ final class StorageBudgetLedger {
     guard !overflow else { return false }
     let (charged, overflow2) = sum.addingReportingOverflow(bytes)
     guard !overflow2 else { return false }
-    return charged <= policy.quotaBytes && charged <= freeBytes() - policy.freeSpaceFloorBytes
+    // Committed photos and physically backed reservations already occupy
+    // disk: the free space bounds only the new bytes.
+    let free = freeBytes()
+    return bytes <= free - policy.freeSpaceFloorBytes
+      && charged <= policy.quotaBytes(freeBytes: free, committed: committed, reserved: reserved)
   }
 
   private func reservedBytes() -> Int64 { reservations.values.reduce(0) { $0 + $1.bytes } }

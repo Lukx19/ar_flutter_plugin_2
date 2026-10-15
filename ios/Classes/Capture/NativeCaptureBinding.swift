@@ -91,9 +91,11 @@ final class NativeCaptureBinding {
     do {
       let budgetFiles = RootedDurableFiles(backend: try PosixDurableFileBackend(root: NativeCaptureStorePaths.budget(appFiles)))
       let usable = { usableBytes(NativeCaptureStorePaths.nativeRoot(appFiles)) }
+      // The quota is half of free plus held bytes, measured at each check.
       let budget = try StorageBudgetLedger(
         files: budgetFiles,
-        policy: StorageBudgetPolicy(quotaBytes: max(usable() / 2, NativeCaptureReservationBounds.captureCoexistenceBytes), freeSpaceFloorBytes: 0),
+        policy: StorageBudgetPolicy(
+          captureShareMinimumBytes: NativeCaptureReservationBounds.captureCoexistenceBytes, freeSpaceFloorBytes: 0),
         freeBytes: usable)
       let storeFiles = RootedDurableFiles(backend: try PosixDurableFileBackend(root: NativeCaptureStorePaths.store(appFiles)))
       return NativeCaptureRootResources(lease: lease, store: try DurableCaptureStore(files: storeFiles, budget: budget))
@@ -252,6 +254,10 @@ final class NativeCaptureBinding {
     owner = created
     let store = opened.store
     replay.recover { try store.recoverAndProject() }
+    // Before the first admission: close reservations that startup recovery
+    // did not reach (crash before the accepted record, attempts transferred
+    // to restart recovery while a view stayed open). Never fails the open.
+    store.reconcileReservations()
     let timer = DispatchSource.makeTimerSource(queue: queue)
     timer.schedule(deadline: .now() + 1, repeating: 1)
     timer.setEventHandler { [weak self] in

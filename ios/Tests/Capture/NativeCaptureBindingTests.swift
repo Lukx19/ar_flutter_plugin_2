@@ -24,12 +24,13 @@ final class NativeCaptureBindingTests: XCTestCase {
     super.tearDown()
   }
 
-  private func binding(nowMs: @escaping () -> Int64 = { Int64(Date().timeIntervalSince1970 * 1000) }) -> NativeCaptureBinding {
+  private func binding(nowMs: @escaping () -> Int64 = { Int64(Date().timeIntervalSince1970 * 1000) },
+                       fault: @escaping DurableStoreFaultInjector = { _ in }) -> NativeCaptureBinding {
     let files = appFiles!
     return NativeCaptureBinding(
       openResources: {
         let lease = try NativeCaptureRootLease.acquire(NativeCaptureStorePaths.nativeRoot(files))
-        let (store, _) = try CaptureFixture.store(NativeCaptureStorePaths.nativeRoot(files))
+        let (store, _) = try CaptureFixture.store(NativeCaptureStorePaths.nativeRoot(files), fault: fault)
         return NativeCaptureRootResources(lease: lease, store: store)
       },
       exposure: camera,
@@ -231,6 +232,74 @@ final class NativeCaptureBindingTests: XCTestCase {
     XCTAssertEqual(byAttempt[waiting.accepted.identity.attemptId]?["kind"] as? String, "abandoned")
     XCTAssertEqual(byAttempt[waiting.accepted.identity.attemptId]?["reason"] as? String, "view-replaced-before-exposure")
     XCTAssertEqual(byAttempt[exposed.accepted.identity.attemptId]?["reason"] as? String, "recovered-proven-absent")
+  }
+
+  /// An attempt cut by a pause while the view stays open goes to restart
+  /// recovery; once later photos push it out of the bounded recovery index,
+  /// the next open still proves it absent and releases its reservation.
+  func testPauseCutAttemptBeyondTheRecoveryIndexIsReleasedAtTheNextOpen() throws {
+    var clock: Int64 = 1_000_000
+    let first = binding(nowMs: { clock })
+    let cut = CaptureFixture.request()
+    _ = try complete { first.admit(CaptureFixture.admissionMap(cut), completion: $0) }.get()
+    first.onSessionPaused()
+    drain(first)
+    clock += NativeCaptureBinding.pauseSettleMs + 1_000
+    let tick = expectation(description: "deadline tick")
+    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { tick.fulfill() }
+    wait(for: [tick], timeout: 5)
+    drain(first)
+    XCTAssertTrue(events.contains { $0["kind"] as? String == "recovering" && $0["attemptId"] as? String == cut.accepted.identity.attemptId })
+    let later = (2...4).map {
+      CaptureFixture.request(attemptId: "6f1c2d3e-0000-4000-8000-00000000000\($0)", commitId: "commit-\($0)", ordinal: Int64($0))
+    }
+    for (offset, request) in later.enumerated() {
+      _ = try complete { first.admit(CaptureFixture.admissionMap(request), completion: $0) }.get()
+      camera.deliverJpeg(offset + 1)
+      drain(first)
+    }
+    XCTAssertEqual(photos.count, 3)
+    let closed = expectation(description: "closed")
+    first.close { closed.fulfill() }
+    wait(for: [closed], timeout: 10)
+
+    let nativeRoot = NativeCaptureStorePaths.nativeRoot(appFiles)
+    XCTAssertGreaterThan(try CaptureFixture.store(nativeRoot).1.reservedBytesTotal(), 0, "the cut attempt still holds its reservation")
+    let restarted = binding()
+    let replay = try complete { restarted.replay(completion: $0) }.get()
+    XCTAssertEqual(replay.compactMap { $0["kind"] as? String }, ["committed", "committed"])
+    let (store, budget) = try CaptureFixture.store(nativeRoot)
+    XCTAssertEqual(try budget.reservedBytesTotal(), 0, "the next open released the cut attempt")
+    XCTAssertEqual(try budget.committedBytes(), 3 * Int64(CaptureFixture.jpeg.count), "committed photos stay charged")
+    XCTAssertEqual(try store.queryReceipt(cut.accepted.identity)?.terminal?.reason, "recovered-proven-absent")
+    for request in later {
+      XCTAssertEqual(try store.queryReceipt(request.accepted.identity)?.phase, .committedPicture, "captures are kept")
+    }
+  }
+
+  /// A reservation that fails to reconcile never fails the open: recovery
+  /// is ready and admission goes on.
+  func testReconciliationFailureNeverFailsTheOpen() throws {
+    let nativeRoot = NativeCaptureStorePaths.nativeRoot(appFiles)
+    let (seed, _) = try CaptureFixture.store(nativeRoot)
+    for index in 1...2 {
+      _ = try seed.acceptCaptureBeforeExposure(CaptureFixture.request(
+        attemptId: "6f1c2d3e-0000-4000-8000-00000000000\(index)", commitId: "leaked-\(index)", ordinal: Int64(index)))
+    }
+    try FileManager.default.removeItem(at: nativeRoot.appendingPathComponent("store/recovery-index.properties"))
+    let plan = FaultPlan(.abandonmentRecord)
+    let binding = binding(fault: plan.injector())
+    let replay = try complete { binding.replay(completion: $0) }.get()
+    XCTAssertEqual(replay.first?["kind"] as? String, "ready")
+    XCTAssertEqual(plan.injected, 1)
+    let request = CaptureFixture.request(attemptId: "6f1c2d3e-0000-4000-8000-000000000009", commitId: "commit-9", ordinal: 9)
+    let reply = try complete { binding.admit(CaptureFixture.admissionMap(request), completion: $0) }.get()
+    XCTAssertEqual(reply["phase"] as? String, "reserved_accepted")
+    camera.deliverJpeg()
+    drain(binding)
+    XCTAssertEqual(photos.count, 1)
+    let liability = request.accepted.reservation.totalStoreLiability
+    XCTAssertEqual(try CaptureFixture.store(nativeRoot).1.reservedBytesTotal(), liability, "only the failed reservation remains")
   }
 
   func testCommittedPhotoMaterializesAPreviewAfterReconcile() throws {

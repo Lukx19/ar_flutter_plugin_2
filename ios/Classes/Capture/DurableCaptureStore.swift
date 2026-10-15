@@ -555,12 +555,14 @@ final class DurableCaptureStore {
       let session = sessionRoot + [sessionHash]
       let accepted = session + ["attempts", attemptHash, "accepted.properties"]
       guard files.isFile(accepted) else { continue }
-      validEntries.append((sessionHash, attemptHash))
       try repairAcceptedCandidate(session: session, accepted: accepted)
       let acceptedValues = try readProperties(accepted)
-      guard let attemptId = acceptedValues["attemptId"] else {
-        throw DurableStoreConflict("Recovered acceptance has no attempt identity")
-      }
+      // The accepted record is created under its final name and then
+      // written, after its index entry: without an attempt identity it is an
+      // acceptance that never finished (no exposure can precede it). Repair
+      // proved it absent; it is neither projected nor kept in the index.
+      guard let attemptId = acceptedValues["attemptId"] else { continue }
+      validEntries.append((sessionHash, attemptHash))
       let context = try Self.recoveryContext(acceptedValues)
       let receiptPath = Array(accepted.dropLast()) + ["receipt.properties"]
       guard files.isFile(receiptPath) else {
@@ -594,6 +596,51 @@ final class DurableCaptureStore {
       try writeRecoveryIndex(validEntries)
     }
     return result
+  }
+
+  /// Reservation-driven reconciliation at binding open, after the bounded
+  /// startup recovery and before the first admission: every live
+  /// reservation names its attempt (`capture:<session>:<commit>`). Without
+  /// an accepted record, or when the record names another reservation, the
+  /// reservation is released; otherwise the attempt is repaired by the
+  /// recovery rules (no receipt: abandoned and released; committed receipt
+  /// in the retained graph: settled; partial receipt or root outside the
+  /// retained graph: the liability stays). Committed roots, receipts and
+  /// assets are never deleted. A failure on one reservation is logged and the
+  /// next one goes on. Returns the number of reservations closed.
+  @discardableResult
+  func reconcileReservations(log: (String) -> Void = { NSLog("capture3d store: %@", $0) }) -> Int {
+    let live: [StorageBudgetReservation]
+    do {
+      live = try budget.liveReservations()
+    } catch {
+      log("reservation reconciliation skipped: \(error)")
+      return 0
+    }
+    var closed = 0
+    for reservation in live {
+      do {
+        if try reconcile(reservation) { closed += 1 }
+      } catch {
+        log("reservation \(reservation.owner) not reconciled: \(error)")
+      }
+    }
+    return closed
+  }
+
+  /// True when [reservation] is closed after reconciliation.
+  private func reconcile(_ reservation: StorageBudgetReservation) throws -> Bool {
+    let parts = reservation.owner.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
+    guard parts.count == 3, parts[0] == "capture", DurableStoreEncoding.isHash(parts[1]), DurableStoreEncoding.isHash(parts[2]) else {
+      throw DurableStoreStateError("Reservation owner is not a capture attempt")
+    }
+    let session = sessionRoot + [parts[1]]
+    let accepted = session + ["attempts", parts[2], "accepted.properties"]
+    guard files.isFile(accepted), try readProperties(accepted)["reservationToken"] == reservation.token else {
+      return try budget.release(reservation)
+    }
+    try repairAcceptedCandidate(session: session, accepted: accepted)
+    return try budget.reservation(token: reservation.token) == nil
   }
 
   private func repairAcceptedCandidate(session: [String], accepted: [String]) throws {
