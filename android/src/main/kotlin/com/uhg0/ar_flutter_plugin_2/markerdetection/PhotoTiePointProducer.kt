@@ -2,8 +2,6 @@ package com.uhg0.ar_flutter_plugin_2.markerdetection
 
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.os.Handler
-import android.os.HandlerThread
 import android.os.SystemClock
 import com.uhg0.ar_flutter_plugin_2.visibilitycontract.PhotoSavedLayout
 import com.uhg0.ar_flutter_plugin_2.visibilitycontract.contractMagic
@@ -68,17 +66,18 @@ internal object TiePointBatchLayout {
  * corners and centres stay in the photo's raw pixels (lens distortion is
  * modelled during the fit when coefficients are given). Runs on its own
  * thread, one photo at a time, off the capture path (about 80 ms per 12 MP
- * photo on the SM-X700).
+ * photo on the SM-X700). The native detector is created by the first photo
+ * on that thread.
  */
 internal class PhotoTiePointProducer(
     private val sink: TiePointBatchSink,
     dictionary: Int = MarkerDetectorNative.DICTIONARY_ARUCO_MIP_36H12,
     private val maxRecords: Int = MarkerDetectorNative.MAX_MARKERS,
+    factory: MarkerDetectorFactory = MarkerDetectorFactory.NATIVE,
+    private val worker: MarkerDetectionWorker = HandlerMarkerDetectionWorker("capture3d-marker-tie-points"),
 ) : AutoCloseable, TiePointPhotoTarget {
-    private val thread = HandlerThread("capture3d-marker-tie-points").apply { start() }
-    private val worker = Handler(thread.looper)
-    private var handle: Long =
-        if (MarkerDetectorNative.available) MarkerDetectorNative.nativeCreate(dictionary) else 0L
+    // Created by the first photo or configuration on the worker thread.
+    private val detector = LazyMarkerDetector(factory, dictionary)
     private val batch: ByteBuffer = ByteBuffer
         .allocateDirect(TiePointBatchLayout.HEADER_BYTES + maxRecords * MarkerDetectorNative.TIE_POINT_BYTES)
         .order(ByteOrder.LITTLE_ENDIAN)
@@ -86,16 +85,20 @@ internal class PhotoTiePointProducer(
     private val event = ByteBuffer.allocate(PhotoSavedLayout.BYTES).order(ByteOrder.LITTLE_ENDIAN)
     val timings = DoubleArray(3)
 
-    val available: Boolean get() = handle != 0L
+    val available: Boolean get() = detector.available
+
+    /** True once the native detector exists (it is created on first use). */
+    val detectorCreated: Boolean get() = detector.isCreated
     var photos = 0
         private set
     var failures = 0
         private set
 
     fun configure(markerSizeMetres: Double, sizesById: Map<Int, Double> = emptyMap()) {
-        val h = handle
-        if (h == 0L) return
+        if (!available) return
         worker.post {
+            val h = detector.handle()
+            if (h == 0L) return@post
             MarkerDetectorNative.nativeSetMarkerSize(h, markerSizeMetres)
             for ((id, size) in sizesById) MarkerDetectorNative.nativeSetMarkerSizeForId(h, id, size)
         }
@@ -153,6 +156,12 @@ internal class PhotoTiePointProducer(
         event.clear()
         event.put(eventBytes, 0, PhotoSavedLayout.BYTES)
         val exposure = event.getLong(PhotoSavedLayout.EXPOSURE_TIMESTAMP_NS)
+        val handle = detector.handle()
+        if (handle == 0L) {
+            failures++
+            send(photoId, 0, 0, 0, groupEpoch, exposure, MarkerDetectorNative.STATUS_UNAVAILABLE, started)
+            return
+        }
         val decoded = decode(jpegPath)
         if (decoded == null) {
             failures++
@@ -223,14 +232,10 @@ internal class PhotoTiePointProducer(
     }
 
     override fun close() {
-        worker.post {
-            if (handle != 0L) {
-                MarkerDetectorNative.nativeDestroy(handle)
-                handle = 0L
-            }
+        worker.quit {
+            detector.close()
             bitmap?.recycle()
             bitmap = null
         }
-        thread.quitSafely()
     }
 }

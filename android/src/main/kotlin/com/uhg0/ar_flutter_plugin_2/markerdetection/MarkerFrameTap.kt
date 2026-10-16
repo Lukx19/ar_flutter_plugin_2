@@ -33,8 +33,8 @@ internal interface MarkerDetectionWorker {
 }
 
 /** [MarkerDetectionWorker] on its own [HandlerThread]. */
-internal class HandlerMarkerDetectionWorker : MarkerDetectionWorker {
-    private val thread = HandlerThread("capture3d-marker-detector").apply { start() }
+internal class HandlerMarkerDetectionWorker(name: String = "capture3d-marker-detector") : MarkerDetectionWorker {
+    private val thread = HandlerThread(name).apply { start() }
     private val handler = Handler(thread.looper)
 
     override fun post(job: Runnable): Boolean = handler.post(job)
