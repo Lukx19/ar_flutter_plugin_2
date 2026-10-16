@@ -81,7 +81,11 @@ final class WorldMapInitialMapStore {
     return consumedGeneration == owner ? .consumedByRun : .superseded
   }
 
-  /// Drops a staged map; returns whether one was staged.
+  /// Drops a staged map; returns whether one was staged. A dropped map
+  /// counts as consumed by the current run (`.consumedByRun`, reported as
+  /// `appliedByStart`), so a pending restart is skipped: a recorded playback
+  /// reset run calls this and drops the map without relocalizing, unlike a
+  /// live start that begins from it.
   @discardableResult
   func discardPending() -> Bool {
     lock.lock(); defer { lock.unlock() }
