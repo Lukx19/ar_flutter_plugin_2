@@ -389,6 +389,141 @@ final class WorldMapTests: XCTestCase {
     XCTAssertEqual(failed["code"] as? String, WorldMapFailureCode.readFailed)
     XCTAssertEqual(source.restarts, 2, "a failed load never restarts the session")
   }
+
+  // MARK: Load ownership and the restart reply
+
+  private func ownershipHandler(
+    _ source: FakeWorldMapSource, _ staging: WorldMapInitialMapStore,
+    workQueue: DispatchQueue, replyQueue: DispatchQueue
+  ) -> WorldMapChannelHandler {
+    WorldMapChannelHandler(
+      source: source, initialMaps: staging,
+      monitor: WorldMapRelocalizationMonitor(emitter: NativeSessionLogEmitter()),
+      emitter: NativeSessionLogEmitter(), workQueue: workQueue, replyQueue: replyQueue)
+  }
+
+  /// Writes the recorded map into the session folder; returns its path and SHA-256.
+  private func writeRecordedMap() throws -> (args: [String: Any], map: ARWorldMap) {
+    let data = try recordedWorldMapData()
+    let map = try WorldMapArchive.decode(data)
+    let ref = try WorldMapFileStore.write(
+      data, sessionDirectory: sessionDirectory.path, relativePath: "groups/g/world_map.arworldmap")
+    let args: [String: Any] = [
+      "sessionDirectory": sessionDirectory.path, "path": ref.path, "sha256": ref.sha256,
+      "restartSession": true,
+    ]
+    return (args, map)
+  }
+
+  /// A session start on the main thread takes the staged map between the
+  /// load's staging and its reply: the reply restarts nothing (a second
+  /// `.resetTracking` would drop the map) and says the start applied it.
+  func testALoadWhoseMapASessionStartTookFirstNeverRestarts() throws {
+    let (args, _) = try writeRecordedMap()
+    let source = FakeWorldMapSource()
+    source.restartEpoch = 3
+    let staging = WorldMapInitialMapStore()
+    let replyQueue = DispatchQueue(label: "test.reply")
+    let handler = ownershipHandler(
+      source, staging, workQueue: DispatchQueue(label: "test.world-map"), replyQueue: replyQueue)
+    replyQueue.suspend()
+    let done = expectation(description: "load")
+    var reply: [String: Any] = [:]
+    handler.handle(method: "load", arguments: args) { reply = $0; done.fulfill() }
+    let deadline = Date().addingTimeInterval(30)
+    while !staging.hasPending && Date() < deadline { usleep(10_000) }
+    XCTAssertTrue(staging.hasPending, "the load staged the map")
+    let configuration = ARWorldTrackingConfiguration()
+    XCTAssertTrue(staging.apply(to: configuration), "the start takes the staged map")
+    replyQueue.resume()
+    wait(for: [done], timeout: 30)
+    XCTAssertEqual(reply["status"] as? String, "ok")
+    XCTAssertEqual(reply["restarted"] as? Bool, false)
+    XCTAssertEqual(reply["appliedByStart"] as? Bool, true)
+    XCTAssertNil(reply["epoch"])
+    XCTAssertEqual(source.restarts, 0, "no second reset that drops the map")
+    XCTAssertNotNil(configuration.initialWorldMap)
+  }
+
+  /// A `clear` (a new session) that arrives while a continuation's load
+  /// still reads: the load stages nothing and restarts nothing.
+  func testAClearDuringALoadSupersedesIt() throws {
+    let (args, _) = try writeRecordedMap()
+    let source = FakeWorldMapSource()
+    source.restartEpoch = 3
+    let staging = WorldMapInitialMapStore()
+    let workQueue = DispatchQueue(label: "test.world-map")
+    let handler = ownershipHandler(source, staging, workQueue: workQueue, replyQueue: DispatchQueue(label: "test.reply"))
+    workQueue.suspend()
+    let done = expectation(description: "load")
+    var reply: [String: Any] = [:]
+    handler.handle(method: "load", arguments: args) { reply = $0; done.fulfill() }
+    var cleared: [String: Any] = [:]
+    handler.handle(method: "clear", arguments: nil) { cleared = $0 }
+    XCTAssertEqual(cleared["status"] as? String, "ok")
+    workQueue.resume()
+    wait(for: [done], timeout: 30)
+    XCTAssertEqual(reply["status"] as? String, "ok")
+    XCTAssertEqual(reply["staged"] as? Bool, false)
+    XCTAssertEqual(reply["superseded"] as? Bool, true)
+    XCTAssertEqual(reply["restarted"] as? Bool, false)
+    XCTAssertEqual(source.restarts, 0)
+    XCTAssertFalse(staging.hasPending, "the new session starts without the old map")
+  }
+
+  /// A later load supersedes an earlier one still in flight; only the later
+  /// one stages and restarts.
+  func testALaterLoadSupersedesAnEarlierOneInFlight() throws {
+    let (args, _) = try writeRecordedMap()
+    let source = FakeWorldMapSource()
+    source.restartEpoch = 3
+    let staging = WorldMapInitialMapStore()
+    let workQueue = DispatchQueue(label: "test.world-map")
+    let handler = ownershipHandler(source, staging, workQueue: workQueue, replyQueue: DispatchQueue(label: "test.reply"))
+    workQueue.suspend()
+    let first = expectation(description: "first")
+    let second = expectation(description: "second")
+    var firstReply: [String: Any] = [:]
+    var secondReply: [String: Any] = [:]
+    handler.handle(method: "load", arguments: args) { firstReply = $0; first.fulfill() }
+    handler.handle(method: "load", arguments: args) { secondReply = $0; second.fulfill() }
+    workQueue.resume()
+    wait(for: [first, second], timeout: 60)
+    XCTAssertEqual(firstReply["superseded"] as? Bool, true)
+    XCTAssertEqual(firstReply["restarted"] as? Bool, false)
+    XCTAssertEqual(secondReply["staged"] as? Bool, true)
+    XCTAssertEqual(secondReply["restarted"] as? Bool, true)
+    XCTAssertEqual(source.restarts, 1)
+  }
+
+  /// A failed load (missing file, wrong checksum) leaves no map staged by
+  /// an earlier session's load.
+  func testAFailedLoadDropsAnEarlierStagedMap() throws {
+    let (args, map) = try writeRecordedMap()
+    let source = FakeWorldMapSource()
+    source.restartEpoch = 3
+    let staging = WorldMapInitialMapStore()
+    let handler = ownershipHandler(
+      source, staging, workQueue: DispatchQueue(label: "test.world-map"), replyQueue: DispatchQueue(label: "test.reply"))
+    func load(_ arguments: [String: Any]) -> [String: Any] {
+      let done = expectation(description: "load")
+      var reply: [String: Any] = [:]
+      handler.handle(method: "load", arguments: arguments) { reply = $0; done.fulfill() }
+      wait(for: [done], timeout: 30)
+      return reply
+    }
+    staging.stage(map)
+    var missing = args
+    missing["path"] = "groups/other/world_map.arworldmap"
+    XCTAssertEqual(load(missing)["code"] as? String, WorldMapFailureCode.readFailed)
+    XCTAssertFalse(staging.hasPending)
+    staging.stage(map)
+    var wrongSha = args
+    wrongSha["sha256"] = String(repeating: "0", count: 64)
+    XCTAssertEqual(load(wrongSha)["code"] as? String, WorldMapFailureCode.checksumMismatch)
+    XCTAssertFalse(staging.hasPending)
+    XCTAssertEqual(source.restarts, 0)
+  }
 }
 
 /// A running session whose world map arrives when the test completes it.

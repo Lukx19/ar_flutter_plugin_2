@@ -2,7 +2,8 @@ import XCTest
 @testable import ar_flutter_plugin_2
 
 /// Capture view frame timing for the performance snapshot: draw intervals,
-/// gaps over 100 ms (upload-caused when the frame uploaded grid deltas),
+/// gaps over 100 ms (upload-caused when the previous or the current frame
+/// uploaded grid deltas),
 /// encode and GPU time quantiles, reset.
 final class CaptureViewFrameStatsTests: XCTestCase {
   func testIntervalsGapsAndUploadGaps() {
@@ -24,7 +25,8 @@ final class CaptureViewFrameStatsTests: XCTestCase {
     XCTAssertEqual(snapshot["uploadFrames"] as? Int, 1)
     XCTAssertEqual(snapshot["overlayFrames"] as? Int, 101)
     XCTAssertEqual(snapshot["gaps"] as? Int, 2)
-    XCTAssertEqual(snapshot["uploadGaps"] as? Int, 1)
+    XCTAssertEqual(snapshot["uploadGaps"] as? Int, 2,
+                   "the 150 ms gap ends at the upload frame, the 120 ms gap follows it")
     XCTAssertEqual(try XCTUnwrap(snapshot["longestGapMs"] as? Double), 150, accuracy: 0.01)
     XCTAssertEqual(try XCTUnwrap(snapshot["windowMs"] as? Double), (t - 10) * 1000, accuracy: 0.01)
     let interval = try? XCTUnwrap(snapshot["intervalMs"] as? [String: Any])
@@ -46,6 +48,19 @@ final class CaptureViewFrameStatsTests: XCTestCase {
     stats.recordDraw(nowS: t + 1, encodeMs: 1, uploadedDeltas: false, overlayDrawn: false)
     XCTAssertEqual((stats.snapshot(nowS: t + 1)["intervalMs"] as? [String: Any])?["count"] as? Int, 0,
                    "the first draw after a reset has no interval")
+  }
+
+  func testAGapAfterAnUploadFrameIsUploadCausedEvenWhenItEndsAtAFrameWithoutUploads() {
+    let stats = CaptureViewFrameStats()
+    stats.recordDraw(nowS: 0, encodeMs: 2, uploadedDeltas: false, overlayDrawn: true)
+    stats.recordDraw(nowS: 0.016, encodeMs: 40, uploadedDeltas: true, overlayDrawn: true)
+    stats.recordDraw(nowS: 0.196, encodeMs: 2, uploadedDeltas: false, overlayDrawn: true)
+    stats.recordDraw(nowS: 0.212, encodeMs: 2, uploadedDeltas: false, overlayDrawn: true)
+    stats.recordDraw(nowS: 0.362, encodeMs: 2, uploadedDeltas: false, overlayDrawn: true)
+    let snapshot = stats.snapshot(nowS: 0.362)
+    XCTAssertEqual(snapshot["gaps"] as? Int, 2)
+    XCTAssertEqual(snapshot["uploadGaps"] as? Int, 1,
+                   "only the 180 ms gap follows an upload frame; the 150 ms gap has none on either side")
   }
 
   func testIntervalsBeyondTheHistogramLandInTheOverflowBucket() {

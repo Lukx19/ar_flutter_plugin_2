@@ -143,8 +143,10 @@ final class CaptureRenderLoop: NSObject, MTKViewDelegate {
 /// interval between draws, the CPU time of one draw (camera background,
 /// grid uploads and styles encoded), the GPU time of its command buffer and
 /// whether grid deltas were uploaded in it. A frame gap is an interval over
-/// 100 ms (the iM3 bound); a gap whose frame uploaded grid deltas is counted
-/// as upload-caused. Fixed 1 ms histograms up to 250 ms (one overflow
+/// 100 ms (the iM3 bound). An interval runs from the previous draw's start
+/// to this draw's start, so it holds the previous draw's encode: a gap is
+/// counted as upload-caused when the previous or the current frame uploaded
+/// grid deltas. Fixed 1 ms histograms up to 250 ms (one overflow
 /// bucket), so recording never allocates. Draws record on the main thread,
 /// GPU times on Metal's completion queue; reads come from the main thread.
 final class CaptureViewFrameStats {
@@ -196,6 +198,7 @@ final class CaptureViewFrameStats {
   private var encode = Histogram()
   private var gpu = Histogram()
   private var lastDrawS: Double?
+  private var lastDrawUploaded = false
   private var frames = 0
   private var uploadFrames = 0
   private var overlayFrames = 0
@@ -217,11 +220,12 @@ final class CaptureViewFrameStats {
       intervals.add(ms)
       if ms > Self.gapThresholdMs {
         gaps += 1
-        if uploadedDeltas { uploadGaps += 1 }
+        if uploadedDeltas || lastDrawUploaded { uploadGaps += 1 }
         if ms > longestGapMs { longestGapMs = ms }
       }
     }
     lastDrawS = nowS
+    lastDrawUploaded = uploadedDeltas
   }
 
   func recordGpu(ms: Double) {
@@ -236,6 +240,7 @@ final class CaptureViewFrameStats {
     encode = Histogram()
     gpu = Histogram()
     lastDrawS = nil
+    lastDrawUploaded = false
     frames = 0
     uploadFrames = 0
     overlayFrames = 0

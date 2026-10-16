@@ -44,12 +44,16 @@ final class RegistryWorldMapSource: WorldMapSource {
 /// - `load` `{sessionDirectory, path, sha256?, restartSession?}`: reads,
 ///   verifies and decodes the file and stages it as the `initialWorldMap` of
 ///   the next run that starts a new world frame ([WorldMapInitialMapStore]).
+///   A load drops any earlier staged map; a failed load leaves none.
 ///   With `restartSession: true` a running capture session restarts at once
-///   to apply it (`restarted`, `epoch`); the caller must only ask for that
-///   when continuing a session, before capture starts: a restart resets
-///   tracking, so it never runs during a multi-image shot. Reply
-///   `staged: true`, `restarted` and the summary.
-/// - `clear`: drops a staged map.
+///   to apply it (`restarted`, `epoch`), but only while the map still waits:
+///   when a session start took it first the reply says `appliedByStart`
+///   and nothing restarts. The caller must only ask for a restart when
+///   continuing a session, before capture starts: a restart resets
+///   tracking, so it never runs during a multi-image shot. Reply `staged`,
+///   `restarted` and the summary; a load overtaken by a later load or
+///   `clear` stages nothing and replies `superseded: true`.
+/// - `clear`: drops a staged map and supersedes loads in flight.
 /// - `status`: relocalization of the current run
 ///   ([WorldMapRelocalizationMonitor.statusReply]).
 ///
@@ -148,26 +152,40 @@ final class WorldMapChannelHandler {
     let path = args["path"] as? String ?? ""
     let sha = args["sha256"] as? String
     let restartSession = args["restartSession"] as? Bool ?? false
+    // Called on the main thread like `clear`, so a clear that arrives after
+    // this load supersedes it.
+    let generation = initialMaps.claim()
     workQueue.async {
-      let response: [String: Any]
+      var response: [String: Any]
       do {
         let data = try WorldMapFileStore.read(sessionDirectory: directory, relativePath: path, expectedSha256: sha)
         let map = try WorldMapArchive.decode(data)
-        self.initialMaps.stage(map)
-        var ok = WorldMapArchive.summary(map)
-        ok["status"] = "ok"
-        ok["staged"] = true
-        response = ok
+        response = WorldMapArchive.summary(map)
+        response["status"] = "ok"
+        response["staged"] = self.initialMaps.stage(map, generation: generation)
       } catch {
+        // Never leave an earlier session's map for the next run.
+        self.initialMaps.discardPending(generation: generation)
         self.replyQueue.async { reply(self.failure(error, "load")) }
         return
       }
       self.replyQueue.async {
         var answer = response
         answer["restarted"] = false
-        if restartSession, let epoch = self.source.restartRunningSession() {
-          answer["restarted"] = true
-          answer["epoch"] = epoch
+        // Checked on the main thread, where session starts run too: restart
+        // only while this load's map still waits. A start that took it
+        // already applied it; a later load or clear owns the store.
+        switch self.initialMaps.state(of: generation) {
+        case .pending:
+          if restartSession, let epoch = self.source.restartRunningSession() {
+            answer["restarted"] = true
+            answer["epoch"] = epoch
+          }
+        case .consumedByRun:
+          answer["appliedByStart"] = true
+        case .superseded:
+          answer["staged"] = false
+          answer["superseded"] = true
         }
         reply(answer)
       }

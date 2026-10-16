@@ -7,23 +7,78 @@ import Foundation
 /// run ([apply(to:)]); a run consumes it, so a later run starts without it.
 /// The world map relocalizes the new run into the frame of the session that
 /// saved it, which the app records as the `worldMapHint` transform source.
+///
+/// Ownership: every channel `load` claims a new generation ([claim()]) and
+/// `clear` starts one too, so a later load or clear supersedes a load still
+/// reading or decoding. Such a load stages nothing ([stage(_:generation:)])
+/// and never restarts the session.
 final class WorldMapInitialMapStore {
   static let shared = WorldMapInitialMapStore()
 
+  /// What became of the map a load of one generation staged.
+  enum LoadState: Equatable {
+    /// Still waiting for a run.
+    case pending
+    /// A run start or restart took it (applied, or dropped by a recorded
+    /// session's reset run).
+    case consumedByRun
+    /// A later load or clear owns the store.
+    case superseded
+  }
+
   private let lock = NSLock()
   private var pending: ARWorldMap?
+  private var generation = 0
+  /// Generation of the staged map the latest run consumed.
+  private var consumedGeneration: Int?
 
   var hasPending: Bool {
     lock.lock(); defer { lock.unlock() }
     return pending != nil
   }
 
+  /// Stages [map] for the current generation (tests and callers outside
+  /// the channel's ownership).
   func stage(_ map: ARWorldMap) {
     lock.lock(); pending = map; lock.unlock()
   }
 
+  /// Starts a new generation for one load and returns it: drops a map an
+  /// earlier load staged and supersedes earlier loads still in flight.
+  func claim() -> Int {
+    lock.lock(); defer { lock.unlock() }
+    pending = nil
+    generation += 1
+    return generation
+  }
+
+  /// Stages [map] only while [generation] still owns the store.
+  @discardableResult
+  func stage(_ map: ARWorldMap, generation owner: Int) -> Bool {
+    lock.lock(); defer { lock.unlock() }
+    guard owner == generation else { return false }
+    pending = map
+    return true
+  }
+
+  /// Drops a staged map and supersedes every load in flight.
   func clear() {
-    lock.lock(); pending = nil; lock.unlock()
+    lock.lock(); pending = nil; generation += 1; lock.unlock()
+  }
+
+  /// Drops the staged map while [generation] still owns the store (a load
+  /// that failed must not leave an earlier session's map for the next run).
+  func discardPending(generation owner: Int) {
+    lock.lock(); defer { lock.unlock() }
+    guard owner == generation else { return }
+    pending = nil
+  }
+
+  func state(of owner: Int) -> LoadState {
+    lock.lock(); defer { lock.unlock() }
+    guard owner == generation else { return .superseded }
+    if pending != nil { return .pending }
+    return consumedGeneration == owner ? .consumedByRun : .superseded
   }
 
   /// Drops a staged map; returns whether one was staged.
@@ -31,6 +86,7 @@ final class WorldMapInitialMapStore {
   func discardPending() -> Bool {
     lock.lock(); defer { lock.unlock() }
     let had = pending != nil
+    if had { consumedGeneration = generation }
     pending = nil
     return had
   }
@@ -43,6 +99,7 @@ final class WorldMapInitialMapStore {
     lock.lock()
     let map = pending
     pending = nil
+    if map != nil { consumedGeneration = generation }
     lock.unlock()
     guard let map = map else { return false }
     world.initialWorldMap = map
