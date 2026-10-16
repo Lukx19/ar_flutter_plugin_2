@@ -33,6 +33,10 @@ final class DisplayModeHandler {
 
   private let lock = NSLock()
   private var pending = GridDisplayState()
+  /// When the pending mode version was accepted ([now] seconds).
+  private var modeAcceptedAtS = 0.0
+  /// Monotonic seconds; the same clock as the render loop's frame times.
+  let now: () -> Double
   private var tables = [UInt8](repeating: 0, count: DisplayModeHandler.tableBytes)
   private var tablesVersion = 0
   private var targets = [Float](
@@ -41,7 +45,8 @@ final class DisplayModeHandler {
   private var targetsVersion = 0
   private var rejectedCount = 0
 
-  init() {
+  init(now: @escaping () -> Double = { ProcessInfo.processInfo.systemUptime }) {
+    self.now = now
     // Neutral grey ramp until the first colour tables arrive.
     for t in 0..<GridDisplayCodes.colourAttributes {
       for i in 0..<ColourTableLayout.entries {
@@ -64,6 +69,7 @@ final class DisplayModeHandler {
       let version = pending.modeVersion + 1
       pending = GridDisplayState()
       pending.modeVersion = version
+      modeAcceptedAtS = now()
       targetCount = 0
       targetsVersion += 1
     }
@@ -87,6 +93,7 @@ final class DisplayModeHandler {
       guard base <= GridDisplayCodes.baseNone, colour < GridDisplayCodes.colourAttributes,
             size <= GridDisplayCodes.sizeByConfidence else { return reject() }
       let px = b.leF32(DisplayModeLayout.pointSize)
+      let acceptedAt = now()
       lock.lock()
       pending.baseLayer = base
       pending.overlayBits = b.le8(DisplayModeLayout.overlayBits)
@@ -97,6 +104,7 @@ final class DisplayModeHandler {
       pending.colourTableGeneration = b.leU32(DisplayModeLayout.colourTableGeneration)
       pending.minQuality = b.le8(DisplayModeLayout.minQuality)
       pending.modeVersion += 1
+      modeAcceptedAtS = acceptedAt
       lock.unlock()
       return .mode
     case ColourTableLayout.magic:
@@ -143,10 +151,16 @@ final class DisplayModeHandler {
 
   /// Copies the current mode into [out]; returns whether it changed since [knownVersion].
   func snapshotMode(into out: inout GridDisplayState, knownVersion: Int) -> Bool {
+    snapshotModeAcceptedAt(into: &out, knownVersion: knownVersion) != nil
+  }
+
+  /// Like [snapshotMode]; returns when the copied mode was accepted, or nil
+  /// when it did not change since [knownVersion].
+  func snapshotModeAcceptedAt(into out: inout GridDisplayState, knownVersion: Int) -> Double? {
     lock.lock(); defer { lock.unlock() }
-    if pending.modeVersion == knownVersion { return false }
+    if pending.modeVersion == knownVersion { return nil }
     out = pending
-    return true
+    return modeAcceptedAtS
   }
 
   /// Copies the colour tables (5 x 256 RGBA8) into [out] when newer than

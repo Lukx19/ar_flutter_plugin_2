@@ -14,7 +14,7 @@ final class CaptureViewFrameStatsTests: XCTestCase {
       t += 1.0 / 60
     }
     t += 0.150 - 1.0 / 60
-    stats.recordDraw(nowS: t, encodeMs: 9, uploadedDeltas: true, overlayDrawn: true)
+    stats.recordDraw(nowS: t, encodeMs: 9, uploadedDeltas: true, overlayDrawn: true, drawableWaitMs: 12)
     t += 0.120
     stats.recordDraw(nowS: t, encodeMs: 3, uploadedDeltas: false, overlayDrawn: false)
     stats.recordGpu(ms: 4.5)
@@ -39,6 +39,9 @@ final class CaptureViewFrameStatsTests: XCTestCase {
     XCTAssertEqual(encode?["maxMs"] as? Double, 9)
     let gpu = snapshot["gpuMs"] as? [String: Any]
     XCTAssertEqual(gpu?["count"] as? Int, 1, "a non-finite GPU time is ignored")
+    let wait = snapshot["drawableWaitMs"] as? [String: Any]
+    XCTAssertEqual(wait?["maxMs"] as? Double, 12, "the drawable wait is kept apart from the encode time")
+    XCTAssertEqual(wait?["count"] as? Int, encode?["count"] as? Int)
 
     stats.reset()
     let empty = stats.snapshot(nowS: t)

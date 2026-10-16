@@ -164,6 +164,38 @@ final class DeltaUploadSchedulerTests: XCTestCase {
     XCTAssertEqual(core.store.tableVersion, tableVersion)
   }
 
+  /// iM3 mode switch timing: the frame after the accepted display message
+  /// applies it; its wait from the message and the frames that missed it
+  /// (none) are counted for the performance snapshot.
+  func testModeSwitchLatencyIsMeasuredFromTheMessageToTheApplyingFrame() throws {
+    var nowS = 10.0
+    let target = ByteArrayGpuTarget()
+    let core = GridRendererCore(target: target, display: DisplayModeHandler(now: { nowS }))
+    try frame(core, target)
+    XCTAssertEqual(core.modeSwitches.switches, 0)
+    nowS = 10.004
+    w.displayMode(baseLayer: GridDisplayCodes.baseSplats, overlayBits: 0, colourAttribute: 0, sizeRule: 0)
+    XCTAssertEqual(core.display(w), .mode)
+    nowS = 10.0167
+    try frame(core, target)
+    XCTAssertEqual(core.mode.baseLayer, GridDisplayCodes.baseSplats)
+    XCTAssertEqual(core.modeSwitches.switches, 1)
+    XCTAssertEqual(core.modeSwitches.lastLatencyMs, 12.7, accuracy: 1e-6)
+    XCTAssertEqual(core.modeSwitches.framesLate, 0)
+    nowS = 10.0334
+    try frame(core, target)
+    XCTAssertEqual(core.modeSwitches.switches, 1, "no new message, no switch")
+
+    w.displayMode(baseLayer: GridDisplayCodes.baseVoxels, overlayBits: 0, colourAttribute: 0, sizeRule: 0)
+    XCTAssertEqual(core.display(w), .mode)
+    nowS = 10.0335
+    try frame(core, target)
+    XCTAssertEqual(core.modeSwitches.switches, 2)
+    XCTAssertEqual(core.modeSwitches.lastLatencyMs, 0.1, accuracy: 1e-6)
+    XCTAssertEqual(core.modeSwitches.maxLatencyMs, 12.7, accuracy: 1e-6)
+    XCTAssertEqual(core.modeSwitches.framesLate, 0)
+  }
+
   func testAnAllocationFailureKeepsTheMessageQueuedAndThrows() throws {
     let target = ByteArrayGpuTarget()
     let core = GridRendererCore(target: target)

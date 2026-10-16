@@ -2,6 +2,7 @@
 # Runs the iOS session host XCTests (Tests/Session) on an iOS Simulator.
 # SwiftPM refuses target paths outside a package root, so this assembles a
 # throwaway package of symlinks to the Flutter-free Classes/Session sources
+# (plus the world map and native session log sources they use)
 # and the test files, then runs `xcodebuild test` (10 minute bound).
 #
 # Usage: run_session_tests.sh [simulator-udid]
@@ -16,7 +17,20 @@ for f in ARFrameObserver CaptureFrame ARSessionLifecycle ARSessionHost ARCameraC
          CaptureChannelHostReplies; do
   ln -s "$classes/$f.swift" "$work/Sources/ar_flutter_plugin_2/$f.swift"
 done
-for f in "$here"/*Tests.swift; do ln -s "$f" "$work/Tests/SessionTests/${f:t}"; done
+# The session host stages saved world maps (WorldMap/) whose relocalization
+# monitor logs through the native session log (SessionLog/); the Flutter
+# channel files stay out.
+for f in WorldMap/WorldMapRelocalization WorldMap/WorldMapArchive \
+         SessionLog/NativeSessionLogBuffer SessionLog/NativeSessionLogEmitter SessionLog/NativeAnomalyEmitter; do
+  ln -s "${classes:h}/$f.swift" "$work/Sources/ar_flutter_plugin_2/${f:t}.swift"
+done
+# Test files that need Flutter (the capture view) or the render loop with its
+# grid overlay registry run only in RunnerTests.
+for f in "$here"/*Tests.swift; do
+  grep -q '^import Flutter' "$f" && continue
+  [[ ${f:t} == CaptureViewFrameStatsTests.swift ]] && continue
+  ln -s "$f" "$work/Tests/SessionTests/${f:t}"
+done
 cat > "$work/Package.swift" <<'PKG'
 // swift-tools-version: 6.0
 import PackageDescription

@@ -68,6 +68,9 @@ final class CaptureRenderLoop: NSObject, MTKViewDelegate {
     guard let pass = view.currentRenderPassDescriptor,
           let commandBuffer = commandQueue.makeCommandBuffer()
     else { return }
+    // Getting the render pass waits for a free drawable; kept apart from
+    // the encode time.
+    let passS = CACurrentMediaTime()
     commandBuffer.label = "capture view frame"
     let overlay = overlays.overlay
     if let overlay = overlay, preparedOverlayRevision != overlays.revision {
@@ -132,16 +135,18 @@ final class CaptureRenderLoop: NSObject, MTKViewDelegate {
     }
     commandBuffer.commit()
     frameStats.recordDraw(
-      nowS: startedS, encodeMs: (CACurrentMediaTime() - startedS) * 1000,
-      uploadedDeltas: uploaded > 0, overlayDrawn: overlayDrawn)
+      nowS: startedS, encodeMs: (CACurrentMediaTime() - passS) * 1000,
+      uploadedDeltas: uploaded > 0, overlayDrawn: overlayDrawn,
+      drawableWaitMs: (passS - startedS) * 1000)
   }
 }
 
 
 /// Display-frame timing of the capture view's render loop for the
 /// performance snapshot (`getPerformanceSnapshot` key `captureView`): the
-/// interval between draws, the CPU time of one draw (camera background,
-/// grid uploads and styles encoded), the GPU time of its command buffer and
+/// interval between draws, the wait for a drawable (getting the render
+/// pass), the CPU time of one draw after it (camera background, grid uploads
+/// and styles encoded), the GPU time of its command buffer and
 /// whether grid deltas were uploaded in it. A frame gap is an interval over
 /// 100 ms (the iM3 bound). An interval runs from the previous draw's start
 /// to this draw's start, so it holds the previous draw's encode: a gap is
@@ -196,6 +201,7 @@ final class CaptureViewFrameStats {
   private let lock = NSLock()
   private var intervals = Histogram()
   private var encode = Histogram()
+  private var drawableWait = Histogram()
   private var gpu = Histogram()
   private var lastDrawS: Double?
   private var lastDrawUploaded = false
@@ -208,8 +214,11 @@ final class CaptureViewFrameStats {
   private var startedS: Double?
 
   /// One drawn frame that started at [nowS] (seconds, monotonic).
-  func recordDraw(nowS: Double, encodeMs: Double, uploadedDeltas: Bool, overlayDrawn: Bool) {
+  func recordDraw(
+    nowS: Double, encodeMs: Double, uploadedDeltas: Bool, overlayDrawn: Bool, drawableWaitMs: Double = 0
+  ) {
     lock.lock(); defer { lock.unlock() }
+    drawableWait.add(drawableWaitMs)
     if startedS == nil { startedS = nowS }
     frames += 1
     if uploadedDeltas { uploadFrames += 1 }
@@ -238,6 +247,7 @@ final class CaptureViewFrameStats {
     lock.lock(); defer { lock.unlock() }
     intervals = Histogram()
     encode = Histogram()
+    drawableWait = Histogram()
     gpu = Histogram()
     lastDrawS = nil
     lastDrawUploaded = false
@@ -263,6 +273,7 @@ final class CaptureViewFrameStats {
       "longestGapMs": longestGapMs,
       "intervalMs": intervals.summary(),
       "encodeMs": encode.summary(),
+      "drawableWaitMs": drawableWait.summary(),
       "gpuMs": gpu.summary(),
     ]
   }

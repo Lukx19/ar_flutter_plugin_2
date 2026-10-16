@@ -177,6 +177,7 @@ final class GridRendererHost {
     stateLock.unlock()
     let upload = core.scheduler.counters
     let drawn = draws?.counters
+    let switches = core.modeSwitches
     return [
       "viewAttached": attached,
       "failed": hasFailed,
@@ -192,6 +193,14 @@ final class GridRendererHost {
         "maxFrameBytes": upload.maxFrameBytes,
         "deferredFrames": upload.deferredFrames,
         "maxBacklogBytes": upload.maxBacklogBytes,
+      ],
+      "modeSwitch": [
+        "switches": switches.switches,
+        "lastLatencyMs": switches.lastLatencyMs,
+        "maxLatencyMs": switches.maxLatencyMs,
+        "framesLate": switches.framesLate,
+        "appliedFrame": core.modeAppliedFrame,
+        "frame": core.frameNumber,
       ],
       "lastFrame": [
         "drawCalls": drawn?.drawCalls ?? 0,
