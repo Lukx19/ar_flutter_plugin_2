@@ -25,6 +25,7 @@ final class NativeSessionLogBuffer {
   /// full record (each one carries its own data, such as `heldMs`).
   static let alwaysCodes: Set<String> = [
     NativeSessionLogCodes.backgroundTaskEnded, NativeSessionLogCodes.worldMapRelocalized,
+    NativeSessionLogCodes.worldMapApplied,
   ]
   static let eventsDroppedCode = "LOG_EVENTS_DROPPED"
 

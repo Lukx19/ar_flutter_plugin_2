@@ -94,6 +94,10 @@ final class RecordedFrameSource: CaptureSessionSource {
 
   private let options: ARSessionOptions
   private let registry: ARFrameSourceRegistry?
+  /// A recorded session cannot relocalize: a world map staged for the next
+  /// run is discarded by a run that starts a new world frame, so it never
+  /// reaches a later live session, and the run reports no initial map.
+  private let initialMaps: WorldMapInitialMapStore?
   private let clock: () -> TimeInterval
   private let anchors = RecordedAnchorStore()
   private let replayQueue = DispatchQueue(label: "capture3d.recorded-session.replay", qos: .userInteractive)
@@ -146,9 +150,11 @@ final class RecordedFrameSource: CaptureSessionSource {
     config: RecordedPlaybackConfig,
     options: ARSessionOptions,
     registry: ARFrameSourceRegistry? = .shared,
+    initialMaps: WorldMapInitialMapStore? = .shared,
     clock: @escaping () -> TimeInterval = { Double(clock_gettime_nsec_np(CLOCK_UPTIME_RAW)) / 1e9 }
   ) {
     self.session = session
+    self.initialMaps = initialMaps
     self.config = config
     self.options = options
     self.registry = registry
@@ -348,7 +354,12 @@ final class RecordedFrameSource: CaptureSessionSource {
       let targets = observers.live
       lock.unlock()
       wake.signal()
-      if resetTracking { anchors.removeAll() }
+      if resetTracking {
+        anchors.removeAll()
+        if initialMaps?.discardPending() == true {
+          RecordedPlaybackLog.write("staged world map discarded: a recorded session does not relocalize")
+        }
+      }
       // Enqueued before the replay starts, so it precedes every frame of
       // this run on the serial delegate queue.
       enqueueStart(targets, configuration: configuration, epoch: epoch)

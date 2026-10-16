@@ -52,6 +52,8 @@ final class ARSessionHost: NSObject, CaptureSessionSource, ARSessionDelegate {
   private let driver: ARSessionDriving
   private let registry: ARFrameSourceRegistry?
   private let makeConfiguration: () -> ARConfiguration
+  /// Saved world map staged for the next run that starts a new world frame.
+  private let initialMaps: WorldMapInitialMapStore?
   /// Current time on the `ARFrame.timestamp` clock (system uptime).
   private let clock: () -> TimeInterval
   private let lock = NSLock()
@@ -64,6 +66,9 @@ final class ARSessionHost: NSObject, CaptureSessionSource, ARSessionDelegate {
   ///   - registry: published on creation and cleared on dispose; `nil` keeps
   ///     the host private (tests).
   ///   - makeConfiguration: defaults to [plan]'s world tracking configuration.
+  ///   - initialMaps: a staged world map becomes the `initialWorldMap` of the
+  ///     next run with `.resetTracking` (start or restart, never a resume);
+  ///     `nil` never applies one.
   ///   - clock: defaults to `CLOCK_UPTIME_RAW` (mach absolute time), the
   ///     `ARFrame.timestamp` base.
   init(
@@ -72,9 +77,11 @@ final class ARSessionHost: NSObject, CaptureSessionSource, ARSessionDelegate {
     driver: ARSessionDriving? = nil,
     registry: ARFrameSourceRegistry? = .shared,
     makeConfiguration: (() -> ARConfiguration)? = nil,
+    initialMaps: WorldMapInitialMapStore? = .shared,
     clock: @escaping () -> TimeInterval = { Double(clock_gettime_nsec_np(CLOCK_UPTIME_RAW)) / 1e9 }
   ) {
     self.plan = plan
+    self.initialMaps = initialMaps
     self.session = session
     self.driver = driver ?? session
     self.registry = registry
@@ -220,6 +227,10 @@ final class ARSessionHost: NSObject, CaptureSessionSource, ARSessionDelegate {
       return
     case .run(let resetTracking):
       let arConfiguration = makeConfiguration()
+      // Only a run that starts a new world frame can relocalize into a saved
+      // map; a resume continues the current frame and leaves a staged map
+      // for the next start or restart.
+      if resetTracking { initialMaps?.apply(to: arConfiguration) }
       let configuration = CaptureRunConfiguration(arConfiguration)
       lock.lock()
       currentConfiguration = configuration

@@ -26,6 +26,15 @@ final class WorldMapInitialMapStore {
     lock.lock(); pending = nil; lock.unlock()
   }
 
+  /// Drops a staged map; returns whether one was staged.
+  @discardableResult
+  func discardPending() -> Bool {
+    lock.lock(); defer { lock.unlock() }
+    let had = pending != nil
+    pending = nil
+    return had
+  }
+
   /// Sets the pending map as [configuration]'s `initialWorldMap` (world
   /// tracking only) and consumes it. Returns whether a map was applied.
   @discardableResult
@@ -49,6 +58,12 @@ final class WorldMapInitialMapStore {
 /// - `relocalized`: tracking became normal, so the run shares the saved
 ///   session's world frame: transform source `worldMapHint`.
 ///
+/// The reply also names the run's latest tracking state (`tracking`:
+/// `normal`, `notAvailable` or the limited reason) and whether ARKit
+/// reported `limited(relocalizing)` during it (`relocalizingReported`),
+/// which only a run with an initial world map does. A run that starts with
+/// a map is recorded as `WORLD_MAP_APPLIED`.
+///
 /// Also keeps the latest `ARFrame.worldMappingStatus` (saving needs
 /// `extending` or `mapped` for a useful map). Runs on the session delegate
 /// queue; reads come from the main thread.
@@ -69,6 +84,8 @@ final class WorldMapRelocalizationMonitor: ARFrameObserver {
   private var startedNs: UInt64 = 0
   private var relocalizedMs: Int?
   private var mappingStatus: ARFrame.WorldMappingStatus = .notAvailable
+  private var tracking = "notAvailable"
+  private var relocalizingReported = false
 
   init(
     emitter: NativeSessionLogEmitter = .shared,
@@ -91,6 +108,8 @@ final class WorldMapRelocalizationMonitor: ARFrameObserver {
       "relocalization": state.rawValue,
       "epoch": epoch,
       "mappingStatus": WorldMapArchive.mappingStatusName(mappingStatus),
+      "tracking": tracking,
+      "relocalizingReported": relocalizingReported,
     ]
     if state == .relocalized {
       reply["transformSource"] = Self.transformSource
@@ -119,15 +138,27 @@ final class WorldMapRelocalizationMonitor: ARFrameObserver {
     self.epoch = epoch
     relocalizedMs = nil
     mappingStatus = .notAvailable
+    tracking = "notAvailable"
+    relocalizingReported = false
     startedNs = nowNs()
     state = withInitialWorldMap ? .relocalizing : .none
     lock.unlock()
+    if withInitialWorldMap {
+      emitter.record(
+        NativeSessionLogCodes.worldMapApplied,
+        message: "AR run started from a saved world map",
+        data: ["epoch": epoch],
+        variant: nil,
+        level: .info
+      )
+    }
   }
 
   func trackingChanged(_ tracking: ARCamera.TrackingState) {
-    guard case .normal = tracking else { return }
     lock.lock()
-    guard state == .relocalizing else { lock.unlock(); return }
+    self.tracking = Self.trackingName(tracking)
+    if case .limited(.relocalizing) = tracking { relocalizingReported = true }
+    guard case .normal = tracking, state == .relocalizing else { lock.unlock(); return }
     state = .relocalized
     let ms = Int((nowNs() &- startedNs) / 1_000_000)
     relocalizedMs = ms
@@ -140,5 +171,13 @@ final class WorldMapRelocalizationMonitor: ARFrameObserver {
       variant: nil,
       level: .info
     )
+  }
+
+  static func trackingName(_ tracking: ARCamera.TrackingState) -> String {
+    switch tracking {
+    case .normal: return "normal"
+    case .notAvailable: return "notAvailable"
+    case .limited(let reason): return NativeAnomalyEmitter.limitedReasonName(reason)
+    }
   }
 }

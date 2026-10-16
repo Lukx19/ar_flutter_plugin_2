@@ -159,12 +159,108 @@ final class WorldMapTests: XCTestCase {
     XCTAssertEqual(status["epoch"] as? Int, 3)
     monitor.trackingChanged(.normal)
     let records = emitter.buffer.drain()
-    XCTAssertEqual(records.map { $0[1] as? String }, ["WORLD_MAP_RELOCALIZED"])
-    XCTAssertEqual(records.first?[2] as? String, "info")
+    XCTAssertEqual(records.map { $0[1] as? String }, ["WORLD_MAP_APPLIED", "WORLD_MAP_RELOCALIZED"])
+    XCTAssertEqual(records.last?[2] as? String, "info")
 
     monitor.runStarted(withInitialWorldMap: false, epoch: 4)
     monitor.trackingChanged(.normal)
     XCTAssertEqual(monitor.statusReply()["relocalization"] as? String, "none", "a run without a map is no relocalization")
+  }
+
+  func testRelocalizationStatusNamesTheTrackingAndRecordsAnAppliedMap() {
+    let emitter = NativeSessionLogEmitter()
+    emitter.setActive(true)
+    let monitor = WorldMapRelocalizationMonitor(emitter: emitter, nowNs: { 0 })
+    XCTAssertEqual(monitor.statusReply()["tracking"] as? String, "notAvailable")
+    XCTAssertEqual(monitor.statusReply()["relocalizingReported"] as? Bool, false)
+
+    monitor.runStarted(withInitialWorldMap: true, epoch: 2)
+    monitor.trackingChanged(.limited(.initializing))
+    XCTAssertEqual(monitor.statusReply()["tracking"] as? String, "initializing")
+    XCTAssertEqual(monitor.statusReply()["relocalizingReported"] as? Bool, false)
+    monitor.trackingChanged(.limited(.relocalizing))
+    let relocalizing = monitor.statusReply()
+    XCTAssertEqual(relocalizing["tracking"] as? String, "relocalizing")
+    XCTAssertEqual(relocalizing["relocalizingReported"] as? Bool, true)
+    XCTAssertEqual(relocalizing["relocalization"] as? String, "relocalizing")
+    let records = emitter.buffer.drain()
+    XCTAssertEqual(records.map { $0[1] as? String }, ["WORLD_MAP_APPLIED"])
+    XCTAssertEqual((records.first?[4] as? [String: Any])?["epoch"] as? Int, 2)
+
+    monitor.runStarted(withInitialWorldMap: false, epoch: 3)
+    let fresh = monitor.statusReply()
+    XCTAssertEqual(fresh["tracking"] as? String, "notAvailable", "a new run forgets the earlier tracking")
+    XCTAssertEqual(fresh["relocalizingReported"] as? Bool, false)
+    XCTAssertTrue(emitter.buffer.drain().isEmpty, "a run without a map records nothing")
+  }
+
+  // MARK: Session host
+
+  /// The capture session host applies a staged map to the next run that
+  /// starts a new world frame (start or restart), never to a resume, and
+  /// observers learn from `didStart` that the run relocalizes.
+  func testSessionHostAppliesTheStagedMapOnlyToARunThatResetsTracking() throws {
+    let map = try WorldMapArchive.decode(try recordedWorldMapData())
+    let staging = WorldMapInitialMapStore()
+    let driver = ConfigurationRecordingDriver()
+    let host = ARSessionHost(
+      plan: Self.hostPlan, driver: driver, registry: nil,
+      makeConfiguration: { ARWorldTrackingConfiguration() }, initialMaps: staging, clock: { 0 })
+    let observer = StartRecordingObserver()
+    host.addFrameObserver(observer)
+
+    host.start()
+    XCTAssertNil(driver.worldMaps.last!, "nothing staged: no initial map")
+    staging.stage(map)
+    host.pause()
+    host.resume()
+    XCTAssertNil(driver.worldMaps.last!, "a resume keeps the current world frame")
+    XCTAssertTrue(staging.hasPending, "a resume leaves the map for the next restart")
+    host.restart()
+    XCTAssertTrue(driver.worldMaps.last! === map)
+    XCTAssertEqual(driver.resets, [true, false, true])
+    XCTAssertFalse(staging.hasPending, "the restart consumed the map")
+    XCTAssertEqual(host.runConfiguration?.hasInitialWorldMap, true)
+    host.restart()
+    XCTAssertNil(driver.worldMaps.last!, "one run only")
+    XCTAssertEqual(host.runConfiguration?.hasInitialWorldMap, false)
+
+    host.delegateQueue.sync {}
+    XCTAssertEqual(observer.starts.map { $0.epoch }, [1, 1, 2, 3])
+    XCTAssertEqual(observer.starts.map { $0.map }, [false, false, true, false])
+    host.dispose()
+  }
+
+  func testSessionHostWithoutStagingNeverAppliesAMap() throws {
+    let map = try WorldMapArchive.decode(try recordedWorldMapData())
+    WorldMapInitialMapStore.shared.clear()
+    let driver = ConfigurationRecordingDriver()
+    let host = ARSessionHost(
+      plan: Self.hostPlan, driver: driver, registry: nil,
+      makeConfiguration: { ARWorldTrackingConfiguration() }, initialMaps: nil, clock: { 0 })
+    WorldMapInitialMapStore.shared.stage(map)
+    host.start()
+    XCTAssertNil(driver.worldMaps.last!)
+    XCTAssertTrue(WorldMapInitialMapStore.shared.hasPending)
+    WorldMapInitialMapStore.shared.clear()
+    host.dispose()
+  }
+
+  /// A recorded session cannot relocalize: its restart discards a staged
+  /// map, so the map never reaches a later live run.
+  func testRecordedSessionDiscardsAStagedMap() throws {
+    let map = try WorldMapArchive.decode(try recordedWorldMapData())
+    let directory = try RecordedSessionFixture.room2URL()
+    let staging = WorldMapInitialMapStore()
+    let source = RecordedFrameSource(
+      session: try RecordedSession(directory: directory),
+      config: RecordedPlaybackConfig(directory: directory, restart: .off, restartGeneration: 0),
+      options: ARSessionOptions(), registry: nil, initialMaps: staging)
+    defer { source.dispose() }
+    staging.stage(map)
+    source.start()
+    XCTAssertFalse(staging.hasPending)
+    XCTAssertEqual(source.runConfiguration?.hasInitialWorldMap, false)
   }
 
   // MARK: Channel
@@ -268,8 +364,30 @@ final class WorldMapTests: XCTestCase {
     let loaded = call("load", ["sessionDirectory": sessionDirectory.path, "path": "groups/g/world_map.arworldmap", "sha256": sha])
     XCTAssertEqual(loaded["status"] as? String, "ok")
     XCTAssertEqual(loaded["staged"] as? Bool, true)
+    XCTAssertEqual(loaded["restarted"] as? Bool, false, "no restart asked")
+    XCTAssertEqual(source.restarts, 0)
     XCTAssertTrue(staging.hasPending)
     XCTAssertEqual(call("status", nil)["staged"] as? Bool, true)
+
+    let args: [String: Any] = [
+      "sessionDirectory": sessionDirectory.path, "path": "groups/g/world_map.arworldmap", "sha256": sha,
+      "restartSession": true,
+    ]
+    source.restartEpoch = nil
+    let idle = call("load", args)
+    XCTAssertEqual(idle["restarted"] as? Bool, false, "no running session: the next start applies it")
+    XCTAssertNil(idle["epoch"])
+    source.restartEpoch = 4
+    let restarted = call("load", args)
+    XCTAssertEqual(restarted["status"] as? String, "ok")
+    XCTAssertEqual(restarted["restarted"] as? Bool, true)
+    XCTAssertEqual(restarted["epoch"] as? Int, 4)
+    XCTAssertEqual(source.restarts, 2)
+
+    source.restartEpoch = 5
+    let failed = call("load", ["sessionDirectory": sessionDirectory.path, "path": "missing", "restartSession": true])
+    XCTAssertEqual(failed["code"] as? String, WorldMapFailureCode.readFailed)
+    XCTAssertEqual(source.restarts, 2, "a failed load never restarts the session")
   }
 }
 
@@ -281,6 +399,8 @@ private final class DeferredWorldMapSource: WorldMapSource {
     pending = completion
     return true
   }
+
+  func restartRunningSession() -> Int? { nil }
 
   func complete(_ map: ARWorldMap?, _ error: Error?) {
     let completion = pending
@@ -300,4 +420,41 @@ private final class FakeWorldMapSource: WorldMapSource {
     DispatchQueue.global().async { completion(map, error) }
     return true
   }
+
+  /// Epoch the next restart reports; nil: no running session.
+  var restartEpoch: Int?
+  private(set) var restarts = 0
+
+  func restartRunningSession() -> Int? {
+    restarts += 1
+    return restartEpoch
+  }
+}
+
+/// Records the initial world map and reset option of every run.
+private final class ConfigurationRecordingDriver: ARSessionDriving {
+  var worldMaps: [ARWorldMap?] = []
+  var resets: [Bool] = []
+  func run(_ configuration: ARConfiguration, options: ARSession.RunOptions) {
+    worldMaps.append((configuration as? ARWorldTrackingConfiguration)?.initialWorldMap)
+    resets.append(options.contains(.resetTracking))
+  }
+  func pause() {}
+}
+
+private final class StartRecordingObserver: ARFrameObserver {
+  var starts: [(epoch: Int, map: Bool)] = []
+  func frameSource(_ source: ARFrameSource, didUpdate frame: CaptureFrame) {}
+  func frameSource(_ source: ARFrameSource, didStart configuration: CaptureRunConfiguration, epoch: Int) {
+    starts.append((epoch, configuration.hasInitialWorldMap))
+  }
+}
+
+extension WorldMapTests {
+  static let hostPlan = ARSessionConfigurationPlan(
+    options: ARSessionOptions(),
+    capabilities: ARCameraCapabilities(
+      modelIdentifier: "test", worldTrackingSupported: true, sceneDepthSupported: false,
+      smoothedSceneDepthSupported: false, sceneReconstructionSupported: false,
+      videoFormats: [], highResolutionFrameCaptureFormat: nil))
 }

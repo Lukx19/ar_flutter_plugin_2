@@ -7,6 +7,11 @@ protocol WorldMapSource: AnyObject {
   /// Asks the running AR session for its world map; false (and no
   /// completion) when no capture view runs.
   func currentWorldMap(_ completion: @escaping (ARWorldMap?, Error?) -> Void) -> Bool
+  /// Restarts the running capture session (new world frame, `.resetTracking`)
+  /// so its next run applies a staged map; returns the new run's epoch, or
+  /// nil when no session runs (an idle one applies the map when it starts,
+  /// a paused one at its next start or restart). Main thread.
+  func restartRunningSession() -> Int?
 }
 
 /// The frame source of the current capture view (`ARFrameSourceRegistry`):
@@ -16,6 +21,14 @@ final class RegistryWorldMapSource: WorldMapSource {
     guard let source = ARFrameSourceRegistry.shared.current else { return false }
     source.getCurrentWorldMap(completion: completion)
     return true
+  }
+
+  func restartRunningSession() -> Int? {
+    guard let session = ARFrameSourceRegistry.shared.current as? CaptureSessionSource,
+          session.lifecycleState == .running
+    else { return nil }
+    session.restart()
+    return session.epoch
   }
 }
 
@@ -28,9 +41,14 @@ final class RegistryWorldMapSource: WorldMapSource {
 ///   written durably to `path` (relative to the session folder). Reply
 ///   `path`, `sha256`, `bytes` (the manifest file reference) and the map
 ///   summary (`anchors`, `featurePoints`, `center`, `extent`).
-/// - `load` `{sessionDirectory, path, sha256?}`: reads, verifies and decodes
-///   the file and stages it as the next run's `initialWorldMap`
-///   ([WorldMapInitialMapStore]). Reply `staged: true` and the summary.
+/// - `load` `{sessionDirectory, path, sha256?, restartSession?}`: reads,
+///   verifies and decodes the file and stages it as the `initialWorldMap` of
+///   the next run that starts a new world frame ([WorldMapInitialMapStore]).
+///   With `restartSession: true` a running capture session restarts at once
+///   to apply it (`restarted`, `epoch`); the caller must only ask for that
+///   when continuing a session, before capture starts: a restart resets
+///   tracking, so it never runs during a multi-image shot. Reply
+///   `staged: true`, `restarted` and the summary.
 /// - `clear`: drops a staged map.
 /// - `status`: relocalization of the current run
 ///   ([WorldMapRelocalizationMonitor.statusReply]).
@@ -129,6 +147,7 @@ final class WorldMapChannelHandler {
     let directory = args["sessionDirectory"] as? String ?? ""
     let path = args["path"] as? String ?? ""
     let sha = args["sha256"] as? String
+    let restartSession = args["restartSession"] as? Bool ?? false
     workQueue.async {
       let response: [String: Any]
       do {
@@ -140,9 +159,18 @@ final class WorldMapChannelHandler {
         ok["staged"] = true
         response = ok
       } catch {
-        response = self.failure(error, "load")
+        self.replyQueue.async { reply(self.failure(error, "load")) }
+        return
       }
-      self.replyQueue.async { reply(response) }
+      self.replyQueue.async {
+        var answer = response
+        answer["restarted"] = false
+        if restartSession, let epoch = self.source.restartRunningSession() {
+          answer["restarted"] = true
+          answer["epoch"] = epoch
+        }
+        reply(answer)
+      }
     }
   }
 

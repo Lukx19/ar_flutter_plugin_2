@@ -12,6 +12,7 @@ enum NativeSessionLogCodes {
   static let backgroundTaskEnded = "BACKGROUND_TASK_ENDED"
   static let worldMapFailed = "WORLD_MAP_FAILED"
   static let worldMapRelocalized = "WORLD_MAP_RELOCALIZED"
+  static let worldMapApplied = "WORLD_MAP_APPLIED"
 }
 
 /// Maps ARKit and system events to native session log records:
