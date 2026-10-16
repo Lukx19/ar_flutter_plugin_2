@@ -153,6 +153,12 @@ internal class PhotoSavedEmitter(
     private val durableListeners: () -> Array<DurablePhotoListener>,
     private val jpegLocator: DurableJpegLocator,
     private val groupEpoch: () -> Int,
+    /**
+     * Receives one line per emitted photo with its epoch derivation
+     * ([epochTraceLine]; debug and profile builds, null in release), so a
+     * device run shows whether an exposure fell in the ungrouped epoch.
+     */
+    private val epochTrace: ((String) -> Unit)? = null,
 ) : DurableTerminalTap {
     companion object {
         const val RECENT = 64
@@ -236,16 +242,39 @@ internal class PhotoSavedEmitter(
      * session after it.
      */
     internal fun epochAt(exposureNs: Long): Int = synchronized(poseLock) {
-        if (epochCount == 0 || exposureNs <= 0L) return groupEpoch()
-        var at = 0
-        for (i in epochCount - 1 downTo 0) {
-            if (epochStartNs[i] <= exposureNs) {
-                at = i
-                break
-            }
+        val exposed = exposedEpochIndex(exposureNs)
+        if (exposed < 0) groupEpoch() else epochValue[resolvedEpochIndex(exposed)]
+    }
+
+    /**
+     * The epoch derivation of a photo exposed at [exposureNs]: the epoch in
+     * effect at the exposure and its start, and the epoch the event carries
+     * ([epochAt]) and its start (camera image clock).
+     */
+    internal fun epochTraceLine(captureId: String, exposureNs: Long): String = synchronized(poseLock) {
+        val exposed = exposedEpochIndex(exposureNs)
+        val prefix = "photo epoch capture=${captureId.take(12)} exposureNs=$exposureNs"
+        if (exposed < 0) {
+            "$prefix exposedEpoch=none resolvedEpoch=${groupEpoch()}"
+        } else {
+            val resolved = resolvedEpochIndex(exposed)
+            "$prefix exposedEpoch=${epochValue[exposed]} exposedStartNs=${epochStartNs[exposed]} " +
+                "resolvedEpoch=${epochValue[resolved]} resolvedStartNs=${epochStartNs[resolved]}"
         }
+    }
+
+    /** Under [poseLock]: history index in effect at [exposureNs], -1 without history or exposure time. */
+    private fun exposedEpochIndex(exposureNs: Long): Int {
+        if (epochCount == 0 || exposureNs <= 0L) return -1
+        for (i in epochCount - 1 downTo 0) if (epochStartNs[i] <= exposureNs) return i
+        return 0
+    }
+
+    /** Under [poseLock]: the ungrouped epoch at [exposed] moves to the group that relabelled the same AR session. */
+    private fun resolvedEpochIndex(exposed: Int): Int {
+        var at = exposed
         while (epochValue[at] == UNGROUPED_EPOCH && at + 1 < epochCount && epochContinues[at + 1]) at++
-        epochValue[at]
+        return at
     }
 
     @Synchronized
@@ -262,6 +291,13 @@ internal class PhotoSavedEmitter(
         recentNext = (recentNext + 1) % RECENT
         fill(request, terminal, captureId, exposureTimestampNs)
         emitted++
+        epochTrace?.let { trace ->
+            try {
+                trace(epochTraceLine(captureId, exposureTimestampNs))
+            } catch (_: RuntimeException) {
+                listenerFailures++
+            }
+        }
         try {
             listener().onDurableTerminal(photoId, event)
         } catch (_: RuntimeException) {

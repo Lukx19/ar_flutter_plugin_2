@@ -148,6 +148,25 @@ class PhotoSavedEmitterTest {
     }
 
     @Test
+    fun `the diagnostic log names the epoch at the exposure and the epoch the photo carries`() {
+        val lines = mutableListOf<String>()
+        val logged = VisibilityGridIngestShell(clock, null, diagnosticLog = { lines += it })
+        logged.start(IngestShellConfig(0, 0, 0, 0, 0f, PhotoSavedEmitter.UNGROUPED_EPOCH))
+        val ungroupedStart = exposureNs - 1_000_000_000L
+        val groupStart = exposureNs + 500_000_000L
+        for ((cameraNs, config) in listOf(ungroupedStart to null, groupStart to 1)) {
+            config?.let { logged.start(IngestShellConfig(0, 0, 0, 0, 0f, it)) }
+            logged.process(FakeFrame().apply { timestampNs = cameraNs; androidCameraTimestampNs = cameraNs }, SESSION)
+        }
+        logged.onDurableTerminal(request(attemptId, CaptureLane.MANUAL), committed(attemptId, captureId), exposureNs)
+        assertEquals(
+            "photo epoch capture=${captureId.take(12)} exposureNs=$exposureNs exposedEpoch=0 " +
+                "exposedStartNs=$ungroupedStart resolvedEpoch=1 resolvedStartNs=$groupStart",
+            lines.single { it.startsWith("photo epoch") },
+        )
+    }
+
+    @Test
     fun `a photo exposed before an AR restart into the first group stays ungrouped`() {
         // A new AR session (other world frame) between the ungrouped exposure
         // and the group: the photo is not the group's.

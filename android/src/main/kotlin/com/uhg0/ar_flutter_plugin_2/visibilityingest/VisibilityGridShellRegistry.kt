@@ -70,7 +70,7 @@ internal object VisibilityGridShellRegistry {
             } else {
                 null
             }
-            // Depth telemetry (1 Hz while started) in debug and profile builds only.
+            // Depth telemetry (1 Hz while started) and photo epoch lines in debug and profile builds only.
             val telemetry: ((String) -> Unit)? = if (BuildConfig.DEBUG || BuildConfig.BUILD_TYPE == "profile") {
                 { line -> Log.i(TAG, line) }
             } else {

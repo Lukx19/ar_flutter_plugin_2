@@ -43,13 +43,14 @@ internal class VisibilityGridIngestShell(
     val recorder: IngestRecorder?,
     jpegLocator: DurableJpegLocator = DurableJpegLocator(null),
     /**
-     * Receives one depth telemetry line per second of started frames (debug
-     * and profile builds; null in release and tests): published, duplicate,
-     * stale-dropped, identity refusals, STALE_AUTOMATIC, not yet available,
-     * failures and the age of the newest depth image, so a device run shows
-     * why depth stops.
+     * Diagnostic lines of debug and profile builds (null in release and
+     * tests): one depth telemetry line per second of started frames
+     * (published, duplicate, stale-dropped, identity refusals,
+     * STALE_AUTOMATIC, not yet available, failures and the age of the newest
+     * depth image, so a device run shows why depth stops) and one photo
+     * epoch line per emitted photo ([PhotoSavedEmitter.epochTraceLine]).
      */
-    private val depthTelemetry: ((String) -> Unit)? = null,
+    private val diagnosticLog: ((String) -> Unit)? = null,
 ) : VisibilityGridFrameTap, DurableTerminalTap {
     val pull = IngestPullHandler(clock, recorder)
     private val session = IngestSessionState()
@@ -79,6 +80,7 @@ internal class VisibilityGridIngestShell(
         durableListeners = { durablePhotoListeners },
         jpegLocator = jpegLocator,
         groupEpoch = { epochForEvents },
+        epochTrace = diagnosticLog,
     )
 
     @Volatile var started = false
@@ -299,7 +301,7 @@ internal class VisibilityGridIngestShell(
             rebaselineSessionCounters()
         }
         // Before the tracking check, so a run also shows depth stopping while not tracking.
-        if (depthTelemetry != null || NativeSessionLogEmitter.active) depthTelemetryTick(ts, tracking)
+        if (diagnosticLog != null || NativeSessionLogEmitter.active) depthTelemetryTick(ts, tracking)
         if (tracking != IngestTrackingState.TRACKING) return
 
         source.readPose(tq)
@@ -419,7 +421,7 @@ internal class VisibilityGridIngestShell(
         val now = clock.nowNs()
         if (lastTelemetryNs != Long.MIN_VALUE && now - lastTelemetryNs < TELEMETRY_INTERVAL_NS) return
         lastTelemetryNs = now
-        depthTelemetry?.let { logDepthTelemetry(it, frameNs, tracking) }
+        diagnosticLog?.let { logDepthTelemetry(it, frameNs, tracking) }
         logSessionCounters(frameNs)
     }
 
