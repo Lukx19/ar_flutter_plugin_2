@@ -402,6 +402,108 @@ class StorageBudgetCoordinatorV2Test {
         }
     }
 
+    @Test fun `ledger writes carry budget fault labels, never the session store labels`() {
+        val root = directory(); val policy = StorageBudgetPolicyV2(1_000_000, 0)
+        val fired = mutableListOf<DurableStoreFaultPointV2>()
+        StorageBudgetCoordinatorV2(root, policy, physicalFilesystem(), DurableStoreFaultInjectorV2 { fired += it }) { 10_000_000 }
+            .use { coordinator ->
+                val plain = coordinator.reserve("capture:session:labels", 8_192)!!
+                coordinator.commit(plain, 4_096)
+                assertEquals(
+                    listOf(
+                        DurableStoreFaultPointV2.RESERVATION_RECORD_REPLACE,
+                        DurableStoreFaultPointV2.LEDGER_REPLACE,
+                        DurableStoreFaultPointV2.RESERVATION_COMMIT_REPLACE,
+                        DurableStoreFaultPointV2.LEDGER_REPLACE,
+                    ),
+                    fired.filter { it != DurableStoreFaultPointV2.POINTER_DIRECTORY_SYNC && it != DurableStoreFaultPointV2.DELETE_RECLAIM },
+                )
+                fired.clear()
+                coordinator.reclaimVerifiedOnce("cd".repeat(32), 4_096)
+                assertEquals(
+                    listOf(
+                        DurableStoreFaultPointV2.RECLAIM_MARKER_REPLACE,
+                        DurableStoreFaultPointV2.LEDGER_REPLACE,
+                        DurableStoreFaultPointV2.RECLAIM_MARKER_REPLACE,
+                    ),
+                    fired.filter { it != DurableStoreFaultPointV2.POINTER_DIRECTORY_SYNC },
+                )
+                fired.clear()
+                coordinator.reserveCandidate(
+                    "canonical-surface:canonical:labels", File(root, "candidate.staging-1"), File(root, "candidate-v6"),
+                    mapOf("empty" to 0L, "pages" to 4_096L), 64_000L,
+                )!!
+                assertTrue(DurableStoreFaultPointV2.STAGING_FILE_CREATE in fired)
+            }
+        // The session store's own labels name only session store writes.
+        assertFalse(DurableStoreFaultPointV2.ACCEPTED_RECORD in fired)
+        assertFalse(DurableStoreFaultPointV2.POINTER_SLOT_REPLACE in fired)
+    }
+
+    @Test fun `commit record and ledger cuts charge exactly once after reopen`() {
+        val policy = StorageBudgetPolicyV2(1_000_000, 0)
+        fun cutAt(point: DurableStoreFaultPointV2): File {
+            val root = directory()
+            var cuts = 0
+            var armed = false
+            StorageBudgetCoordinatorV2(root, policy, physicalFilesystem(), DurableStoreFaultInjectorV2 {
+                if (armed && it == point && cuts++ == 0) throw IllegalStateException("cut at $it")
+            }) { 10_000_000 }.use { coordinator ->
+                val reservation = coordinator.reserve("capture:session:cut", 8_192)!!
+                armed = true
+                assertThrows(IllegalStateException::class.java) { coordinator.commit(reservation, 4_096) }
+            }
+            assertEquals(1, cuts)
+            return root
+        }
+        // Before the COMMITTING record is renamed: no charge, the reservation stays live.
+        val beforeRecord = cutAt(DurableStoreFaultPointV2.RESERVATION_COMMIT_REPLACE)
+        StorageBudgetCoordinatorV2(beforeRecord, policy, physicalFilesystem()) { 10_000_000 }.use {
+            assertEquals(0L, it.committedBytes())
+            assertEquals(8_192L, it.reservedBytes())
+        }
+        // Before the ledger is renamed: the durable COMMITTING record charges once.
+        val beforeLedger = cutAt(DurableStoreFaultPointV2.LEDGER_REPLACE)
+        repeat(2) {
+            StorageBudgetCoordinatorV2(beforeLedger, policy, physicalFilesystem()) { 10_000_000 }.use {
+                assertEquals(4_096L, it.committedBytes())
+                assertEquals(0L, it.reservedBytes())
+            }
+        }
+    }
+
+    @Test fun `staging file and reclaim marker cuts leave no partial authority`() {
+        val policy = StorageBudgetPolicyV2(1_000_000, 0)
+        val root = directory()
+        val staging = File(root, "candidate.staging-1")
+        StorageBudgetCoordinatorV2(root, policy, physicalFilesystem(), DurableStoreFaultInjectorV2 {
+            if (it == DurableStoreFaultPointV2.STAGING_FILE_CREATE) throw IllegalStateException("cut at $it")
+        }) { 10_000_000 }.use { coordinator ->
+            assertThrows(IllegalStateException::class.java) {
+                coordinator.reserveCandidate(
+                    "canonical-surface:canonical:cut", staging, File(root, "candidate-v6"), mapOf("empty" to 0L), 64_000L,
+                )
+            }
+        }
+        assertFalse(staging.exists())
+        StorageBudgetCoordinatorV2(root, policy, physicalFilesystem()) { 10_000_000 }.use {
+            assertEquals(0L, it.reservedBytes())
+            val reservation = it.reserve("capture:session:reclaim", 4_096)!!
+            it.commit(reservation, 4_096)
+        }
+        val id = "ef".repeat(32)
+        StorageBudgetCoordinatorV2(root, policy, physicalFilesystem(), DurableStoreFaultInjectorV2 {
+            if (it == DurableStoreFaultPointV2.RECLAIM_MARKER_REPLACE) throw IllegalStateException("cut at $it")
+        }) { 10_000_000 }.use { coordinator ->
+            assertThrows(IllegalStateException::class.java) { coordinator.reclaimVerifiedOnce(id, 4_096) }
+        }
+        StorageBudgetCoordinatorV2(root, policy, physicalFilesystem()) { 10_000_000 }.use {
+            assertEquals(4_096L, it.committedBytes())
+            it.reclaimVerifiedOnce(id, 4_096)
+            assertEquals(0L, it.committedBytes())
+        }
+    }
+
     @Test fun `unfinished reservation records are orphans and never block the ledger`() {
         val root = directory(); val policy = StorageBudgetPolicyV2(1_000_000, 0)
         StorageBudgetCoordinatorV2(root, policy, physicalFilesystem()) { 10_000_000 }.use { coordinator ->

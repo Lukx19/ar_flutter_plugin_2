@@ -193,8 +193,15 @@ class DurableSessionStoreV2Test {
     }
 
     @Test fun `generated durable fault matrix asserts exact classification cleanup release and later success at every cut`() {
-        assertEquals(23, DurableStoreFaultPointV2.entries.size)
-        DurableStoreFaultPointV2.entries.forEach { cut ->
+        assertEquals(27, DurableStoreFaultPointV2.entries.size)
+        // Ledger-only writes of the budget coordinator; StorageBudgetCoordinatorV2Test cuts each of them.
+        val budgetOnly = setOf(
+            DurableStoreFaultPointV2.STAGING_FILE_CREATE,
+            DurableStoreFaultPointV2.RESERVATION_COMMIT_REPLACE,
+            DurableStoreFaultPointV2.LEDGER_REPLACE,
+            DurableStoreFaultPointV2.RECLAIM_MARKER_REPLACE,
+        )
+        DurableStoreFaultPointV2.entries.filter { it !in budgetOnly }.forEach { cut ->
             val root = directory()
             var injected = 0
             val injector = DurableStoreFaultInjectorV2 {

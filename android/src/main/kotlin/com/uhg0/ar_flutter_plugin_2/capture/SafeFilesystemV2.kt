@@ -23,6 +23,14 @@ enum class DurableStoreFaultPointV2 {
     RECEIPT_REPLACE,
     /** Cut after a complete temporary ledger reservation record and before its rename. */
     RESERVATION_RECORD_REPLACE,
+    /** Cut before an empty staging file of a candidate reservation is created. */
+    STAGING_FILE_CREATE,
+    /** Cut after a complete temporary `COMMITTING` reservation record (the charge) and before its rename. */
+    RESERVATION_COMMIT_REPLACE,
+    /** Cut after a complete temporary committed-bytes ledger and before its rename. */
+    LEDGER_REPLACE,
+    /** Cut after a complete temporary reclaim marker (pending, verified or done) and before its rename. */
+    RECLAIM_MARKER_REPLACE,
 }
 
 fun interface DurableStoreFaultInjectorV2 { fun at(point: DurableStoreFaultPointV2) }
