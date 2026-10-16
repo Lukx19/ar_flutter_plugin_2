@@ -26,8 +26,16 @@ final class WorldMapInitialMapStore {
     case superseded
   }
 
+  /// A map applied to a run: [source] is the session-relative path the
+  /// load named (`<sessionId>/groups/<groupId>/world_map-<seq>.arworldmap`),
+  /// nil for a map staged without one.
+  struct Applied: Equatable {
+    let source: String?
+  }
+
   private let lock = NSLock()
   private var pending: ARWorldMap?
+  private var pendingSource: String?
   private var generation = 0
   /// Generation of the staged map the latest run consumed.
   private var consumedGeneration: Int?
@@ -39,8 +47,8 @@ final class WorldMapInitialMapStore {
 
   /// Stages [map] for the current generation (tests and callers outside
   /// the channel's ownership).
-  func stage(_ map: ARWorldMap) {
-    lock.lock(); pending = map; lock.unlock()
+  func stage(_ map: ARWorldMap, source: String? = nil) {
+    lock.lock(); pending = map; pendingSource = source; lock.unlock()
   }
 
   /// Starts a new generation for one load and returns it: drops a map an
@@ -48,22 +56,26 @@ final class WorldMapInitialMapStore {
   func claim() -> Int {
     lock.lock(); defer { lock.unlock() }
     pending = nil
+    pendingSource = nil
     generation += 1
     return generation
   }
 
-  /// Stages [map] only while [generation] still owns the store.
+  /// Stages [map] only while [generation] still owns the store; [source]
+  /// is the path the load read it from, reported with the run's
+  /// relocalization.
   @discardableResult
-  func stage(_ map: ARWorldMap, generation owner: Int) -> Bool {
+  func stage(_ map: ARWorldMap, generation owner: Int, source: String? = nil) -> Bool {
     lock.lock(); defer { lock.unlock() }
     guard owner == generation else { return false }
     pending = map
+    pendingSource = source
     return true
   }
 
   /// Drops a staged map and supersedes every load in flight.
   func clear() {
-    lock.lock(); pending = nil; generation += 1; lock.unlock()
+    lock.lock(); pending = nil; pendingSource = nil; generation += 1; lock.unlock()
   }
 
   /// Drops the staged map while [generation] still owns the store (a load
@@ -72,6 +84,7 @@ final class WorldMapInitialMapStore {
     lock.lock(); defer { lock.unlock() }
     guard owner == generation else { return }
     pending = nil
+    pendingSource = nil
   }
 
   func state(of owner: Int) -> LoadState {
@@ -92,6 +105,7 @@ final class WorldMapInitialMapStore {
     let had = pending != nil
     if had { consumedGeneration = generation }
     pending = nil
+    pendingSource = nil
     return had
   }
 
@@ -99,15 +113,23 @@ final class WorldMapInitialMapStore {
   /// tracking only) and consumes it. Returns whether a map was applied.
   @discardableResult
   func apply(to configuration: ARConfiguration) -> Bool {
-    guard let world = configuration as? ARWorldTrackingConfiguration else { return false }
+    applyMap(to: configuration) != nil
+  }
+
+  /// Like [apply(to:)]; returns what was applied (with the map's source
+  /// path), or nil when no map was applied.
+  func applyMap(to configuration: ARConfiguration) -> Applied? {
+    guard let world = configuration as? ARWorldTrackingConfiguration else { return nil }
     lock.lock()
     let map = pending
+    let source = pendingSource
     pending = nil
+    pendingSource = nil
     if map != nil { consumedGeneration = generation }
     lock.unlock()
-    guard let map = map else { return false }
+    guard let map = map else { return nil }
     world.initialWorldMap = map
-    return true
+    return Applied(source: source)
   }
 }
 
@@ -118,6 +140,10 @@ final class WorldMapInitialMapStore {
 /// - `relocalizing`: started with one, tracking not yet normal;
 /// - `relocalized`: tracking became normal, so the run shares the saved
 ///   session's world frame: transform source `worldMapHint`.
+///
+/// A run started from a map a channel `load` staged also reports that
+/// map's path (`mapPath`, relative to the load's session directory), so the
+/// app can tell which saved group's world frame the run relocalizes into.
 ///
 /// The reply also names the run's latest tracking state (`tracking`:
 /// `normal`, `notAvailable` or the limited reason) and whether ARKit
@@ -147,6 +173,7 @@ final class WorldMapRelocalizationMonitor: ARFrameObserver {
   private var mappingStatus: ARFrame.WorldMappingStatus = .notAvailable
   private var tracking = "notAvailable"
   private var relocalizingReported = false
+  private var mapPath: String?
 
   init(
     emitter: NativeSessionLogEmitter = .shared,
@@ -172,6 +199,7 @@ final class WorldMapRelocalizationMonitor: ARFrameObserver {
       "tracking": tracking,
       "relocalizingReported": relocalizingReported,
     ]
+    if state != .none, let path = mapPath { reply["mapPath"] = path }
     if state == .relocalized {
       reply["transformSource"] = Self.transformSource
       if let ms = relocalizedMs { reply["relocalizedMs"] = ms }
@@ -187,16 +215,19 @@ final class WorldMapRelocalizationMonitor: ARFrameObserver {
   }
 
   func frameSource(_ source: ARFrameSource, didStart configuration: CaptureRunConfiguration, epoch: Int) {
-    runStarted(withInitialWorldMap: configuration.hasInitialWorldMap, epoch: epoch)
+    runStarted(
+      withInitialWorldMap: configuration.hasInitialWorldMap, epoch: epoch,
+      mapPath: configuration.initialWorldMapSource)
   }
 
   func frameSource(_ source: ARFrameSource, trackingChanged state: ARCamera.TrackingState) {
     trackingChanged(state)
   }
 
-  func runStarted(withInitialWorldMap: Bool, epoch: Int) {
+  func runStarted(withInitialWorldMap: Bool, epoch: Int, mapPath: String? = nil) {
     lock.lock()
     self.epoch = epoch
+    self.mapPath = withInitialWorldMap ? mapPath : nil
     relocalizedMs = nil
     mappingStatus = .notAvailable
     tracking = "notAvailable"

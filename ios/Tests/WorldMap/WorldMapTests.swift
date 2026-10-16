@@ -194,6 +194,49 @@ final class WorldMapTests: XCTestCase {
     XCTAssertTrue(emitter.buffer.drain().isEmpty, "a run without a map records nothing")
   }
 
+  /// The run reports the path of the map it started from, so the app can
+  /// name the saved group whose world frame it relocalizes into; a run
+  /// without a map, or a later run, names none.
+  func testRelocalizationStatusNamesTheAppliedMapPath() {
+    let monitor = WorldMapRelocalizationMonitor(emitter: NativeSessionLogEmitter(), nowNs: { 0 })
+    let path = "session-a/groups/group-1/world_map-4.arworldmap"
+    monitor.runStarted(withInitialWorldMap: true, epoch: 2, mapPath: path)
+    XCTAssertEqual(monitor.statusReply()["mapPath"] as? String, path, "relocalizing")
+    monitor.trackingChanged(.normal)
+    XCTAssertEqual(monitor.statusReply()["mapPath"] as? String, path, "relocalized")
+    monitor.runStarted(withInitialWorldMap: false, epoch: 3, mapPath: path)
+    XCTAssertNil(monitor.statusReply()["mapPath"], "a run without a map")
+    monitor.runStarted(withInitialWorldMap: true, epoch: 4)
+    XCTAssertNil(monitor.statusReply()["mapPath"], "a map staged without a path")
+  }
+
+  /// The staged map's path travels with it: the run that applies it carries
+  /// the path in its configuration; a clear or a later stage drops it.
+  func testAppliedMapCarriesTheLoadedPathIntoTheRunConfiguration() throws {
+    let map = try WorldMapArchive.decode(try recordedWorldMapData())
+    let staging = WorldMapInitialMapStore()
+    let path = "session-a/groups/group-1/world_map-4.arworldmap"
+    let generation = staging.claim()
+    XCTAssertTrue(staging.stage(map, generation: generation, source: path))
+    let driver = ConfigurationRecordingDriver()
+    let host = ARSessionHost(
+      plan: Self.hostPlan, driver: driver, registry: nil,
+      makeConfiguration: { ARWorldTrackingConfiguration() }, initialMaps: staging, clock: { 0 })
+    let observer = StartRecordingObserver()
+    host.addFrameObserver(observer)
+    host.start()
+    XCTAssertEqual(host.runConfiguration?.initialWorldMapSource, path)
+    host.restart()
+    XCTAssertNil(host.runConfiguration?.initialWorldMapSource, "the next run starts without a map")
+    staging.stage(map, generation: staging.claim(), source: path)
+    staging.stage(map)
+    host.restart()
+    XCTAssertEqual(host.runConfiguration?.hasInitialWorldMap, true)
+    XCTAssertNil(host.runConfiguration?.initialWorldMapSource, "the later stage named no path")
+    host.delegateQueue.sync {}
+    host.dispose()
+  }
+
   // MARK: Session host
 
   /// The capture session host applies a staged map to the next run that

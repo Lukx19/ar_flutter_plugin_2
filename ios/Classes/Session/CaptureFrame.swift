@@ -90,14 +90,19 @@ struct CaptureRunConfiguration: Equatable {
   /// The run started from a saved world map (`initialWorldMap`) and
   /// relocalizes into that map's world frame.
   let hasInitialWorldMap: Bool
+  /// Path of the saved world map the run started from, as the world map
+  /// channel's load named it; nil without a map or for a map staged
+  /// without a path.
+  let initialWorldMapSource: String?
 
-  init(depth: Depth, hasInitialWorldMap: Bool = false) {
+  init(depth: Depth, hasInitialWorldMap: Bool = false, initialWorldMapSource: String? = nil) {
     self.depth = depth
     self.hasInitialWorldMap = hasInitialWorldMap
+    self.initialWorldMapSource = hasInitialWorldMap ? initialWorldMapSource : nil
   }
 
   /// Raw `sceneDepth` is preferred over `smoothedSceneDepth`.
-  init(_ configuration: ARConfiguration) {
+  init(_ configuration: ARConfiguration, initialWorldMapSource: String? = nil) {
     let semantics = configuration.frameSemantics
     if semantics.contains(.sceneDepth) {
       depth = .raw
@@ -107,6 +112,7 @@ struct CaptureRunConfiguration: Equatable {
       depth = .none
     }
     hasInitialWorldMap = (configuration as? ARWorldTrackingConfiguration)?.initialWorldMap != nil
+    self.initialWorldMapSource = hasInitialWorldMap ? initialWorldMapSource : nil
   }
 }
 

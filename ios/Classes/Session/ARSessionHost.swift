@@ -230,8 +230,8 @@ final class ARSessionHost: NSObject, CaptureSessionSource, ARSessionDelegate {
       // Only a run that starts a new world frame can relocalize into a saved
       // map; a resume continues the current frame and leaves a staged map
       // for the next start or restart.
-      if resetTracking { initialMaps?.apply(to: arConfiguration) }
-      let configuration = CaptureRunConfiguration(arConfiguration)
+      let applied = resetTracking ? initialMaps?.applyMap(to: arConfiguration) : nil
+      let configuration = CaptureRunConfiguration(arConfiguration, initialWorldMapSource: applied?.source)
       lock.lock()
       currentConfiguration = configuration
       lock.unlock()

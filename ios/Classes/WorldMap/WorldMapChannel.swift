@@ -55,7 +55,8 @@ final class RegistryWorldMapSource: WorldMapSource {
 ///   `clear` stages nothing and replies `superseded: true`.
 /// - `clear`: drops a staged map and supersedes loads in flight.
 /// - `status`: relocalization of the current run
-///   ([WorldMapRelocalizationMonitor.statusReply]).
+///   ([WorldMapRelocalizationMonitor.statusReply]); a run started from a
+///   loaded map names its `path` as `mapPath`.
 ///
 /// Archive and file work runs on a utility queue; replies go out on the main
 /// thread. An asynchronous save or load holds the handler until it replied,
@@ -162,7 +163,7 @@ final class WorldMapChannelHandler {
         let map = try WorldMapArchive.decode(data)
         response = WorldMapArchive.summary(map)
         response["status"] = "ok"
-        response["staged"] = self.initialMaps.stage(map, generation: generation)
+        response["staged"] = self.initialMaps.stage(map, generation: generation, source: path)
       } catch {
         // Never leave an earlier session's map for the next run.
         self.initialMaps.discardPending(generation: generation)
