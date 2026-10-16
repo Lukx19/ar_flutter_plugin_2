@@ -48,7 +48,7 @@ internal class VisibilityGridIngestShell(
      * (published, duplicate, stale-dropped, identity refusals,
      * STALE_AUTOMATIC, not yet available, failures and the age of the newest
      * depth image, so a device run shows why depth stops) and one photo
-     * epoch line per emitted photo ([PhotoSavedEmitter.epochTraceLine]).
+     * epoch line per emitted photo (its resolvedEpoch is the event's epoch).
      */
     private val diagnosticLog: ((String) -> Unit)? = null,
 ) : VisibilityGridFrameTap, DurableTerminalTap {

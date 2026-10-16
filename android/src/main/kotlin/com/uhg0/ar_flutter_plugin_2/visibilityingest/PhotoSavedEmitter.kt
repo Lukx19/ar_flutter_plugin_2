@@ -155,7 +155,7 @@ internal class PhotoSavedEmitter(
     private val groupEpoch: () -> Int,
     /**
      * Receives one line per emitted photo with its epoch derivation
-     * ([epochTraceLine]; debug and profile builds, null in release), so a
+     * ([resolveEpoch]; debug and profile builds, null in release), so a
      * device run shows whether an exposure fell in the ungrouped epoch.
      */
     private val epochTrace: ((String) -> Unit)? = null,
@@ -235,32 +235,37 @@ internal class PhotoSavedEmitter(
     }
 
     /**
-     * Epoch active at [exposureNs]: the newest epoch started at or before it.
-     * Without a recorded epoch or exposure time, the current epoch; before the
-     * oldest recorded start, the oldest recorded epoch (older ones were evicted).
-     * The ungrouped epoch resolves to the group that relabelled the same AR
-     * session after it.
+     * Epoch trace line of the last emitted photo, built in [fill] under the
+     * same [poseLock] acquisition that resolved the event's epoch; null
+     * without an [epochTrace] sink.
      */
-    internal fun epochAt(exposureNs: Long): Int = synchronized(poseLock) {
-        val exposed = exposedEpochIndex(exposureNs)
-        if (exposed < 0) groupEpoch() else epochValue[resolvedEpochIndex(exposed)]
-    }
+    private var pendingEpochTrace: String? = null
 
     /**
-     * The epoch derivation of a photo exposed at [exposureNs]: the epoch in
-     * effect at the exposure and its start, and the epoch the event carries
-     * ([epochAt]) and its start (camera image clock).
+     * Under [poseLock]: the epoch the event of a photo exposed at [exposureNs]
+     * carries, the newest epoch started at or before it. Without a recorded
+     * epoch or exposure time, the current epoch; before the oldest recorded
+     * start, the oldest recorded epoch (older ones were evicted). The
+     * ungrouped epoch resolves to the group that relabelled the same AR
+     * session after it. With [captureId], also sets [pendingEpochTrace] to
+     * its derivation from the same history indices: the epoch in effect at
+     * the exposure and its start, and the resolved epoch and its start
+     * (camera image clock).
      */
-    internal fun epochTraceLine(captureId: String, exposureNs: Long): String = synchronized(poseLock) {
+    private fun resolveEpoch(exposureNs: Long, captureId: String?): Int {
         val exposed = exposedEpochIndex(exposureNs)
-        val prefix = "photo epoch capture=${captureId.take(12)} exposureNs=$exposureNs"
-        if (exposed < 0) {
-            "$prefix exposedEpoch=none resolvedEpoch=${groupEpoch()}"
-        } else {
-            val resolved = resolvedEpochIndex(exposed)
-            "$prefix exposedEpoch=${epochValue[exposed]} exposedStartNs=${epochStartNs[exposed]} " +
-                "resolvedEpoch=${epochValue[resolved]} resolvedStartNs=${epochStartNs[resolved]}"
+        val resolved = if (exposed < 0) -1 else resolvedEpochIndex(exposed)
+        val epoch = if (resolved < 0) groupEpoch() else epochValue[resolved]
+        if (captureId != null) {
+            val prefix = "photo epoch capture=${captureId.take(12)} exposureNs=$exposureNs"
+            pendingEpochTrace = if (resolved < 0) {
+                "$prefix exposedEpoch=none resolvedEpoch=$epoch"
+            } else {
+                "$prefix exposedEpoch=${epochValue[exposed]} exposedStartNs=${epochStartNs[exposed]} " +
+                    "resolvedEpoch=$epoch resolvedStartNs=${epochStartNs[resolved]}"
+            }
         }
+        return epoch
     }
 
     /** Under [poseLock]: history index in effect at [exposureNs], -1 without history or exposure time. */
@@ -292,10 +297,14 @@ internal class PhotoSavedEmitter(
         fill(request, terminal, captureId, exposureTimestampNs)
         emitted++
         epochTrace?.let { trace ->
-            try {
-                trace(epochTraceLine(captureId, exposureTimestampNs))
-            } catch (_: RuntimeException) {
-                listenerFailures++
+            val line = pendingEpochTrace
+            pendingEpochTrace = null
+            if (line != null) {
+                try {
+                    trace(line)
+                } catch (_: RuntimeException) {
+                    listenerFailures++
+                }
             }
         }
         try {
@@ -377,7 +386,9 @@ internal class PhotoSavedEmitter(
         if (request.accepted.lane == CaptureLane.AUTOMATIC) flags = flags or PhotoSavedLayout.FLAG_AUTOMATIC
         if (assessment?.reason == CaptureQualityReasonV1.BELOW_THRESHOLD) flags = flags or PhotoSavedLayout.FLAG_BLUR_REJECTED
         b.put(PhotoSavedLayout.FLAGS, flags.toByte())
-        b.put(PhotoSavedLayout.GROUP_EPOCH_LOW, epochAt(exposureNs).toByte())
+        // One poseLock acquisition resolves the carried epoch and its trace line.
+        val epoch = synchronized(poseLock) { resolveEpoch(exposureNs, if (epochTrace != null) captureId else null) }
+        b.put(PhotoSavedLayout.GROUP_EPOCH_LOW, epoch.toByte())
     }
 
     /** Shutter pose from the recovery context: OpenCV camera-to-world to OpenGL (flip camera y and z). */

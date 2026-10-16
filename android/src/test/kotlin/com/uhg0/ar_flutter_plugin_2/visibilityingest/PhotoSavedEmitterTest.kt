@@ -158,13 +158,43 @@ class PhotoSavedEmitterTest {
             config?.let { logged.start(IngestShellConfig(0, 0, 0, 0, 0f, it)) }
             logged.process(FakeFrame().apply { timestampNs = cameraNs; androidCameraTimestampNs = cameraNs }, SESSION)
         }
+        val photos = mutableListOf<DurablePhoto>()
+        logged.durablePhotoListeners = arrayOf(DurablePhotoListener { photos += it })
         logged.onDurableTerminal(request(attemptId, CaptureLane.MANUAL), committed(attemptId, captureId), exposureNs)
+        val line = lines.single { it.startsWith("photo epoch") }
         assertEquals(
             "photo epoch capture=${captureId.take(12)} exposureNs=$exposureNs exposedEpoch=0 " +
                 "exposedStartNs=$ungroupedStart resolvedEpoch=1 resolvedStartNs=$groupStart",
-            lines.single { it.startsWith("photo epoch") },
+            line,
         )
+        assertEquals(loggedEpoch(line), photos.single().event[PhotoSavedLayout.GROUP_EPOCH_LOW].toInt())
     }
+
+    @Test
+    fun `the logged resolved epoch is the epoch the photo saved event carries`() {
+        // Ungrouped epoch 0 is the newest history entry when the first photo is
+        // emitted; the first group then relabels the same AR session.
+        val lines = mutableListOf<String>()
+        val logged = VisibilityGridIngestShell(clock, null, diagnosticLog = { lines += it })
+        val photos = mutableListOf<DurablePhoto>()
+        logged.durablePhotoListeners = arrayOf(DurablePhotoListener { photos += it })
+        logged.start(IngestShellConfig(0, 0, 0, 0, 0f, PhotoSavedEmitter.UNGROUPED_EPOCH))
+        logged.process(FakeFrame().apply { timestampNs = exposureNs - 1_000L; androidCameraTimestampNs = exposureNs - 1_000L }, SESSION)
+        logged.onDurableTerminal(request(attemptId, CaptureLane.MANUAL), committed(attemptId, captureId), exposureNs)
+        logged.start(IngestShellConfig(0, 0, 0, 0, 0f, 1))
+        logged.process(FakeFrame().apply { timestampNs = exposureNs + 1_000L; androidCameraTimestampNs = exposureNs + 1_000L }, SESSION)
+        val laterId = (32 until 64).joinToString("") { "%02x".format(it) }
+        logged.onDurableTerminal(request(attemptId, CaptureLane.MANUAL), committed(attemptId, laterId), exposureNs)
+
+        val epochLines = lines.filter { it.startsWith("photo epoch") }
+        assertEquals(2, epochLines.size)
+        assertEquals(listOf(PhotoSavedEmitter.UNGROUPED_EPOCH, 1), epochLines.map(::loggedEpoch))
+        assertEquals(epochLines.map(::loggedEpoch), photos.map { it.event[PhotoSavedLayout.GROUP_EPOCH_LOW].toInt() })
+    }
+
+    /** resolvedEpoch value of a photo epoch line. */
+    private fun loggedEpoch(line: String): Int =
+        Regex("resolvedEpoch=(\\d+)").find(line)!!.groupValues[1].toInt()
 
     @Test
     fun `a photo exposed before an AR restart into the first group stays ungrouped`() {
