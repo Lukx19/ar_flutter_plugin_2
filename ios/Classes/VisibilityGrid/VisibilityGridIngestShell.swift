@@ -210,6 +210,8 @@ final class VisibilityGridIngestShell: GridShellControlTarget {
     guard on else { return }
     let ts = frame.timestampNs
     let tracking = frame.trackingState
+    // A new AR session generation (world frame) starts at this frame.
+    let newSession = restartPending || (lastFrameNs != .min && ts < lastFrameNs)
     if appliedVersion != version {
       appliedVersion = version
       groupEpoch = (cfg?.groupEpoch ?? 0) & 0xffff
@@ -244,7 +246,7 @@ final class VisibilityGridIngestShell: GridShellControlTarget {
                          value: Int64(IngestMessageLayout.trackingResetArResumed), sampleNs: ts,
                          trackingState: tracking, groupEpoch: groupEpoch)
     }
-    photos.recordEpochStart(frameNs: ts, epoch: groupEpoch)
+    photos.recordEpochStart(frameNs: ts, epoch: groupEpoch, continuesSession: !newSession)
     lastFrameNs = ts
 
     if tracking != lastTracking {

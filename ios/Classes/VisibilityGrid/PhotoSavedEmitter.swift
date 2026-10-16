@@ -53,9 +53,17 @@ protocol DurablePhotoListener: AnyObject {
 /// ignored. The group epoch byte is the epoch active at the exposure
 /// (recorded per frame on the AR frame clock, which is also the exposure
 /// clock on iOS), so a photo exposed before a group switch keeps its group.
+/// The [ungroupedEpoch] of a shell started before its first group names no
+/// group: a photo exposed then belongs to the group that relabelled the
+/// same AR session ([recordEpochStart] `continuesSession`), as the session
+/// commits it (a playback still is up to half the still interval older than
+/// its request; a live shot can expose before the group's shell restart
+/// reaches the frame queue).
 final class PhotoSavedEmitter {
   static let recent = 64
   static let epochHistory = 16
+  /// Epoch of a shell started without a group (capture group indices are 1-based).
+  static let ungroupedEpoch = 0
 
   private let sink: IngestMessageSink
   private let clock: IngestClock
@@ -67,6 +75,8 @@ final class PhotoSavedEmitter {
 
   private var epochStartNs = [Int64](repeating: 0, count: PhotoSavedEmitter.epochHistory)
   private var epochValue = [Int](repeating: 0, count: PhotoSavedEmitter.epochHistory)
+  /// The entry relabels the AR session of the previous entry (no restart).
+  private var epochContinues = [Bool](repeating: false, count: PhotoSavedEmitter.epochHistory)
   private var epochCount = 0
 
   /// True while the shell is started (the event is offered to the ingest queue).
@@ -87,7 +97,9 @@ final class PhotoSavedEmitter {
   }
 
   /// AR frame queue: [epoch] applies from the frame at [frameNs] on.
-  func recordEpochStart(frameNs: Int64, epoch: Int) {
+  /// [continuesSession]: the frame belongs to the same AR session generation
+  /// (same world frame) as the previous one; false after a restart.
+  func recordEpochStart(frameNs: Int64, epoch: Int, continuesSession: Bool = false) {
     guard frameNs > 0 else { return }
     lock.lock(); defer { lock.unlock() }
     if epochCount > 0 && epochValue[epochCount - 1] == epoch { return }
@@ -95,11 +107,13 @@ final class PhotoSavedEmitter {
       for i in 1..<Self.epochHistory {
         epochStartNs[i - 1] = epochStartNs[i]
         epochValue[i - 1] = epochValue[i]
+        epochContinues[i - 1] = epochContinues[i]
       }
       epochCount -= 1
     }
     epochStartNs[epochCount] = frameNs
     epochValue[epochCount] = epoch
+    epochContinues[epochCount] = continuesSession
     epochCount += 1
   }
 
@@ -111,10 +125,17 @@ final class PhotoSavedEmitter {
 
   private func epochAtLocked(_ exposureNs: Int64) -> Int {
     if epochCount == 0 || exposureNs <= 0 { return currentEpoch() }
+    var at = 0
     for i in stride(from: epochCount - 1, through: 0, by: -1) where epochStartNs[i] <= exposureNs {
-      return epochValue[i]
+      at = i
+      break
     }
-    return epochValue[0]
+    // The ungrouped epoch names no group: the group that relabelled the same
+    // AR session holds the photo.
+    while epochValue[at] == Self.ungroupedEpoch && at + 1 < epochCount && epochContinues[at + 1] {
+      at += 1
+    }
+    return epochValue[at]
   }
 
   /// Emits the event of [record] once; returns false for a duplicate.

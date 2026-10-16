@@ -205,6 +205,42 @@ final class VisibilityGridIngestShellTests: XCTestCase {
     XCTAssertEqual(listener.events.count, 2)
   }
 
+  /// Epoch byte of the one photo saved message the shell queued for a
+  /// photo exposed at [PhotoSavedFixture.exposureNs].
+  private func photoEpoch() -> Int? {
+    XCTAssertTrue(shell.photos.onDurableTerminal(PhotoSavedFixture.record()))
+    let photos = drain().filter { $0.ingestKind == IngestMessageLayout.kindPhotoSaved }
+    XCTAssertEqual(photos.count, 1)
+    guard let m = photos.first else { return nil }
+    XCTAssertEqual(m.u16(IngestMessageLayout.groupEpoch),
+                   m.u8(IngestMessageLayout.headerBytes + PhotoSavedLayout.groupEpochLow), "header and event agree")
+    return m.u8(IngestMessageLayout.headerBytes + PhotoSavedLayout.groupEpochLow)
+  }
+
+  func testPhotoExposedBeforeTheFirstGroupBelongsToTheGroupOfTheSameSession() {
+    // The shell starts ungrouped, then the first group relabels the same AR
+    // session; a still exposed before that relabel (a playback still up to
+    // half the still interval older than its request) is the group's photo.
+    shell.onSourceAttached(sourceEpoch: 1, depthMode: IngestDepthMode.disabled, replacesSession: false)
+    shell.start(config(epoch: PhotoSavedEmitter.ungroupedEpoch))
+    frameAt(PhotoSavedFixture.exposureNs - 1_000_000_000)
+    shell.start(config(epoch: 1))
+    frameAt(PhotoSavedFixture.exposureNs + 500_000_000)
+    XCTAssertEqual(photoEpoch(), 1)
+  }
+
+  func testPhotoExposedBeforeARestartIntoTheFirstGroupStaysUngrouped() {
+    // A new AR session generation (other world frame) between the ungrouped
+    // exposure and the group: the photo is not the group's.
+    shell.onSourceAttached(sourceEpoch: 1, depthMode: IngestDepthMode.disabled, replacesSession: false)
+    shell.start(config(epoch: PhotoSavedEmitter.ungroupedEpoch))
+    frameAt(PhotoSavedFixture.exposureNs - 1_000_000_000)
+    shell.onSessionStarted(sourceEpoch: 2, depthMode: IngestDepthMode.disabled)
+    shell.start(config(epoch: 1))
+    frameAt(PhotoSavedFixture.exposureNs + 500_000_000)
+    XCTAssertEqual(photoEpoch(), PhotoSavedEmitter.ungroupedEpoch)
+  }
+
   func testPhotoWithoutPoseCarriesNoPoseOrIntrinsics() {
     var record = PhotoSavedFixture.record()
     record.cameraToWorld = nil
