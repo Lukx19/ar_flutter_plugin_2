@@ -91,3 +91,62 @@ internal object MarkerDetectorNative {
     /** Detect, pose and refine milliseconds of the last calls (3 doubles). */
     @JvmStatic external fun nativeTimings(handle: Long, out: DoubleArray)
 }
+
+/**
+ * Creates and destroys native detector handles. A detector holds the AprilTag
+ * quick-decode table of its dictionary (about 8 MB for 36h12), so producers
+ * create one on first use, never at construction. [NATIVE] is the JNI
+ * library; host tests substitute a counting fake.
+ */
+internal interface MarkerDetectorFactory {
+    /** True when [create] can return a detector (library packaged with its backend). */
+    val available: Boolean
+
+    /** A new detector handle for [dictionary], 0 on failure. */
+    fun create(dictionary: Int): Long
+
+    fun destroy(handle: Long)
+
+    companion object {
+        val NATIVE: MarkerDetectorFactory = object : MarkerDetectorFactory {
+            override val available: Boolean get() = MarkerDetectorNative.available
+            override fun create(dictionary: Int): Long = MarkerDetectorNative.nativeCreate(dictionary)
+            override fun destroy(handle: Long) = MarkerDetectorNative.nativeDestroy(handle)
+        }
+    }
+}
+
+/**
+ * One lazily created native detector: [handle] creates it on the first call
+ * (on the owner's worker thread) and a failed creation is not retried.
+ * [available] stays true until creation failed or [close].
+ */
+internal class LazyMarkerDetector(
+    private val factory: MarkerDetectorFactory,
+    private val dictionary: Int,
+) {
+    @Volatile private var closed = false
+    @Volatile private var createFailed = false
+    private var created = 0L
+
+    val available: Boolean get() = !closed && !createFailed && factory.available
+
+    /** True once the native detector exists. */
+    val isCreated: Boolean get() = created != 0L
+
+    /** The detector, created on first use; 0 when unavailable, failed or closed. */
+    fun handle(): Long {
+        if (created != 0L || !available) return created
+        created = factory.create(dictionary)
+        if (created == 0L) createFailed = true
+        return created
+    }
+
+    /** Destroys the detector if it was created; later calls get 0. */
+    fun close() {
+        closed = true
+        val h = created
+        created = 0L
+        if (h != 0L) factory.destroy(h)
+    }
+}

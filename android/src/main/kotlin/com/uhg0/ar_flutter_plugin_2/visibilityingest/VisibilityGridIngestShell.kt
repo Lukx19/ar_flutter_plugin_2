@@ -222,6 +222,9 @@ internal class VisibilityGridIngestShell(
     internal fun process(source: IngestFrameSource, sessionIdentity: Any?) {
         if (!started) return
         val ts = source.timestampNs
+        // A new AR session (world frame) starts at this frame.
+        val newSession = (sessionIdentity != null && lastSession != null && sessionIdentity !== lastSession) ||
+            (lastFrameNs != Long.MIN_VALUE && ts < lastFrameNs)
         if (appliedVersion != configVersion) {
             appliedVersion = configVersion
             session.groupEpoch = config?.groupEpoch?.and(0xffff) ?: 0
@@ -231,8 +234,7 @@ internal class VisibilityGridIngestShell(
             lastTracking = -1
             lastDepthMode = -1
             lastSession = sessionIdentity
-        } else if ((sessionIdentity != null && lastSession != null && sessionIdentity !== lastSession) ||
-            (lastFrameNs != Long.MIN_VALUE && ts < lastFrameNs)) {
+        } else if (newSession) {
             session.groupEpoch = (session.groupEpoch + 1) and 0xffff
             resetSession()
             restarts++
@@ -253,7 +255,7 @@ internal class VisibilityGridIngestShell(
                 IngestMessageLayout.TRACKING_RESET_AR_RESUMED.toLong(), ts, source.trackingState, session.groupEpoch)
             requestDepthReapply(clock.nowNs())
         }
-        photoEmitter.recordEpochStart(source.androidCameraTimestampNs, session.groupEpoch)
+        photoEmitter.recordEpochStart(source.androidCameraTimestampNs, session.groupEpoch, continuesSession = !newSession)
         lastFrameNs = ts
         lastFrameNsSnapshot = ts
 

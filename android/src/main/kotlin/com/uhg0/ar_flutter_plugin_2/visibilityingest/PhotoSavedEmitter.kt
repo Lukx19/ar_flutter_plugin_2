@@ -139,6 +139,13 @@ internal class DurableJpegLocator(private val storeRoot: File?) {
  * shutter pose of the recovery context (OpenCV camera-to-world of
  * `pose_batch_v2`) is converted to the OpenGL convention; without either the
  * event carries zero intrinsics, which the grid treats as invalid.
+ *
+ * Epoch: the [UNGROUPED_EPOCH] of a shell started before its first group
+ * names no group: a photo exposed then belongs to the group that relabelled
+ * the same AR session ([recordEpochStart] `continuesSession`), as the
+ * session commits it (a playback still is up to half the still interval
+ * older than its request; a live shot can expose before the group's shell
+ * restart reaches the frame).
  */
 internal class PhotoSavedEmitter(
     private val stillCamera: () -> StillCameraModelSource,
@@ -150,6 +157,9 @@ internal class PhotoSavedEmitter(
     companion object {
         const val RECENT = 64
         const val EPOCH_HISTORY = 16
+
+        /** Epoch of a shell started without a group (capture group indices are 1-based). */
+        const val UNGROUPED_EPOCH = 0
         private val HEX = Regex("[0-9a-f]{64}")
     }
 
@@ -188,6 +198,9 @@ internal class PhotoSavedEmitter(
     // clock), newest last; a small ring because epochs change rarely.
     private val epochStartNs = LongArray(EPOCH_HISTORY)
     private val epochValue = IntArray(EPOCH_HISTORY)
+
+    // The entry relabels the AR session of the previous entry (no restart).
+    private val epochContinues = BooleanArray(EPOCH_HISTORY)
     private var epochCount = 0
 
     /**
@@ -195,18 +208,22 @@ internal class PhotoSavedEmitter(
      * [androidCameraTimestampNs] on. A photo is stamped with the epoch active
      * at its exposure, so a photo exposed before a group switch that becomes
      * durable after the shell restarted still belongs to its own group.
+     * [continuesSession]: the frame belongs to the same AR session (same
+     * world frame) as the previous one; false after a restart.
      */
-    fun recordEpochStart(androidCameraTimestampNs: Long, epoch: Int) {
+    fun recordEpochStart(androidCameraTimestampNs: Long, epoch: Int, continuesSession: Boolean = false) {
         if (androidCameraTimestampNs <= 0L) return
         synchronized(poseLock) {
             if (epochCount > 0 && epochValue[epochCount - 1] == epoch) return
             if (epochCount == EPOCH_HISTORY) {
                 System.arraycopy(epochStartNs, 1, epochStartNs, 0, EPOCH_HISTORY - 1)
                 System.arraycopy(epochValue, 1, epochValue, 0, EPOCH_HISTORY - 1)
+                System.arraycopy(epochContinues, 1, epochContinues, 0, EPOCH_HISTORY - 1)
                 epochCount--
             }
             epochStartNs[epochCount] = androidCameraTimestampNs
             epochValue[epochCount] = epoch
+            epochContinues[epochCount] = continuesSession
             epochCount++
         }
     }
@@ -215,11 +232,20 @@ internal class PhotoSavedEmitter(
      * Epoch active at [exposureNs]: the newest epoch started at or before it.
      * Without a recorded epoch or exposure time, the current epoch; before the
      * oldest recorded start, the oldest recorded epoch (older ones were evicted).
+     * The ungrouped epoch resolves to the group that relabelled the same AR
+     * session after it.
      */
     internal fun epochAt(exposureNs: Long): Int = synchronized(poseLock) {
         if (epochCount == 0 || exposureNs <= 0L) return groupEpoch()
-        for (i in epochCount - 1 downTo 0) if (epochStartNs[i] <= exposureNs) return epochValue[i]
-        epochValue[0]
+        var at = 0
+        for (i in epochCount - 1 downTo 0) {
+            if (epochStartNs[i] <= exposureNs) {
+                at = i
+                break
+            }
+        }
+        while (epochValue[at] == UNGROUPED_EPOCH && at + 1 < epochCount && epochContinues[at + 1]) at++
+        epochValue[at]
     }
 
     @Synchronized

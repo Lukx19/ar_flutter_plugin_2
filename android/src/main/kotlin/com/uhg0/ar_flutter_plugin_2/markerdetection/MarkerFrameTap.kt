@@ -33,8 +33,8 @@ internal interface MarkerDetectionWorker {
 }
 
 /** [MarkerDetectionWorker] on its own [HandlerThread]. */
-internal class HandlerMarkerDetectionWorker : MarkerDetectionWorker {
-    private val thread = HandlerThread("capture3d-marker-detector").apply { start() }
+internal class HandlerMarkerDetectionWorker(name: String = "capture3d-marker-detector") : MarkerDetectionWorker {
+    private val thread = HandlerThread(name).apply { start() }
     private val handler = Handler(thread.looper)
 
     override fun post(job: Runnable): Boolean = handler.post(job)
@@ -62,7 +62,7 @@ internal class HandlerMarkerDetectionWorker : MarkerDetectionWorker {
  *
  * Live detection uses the CPU image at the resolution ARCore is configured
  * for; 1920x1080 is the measured choice (range to 4 m for 10 cm markers,
- * about 12 ms per image on the SM-X700).
+ * about 5 ms per image on the SM-X700 with the AprilTag backend).
  */
 internal class MarkerFrameTap(
     private val detector: GreyFrameDetector,

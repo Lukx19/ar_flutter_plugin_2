@@ -19,7 +19,8 @@ import com.uhg0.ar_flutter_plugin_2.visibilityingest.VisibilityGridIngestShell
  * isolate rescales poses of markers with another printed size (tapes) from
  * the session's marker layout. Exists only when the detector library is
  * packaged (`CAPTURE3D_GRID_MARKERS` build), so the default build creates
- * nothing.
+ * nothing; with it, each native detector (about 8 MB decode table) is
+ * created on first use.
  */
 internal class GridMarkerShellTaps internal constructor(
     private val producer: GreyFrameDetector,
@@ -63,19 +64,29 @@ internal class GridMarkerShellTaps internal constructor(
         /** Detection rate of a control message rate ([DEFAULT_HZ] when 0). */
         fun rateHz(controlHz: Int): Int = if (controlHz > 0) controlHz else DEFAULT_HZ
 
-        /** The taps, or null when the detector library is not packaged. */
+        /**
+         * The taps, or null when the detector library is not packaged. Creates
+         * no native detector: live detection creates its own on the first
+         * frame with marker detection on, tie point detection on the first
+         * relayed photo (as on iOS).
+         */
         fun create(
             ingestSink: () -> IngestMessageSink?,
             shell: () -> VisibilityGridIngestShell?,
             clock: IngestClock,
+            factory: MarkerDetectorFactory = MarkerDetectorFactory.NATIVE,
+            worker: () -> MarkerDetectionWorker = { HandlerMarkerDetectionWorker() },
+            tiePointWorker: () -> MarkerDetectionWorker = { HandlerMarkerDetectionWorker("capture3d-marker-tie-points") },
         ): GridMarkerShellTaps? {
-            if (!MarkerDetectorNative.available) return null
+            if (!factory.available) return null
             val producer = MarkerDetectionProducer(
                 MarkerDetectionSink { message, length -> ingestSink()?.offer(message, length) },
+                factory = factory,
             )
-            val tap = MarkerFrameTap(producer, groupEpoch = { shell()?.groupEpoch ?: 0 }, hz = DEFAULT_HZ)
+            val tap = MarkerFrameTap(producer, groupEpoch = { shell()?.groupEpoch ?: 0 }, hz = DEFAULT_HZ, worker = worker())
             val writer = TiePointIngestWriter(ingestSink, clock)
-            return GridMarkerShellTaps(producer, tap, shell, PhotoTiePointProducer(writer), writer)
+            val tiePoints = PhotoTiePointProducer(writer, factory = factory, worker = tiePointWorker())
+            return GridMarkerShellTaps(producer, tap, shell, tiePoints, writer)
         }
     }
 }

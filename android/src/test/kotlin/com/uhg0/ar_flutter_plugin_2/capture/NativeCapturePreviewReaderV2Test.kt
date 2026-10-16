@@ -15,7 +15,7 @@ import org.junit.Test
 class NativeCapturePreviewReaderV2Test {
     @Test
     fun `materializes a smaller preview after original digest validation without rewriting source`() {
-        val root = Files.createTempDirectory("preview-reader").toFile()
+        val root = canonicalTempDirectory("preview-reader")
         try {
             val image = ByteArray(96 * 1024 + 17) { index -> (index * 31).toByte() }
             val componentHash = sha256(image)
@@ -89,7 +89,7 @@ class NativeCapturePreviewReaderV2Test {
     }
 
     @Test fun `older than three roots repairs once from committed ancestor with bounded preview bytes`() {
-        val root = Files.createTempDirectory("older-preview").toFile()
+        val root = canonicalTempDirectory("older-preview")
         try {
             val fixture = committedChain(root)
             var writes = 0
@@ -106,8 +106,23 @@ class NativeCapturePreviewReaderV2Test {
         } finally { root.deleteRecursively() }
     }
 
+    @Test fun `a preview target under a symlinked folder is refused`() {
+        val root = canonicalTempDirectory("symlinked-preview")
+        try {
+            val fixture = committedChain(root)
+            var writes = 0
+            val reader = NativeCapturePreviewReaderV2(root, { _, target, _, _ -> writes++; target.writeBytes(byteArrayOf(1)); true },
+                { _, _ -> false })
+            val link = Files.createSymbolicLink(File(root, "linked").toPath(), File(root, "real").apply { mkdirs() }.toPath()).toFile()
+            assertFalse(reader.materializeJpegPreview(fixture.first, fixture.second, File(link, "display.jpg")))
+            assertEquals(0, writes)
+            assertFalse(File(root, "real/display.jpg").exists())
+            assertTrue(reader.materializeJpegPreview(fixture.first, fixture.second, File(root, "real/display.jpg")))
+        } finally { root.deleteRecursively() }
+    }
+
     @Test fun `off chain immutable object cannot authorize preview and cancelled traversal writes nothing`() {
-        val root = Files.createTempDirectory("cancel-preview").toFile()
+        val root = canonicalTempDirectory("cancel-preview")
         try {
             val fixture = committedChain(root)
             var writes = 0
@@ -125,7 +140,7 @@ class NativeCapturePreviewReaderV2Test {
     }
 
     @Test fun `tampered original cannot create thumbnail or change authoritative bytes`() {
-        val root = Files.createTempDirectory("tampered-preview").toFile()
+        val root = canonicalTempDirectory("tampered-preview")
         try {
             val fixture = committedChain(root)
             val source = File(root, "sessions/session/assets/${fixture.second}/jpeg.${sha256(fixture.third)}.blob")
@@ -201,7 +216,7 @@ class NativeCapturePreviewReaderV2Test {
     }
 
     @Test fun retainedReviewPreviewRequiresMatchingReceiptAndNeverPromotesQuality() {
-        val folder = Files.createTempDirectory("retained-preview").toFile()
+        val folder = canonicalTempDirectory("retained-preview")
         try {
             AdmittedJpegStoreFixture(folder, CaptureLane.MANUAL).use { fixture ->
                 fixture.store.acceptCaptureBeforeExposure(fixture.request, requireRecoveryIdentity = true)
@@ -234,7 +249,7 @@ class NativeCapturePreviewReaderV2Test {
     }
 
     @Test fun assessedSelectedRootKeepsOlderLegacyPreviewReadable() {
-        val folder = Files.createTempDirectory("mixed-preview").toFile()
+        val folder = canonicalTempDirectory("mixed-preview")
         try {
             val fixture = committedChain(folder)
             val session = File(folder, "sessions/session")
@@ -275,4 +290,13 @@ class NativeCapturePreviewReaderV2Test {
 
     private fun digest(bytes: ByteArray): ByteArray =
         MessageDigest.getInstance("SHA-256").digest(bytes)
+
+    /**
+     * Production preview targets live under the canonical app files folder
+     * (`NativeCapturePreviewOwnerV2`), and the reader refuses a target whose
+     * path is not canonical (a symlinked ancestor). Host temporary folders
+     * can have one (macOS `/var` -> `/private/var`), so fixtures use the
+     * canonical folder as production does.
+     */
+    private fun canonicalTempDirectory(prefix: String): File = Files.createTempDirectory(prefix).toFile().canonicalFile
 }

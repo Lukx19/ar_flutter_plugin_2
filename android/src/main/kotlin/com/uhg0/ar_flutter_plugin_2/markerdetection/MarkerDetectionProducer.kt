@@ -41,10 +41,12 @@ internal class MarkerDetectionProducer(
     private val sink: MarkerDetectionSink,
     dictionary: Int = MarkerDetectorNative.DICTIONARY_ARUCO_MIP_36H12,
     maxRecords: Int = 64,
+    factory: MarkerDetectorFactory = MarkerDetectorFactory.NATIVE,
 ) : GreyFrameDetector {
     private val writer = MarkerDetectionMessageWriter(maxRecords)
-    private var handle: Long =
-        if (MarkerDetectorNative.available) MarkerDetectorNative.nativeCreate(dictionary) else 0L
+
+    // Created by the first detection or configuration on the worker thread.
+    private val detector = LazyMarkerDetector(factory, dictionary)
     private var sequence = 0
     val timings = DoubleArray(3)
     var messages = 0
@@ -52,7 +54,10 @@ internal class MarkerDetectionProducer(
     var failures = 0
         private set
 
-    override val available: Boolean get() = handle != 0L
+    override val available: Boolean get() = detector.available
+
+    /** True once the native detector exists (it is created on first use). */
+    val detectorCreated: Boolean get() = detector.isCreated
 
     fun configure(
         markerSizeMetres: Double,
@@ -61,7 +66,8 @@ internal class MarkerDetectionProducer(
         minSharpness: Float = 0.12f,
         maxViewingAngleDeg: Float = 75f,
     ) {
-        if (!available) return
+        val handle = detector.handle()
+        if (handle == 0L) return
         MarkerDetectorNative.nativeSetMarkerSize(handle, markerSizeMetres)
         for ((id, size) in sizesById) MarkerDetectorNative.nativeSetMarkerSizeForId(handle, id, size)
         MarkerDetectorNative.nativeSetQuality(handle, minSidePx, minSharpness, maxViewingAngleDeg)
@@ -84,7 +90,11 @@ internal class MarkerDetectionProducer(
 
     /** Detects markers on [frame] and sends one message; returns the count or an error. */
     fun produce(frame: GreyFrame, nowNs: Long = System.nanoTime()): Int {
-        if (!available) return MarkerDetectorNative.STATUS_UNAVAILABLE
+        val handle = detector.handle()
+        if (handle == 0L) {
+            failures++
+            return MarkerDetectorNative.STATUS_UNAVAILABLE
+        }
         val size = requestedMarkerSize
         if (size > 0.0 && size != appliedMarkerSize) {
             configure(size)
@@ -129,9 +139,6 @@ internal class MarkerDetectionProducer(
     }
 
     override fun close() {
-        if (handle != 0L) {
-            MarkerDetectorNative.nativeDestroy(handle)
-            handle = 0L
-        }
+        detector.close()
     }
 }

@@ -205,7 +205,7 @@ class StorageBudgetCoordinatorV2(
             files.ensureDirectory(staging)
             fileBytes.toSortedMap().forEach { (name, bytes) ->
                 if (bytes == 0L) files.writeExclusive(
-                    File(staging, name), ByteArray(0), DurableStoreFaultPointV2.ACCEPTED_RECORD,
+                    File(staging, name), ByteArray(0), DurableStoreFaultPointV2.STAGING_FILE_CREATE,
                 ) else files.allocateExclusive(File(staging, name), bytes)
                 require(files.allocatedTreeBytes(staging) <= maximumPhysicalBytes)
                 require(freeBytes() >= policy.freeSpaceFloorBytes) {
@@ -363,14 +363,14 @@ class StorageBudgetCoordinatorV2(
         files.atomicReplace(
             marker,
             "PENDING\n$reclaimId\n$bytes\n$previous\n".toByteArray(),
-            DurableStoreFaultPointV2.POINTER_SLOT_REPLACE,
+            DurableStoreFaultPointV2.RECLAIM_MARKER_REPLACE,
         )
         committed = previous - bytes
         persistLedgerLocked()
         files.atomicReplace(
             marker,
             "DONE\n$reclaimId\n$bytes\n$previous\n".toByteArray(),
-            DurableStoreFaultPointV2.POINTER_SLOT_REPLACE,
+            DurableStoreFaultPointV2.RECLAIM_MARKER_REPLACE,
         )
     }
 
@@ -398,7 +398,7 @@ class StorageBudgetCoordinatorV2(
         files.atomicReplace(
             marker,
             "$candidatePath\n$actual\n$previous\n".toByteArray(),
-            DurableStoreFaultPointV2.POINTER_SLOT_REPLACE,
+            DurableStoreFaultPointV2.RECLAIM_MARKER_REPLACE,
         )
         files.deleteTree(candidate, DurableStoreFaultPointV2.DELETE_RECLAIM)
         committed = previous - actual
@@ -450,7 +450,7 @@ class StorageBudgetCoordinatorV2(
                     files.atomicReplace(
                         marker,
                         "DONE\n${lines[1]}\n$bytes\n$previous\n".toByteArray(),
-                        DurableStoreFaultPointV2.POINTER_SLOT_REPLACE,
+                        DurableStoreFaultPointV2.RECLAIM_MARKER_REPLACE,
                     )
                 }
             }
@@ -642,7 +642,7 @@ class StorageBudgetCoordinatorV2(
         files.atomicReplace(
             metadataFile(value.token),
             "${value.owner}\n${value.bytes}\n${value.stagingName}\n${value.targetName}\nCOMMITTING:$actualBytes:$committed\n".toByteArray(),
-            DurableStoreFaultPointV2.POINTER_SLOT_REPLACE,
+            DurableStoreFaultPointV2.RESERVATION_COMMIT_REPLACE,
         )
         committed = Math.addExact(committed, actualBytes)
         persistLedgerLocked()
@@ -659,7 +659,7 @@ class StorageBudgetCoordinatorV2(
         files.atomicReplace(
             metadataFile(value.token),
             (pointerMetadata(value) + "COMMITTING:$actualBytes:$committed\n").toByteArray(),
-            DurableStoreFaultPointV2.POINTER_SLOT_REPLACE,
+            DurableStoreFaultPointV2.RESERVATION_COMMIT_REPLACE,
         )
         committed = Math.addExact(committed, actualBytes)
         persistLedgerLocked()
@@ -675,7 +675,7 @@ class StorageBudgetCoordinatorV2(
         files.atomicReplace(
             metadataFile(value.token),
             "${value.owner}\n${value.bytes}\nCOMMITTING:$actualBytes:$committed\n".toByteArray(),
-            DurableStoreFaultPointV2.POINTER_SLOT_REPLACE,
+            DurableStoreFaultPointV2.RESERVATION_COMMIT_REPLACE,
         )
         committed = Math.addExact(committed, actualBytes)
         persistLedgerLocked()
@@ -692,7 +692,7 @@ class StorageBudgetCoordinatorV2(
         reservations.remove(value.token)
     }
     private fun nextTokenLocked() = "${reservations.size}:${committed}:${System.nanoTime()}"
-    private fun persistLedgerLocked() = files.atomicReplace(ledger, "$committed\n".toByteArray(), DurableStoreFaultPointV2.POINTER_SLOT_REPLACE)
+    private fun persistLedgerLocked() = files.atomicReplace(ledger, "$committed\n".toByteArray(), DurableStoreFaultPointV2.LEDGER_REPLACE)
     private fun metadataFile(token: String) = files.child("reservations-v2", "$token.reservation")
     private fun allocationFile(token: String) = files.child("reservations-v2", "$token.allocation")
     private fun pointerMetadata(value: StorageBudgetReservationV2) =
