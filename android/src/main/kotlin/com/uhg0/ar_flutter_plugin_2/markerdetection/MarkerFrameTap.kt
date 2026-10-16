@@ -62,7 +62,7 @@ internal class HandlerMarkerDetectionWorker(name: String = "capture3d-marker-det
  *
  * Live detection uses the CPU image at the resolution ARCore is configured
  * for; 1920x1080 is the measured choice (range to 4 m for 10 cm markers,
- * about 12 ms per image on the SM-X700).
+ * about 5 ms per image on the SM-X700 with the AprilTag backend).
  */
 internal class MarkerFrameTap(
     private val detector: GreyFrameDetector,

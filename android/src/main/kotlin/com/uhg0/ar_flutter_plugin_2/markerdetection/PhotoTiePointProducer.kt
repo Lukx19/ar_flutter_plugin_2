@@ -65,8 +65,8 @@ internal object TiePointBatchLayout {
  * grey natively, searched at full resolution and refined with edge lines;
  * corners and centres stay in the photo's raw pixels (lens distortion is
  * modelled during the fit when coefficients are given). Runs on its own
- * thread, one photo at a time, off the capture path (about 80 ms per 12 MP
- * photo on the SM-X700). The native detector is created by the first photo
+ * thread, one photo at a time, off the capture path (about 130-145 ms per 12 MP
+ * photo on the SM-X700 with the AprilTag backend). The native detector is created by the first photo
  * on that thread.
  */
 internal class PhotoTiePointProducer(
