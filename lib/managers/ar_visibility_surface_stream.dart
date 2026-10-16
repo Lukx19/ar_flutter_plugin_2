@@ -4,6 +4,8 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/services.dart';
 
+import 'background_platform_messenger.dart';
+
 /// Immutable bytes pinned for one platform invocation. The bytes remain
 /// unchanged while the invocation is in flight, including after a timeout.
 final class ARVisibilitySurfaceStreamAttempt {
@@ -123,11 +125,11 @@ final class ARVisibilitySurfaceStreamWorker {
     required int viewId,
     required Uint8List request,
   }) async {
-    BackgroundIsolateBinaryMessenger.ensureInitialized(rootIsolateToken);
     final channel = BasicMessageChannel<ByteData?>(
       'visibility_surface_stream_$viewId',
       const BinaryCodec(),
-      binaryMessenger: BackgroundIsolateBinaryMessenger.instance,
+      binaryMessenger:
+          BackgroundPlatformMessenger.ensureInitialized(rootIsolateToken),
     );
     final response = await channel.send(ByteData.sublistView(request));
     _requireResponsePacket(response);

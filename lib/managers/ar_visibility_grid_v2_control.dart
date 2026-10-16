@@ -7,6 +7,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
 import 'ar_visibility_surface_stream.dart';
+import 'background_platform_messenger.dart';
 import '../models/renderer_attribute.dart';
 
 const int _visibilityWorkerRequestCeilingBytes = 16 * 1024;
@@ -1628,9 +1629,10 @@ final class ARVisibilityGridV2WorkerBinding {
         _streamChannel = streamChannel,
         _cleanupLease = cleanupLease;
 
-  /// Creates a worker binding using Flutter's background messenger with one
-  /// fresh, connection-owned 16-byte Dart cleanup lease available before any
-  /// native reply. The lease is never replaced by a later binding generation.
+  /// Creates a worker binding on the isolate's [BackgroundPlatformMessenger]
+  /// with one fresh, connection-owned 16-byte Dart cleanup lease available
+  /// before any native reply. The lease is never replaced by a later binding
+  /// generation.
   ///
   /// The control channel accepts `start`, `beginCheckpoint`,
   /// `releaseCheckpoint`, and `stop`; each method takes one [Uint8List] and
@@ -1666,8 +1668,10 @@ final class ARVisibilityGridV2WorkerBinding {
       throw ArgumentError('Worker binding test channels must be paired.');
     }
     if (controlChannel == null) {
-      BackgroundIsolateBinaryMessenger.ensureInitialized(rootIsolateToken);
-      final messenger = BackgroundIsolateBinaryMessenger.instance;
+      // Each control and stream message gets its own reply, including the
+      // empty reply of a closed view (see BackgroundPlatformMessenger).
+      final messenger =
+          BackgroundPlatformMessenger.ensureInitialized(rootIsolateToken);
       controlChannel = MethodChannel(
         'visibility_grid_v2_control_$viewId',
         const StandardMethodCodec(),
