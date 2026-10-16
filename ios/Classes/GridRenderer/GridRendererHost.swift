@@ -166,6 +166,42 @@ final class GridRendererHost {
   /// Draw statistics of the last encoded frame.
   var drawCounters: StyleDrawCounters? { draws?.counters }
 
+  /// Renderer state for the capture performance snapshot (`gridRenderer`):
+  /// whether a capture view prepared it, failures, upload scheduler counters
+  /// and the last frame's draw counters. Main thread.
+  func diagnostics() -> [String: Any] {
+    stateLock.lock()
+    let attached = viewAttached
+    let hasFailed = failed
+    let failureTotal = failures
+    stateLock.unlock()
+    let upload = core.scheduler.counters
+    let drawn = draws?.counters
+    return [
+      "viewAttached": attached,
+      "failed": hasFailed,
+      "failures": failureTotal,
+      "mode": "\(core.mode)",
+      "upload": [
+        "offered": upload.offered,
+        "accepted": upload.accepted,
+        "droppedAwaitingReset": upload.droppedAwaitingReset,
+        "overflows": upload.overflows,
+        "malformed": upload.malformed,
+        "frames": upload.frames,
+        "maxFrameBytes": upload.maxFrameBytes,
+        "deferredFrames": upload.deferredFrames,
+        "maxBacklogBytes": upload.maxBacklogBytes,
+      ],
+      "lastFrame": [
+        "drawCalls": drawn?.drawCalls ?? 0,
+        "instances": drawn?.instances ?? 0,
+        "voxelInstances": drawn?.voxelInstances ?? 0,
+        "lineSegments": drawn?.lineSegments ?? 0,
+      ],
+    ]
+  }
+
   /// A new capture view starts drawing: overlays forget the previous view's
   /// quest frame, marker outlines and pose frusta, as the Android host that
   /// is created per view. Grid buffers stay (they belong to the device).

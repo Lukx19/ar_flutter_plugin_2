@@ -1,6 +1,7 @@
 import ARKit
 import Flutter
 import Foundation
+import QuartzCore
 import simd
 
 /// Registers native still capture with the plugin: the `arcapture_<id>`
@@ -172,7 +173,7 @@ final class NativeCaptureChannel: CaptureChannelExtension {
     case "getCameraIntrinsics":
       guard requireInitialized(result) != nil else { return true }
       result(currentIntrinsicsMap() ?? NSNull())
-    case "getPerformanceSnapshot": performanceSnapshot(result)
+    case "getPerformanceSnapshot": performanceSnapshot(arguments, result)
     default:
       return false
     }
@@ -476,7 +477,10 @@ final class NativeCaptureChannel: CaptureChannelExtension {
 
   // MARK: Diagnostics
 
-  private func performanceSnapshot(_ result: @escaping FlutterResult) {
+  /// `resetDiagnosticTiming` starts a new capture view timing window after
+  /// the reply's values were read.
+  private func performanceSnapshot(_ arguments: Any?, _ result: @escaping FlutterResult) {
+    let options = arguments as? [String: Any] ?? [:]
     let counters = stills?.snapshot
     var snapshot: [String: Any] = [
       "platform": "ios",
@@ -491,7 +495,10 @@ final class NativeCaptureChannel: CaptureChannelExtension {
         "lastWidth": counters?.lastWidth ?? 0,
         "lastHeight": counters?.lastHeight ?? 0,
       ] as [String: Any],
+      "captureView": CaptureViewFrameStats.shared.snapshot(nowS: CACurrentMediaTime()),
+      "gridRenderer": GridRendererRegistry.shared.host?.diagnostics() ?? NSNull(),
     ]
+    if options["resetDiagnosticTiming"] as? Bool == true { CaptureViewFrameStats.shared.reset() }
     guard let binding = binding else { return result(snapshot) }
     binding.health { outcome in
       if case .success(let health) = outcome { snapshot["nativeCaptureHealth"] = health["health"] ?? NSNull() }

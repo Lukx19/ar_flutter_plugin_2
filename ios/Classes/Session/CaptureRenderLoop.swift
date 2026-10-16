@@ -20,8 +20,12 @@ final class CaptureRenderLoop: NSObject, MTKViewDelegate {
   private var preparedOverlayRevision = -1
   /// The overlay this loop prepared; told once when the loop goes away.
   private weak var preparedOverlay: GridOverlayRenderer?
+  private let frameStats: CaptureViewFrameStats
 
-  init(device: MTLDevice, source: ARFrameSource, overlays: GridOverlayRegistry = .shared) throws {
+  init(
+    device: MTLDevice, source: ARFrameSource, overlays: GridOverlayRegistry = .shared,
+    frameStats: CaptureViewFrameStats = .shared
+  ) throws {
     guard let queue = device.makeCommandQueue() else { throw CaptureRenderError.metalUnavailable }
     queue.label = "capture view"
     commandQueue = queue
@@ -31,6 +35,7 @@ final class CaptureRenderLoop: NSObject, MTKViewDelegate {
       depthPixelFormat: CaptureRenderLoop.depthPixelFormat)
     self.source = source
     self.overlays = overlays
+    self.frameStats = frameStats
     super.init()
   }
 
@@ -59,6 +64,7 @@ final class CaptureRenderLoop: NSObject, MTKViewDelegate {
   }
 
   func draw(in view: MTKView) {
+    let startedS = CACurrentMediaTime()
     guard let pass = view.currentRenderPassDescriptor,
           let commandBuffer = commandQueue.makeCommandBuffer()
     else { return }
@@ -73,7 +79,8 @@ final class CaptureRenderLoop: NSObject, MTKViewDelegate {
       preparedOverlayRevision = overlays.revision
       preparedOverlay = overlay
     }
-    (overlay as? GridOverlayFrameUploader)?.encodeFrameUploads(into: commandBuffer)
+    let uploaded = (overlay as? GridOverlayFrameUploader)?.encodeFrameUploads(into: commandBuffer) ?? 0
+    var overlayDrawn = false
     guard let encoder = commandBuffer.makeRenderCommandEncoder(descriptor: pass) else {
       // Uploads already encoded must still run.
       commandBuffer.commit()
@@ -103,6 +110,7 @@ final class CaptureRenderLoop: NSObject, MTKViewDelegate {
         encoder.pushDebugGroup("grid overlay")
         overlay.encodeOverlay(into: encoder, context: context)
         encoder.popDebugGroup()
+        overlayDrawn = true
       }
     }
     encoder.endEncoding()
@@ -114,10 +122,143 @@ final class CaptureRenderLoop: NSObject, MTKViewDelegate {
     // then let the cache owner go.
     var inFlightTextures: [CVMetalTexture]? = imageTextures
     let textureCacheOwner = background
-    commandBuffer.addCompletedHandler { _ in
+    let stats = frameStats
+    commandBuffer.addCompletedHandler { buffer in
       inFlightTextures = nil
       withExtendedLifetime(textureCacheOwner) {}
+      if buffer.gpuEndTime > buffer.gpuStartTime, buffer.gpuStartTime > 0 {
+        stats.recordGpu(ms: (buffer.gpuEndTime - buffer.gpuStartTime) * 1000)
+      }
     }
     commandBuffer.commit()
+    frameStats.recordDraw(
+      nowS: startedS, encodeMs: (CACurrentMediaTime() - startedS) * 1000,
+      uploadedDeltas: uploaded > 0, overlayDrawn: overlayDrawn)
+  }
+}
+
+
+/// Display-frame timing of the capture view's render loop for the
+/// performance snapshot (`getPerformanceSnapshot` key `captureView`): the
+/// interval between draws, the CPU time of one draw (camera background,
+/// grid uploads and styles encoded), the GPU time of its command buffer and
+/// whether grid deltas were uploaded in it. A frame gap is an interval over
+/// 100 ms (the iM3 bound); a gap whose frame uploaded grid deltas is counted
+/// as upload-caused. Fixed 1 ms histograms up to 250 ms (one overflow
+/// bucket), so recording never allocates. Draws record on the main thread,
+/// GPU times on Metal's completion queue; reads come from the main thread.
+final class CaptureViewFrameStats {
+  static let shared = CaptureViewFrameStats()
+
+  static let gapThresholdMs = 100.0
+  static let bucketCount = 251
+
+  private struct Histogram {
+    var buckets = [Int](repeating: 0, count: CaptureViewFrameStats.bucketCount)
+    var count = 0
+    var sumMs = 0.0
+    var maxMs = 0.0
+
+    mutating func add(_ ms: Double) {
+      let index = min(max(Int(ms.rounded(.down)), 0), CaptureViewFrameStats.bucketCount - 1)
+      buckets[index] += 1
+      count += 1
+      sumMs += ms
+      if ms > maxMs { maxMs = ms }
+    }
+
+    /// Upper edge of the bucket holding quantile [q] (ms); 0 when empty.
+    func quantile(_ q: Double) -> Double {
+      guard count > 0 else { return 0 }
+      let target = Int((Double(count) * q).rounded(.up))
+      var seen = 0
+      for (index, n) in buckets.enumerated() {
+        seen += n
+        if seen >= max(target, 1) { return Double(index + 1) }
+      }
+      return Double(CaptureViewFrameStats.bucketCount)
+    }
+
+    func summary() -> [String: Any] {
+      [
+        "count": count,
+        "meanMs": count > 0 ? sumMs / Double(count) : 0,
+        "p50Ms": quantile(0.5),
+        "p95Ms": quantile(0.95),
+        "p99Ms": quantile(0.99),
+        "maxMs": maxMs,
+      ]
+    }
+  }
+
+  private let lock = NSLock()
+  private var intervals = Histogram()
+  private var encode = Histogram()
+  private var gpu = Histogram()
+  private var lastDrawS: Double?
+  private var frames = 0
+  private var uploadFrames = 0
+  private var overlayFrames = 0
+  private var gaps = 0
+  private var uploadGaps = 0
+  private var longestGapMs = 0.0
+  private var startedS: Double?
+
+  /// One drawn frame that started at [nowS] (seconds, monotonic).
+  func recordDraw(nowS: Double, encodeMs: Double, uploadedDeltas: Bool, overlayDrawn: Bool) {
+    lock.lock(); defer { lock.unlock() }
+    if startedS == nil { startedS = nowS }
+    frames += 1
+    if uploadedDeltas { uploadFrames += 1 }
+    if overlayDrawn { overlayFrames += 1 }
+    encode.add(encodeMs)
+    if let last = lastDrawS {
+      let ms = (nowS - last) * 1000
+      intervals.add(ms)
+      if ms > Self.gapThresholdMs {
+        gaps += 1
+        if uploadedDeltas { uploadGaps += 1 }
+        if ms > longestGapMs { longestGapMs = ms }
+      }
+    }
+    lastDrawS = nowS
+  }
+
+  func recordGpu(ms: Double) {
+    guard ms.isFinite, ms >= 0 else { return }
+    lock.lock(); gpu.add(ms); lock.unlock()
+  }
+
+  /// Starts a new measurement window (`resetDiagnosticTiming`).
+  func reset() {
+    lock.lock(); defer { lock.unlock() }
+    intervals = Histogram()
+    encode = Histogram()
+    gpu = Histogram()
+    lastDrawS = nil
+    frames = 0
+    uploadFrames = 0
+    overlayFrames = 0
+    gaps = 0
+    uploadGaps = 0
+    longestGapMs = 0
+    startedS = nil
+  }
+
+  func snapshot(nowS: Double) -> [String: Any] {
+    lock.lock(); defer { lock.unlock() }
+    return [
+      "frames": frames,
+      "windowMs": startedS.map { (nowS - $0) * 1000 } ?? 0,
+      "uploadFrames": uploadFrames,
+      "overlayFrames": overlayFrames,
+      "gapThresholdMs": Self.gapThresholdMs,
+      "gaps": gaps,
+      "uploadGaps": uploadGaps,
+      "longestGapMs": longestGapMs,
+      "intervalMs": intervals.summary(),
+      "encodeMs": encode.summary(),
+      "gpuMs": gpu.summary(),
+    ]
   }
 }

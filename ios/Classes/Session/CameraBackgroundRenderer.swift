@@ -150,7 +150,9 @@ extension GridOverlayRenderer {
 /// command buffer. Called on the main thread for every drawn frame, after
 /// `prepare` and before `encodeOverlay`.
 protocol GridOverlayFrameUploader: AnyObject {
-  func encodeFrameUploads(into commandBuffer: MTLCommandBuffer)
+  /// Encodes the frame's queued uploads; returns how much was uploaded (0:
+  /// nothing this frame).
+  func encodeFrameUploads(into commandBuffer: MTLCommandBuffer) -> Int
 }
 
 /// Process-wide overlay slot read by the active capture view each frame, so

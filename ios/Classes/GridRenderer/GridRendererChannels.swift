@@ -160,7 +160,7 @@ final class GridRendererOverlay: GridOverlayRenderer, GridOverlayFrameUploader {
     host.detachView(owner)
   }
 
-  func encodeFrameUploads(into commandBuffer: MTLCommandBuffer) {
+  func encodeFrameUploads(into commandBuffer: MTLCommandBuffer) -> Int {
     host.encodeUploads(into: commandBuffer)
   }
 
