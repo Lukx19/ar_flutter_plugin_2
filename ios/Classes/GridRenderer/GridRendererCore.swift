@@ -22,19 +22,17 @@ final class GridRendererCore {
   private(set) var modeAppliedFrame = -1
 
   /// Display mode switches taken by [frame] (plan iM3: a switch takes
-  /// effect within one frame): how many, the wait from the accepted display
-  /// message to the start of the frame that applied it (latest and longest),
-  /// and frames that started after the message without applying it (0
-  /// when every switch shows in the next frame).
+  /// effect within one frame): how many, and the wait from the accepted
+  /// display message to the start of the frame that applied it (latest and
+  /// longest). A wait of at most one draw interval shows the switch in the
+  /// next frame.
   struct ModeSwitchStats: Equatable {
     var switches = 0
     var lastLatencyMs = 0.0
     var maxLatencyMs = 0.0
-    var framesLate = 0
   }
 
   private(set) var modeSwitches = ModeSwitchStats()
-  private var lastFrameStartS: Double?
 
   /// Data-only overlays; their display-channel messages are routed by magic.
   /// Set up before the channels deliver messages; read on both threads.
@@ -126,10 +124,7 @@ final class GridRendererCore {
       modeSwitches.switches += 1
       modeSwitches.lastLatencyMs = latencyMs
       modeSwitches.maxLatencyMs = max(modeSwitches.maxLatencyMs, latencyMs)
-      // The previous frame started after the message and kept the old mode.
-      if let previous = lastFrameStartS, previous > acceptedAt { modeSwitches.framesLate += 1 }
     }
-    lastFrameStartS = startS
     return try scheduler.drainFrame(store: store, target: target, budgetBytes: frameBudgetBytes)
   }
 }

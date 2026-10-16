@@ -430,6 +430,8 @@ class ARSessionManager {
   /// capture manager become disposed on the Dart side only, without a native
   /// call. Later calls fail as on a disposed session instead of reaching a
   /// channel without a handler. A [dispose] in flight keeps ownership.
+  /// [ARView] calls this for iOS views only; an Android view still sends
+  /// capture finalization events while its native teardown drains.
   void platformViewDetached() {
     if (_sessionState == ARSessionState.disposed || _disposeAttempt != null) {
       return;

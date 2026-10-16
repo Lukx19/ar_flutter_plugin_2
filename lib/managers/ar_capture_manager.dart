@@ -2479,9 +2479,6 @@ class ARCaptureManager {
     );
   }
 
-  /// Shares a close attempt. Native refusal retains the channel and streams.
-  /// A later call requests another attempt; cached native failure may persist.
-  /// Throws the native [PlatformException] when release is refused.
   /// The platform view went away without [dispose] (`arcapture_<id>` has
   /// no native handler any more): disposed on the Dart side only, so
   /// [isEnabled] is false and later calls fail with
@@ -2509,6 +2506,9 @@ class ARCaptureManager {
     unawaited(_nativeCaptureV2Controller.close());
   }
 
+  /// Shares a close attempt. Native refusal retains the channel and streams.
+  /// A later call requests another attempt; cached native failure may persist.
+  /// Throws the native [PlatformException] when release is refused.
   Future<void> dispose() {
     final pending = _disposeAttempt;
     if (pending != null) return pending;

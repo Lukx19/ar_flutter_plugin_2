@@ -198,7 +198,6 @@ final class GridRendererHost {
         "switches": switches.switches,
         "lastLatencyMs": switches.lastLatencyMs,
         "maxLatencyMs": switches.maxLatencyMs,
-        "framesLate": switches.framesLate,
         "appliedFrame": core.modeAppliedFrame,
         "frame": core.frameNumber,
       ],

@@ -165,8 +165,8 @@ final class DeltaUploadSchedulerTests: XCTestCase {
   }
 
   /// iM3 mode switch timing: the frame after the accepted display message
-  /// applies it; its wait from the message and the frames that missed it
-  /// (none) are counted for the performance snapshot.
+  /// applies it; its wait from the message (latest and longest) is counted
+  /// for the performance snapshot.
   func testModeSwitchLatencyIsMeasuredFromTheMessageToTheApplyingFrame() throws {
     var nowS = 10.0
     let target = ByteArrayGpuTarget()
@@ -181,7 +181,6 @@ final class DeltaUploadSchedulerTests: XCTestCase {
     XCTAssertEqual(core.mode.baseLayer, GridDisplayCodes.baseSplats)
     XCTAssertEqual(core.modeSwitches.switches, 1)
     XCTAssertEqual(core.modeSwitches.lastLatencyMs, 12.7, accuracy: 1e-6)
-    XCTAssertEqual(core.modeSwitches.framesLate, 0)
     nowS = 10.0334
     try frame(core, target)
     XCTAssertEqual(core.modeSwitches.switches, 1, "no new message, no switch")
@@ -193,7 +192,6 @@ final class DeltaUploadSchedulerTests: XCTestCase {
     XCTAssertEqual(core.modeSwitches.switches, 2)
     XCTAssertEqual(core.modeSwitches.lastLatencyMs, 0.1, accuracy: 1e-6)
     XCTAssertEqual(core.modeSwitches.maxLatencyMs, 12.7, accuracy: 1e-6)
-    XCTAssertEqual(core.modeSwitches.framesLate, 0)
   }
 
   func testAnAllocationFailureKeepsTheMessageQueuedAndThrows() throws {

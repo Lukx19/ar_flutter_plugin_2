@@ -13,9 +13,12 @@ import 'package:flutter_test/flutter_test.dart';
 
 /// A platform view removed without `ARSessionManager.dispose` (its widget
 /// left the tree or a new configuration replaced it) takes its native
-/// channels with it: the Dart managers it created become disposed without a
-/// native call, so a later lifecycle notification fails as on a disposed
-/// manager instead of reaching `arcapture_<id>` without a handler.
+/// channels with it on iOS: the Dart managers it created become disposed
+/// without a native call, so a later lifecycle notification fails as on a
+/// disposed manager instead of reaching `arcapture_<id>` without a handler.
+/// An Android view still drains its capture teardown after removal, so its
+/// managers keep the inbound handler and streams and late finalization
+/// events still reach the app.
 class _FakeContext extends Fake implements BuildContext {}
 
 void main() {
@@ -29,19 +32,23 @@ void main() {
     format: CaptureFormat.jpeg,
   );
   final nativeCalls = <String>[];
+  // Platform view ids grow across the tests of this file.
+  final channelNames = [
+    for (var id = 0; id < 8; id++) ...['arsession_$id', 'arcapture_$id'],
+  ];
 
   setUp(() {
     ARCaptureManager.debugIsSupportedOverride = true;
     nativeCalls.clear();
-    messenger.setMockMethodCallHandler(SystemChannels.platform_views,
-        (call) async => null);
+    messenger.setMockMethodCallHandler(
+        SystemChannels.platform_views, (call) async => null);
     // Camera permission granted (Permission.camera 1, granted 1).
     messenger.setMockMethodCallHandler(permissions, (call) async {
       if (call.method == 'requestPermissions') return <int, int>{1: 1};
       if (call.method == 'checkPermissionStatus') return 1;
       return null;
     });
-    for (final name in ['arsession_0', 'arcapture_0', 'arsession_1', 'arcapture_1']) {
+    for (final name in channelNames) {
       messenger.setMockMethodCallHandler(MethodChannel(name), (call) async {
         nativeCalls.add('$name.${call.method}');
         return null;
@@ -53,7 +60,7 @@ void main() {
     ARCaptureManager.debugIsSupportedOverride = null;
     messenger.setMockMethodCallHandler(SystemChannels.platform_views, null);
     messenger.setMockMethodCallHandler(permissions, null);
-    for (final name in ['arsession_0', 'arcapture_0', 'arsession_1', 'arcapture_1']) {
+    for (final name in channelNames) {
       messenger.setMockMethodCallHandler(MethodChannel(name), null);
     }
   });
@@ -111,7 +118,66 @@ void main() {
     await tester.pumpAndSettle();
   }, variant: TargetPlatformVariant.only(TargetPlatform.iOS));
 
-  test('a dispose in flight keeps ownership; detaching after dispose is a '
+  // A message from the native view, delivered by the following pumps.
+  void sendInbound(int id, String method, Object? arguments) {
+    final message = const StandardMethodCodec()
+        .encodeMethodCall(MethodCall(method, arguments));
+    ServicesBinding.instance.channelBuffers
+        .push('arcapture_$id', message, (_) {});
+  }
+
+  testWidgets(
+      'an Android view removed during capture teardown still delivers a late '
+      'onCaptureFinalized', (tester) async {
+    final created = <ARSessionManager>[];
+    await tester.pumpWidget(view(created));
+    await tester.pumpAndSettle();
+    expect(created, hasLength(1));
+    final session = created.single;
+    final capture = session.captureManager!;
+    final finalized = <Map<String, dynamic>>[];
+    final subscription = capture.captureFinalizedStream.listen(finalized.add);
+    nativeCalls.clear();
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pumpAndSettle();
+
+    expect(session.sessionState, isNot(ARSessionState.disposed));
+    expect(capture.isDisposed, isFalse);
+    sendInbound(session.channelId, 'onCaptureFinalized',
+        <String, Object?>{'captureId': 'late', 'status': 'committed'});
+    await tester.pump();
+    await tester.pump();
+    expect(finalized, hasLength(1));
+    expect(finalized.single['status'], 'committed');
+    expect(nativeCalls, isEmpty);
+    // Both wait on futures outside the test's fake async zone.
+    await tester.runAsync(subscription.cancel);
+    await tester.runAsync(session.dispose);
+  }, variant: TargetPlatformVariant.only(TargetPlatform.android));
+
+  testWidgets(
+      'an Android view replaced by a new configuration keeps the old '
+      'managers open', (tester) async {
+    final created = <ARSessionManager>[];
+    await tester.pumpWidget(view(created, key: const ValueKey(1)));
+    await tester.pumpAndSettle();
+    await tester.pumpWidget(view(created, key: const ValueKey(2)));
+    await tester.pumpAndSettle();
+    expect(created, hasLength(2));
+    expect(created.first.sessionState, isNot(ARSessionState.disposed));
+    expect(created.first.captureManager!.isDisposed, isFalse);
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pumpAndSettle();
+    await tester.runAsync(() async {
+      for (final session in created) {
+        await session.dispose();
+      }
+    });
+  }, variant: TargetPlatformVariant.only(TargetPlatform.android));
+
+  test(
+      'a dispose in flight keeps ownership; detaching after dispose is a '
       'no-op', () async {
     final session = ARSessionManager(
         0, _FakeContext(), PlaneDetectionConfig.none,

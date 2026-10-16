@@ -295,6 +295,20 @@ class _ARViewState extends State<ARView> {
   /// view goes away ([ARSessionManager.platformViewDetached]).
   ARSessionManager? _createdSession;
 
+  /// Platform the last view was built for.
+  TargetPlatform? _createdPlatform;
+
+  /// Releases the Dart side of a session whose platform view is gone, on iOS
+  /// only: `CaptureARView.deinit` sends nothing after the view goes, so the
+  /// Dart handlers can close. An Android view still drains its capture
+  /// teardown after removal and may send `onCaptureFinalized` or
+  /// `onNativeCaptureV2Event`; its session keeps the inbound handler and
+  /// streams until the app disposes it or a replacement view takes over.
+  void _detachSession(ARSessionManager session) {
+    if (_createdPlatform != TargetPlatform.iOS) return;
+    session.platformViewDetached();
+  }
+
   @override
   void initState() {
     super.initState();
@@ -305,7 +319,8 @@ class _ARViewState extends State<ARView> {
   void dispose() {
     // The platform view goes with this widget: a session the app did not
     // dispose first must not keep calling its gone channels.
-    _createdSession?.platformViewDetached();
+    final created = _createdSession;
+    if (created != null) _detachSession(created);
     _createdSession = null;
     super.dispose();
   }
@@ -318,9 +333,10 @@ class _ARViewState extends State<ARView> {
     // A new platform view replaced the previous one, which is gone.
     final previous = _createdSession;
     if (previous != null && !identical(previous, session)) {
-      previous.platformViewDetached();
+      _detachSession(previous);
     }
     _createdSession = session;
+    _createdPlatform = Theme.of(context).platform;
     widget.onARViewCreated(session, objects, anchors, locations);
   }
 
