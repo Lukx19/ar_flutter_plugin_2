@@ -119,6 +119,56 @@ class PhotoSavedEmitterTest {
         assertEquals(4, photos.last().event[PhotoSavedLayout.GROUP_EPOCH_LOW].toInt())
     }
 
+    /** One frame of [session] at camera image time [cameraNs]. */
+    private fun frameAt(cameraNs: Long, session: Any = SESSION) {
+        val frame = FakeFrame()
+        frame.timestampNs = cameraNs
+        frame.androidCameraTimestampNs = cameraNs
+        shell.process(frame, session)
+    }
+
+    /** Group epoch byte of the photo saved event of the photo exposed at [exposureNs]. */
+    private fun photoEpoch(): Int {
+        val photos = mutableListOf<DurablePhoto>()
+        shell.durablePhotoListeners = arrayOf(DurablePhotoListener { photos += it })
+        shell.onDurableTerminal(request(attemptId, CaptureLane.AUTOMATIC), committed(attemptId, captureId), exposureNs)
+        return photos.single().event[PhotoSavedLayout.GROUP_EPOCH_LOW].toInt()
+    }
+
+    @Test
+    fun `a photo exposed before the first group belongs to the group of the same AR session`() {
+        // The shell starts ungrouped, then the first group relabels the same AR
+        // session; a still exposed before that relabel (a playback still up to
+        // half the still interval older than its request) is the group's photo.
+        shell.start(IngestShellConfig(0, 0, 0, 0, 0f, PhotoSavedEmitter.UNGROUPED_EPOCH))
+        frameAt(exposureNs - 1_000_000_000L)
+        shell.start(IngestShellConfig(0, 0, 0, 0, 0f, 1))
+        frameAt(exposureNs + 500_000_000L)
+        assertEquals(1, photoEpoch())
+    }
+
+    @Test
+    fun `a photo exposed before an AR restart into the first group stays ungrouped`() {
+        // A new AR session (other world frame) between the ungrouped exposure
+        // and the group: the photo is not the group's.
+        shell.start(IngestShellConfig(0, 0, 0, 0, 0f, PhotoSavedEmitter.UNGROUPED_EPOCH))
+        frameAt(exposureNs - 1_000_000_000L)
+        frameAt(exposureNs + 200_000_000L, Any())
+        shell.start(IngestShellConfig(0, 0, 0, 0, 0f, 1))
+        frameAt(exposureNs + 500_000_000L)
+        assertEquals(PhotoSavedEmitter.UNGROUPED_EPOCH, photoEpoch())
+    }
+
+    @Test
+    fun `a photo exposed before the first group stays ungrouped when the group starts in a replaced session`() {
+        // The group's first frame already comes from a replaced AR session.
+        shell.start(IngestShellConfig(0, 0, 0, 0, 0f, PhotoSavedEmitter.UNGROUPED_EPOCH))
+        frameAt(exposureNs - 1_000_000_000L)
+        shell.start(IngestShellConfig(0, 0, 0, 0, 0f, 1))
+        frameAt(exposureNs + 500_000_000L, Any())
+        assertEquals(PhotoSavedEmitter.UNGROUPED_EPOCH, photoEpoch())
+    }
+
     @Test
     fun `missing frame pose falls back to the OpenCV shutter pose converted to OpenGL`() {
         shell.start(IngestShellConfig(0, 0, 0, 0, 0f, 3))
