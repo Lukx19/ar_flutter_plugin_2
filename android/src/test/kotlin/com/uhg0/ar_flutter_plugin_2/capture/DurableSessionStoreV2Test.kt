@@ -144,7 +144,8 @@ class DurableSessionStoreV2Test {
                 edge == 512 && file.isFile && file.readBytes().contentEquals(jpeg)
             },
         )
-        val target = File(root, "preview-cache/reader.jpg")
+        // Canonical like production targets (the reader refuses symlinked ancestors such as macOS /var).
+        val target = File(root.canonicalFile, "preview-cache/reader.jpg")
 
         assertTrue(reader.materializeJpegPreview(manifestId, captureId, target))
         assertArrayEquals(jpeg, target.readBytes())
