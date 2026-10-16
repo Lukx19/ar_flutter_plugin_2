@@ -291,10 +291,37 @@ class _ARViewState extends State<ARView> {
       required this.permissionPromptButtonText,
       required this.permissionPromptParentalRestriction});
 
+  /// Session of the platform view this widget created last; told when the
+  /// view goes away ([ARSessionManager.platformViewDetached]).
+  ARSessionManager? _createdSession;
+
   @override
   void initState() {
     super.initState();
     initCameraPermission();
+  }
+
+  @override
+  void dispose() {
+    // The platform view goes with this widget: a session the app did not
+    // dispose first must not keep calling its gone channels.
+    _createdSession?.platformViewDetached();
+    _createdSession = null;
+    super.dispose();
+  }
+
+  void _onARViewCreated(
+      ARSessionManager session,
+      ARObjectManager objects,
+      ARAnchorManager anchors,
+      ARLocationManager locations) {
+    // A new platform view replaced the previous one, which is gone.
+    final previous = _createdSession;
+    if (previous != null && !identical(previous, session)) {
+      previous.platformViewDetached();
+    }
+    _createdSession = session;
+    widget.onARViewCreated(session, objects, anchors, locations);
   }
 
   initCameraPermission() async {
@@ -330,7 +357,7 @@ class _ARViewState extends State<ARView> {
             Expanded(
                 child: PlatformARView(Theme.of(context).platform).build(
                     context: context,
-                    arViewCreatedCallback: widget.onARViewCreated,
+                    arViewCreatedCallback: _onARViewCreated,
                     planeDetectionConfig: widget.planeDetectionConfig,
                     captureConfig: widget.captureConfig,
                     rearCameraId: widget.rearCameraId,

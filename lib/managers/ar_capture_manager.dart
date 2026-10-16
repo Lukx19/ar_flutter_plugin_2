@@ -2482,6 +2482,33 @@ class ARCaptureManager {
   /// Shares a close attempt. Native refusal retains the channel and streams.
   /// A later call requests another attempt; cached native failure may persist.
   /// Throws the native [PlatformException] when release is refused.
+  /// The platform view went away without [dispose] (`arcapture_<id>` has
+  /// no native handler any more): disposed on the Dart side only, so
+  /// [isEnabled] is false and later calls fail with
+  /// `CAPTURE_NOT_INITIALIZED` instead of a missing plugin. A [dispose] in
+  /// flight keeps ownership. Called by [ARSessionManager.platformViewDetached].
+  void platformViewDetached() {
+    if (isDisposed || _disposeAttempt != null) return;
+    _releaseDartSide();
+  }
+
+  void _releaseDartSide() {
+    _channel.setMethodCallHandler(null);
+    _closeState = ARCaptureCloseState.disposed;
+    // Closing broadcast streams need not wait for paused consumers.
+    unawaited(_poseStreamController.close());
+    unawaited(_captureResultController.close());
+    unawaited(_captureAcceptedController.close());
+    unawaited(_captureFinalizedController.close());
+    unawaited(_captureCapacityController.close());
+    unawaited(_exposureStateController.close());
+    unawaited(_focusStateController.close());
+    unawaited(_whiteBalanceStateController.close());
+    unawaited(_flashStateController.close());
+    unawaited(_profileStatusController.close());
+    unawaited(_nativeCaptureV2Controller.close());
+  }
+
   Future<void> dispose() {
     final pending = _disposeAttempt;
     if (pending != null) return pending;
@@ -2492,20 +2519,7 @@ class ARCaptureManager {
     unawaited(() async {
       try {
         await _channel.invokeMethod<void>('dispose');
-        _channel.setMethodCallHandler(null);
-        _closeState = ARCaptureCloseState.disposed;
-        // Closing broadcast streams need not wait for paused consumers.
-        unawaited(_poseStreamController.close());
-        unawaited(_captureResultController.close());
-        unawaited(_captureAcceptedController.close());
-        unawaited(_captureFinalizedController.close());
-        unawaited(_captureCapacityController.close());
-        unawaited(_exposureStateController.close());
-        unawaited(_focusStateController.close());
-        unawaited(_whiteBalanceStateController.close());
-        unawaited(_flashStateController.close());
-        unawaited(_profileStatusController.close());
-        unawaited(_nativeCaptureV2Controller.close());
+        _releaseDartSide();
         completion.complete();
       } on Object catch (error, stack) {
         _closeState = ARCaptureCloseState.retained;

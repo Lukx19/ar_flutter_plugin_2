@@ -424,6 +424,25 @@ class ARSessionManager {
     return _channel.invokeMethod<T>(method, arguments);
   }
 
+  /// The platform view of this session went away without [dispose] (its
+  /// [ARView] was removed or replaced): the native view and its channels
+  /// (`arsession_<id>`, `arcapture_<id>`) are gone, so this session and its
+  /// capture manager become disposed on the Dart side only, without a native
+  /// call. Later calls fail as on a disposed session instead of reaching a
+  /// channel without a handler. A [dispose] in flight keeps ownership.
+  void platformViewDetached() {
+    if (_sessionState == ARSessionState.disposed || _disposeAttempt != null) {
+      return;
+    }
+    _closeStarted = true;
+    _captureManager?.platformViewDetached();
+    _captureManager = null;
+    _canonicalReadyHandler = null;
+    _channel.setMethodCallHandler(null);
+    _setState(ARSessionState.disposed);
+    unawaited(_stateController.close());
+  }
+
   /// Shares one capture-then-view close. Failure preserves remaining owners.
   /// Throws the native [PlatformException] from capture or session release.
   Future<void> dispose() {
