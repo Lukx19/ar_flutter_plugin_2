@@ -226,10 +226,14 @@ C3MD_API int32_t c3md_estimate_pose(C3MarkerDetector* d) {
   for (int i = 0; i < d->count; i++) {
     C3MarkerDetectionRecord& r = d->records[i];
     double rv[3], tv[3], rms;
-    if (!c3md::solveSquarePose(d->camera, d->sizeOf(d->ids[i]) / 2, d->corners[i], rv, tv, rms)) continue;
+    c3md::PoseAlternative alternative;
+    const double side = d->sizeOf(d->ids[i]);
+    if (!c3md::solveSquarePose(d->camera, side / 2, d->corners[i], rv, tv, rms, &alternative)) continue;
     const double angle = c3md::viewingAngleDeg(rv, tv);
     uint8_t flags = r.flags;
     if (angle > d->quality.max_viewing_angle_deg) flags |= C3_MARKER_FLAG_REJECTED_OBLIQUE;
+    const double cue = c3md::flipPerspectiveCuePx(0.5 * (d->camera.fx + d->camera.fy), side, tv, angle);
+    if (c3md::squarePoseAmbiguous(rms, alternative, cue, angle)) flags |= C3_MARKER_FLAG_POSE_AMBIGUOUS;
     c3md::encodeRecord(r.marker_id, r.dictionary, flags, d->corners[i], rv, tv, static_cast<float>(rms),
                        static_cast<float>(angle), d->sharpness[i], r);
     written++;

@@ -166,6 +166,8 @@ internal object MarkerDetectionLayout {
     const val FLAG_REJECTED_SMALL = 1
     const val FLAG_REJECTED_BLUR = 2
     const val FLAG_REJECTED_OBLIQUE = 4
+    /** Not a rejection: the pose may be the IPPE mirror of the true one. */
+    const val FLAG_POSE_AMBIGUOUS = 8
 }
 
 internal object RendererDeltaLayout {

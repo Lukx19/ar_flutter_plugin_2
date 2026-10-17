@@ -18,6 +18,7 @@
 
 #include "marker_detector.h"
 #include "marker_detector_internal.h"
+#include "marker_pose.h"
 
 namespace {
 
@@ -428,6 +429,129 @@ void testSharpness() {
   check(previous < 0.25 && previous > 0.05, "sharpness of blur 2.4 px", previous);
 }
 
+double rotationAngleDeg(const double* A, const double* B) {
+  double tr = 0;
+  for (int k = 0; k < 9; k++) tr += A[k] * B[k];
+  return std::acos(std::max(-1.0, std::min(1.0, (tr - 1) / 2))) * 180 / kPi;
+}
+
+/// Threshold edges of the ambiguity classification (marker_pose.h).
+void testPoseAmbiguityEdges() {
+  using c3md::kPoseAmbiguityErrorRatio;
+  using c3md::kPoseAmbiguityFlipCuePx;
+  using c3md::kPoseAmbiguityMinFlipDeg;
+  c3md::PoseAlternative alt;
+  alt.found = true;
+  alt.rms = 0.2;
+  alt.rotationGapDeg = 30;
+  const double strong = 10 * kPoseAmbiguityFlipCuePx;  // cue far above the regime bound
+  // Error ratio: at the threshold ambiguous, just below not.
+  check(c3md::squarePoseAmbiguous(kPoseAmbiguityErrorRatio * alt.rms, alt, strong, 15), "ratio at threshold");
+  check(!c3md::squarePoseAmbiguous(std::nextafter(kPoseAmbiguityErrorRatio * alt.rms, 0.0), alt, strong, 15),
+        "ratio just below threshold");
+  check(c3md::squarePoseAmbiguous(alt.rms, alt, strong, 15), "equal errors");
+  c3md::PoseAlternative exact = alt;
+  exact.rms = 0;
+  check(c3md::squarePoseAmbiguous(0, exact, strong, 15), "two exact fits");
+  // Flip cue: just below the bound ambiguous, at it not.
+  check(c3md::squarePoseAmbiguous(0.01, alt, std::nextafter(kPoseAmbiguityFlipCuePx, 0.0), 15), "cue below bound");
+  check(!c3md::squarePoseAmbiguous(0.01, alt, kPoseAmbiguityFlipCuePx, 15), "cue at bound");
+  check(c3md::squarePoseAmbiguous(0.01, alt, NAN, 15), "unknown cue is ambiguous");
+  // Without an alternative only the cue decides.
+  c3md::PoseAlternative none;
+  check(!c3md::squarePoseAmbiguous(0.2, none, strong, 15), "no alternative, strong cue");
+  check(c3md::squarePoseAmbiguous(0.2, none, 0.1, 15), "no alternative, weak cue");
+  // Flip size: the larger of the gap and twice the viewing angle.
+  c3md::PoseAlternative merged = alt;
+  merged.rotationGapDeg = 0;
+  const double edge = kPoseAmbiguityMinFlipDeg / 2;
+  check(c3md::squarePoseAmbiguous(0.2, merged, 0.0, edge), "merged minima, flip at the minimum");
+  check(!c3md::squarePoseAmbiguous(0.2, merged, 0.0, std::nextafter(edge, 0.0)), "merged minima, flip below it");
+  merged.rotationGapDeg = kPoseAmbiguityMinFlipDeg;
+  check(c3md::squarePoseAmbiguous(0.2, merged, 0.0, 0), "gap at the minimum flip");
+  // Cue: f S^2 sin(angle) / |t|^2.
+  const double t[3] = {0, 3, 4};
+  check(std::abs(c3md::flipPerspectiveCuePx(1000, 0.1, t, 30) - 1000 * 0.01 * 0.5 / 25) < 1e-12, "cue formula",
+        c3md::flipPerspectiveCuePx(1000, 0.1, t, 30));
+  const double zero[3] = {0, 0, 0};
+  check(c3md::flipPerspectiveCuePx(1000, 0.1, zero, 30) == 0, "cue of a degenerate pose");
+}
+
+/// IPPE planar ambiguity on rendered corners: a 21 px marker about 17 deg
+/// off frontal flips under 0.1 px corner noise (the kept pose is the
+/// mirror), and every flip is flagged; large oblique and frontal markers
+/// stay unflagged.
+void testPoseAmbiguityOnCorners() {
+  int trials = 0, flips = 0, unflaggedFlips = 0, flagged = 0;
+  for (uint64_t seed = 1; seed <= 200; seed++) {
+    Scene sc = makeScene(7.0, 17, 25, seed, false);
+    float corners[8];
+    truthCorners(sc, false, corners);
+    Rng rng{seed * 7919};
+    for (auto& c : corners) c += static_cast<float>(0.1 * rng.gauss());
+    c3md::Camera cam;
+    cam.fx = sc.fx;
+    cam.fy = sc.fy;
+    cam.cx = sc.cx;
+    cam.cy = sc.cy;
+    double rv[3], tv[3], rms, R[9];
+    c3md::PoseAlternative alt;
+    if (!c3md::solveSquarePose(cam, sc.side / 2, corners, rv, tv, rms, &alt)) continue;
+    trials++;
+    rodrigues(rv, R);
+    const double error = rotationAngleDeg(R, sc.R);
+    const double angle = c3md::viewingAngleDeg(rv, tv);
+    const bool ambiguous =
+        c3md::squarePoseAmbiguous(rms, alt, c3md::flipPerspectiveCuePx(sc.fx, sc.side, tv, angle), angle);
+    if (ambiguous) flagged++;
+    if (error > 10) {
+      flips++;
+      if (!ambiguous) unflaggedFlips++;
+    }
+  }
+  check(trials == 200, "small near-frontal trials solved", trials);
+  check(flips >= 20, "small near-frontal markers flip without the bound", flips);
+  check(unflaggedFlips == 0, "every flip is flagged ambiguous", unflaggedFlips);
+  check(flagged == trials, "the whole flip-prone regime is flagged", flagged);
+
+  // Large and oblique: unambiguous under the same noise.
+  for (uint64_t seed = 1; seed <= 50; seed++) {
+    Scene sc = makeScene(0.8, 50, 25, seed, false);
+    float corners[8];
+    truthCorners(sc, false, corners);
+    Rng rng{seed * 104729};
+    for (auto& c : corners) c += static_cast<float>(0.1 * rng.gauss());
+    c3md::Camera cam;
+    cam.fx = sc.fx;
+    cam.fy = sc.fy;
+    cam.cx = sc.cx;
+    cam.cy = sc.cy;
+    double rv[3], tv[3], rms;
+    c3md::PoseAlternative alt;
+    check(c3md::solveSquarePose(cam, sc.side / 2, corners, rv, tv, rms, &alt), "oblique pose solved", seed);
+    const double angle = c3md::viewingAngleDeg(rv, tv);
+    check(alt.found && alt.rms > 4 * rms, "oblique alternative clearly worse", alt.rms / std::max(rms, 1e-12));
+    check(!c3md::squarePoseAmbiguous(rms, alt, c3md::flipPerspectiveCuePx(sc.fx, sc.side, tv, angle), angle),
+          "large oblique marker not ambiguous", seed);
+  }
+  // Exactly frontal: the two solutions coincide; a flip changes nothing.
+  Scene sc = makeScene(0.8, 0, 25, 3, false);
+  sc.t[0] = sc.t[1] = 0;
+  float corners[8];
+  truthCorners(sc, false, corners);
+  c3md::Camera cam;
+  cam.fx = sc.fx;
+  cam.fy = sc.fy;
+  cam.cx = sc.cx;
+  cam.cy = sc.cy;
+  double rv[3], tv[3], rms;
+  c3md::PoseAlternative alt;
+  check(c3md::solveSquarePose(cam, sc.side / 2, corners, rv, tv, rms, &alt), "frontal pose solved");
+  const double angle = c3md::viewingAngleDeg(rv, tv);
+  check(!c3md::squarePoseAmbiguous(rms, alt, c3md::flipPerspectiveCuePx(sc.fx, sc.side, tv, angle), angle),
+        "frontal marker not ambiguous", alt.rotationGapDeg);
+}
+
 void testAbiWithoutDetector() {
   check(c3md_abi_version() == C3MD_ABI_VERSION, "abi version");
   check(c3md_create(-1) == nullptr && c3md_create(C3MD_DICTIONARY_COUNT) == nullptr, "unknown dictionary refused");
@@ -472,6 +596,8 @@ int main(int argc, char** argv) {
   testRefinement();
   testTwelveMegapixel();
   testSharpness();
+  testPoseAmbiguityEdges();
+  testPoseAmbiguityOnCorners();
   testAbiWithoutDetector();
   testJniBoundaries();
   if (failures == 0) std::printf("marker detector host test: all checks passed\n");

@@ -163,6 +163,17 @@ void main() {
     expect(m.reprojectionErrorPx, 0.75);
     expect(m.viewingAngleDegrees, 30);
     expect(m.sharpness, 200);
+    expect(m.rejected, isTrue);
+    expect(m.poseAmbiguous, isFalse);
+    // Bit 3 marks a possibly mirrored pose; it is not a rejection.
+    m.flags = MarkerDetectionLayout.flagPoseAmbiguous;
+    expect(m.rejected, isFalse);
+    expect(m.poseAmbiguous, isTrue);
+    m.flags = MarkerDetectionLayout.flagPoseAmbiguous |
+        MarkerDetectionLayout.flagRejectedOblique;
+    expect(m.rejected, isTrue);
+    expect(m.poseAmbiguous, isTrue);
+    expect(MarkerDetectionLayout.flagsRejected, 7);
   });
 
   test('session event and idle goldens decode', () {

@@ -27,6 +27,12 @@ for f in ARFrameObserver CaptureFrame ARSessionLifecycle ARSessionHost ARCameraC
          PoseBatchWire PoseStreamObserver CameraBackgroundRenderer CaptureChannelHostReplies; do
   ln -s "$ios/Classes/Session/$f.swift" "$swift/$f.swift"
 done
+# ARSessionHost keeps the staged world map of a restarted session, which
+# reports to the native session log.
+for f in WorldMap/WorldMapRelocalization WorldMap/WorldMapArchive SessionLog/NativeSessionLogEmitter \
+         SessionLog/NativeSessionLogBuffer SessionLog/NativeAnomalyEmitter; do
+  ln -s "$ios/Classes/$f.swift" "$swift/${f:t}.swift"
+done
 for f in "$ios"/Classes/VisibilityGrid/*.swift; do
   [[ ${f:t} == VisibilityGridShellRegistry.swift ]] || ln -s "$f" "$swift/${f:t}"
 done
