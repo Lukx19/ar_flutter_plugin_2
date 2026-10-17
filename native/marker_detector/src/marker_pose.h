@@ -54,7 +54,9 @@ bool solveSquarePose(const Camera& camera, double halfSide, const float* corners
 /// is ambiguous when the flip it risks is at least kPoseAmbiguityMinFlipDeg
 /// and either the error ratio (kept RMS over the alternative's) is at least
 /// kPoseAmbiguityErrorRatio or the flip perspective cue is below
-/// kPoseAmbiguityFlipCuePx.
+/// kPoseAmbiguityFlipCuePx. The ratio counts only for a distinct alternative
+/// (rotation gap of at least kPoseAmbiguityMinFlipDeg); when both seeds
+/// refine to one minimum the cue alone decides.
 ///
 /// Error ratio 0.5: with 4 corners (8 residuals, 6 parameters) the kept RMS
 /// is about half the corner noise sigma; a ratio of 0.5 or more means the
@@ -80,8 +82,9 @@ double flipPerspectiveCuePx(double focalPx, double sideMetres, const double* tve
 
 /// Whether a square marker pose with RMS `rms`, its IPPE `alternative`,
 /// flip cue `cuePx` and viewing angle is ambiguous (see above). The flip
-/// size is the larger of the rotation gap to the alternative and twice the
-/// viewing angle (a merged or missing alternative still risks the mirror).
+/// size is the larger of the rotation gap to a distinct alternative and
+/// twice the viewing angle (a merged or missing alternative still risks the
+/// mirror; then only the cue decides).
 bool squarePoseAmbiguous(double rms, const PoseAlternative& alternative, double cuePx, double viewingAngleDeg);
 
 }  // namespace c3md

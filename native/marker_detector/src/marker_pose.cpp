@@ -552,10 +552,13 @@ double flipPerspectiveCuePx(double focalPx, double sideMetres, const double* tve
 }
 
 bool squarePoseAmbiguous(double rms, const PoseAlternative& alternative, double cuePx, double viewingAngleDeg) {
-  const double flipDeg = std::max(alternative.found ? alternative.rotationGapDeg : 0.0, 2 * viewingAngleDeg);
+  // Both IPPE seeds refined to one minimum (or one was behind the camera):
+  // their error ratio says nothing about the mirror, only the cue decides.
+  const bool distinct = alternative.found && alternative.rotationGapDeg >= kPoseAmbiguityMinFlipDeg;
+  const double flipDeg = std::max(distinct ? alternative.rotationGapDeg : 0.0, 2 * viewingAngleDeg);
   if (!(flipDeg >= kPoseAmbiguityMinFlipDeg)) return false;
   // rms / alternative.rms >= ratio, written without the division (two exact fits are ambiguous).
-  if (alternative.found && rms >= kPoseAmbiguityErrorRatio * alternative.rms) return true;
+  if (distinct && rms >= kPoseAmbiguityErrorRatio * alternative.rms) return true;
   return !(cuePx >= kPoseAmbiguityFlipCuePx);
 }
 

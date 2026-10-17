@@ -98,10 +98,11 @@ if(C3MD_BUILD_HOST_TEST)
 
     # The C ABI as a host shared library for the synthetic scene runner
     # (ctypes); the same sources and defines as the Android library without
-    # the JNI shim.
+    # the JNI shim, plus the test-only pose probe (both IPPE solutions of one
+    # detection) the scene check reads.
     add_library(marker_detector_scene_host SHARED
       src/marker_geometry.cpp src/marker_pose.cpp src/marker_detector.cpp src/marker_apriltag.cpp
-      ${C3MD_APRILTAG_SOURCES})
+      ${C3MD_APRILTAG_SOURCES} test/marker_scene_pose_probe.cpp)
     target_include_directories(marker_detector_scene_host PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src ${C3MD_APRILTAG_DIR})
     target_compile_features(marker_detector_scene_host PRIVATE cxx_std_17)

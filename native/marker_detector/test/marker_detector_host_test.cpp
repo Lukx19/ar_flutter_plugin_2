@@ -467,7 +467,15 @@ void testPoseAmbiguityEdges() {
   const double edge = kPoseAmbiguityMinFlipDeg / 2;
   check(c3md::squarePoseAmbiguous(0.2, merged, 0.0, edge), "merged minima, flip at the minimum");
   check(!c3md::squarePoseAmbiguous(0.2, merged, 0.0, std::nextafter(edge, 0.0)), "merged minima, flip below it");
+  // Merged minima (equal errors, gap below the minimum flip) with a strong
+  // cue: the ratio says nothing, the cue clears it.
+  merged.rms = 0.2;
+  check(!c3md::squarePoseAmbiguous(0.2, merged, strong, 15), "merged minima, strong cue");
+  check(!c3md::squarePoseAmbiguous(0.2, merged, kPoseAmbiguityFlipCuePx, edge), "merged minima, cue at bound");
+  merged.rotationGapDeg = std::nextafter(kPoseAmbiguityMinFlipDeg, 0.0);
+  check(!c3md::squarePoseAmbiguous(0.2, merged, strong, 15), "gap just below the minimum flip is merged");
   merged.rotationGapDeg = kPoseAmbiguityMinFlipDeg;
+  check(c3md::squarePoseAmbiguous(0.2, merged, strong, 15), "gap at the minimum flip is distinct");
   check(c3md::squarePoseAmbiguous(0.2, merged, 0.0, 0), "gap at the minimum flip");
   // Cue: f S^2 sin(angle) / |t|^2.
   const double t[3] = {0, 3, 4};

@@ -33,6 +33,13 @@ class VisibilityGridContractGoldenTest {
         assertEquals(160, IngestMessageLayout.HEADER_BYTES)
         assertEquals(128, PhotoSavedLayout.BYTES)
         assertEquals(64, MarkerDetectionLayout.BYTES)
+        // Detection record flags: C3_MARKER_FLAG_* of marker_detection_record.h.
+        assertEquals(listOf(1, 2, 4, 8), listOf(
+            MarkerDetectionLayout.FLAG_REJECTED_SMALL,
+            MarkerDetectionLayout.FLAG_REJECTED_BLUR,
+            MarkerDetectionLayout.FLAG_REJECTED_OBLIQUE,
+            MarkerDetectionLayout.FLAG_POSE_AMBIGUOUS,
+        ))
         assertEquals(32, RendererDeltaLayout.HEADER_BYTES)
         assertEquals(40, SurfaceInstanceLayout.BYTES)
         assertEquals(16, BrickSummaryLayout.BYTES)
