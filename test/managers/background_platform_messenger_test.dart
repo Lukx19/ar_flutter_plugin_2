@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:isolate';
-import 'dart:typed_data';
 
 import 'package:ar_flutter_plugin_2/managers/background_platform_messenger.dart';
 import 'package:flutter/services.dart';
@@ -40,7 +39,8 @@ void main() {
     expect((await first)!.buffer.asUint8List(), <int>[9]);
     expect((await second)!.buffer.asUint8List(), <int>[7, 8]);
     expect(messenger.outstandingReplies, 0);
-    expect(sent.map((value) => value.channel), <String>['channel_a', 'channel_b']);
+    expect(
+        sent.map((value) => value.channel), <String>['channel_a', 'channel_b']);
   });
 
   test('an empty host reply completes its send with null', () async {
@@ -66,8 +66,7 @@ void main() {
     );
   });
 
-  test('close completes only after every sent message has its reply',
-      () async {
+  test('close completes only after every sent message has its reply', () async {
     final first = messenger.send('channel', ByteData(1))!;
     final second = messenger.send('channel', ByteData(1))!;
     var closed = false;
@@ -103,5 +102,28 @@ void main() {
     );
     expect(failing.outstandingReplies, 0);
     await failing.close().timeout(const Duration(seconds: 1));
+  });
+
+  test('the isolate messenger is the installed one and absent before',
+      () async {
+    BackgroundPlatformMessenger.debugInstall(null);
+    expect(BackgroundPlatformMessenger.instanceOrNull, isNull);
+    expect(() => BackgroundPlatformMessenger.instance, throwsStateError);
+    BackgroundPlatformMessenger.debugInstall(messenger);
+    addTearDown(() => BackgroundPlatformMessenger.debugInstall(null));
+    expect(identical(BackgroundPlatformMessenger.instance, messenger), isTrue);
+    expect(
+      identical(BackgroundPlatformMessenger.instanceOrNull, messenger),
+      isTrue,
+    );
+  });
+
+  test('a reply callback runs before close completes', () async {
+    final order = <String>[];
+    messenger.send('channel', ByteData(1))!.then((_) => order.add('reply'));
+    final closing = messenger.close().then((_) => order.add('closed'));
+    sent.single.replyEmpty();
+    await closing;
+    expect(order, <String>['reply', 'closed']);
   });
 }

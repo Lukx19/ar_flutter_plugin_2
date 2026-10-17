@@ -50,6 +50,24 @@ final class BackgroundPlatformMessenger implements BinaryMessenger {
   /// The current isolate's messenger, or null when it never sent.
   static BackgroundPlatformMessenger? get instanceOrNull => _instance;
 
+  /// The current isolate's messenger, which [ensureInitialized] (or
+  /// [debugInstall]) set up.
+  ///
+  /// Throws a [StateError] before that.
+  static BackgroundPlatformMessenger get instance =>
+      _instance ??
+      (throw StateError(
+        'BackgroundPlatformMessenger.ensureInitialized was not called in '
+        'this isolate.',
+      ));
+
+  /// Makes [messenger] the current isolate's messenger (null clears it), so
+  /// a test drives an isolate's platform replies through
+  /// [BackgroundPlatformMessenger.withDispatch].
+  @visibleForTesting
+  static void debugInstall(BackgroundPlatformMessenger? messenger) =>
+      _instance = messenger;
+
   final BackgroundPlatformMessageDispatch _dispatch;
   int _sequence = 0;
   int _outstanding = 0;
@@ -67,8 +85,9 @@ final class BackgroundPlatformMessenger implements BinaryMessenger {
       ? Future<void>.value()
       : (_allReplied ??= Completer<void>()).future;
 
-  /// Sends nothing more and completes once every sent message has its reply.
-  /// An isolate awaits this before it exits.
+  /// Sends nothing more and completes once every sent message has its reply,
+  /// after the reply callbacks registered on those sends ran. An isolate
+  /// awaits this before it exits.
   Future<void> close() {
     _closed = true;
     return allReplied;
@@ -98,20 +117,22 @@ final class BackgroundPlatformMessenger implements BinaryMessenger {
       if (settled) {
         return;
       }
-      settle();
-      // A reply is [identifier, bytes]; an empty reply is a bare null.
+      // A reply is [identifier, bytes]; an empty reply is a bare null. The
+      // send completes before [allReplied] does, so its reply callbacks run
+      // before an isolate waiting on [close] exits.
       if (reply is List && reply.length == 2 && reply[1] is Uint8List) {
         completer.complete(ByteData.sublistView(reply[1] as Uint8List));
       } else {
         completer.complete(null);
       }
+      settle();
     };
     _sequence += 1;
     try {
       _dispatch(channel, message, _sequence, port.sendPort);
     } on Object catch (error, stackTrace) {
-      settle();
       completer.completeError(error, stackTrace);
+      settle();
     }
     return completer.future;
   }
