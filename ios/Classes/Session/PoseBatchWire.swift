@@ -88,25 +88,31 @@ enum PoseBatchWire {
     return converted
   }
 
-  /// Quaternion x, y, z, w of the rotation part of a column-major transform.
-  /// Same branch order and float arithmetic as the Android encoder, so equal
-  /// inputs give equal bits.
+  /// Quaternion x, y, z, w of the rotation part of a column-major transform,
+  /// normalised. Same branch order, float arithmetic and normalisation as the
+  /// Android `PoseDataExtractor.quaternionFromTransform`, so equal inputs give
+  /// equal bits (`FrameConventionGoldenTests`).
   static func quaternion(fromColumnMajor t: [Float]) -> [Float] {
     let m00 = t[0], m11 = t[5], m22 = t[10]
     let trace = m00 + m11 + m22
+    var q: [Float]
     if trace > 0 {
       let scale = (trace + 1).squareRoot() * 2
-      return [(t[6] - t[9]) / scale, (t[8] - t[2]) / scale, (t[1] - t[4]) / scale, 0.25 * scale]
+      q = [(t[6] - t[9]) / scale, (t[8] - t[2]) / scale, (t[1] - t[4]) / scale, 0.25 * scale]
     } else if m00 > m11 && m00 > m22 {
       let scale = (1 + m00 - m11 - m22).squareRoot() * 2
-      return [0.25 * scale, (t[4] + t[1]) / scale, (t[8] + t[2]) / scale, (t[6] - t[9]) / scale]
+      q = [0.25 * scale, (t[4] + t[1]) / scale, (t[8] + t[2]) / scale, (t[6] - t[9]) / scale]
     } else if m11 > m22 {
       let scale = (1 + m11 - m00 - m22).squareRoot() * 2
-      return [(t[4] + t[1]) / scale, 0.25 * scale, (t[9] + t[6]) / scale, (t[8] - t[2]) / scale]
+      q = [(t[4] + t[1]) / scale, 0.25 * scale, (t[9] + t[6]) / scale, (t[8] - t[2]) / scale]
     } else {
       let scale = (1 + m22 - m00 - m11).squareRoot() * 2
-      return [(t[8] + t[2]) / scale, (t[9] + t[6]) / scale, 0.25 * scale, (t[1] - t[4]) / scale]
+      q = [(t[8] + t[2]) / scale, (t[9] + t[6]) / scale, 0.25 * scale, (t[1] - t[4]) / scale]
     }
+    let squares = q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]
+    let magnitude = squares.squareRoot()
+    if magnitude == 0 { return [0, 0, 0, 1] }
+    return q.map { $0 / magnitude }
   }
 }
 
