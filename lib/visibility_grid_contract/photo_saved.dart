@@ -64,6 +64,19 @@ final class PhotoSavedView extends ContractRecordView {
   void writeCameraToWorldRows(List<double> rows, [int rowsOffset = 0]) =>
       writeF32s(PhotoSavedLayout.cameraToWorldRowsOffset, 12, rows, rowsOffset);
 
+  /// Rows 0-2 (row-major 3x4) of `T_world_cam` (OpenCV camera axes,
+  /// `opencv_c2w_v1`) into [out] at [outOffset]: the raw rows carry the AR
+  /// camera axes the shells write (ARCore and ARKit camera pose), so the
+  /// camera Y and Z columns change sign (docs/02-architecture.md, Coordinate
+  /// frames). Exact.
+  void readWorldFromCameraRows(List<double> out, [int outOffset = 0]) {
+    readCameraToWorldRows(out, outOffset);
+    for (var r = 0; r < 3; r++) {
+      out[outOffset + r * 4 + 1] = -out[outOffset + r * 4 + 1];
+      out[outOffset + r * 4 + 2] = -out[outOffset + r * 4 + 2];
+    }
+  }
+
   double get fx => f32(PhotoSavedLayout.intrinsicsOffset);
   double get fy => f32(PhotoSavedLayout.intrinsicsOffset + 4);
   double get cx => f32(PhotoSavedLayout.intrinsicsOffset + 8);
