@@ -2,7 +2,10 @@ import 'dart:typed_data';
 
 import 'package:vector_math/vector_math_64.dart';
 
-const String arcoreGlCameraToWorldConvention = 'arcore_gl_c2w_v1';
+import 'frame_convention.dart';
+
+export 'frame_convention.dart' show arcoreGlCameraToWorldConvention;
+
 const String poseBatchWireVersion = 'pose_batch_v1';
 const String packedPoseBatchWireVersion = 'pose_batch_v2';
 const int packedPoseSampleBytes = 236;
@@ -165,7 +168,7 @@ class ARFramePose {
       rotation: rotation(64),
       transform: matrix(80),
       timestamp: DateTime.fromMillisecondsSinceEpoch(integer(8)),
-      convention: 'opencv_c2w_v1',
+      convention: openCvCameraToWorldConvention,
       trackingPose: ARPoseTransform(
         position: position(144),
         rotation: rotation(156),
