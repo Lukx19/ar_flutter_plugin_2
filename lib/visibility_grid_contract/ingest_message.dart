@@ -205,7 +205,10 @@ final class IngestMessageView extends ContractRecordView {
   int get poseGapUs => i32(IngestHeaderLayout.poseGapUsOffset);
   set poseGapUs(int v) => setI32(IngestHeaderLayout.poseGapUsOffset, v);
 
-  /// Camera-to-world element [index] (column-major) at the sample timestamp.
+  /// Raw header camera-to-world element [index] (column-major) at the sample
+  /// timestamp, in the AR camera axes the shells write (ARCore `Camera.getPose`,
+  /// ARKit `ARCamera.transform`: +Y up, -Z forward). Consumers read the
+  /// canonical pose with [readWorldFromCamera].
   double cameraToWorld(int index) =>
       f32(IngestHeaderLayout.cameraToWorldOffset + 4 * index);
   void readCameraToWorld(List<double> out, [int outOffset = 0]) =>
@@ -213,6 +216,19 @@ final class IngestMessageView extends ContractRecordView {
   void writeCameraToWorld(List<double> values, [int valuesOffset = 0]) =>
       writeF32s(
           IngestHeaderLayout.cameraToWorldOffset, 16, values, valuesOffset);
+
+  /// `T_world_cam` (column-major, OpenCV camera axes, `opencv_c2w_v1`) of the
+  /// header pose into [out] at [outOffset]: the raw AR camera pose times
+  /// `diag(1, -1, -1, 1)` (docs/02-architecture.md, Coordinate frames).
+  /// Exact: only the signs of the camera Y and Z axis columns change, as in
+  /// `flipCameraYZ` and the native pose encoders.
+  void readWorldFromCamera(List<double> out, [int outOffset = 0]) {
+    readCameraToWorld(out, outOffset);
+    for (var r = 0; r < 4; r++) {
+      out[outOffset + 4 + r] = -out[outOffset + 4 + r];
+      out[outOffset + 8 + r] = -out[outOffset + 8 + r];
+    }
+  }
 
   double get fx => f32(IngestHeaderLayout.intrinsicsOffset);
   double get fy => f32(IngestHeaderLayout.intrinsicsOffset + 4);
