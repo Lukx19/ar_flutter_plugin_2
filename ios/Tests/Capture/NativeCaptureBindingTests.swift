@@ -348,7 +348,7 @@ final class NativeCaptureBindingTests: XCTestCase {
 
   func testStoreVersionsReportThePlainAndShotRootSchemas() {
     let report = NativeStoreFormatVersions.report()
-    XCTAssertEqual(report["nativePhotoStore"] as? Int, 3)
+    XCTAssertEqual(report["nativePhotoStore"] as? Int, 4)
     XCTAssertEqual(report["nativePhotoRootSchema"] as? Int, 5)
     XCTAssertEqual(report["nativePhotoShotRootSchema"] as? Int, 7)
     XCTAssertEqual(report["nativePhotoRootSchemasReadable"] as? [Int], [5, 7])

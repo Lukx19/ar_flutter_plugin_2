@@ -124,14 +124,57 @@ final class ShotProjectionTests: XCTestCase {
     XCTAssertEqual(decoded.images.map { $0.index }, [0, 1, 2])
     XCTAssertEqual(decoded.images[2].flags, .trackingNotNormal)
     var json = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(encoded)) as? [String: Any])
-    json["schema"] = "capture3d-shot-v2"
+    XCTAssertEqual(json["schema"] as? String, "capture3d-shot-v2")
+    XCTAssertEqual(json["cameraConvention"] as? String, "opencv_c2w_v1")
+    json["schema"] = "capture3d-shot-v3"
     XCTAssertNil(ShotRecord.decode([UInt8](try JSONSerialization.data(withJSONObject: json))), "unknown schema")
     json["schema"] = ShotRecord.schema
+    json["cameraConvention"] = "arkit_c2w_v1"
+    XCTAssertNil(ShotRecord.decode([UInt8](try JSONSerialization.data(withJSONObject: json))), "unknown convention")
+    json["cameraConvention"] = ShotRecord.cameraConvention
     var images = try XCTUnwrap(json["images"] as? [[String: Any]])
     images.swapAt(0, 1)
     json["images"] = images
     XCTAssertNil(ShotRecord.decode([UInt8](try JSONSerialization.data(withJSONObject: json))), "indices out of order")
     XCTAssertNil(ShotRecord.decode(Array("{}".utf8)))
+  }
+
+  /// The image pose is stored as `T_world_cam`: the ARKit camera transform
+  /// with its camera Y and Z columns negated.
+  func testTheShotRecordStoresOpenCvCameraToWorld() throws {
+    let source = shot()
+    let decoded = try XCTUnwrap(ShotRecord.decode(ShotRecord.encode(source)))
+    let arkit = try XCTUnwrap(source.images[1].metadata.cameraToWorld)
+    let pose = try XCTUnwrap(decoded.images[1].cameraToWorld)
+    let columns = [arkit.columns.0, arkit.columns.1, arkit.columns.2, arkit.columns.3]
+    for (c, column) in columns.enumerated() {
+      let sign: Double = c == 1 || c == 2 ? -1 : 1
+      for (r, value) in [column.x, column.y, column.z, column.w].enumerated() {
+        XCTAssertEqual(pose[c * 4 + r], sign * Double(value), "column \(c) row \(r)")
+      }
+    }
+  }
+
+  /// A layout 3 record (`capture3d-shot-v1`, ARKit camera transforms) as the
+  /// previous app version wrote it: read and converted to `T_world_cam`.
+  func testALayoutThreeShotRecordIsReadAndConverted() throws {
+    // `test_assets/native_store` is copied into the test bundle; host runs
+    // read the plugin tree.
+    var url = GoldenFixture.bundle.resourceURL?.appendingPathComponent("native_store/shot_record_v1.json")
+    if url == nil || !FileManager.default.fileExists(atPath: url!.path) {
+      url = URL(fileURLWithPath: #filePath).resolvingSymlinksInPath()
+        .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        .deletingLastPathComponent().deletingLastPathComponent()
+        .appendingPathComponent("test_assets/native_store/shot_record_v1.json")
+    }
+    let bytes = [UInt8](try Data(contentsOf: try XCTUnwrap(url)))
+    let decoded = try XCTUnwrap(ShotRecord.decode(bytes))
+    XCTAssertEqual(decoded.images.map { $0.index }, [0, 1, 2])
+    // Recorded ARKit pose of image 1: identity rotation at (1.01, 2, 3).
+    XCTAssertEqual(decoded.images[1].cameraToWorld, [
+      1, 0, 0, 0, -0.0, -1, -0.0, -0.0, -0.0, -0.0, -1, -0.0, 1.0099999904632568, 2, 3, 1,
+    ])
+    XCTAssertNil(decoded.images[2].cameraToWorld)
   }
 
   func testTheWireCarriesTheShotOfACommittedTerminal() throws {
@@ -146,8 +189,9 @@ final class ShotProjectionTests: XCTestCase {
     XCTAssertEqual(images.count, 2)
     XCTAssertEqual(Set(images[0].keys), [
       "index", "captureId", "jpegSizeBytes", "exposureTimestampNs", "width", "height", "trackingNormal", "flags",
-      "cameraToWorld", "intrinsics",
+      "cameraToWorld", "cameraToWorldConvention", "intrinsics",
     ])
+    XCTAssertEqual(images[0]["cameraToWorldConvention"] as? String, "opencv_c2w_v1")
     XCTAssertEqual((images[0]["cameraToWorld"] as? [Double])?.count, 16)
     XCTAssertEqual(images[1]["trackingNormal"] as? Bool, false)
     XCTAssertEqual(images[1]["flags"] as? Int, ShotImageFlags.trackingNotNormal.rawValue)

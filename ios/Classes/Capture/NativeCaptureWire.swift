@@ -218,7 +218,8 @@ enum NativeCaptureWire {
   /// first image's exposure time, and
   /// per image after the first one its index, capture id, JPEG size,
   /// exposure time, size, tracking, flag bits and, when known, its
-  /// column-major ARKit camera-to-world and fx, fy, cx, cy.
+  /// column-major `T_world_cam` (OpenCV camera axes, tagged
+  /// `cameraToWorldConvention: opencv_c2w_v1`) and fx, fy, cx, cy.
   static func shotMap(_ value: CommittedShot) -> [String: Any] {
     [
       "shotId": value.shotId, "mode": value.mode, "imageCount": value.imageCount,
@@ -229,7 +230,10 @@ enum NativeCaptureWire {
           "exposureTimestampNs": Int(image.exposureTimestampNs), "width": image.width, "height": image.height,
           "trackingNormal": image.trackingNormal, "flags": image.flags,
         ]
-        if let pose = image.cameraToWorld { map["cameraToWorld"] = pose }
+        if let pose = image.cameraToWorld {
+          map["cameraToWorld"] = pose
+          map["cameraToWorldConvention"] = ShotRecord.cameraConvention
+        }
         if let k = image.intrinsics { map["intrinsics"] = k }
         return map
       },

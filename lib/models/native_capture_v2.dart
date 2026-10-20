@@ -1,3 +1,4 @@
+import 'frame_convention.dart';
 import 'capture_intent_contract.dart';
 
 const nativeCaptureV2WireVersion = 'native_capture_v2';
@@ -676,8 +677,9 @@ final class ARNativeCaptureEventV2 {
 /// One image after the first one of a committed iOS burst shot: its own
 /// durable capture id (SHA-256 hex of `<first capture id>#<index>`, the id
 /// the session manifest and the photo saved event use), JPEG size, exposure
-/// time, size and, when the frame had them, its ARKit camera-to-world
-/// (column-major, GL camera axes) and fx, fy, cx, cy at the image size.
+/// time, size and, when the frame had them, its camera-to-world
+/// (column-major, tagged [cameraToWorldConvention]) and fx, fy, cx, cy at the
+/// image size.
 final class ARNativeCaptureShotImageV2 {
   ARNativeCaptureShotImageV2({
     required this.index,
@@ -689,6 +691,7 @@ final class ARNativeCaptureShotImageV2 {
     required this.trackingNormal,
     required this.flags,
     List<double>? cameraToWorld,
+    this.cameraToWorldConvention = arkitCameraToWorldConvention,
     List<double>? intrinsics,
   })  : cameraToWorld =
             cameraToWorld == null ? null : List.unmodifiable(cameraToWorld),
@@ -705,6 +708,7 @@ final class ARNativeCaptureShotImageV2 {
       'trackingNormal',
       'flags',
       if (map.containsKey('cameraToWorld')) 'cameraToWorld',
+      if (map.containsKey('cameraToWorldConvention')) 'cameraToWorldConvention',
       if (map.containsKey('intrinsics')) 'intrinsics',
     });
     List<double>? numbers(String key, int count) {
@@ -728,6 +732,14 @@ final class ARNativeCaptureShotImageV2 {
     }
     final flags = _integer(map, 'flags');
     if (flags > 3) throw const FormatException('Unknown shot image flags.');
+    // Photo store layout 4 tags the pose; earlier plugins sent the ARKit
+    // camera transform untagged.
+    final convention =
+        map['cameraToWorldConvention'] ?? arkitCameraToWorldConvention;
+    if (convention != openCvCameraToWorldConvention &&
+        !isArCameraConvention(convention as String?)) {
+      throw const FormatException('Unknown shot image camera convention.');
+    }
     return ARNativeCaptureShotImageV2(
       index: _positiveInteger(map, 'index'),
       captureId: captureId,
@@ -738,6 +750,7 @@ final class ARNativeCaptureShotImageV2 {
       trackingNormal: trackingNormal,
       flags: flags,
       cameraToWorld: numbers('cameraToWorld', 16),
+      cameraToWorldConvention: convention as String,
       intrinsics: intrinsics,
     );
   }
@@ -757,6 +770,10 @@ final class ARNativeCaptureShotImageV2 {
   final bool trackingNormal;
   final int flags;
   final List<double>? cameraToWorld;
+
+  /// Camera axes of [cameraToWorld]: `opencv_c2w_v1` from photo store layout
+  /// 4, `arkit_c2w_v1` (untagged) before.
+  final String cameraToWorldConvention;
   final List<double>? intrinsics;
 
   /// Photo credit and picture delivery may use this image: its frame was

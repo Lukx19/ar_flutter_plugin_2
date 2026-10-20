@@ -14,8 +14,11 @@ enum NativeStoreFormatVersions {
   /// Layout of `capture-v2-native/store` (sessions, attempts, assets, A/B
   /// root pointers). 3: an asset folder may also hold the images after the
   /// first one of a burst shot (`shot-image-<index>.<sha>.blob`) and
-  /// its record (`shot-record.<sha>.blob`); Android writes layout 2.
-  static let photoStoreLayout = 3
+  /// its record (`shot-record.<sha>.blob`); Android writes layout 2. 4: the
+  /// shot record is `capture3d-shot-v2` (per image `T_world_cam`, OpenCV
+  /// camera axes); layout 3 records (`capture3d-shot-v1`, ARKit camera
+  /// transform) are read and converted, never rewritten.
+  static let photoStoreLayout = 4
   /// Root record schema written without a quality assessment.
   static let photoRootSchemaPlain = 5
   /// Root record schema of a burst shot (schema 5 plus shot lines).
