@@ -122,11 +122,13 @@ final class DepthIngestProducer {
       sink.countSourceDrop(kind: IngestMessageLayout.kindDepthImage)
       return false
     }
-    // Multiply first, then divide: exact for the integer ratios of the camera image.
+    // Multiply first, then divide: exact for the integer ratios of the camera
+    // image. Pixel centres are at integer coordinates (OpenCV), so the
+    // principal point scales as (c + 0.5) * s - 0.5.
     let fx = k.x * Float(w) / Float(imageWidth)
     let fy = k.y * Float(h) / Float(imageHeight)
-    let cx = k.z * Float(w) / Float(imageWidth)
-    let cy = k.w * Float(h) / Float(imageHeight)
+    let cx = (k.z + 0.5) * Float(w) / Float(imageWidth) - 0.5
+    let cy = (k.w + 0.5) * Float(h) / Float(imageHeight) - 0.5
     guard imageWidth > 0, imageHeight > 0, fx.isFinite, fx > 0, fy.isFinite, fy > 0, cx.isFinite, cy.isFinite else {
       calibrationUnavailable += 1
       sink.countSourceDrop(kind: IngestMessageLayout.kindDepthImage)

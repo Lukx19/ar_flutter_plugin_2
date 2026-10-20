@@ -29,8 +29,9 @@ final class IngestGoldenTests: XCTestCase {
         producer.publish(
           DepthPlanes(depth: d.baseAddress!, width: 4, height: 3, depthRowBytes: 16, confidence: c.baseAddress!,
                       confidenceRowBytes: 4, confidenceMapping: .identity),
-          // 180, 181, 80, 45 at the 4x3 payload from a 1920x1440 camera image.
-          intrinsics: simd_float4(86_400, 86_880, 38_400, 21_600), imageWidth: 1920, imageHeight: 1440,
+          // 180, 181, 80, 45 at the 4x3 payload from a 1920x1440 camera image
+          // (principal point (c + 0.5) / 480 - 0.5).
+          intrinsics: simd_float4(86_400, 86_880, 38_639.5, 21_839.5), imageWidth: 1920, imageHeight: 1440,
           context: IngestGoldenHeader.context, sourceFlags: IngestMessageLayout.sourceDepth)
       }
     }

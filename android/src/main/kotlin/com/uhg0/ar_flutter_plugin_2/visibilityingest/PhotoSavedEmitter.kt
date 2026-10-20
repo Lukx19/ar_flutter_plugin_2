@@ -33,7 +33,7 @@ internal class StillCameraModel {
     var width = 0
     var height = 0
 
-    /** Camera2 `LENS_DISTORTION` (k1, k2, k3, p1, p2), zeros when not reported. */
+    /** OpenCV distortion (k1, k2, p1, p2, k3), zeros when not reported. */
     val distortion = DoubleArray(5)
 
     val valid: Boolean

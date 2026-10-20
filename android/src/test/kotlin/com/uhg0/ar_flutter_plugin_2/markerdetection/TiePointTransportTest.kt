@@ -136,8 +136,8 @@ class TiePointTransportTest {
         assertEquals(0, target.photos)
 
         shell.start(IngestShellConfig(ShellControlLayout.FLAG_MARKER_DETECTION, 0, 0, 8, 0.1f, 4))
-        // Camera2 order (k1, k2, k3, p1, p2) becomes (k1, k2, p1, p2, k3).
-        doubleArrayOf(0.1, -0.2, 0.05, 0.001, -0.002).copyInto(camera.distortion)
+        // The still camera holds the OpenCV order since the capability query reorders.
+        doubleArrayOf(0.1, -0.2, 0.001, -0.002, 0.05).copyInto(camera.distortion)
         relay.onPhotoDurable(photo(camera))
         assertEquals(1, target.photos)
         assertEquals(0.1, target.size, 1e-6)

@@ -5,7 +5,9 @@ import ImageIO
 import simd
 
 /// Camera intrinsics of a still: ARKit reports them for the camera's image
-/// resolution; a still of another size scales each axis.
+/// resolution; a still of another size scales each axis. Pixel centres are
+/// at integer coordinates (OpenCV; docs/02-architecture.md, Coordinate
+/// frames), so the principal point scales as `(c + 0.5) * s - 0.5`.
 enum StillIntrinsics {
   /// fx, fy, cx, cy of [intrinsics] (column-major K) for [imageResolution]
   /// scaled to a still of [width] x [height].
@@ -13,7 +15,9 @@ enum StillIntrinsics {
     guard imageResolution.width > 0, imageResolution.height > 0, width > 0, height > 0 else { return nil }
     let sx = Float(Double(width) / Double(imageResolution.width))
     let sy = Float(Double(height) / Double(imageResolution.height))
-    let k = simd_float4(intrinsics[0][0] * sx, intrinsics[1][1] * sy, intrinsics[2][0] * sx, intrinsics[2][1] * sy)
+    let k = simd_float4(
+      intrinsics[0][0] * sx, intrinsics[1][1] * sy,
+      (intrinsics[2][0] + 0.5) * sx - 0.5, (intrinsics[2][1] + 0.5) * sy - 0.5)
     guard k.x.isFinite, k.y.isFinite, k.z.isFinite, k.w.isFinite, k.x > 0, k.y > 0 else { return nil }
     return k
   }

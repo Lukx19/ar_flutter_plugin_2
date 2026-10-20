@@ -28,7 +28,7 @@ internal interface TiePointPhotoTarget {
  * Registered on the ingest shell's durable photo listeners: while the shell
  * runs with marker detection on, every durable photo goes to tie point
  * detection with its committed JPEG (resolved on the detection thread), the
- * still intrinsics of its photo saved event and Camera2 `LENS_DISTORTION`.
+ * still intrinsics of its photo saved event and its OpenCV order distortion.
  */
 internal class TiePointPhotoRelay(
     private val target: TiePointPhotoTarget,
@@ -48,14 +48,14 @@ internal class TiePointPhotoRelay(
 
     companion object {
         /**
-         * Camera2 `LENS_DISTORTION` (k1, k2, k3, p1, p2) reordered to the
-         * detector's (k1, k2, p1, p2, k3); null when not reported (all zero).
-         * Both act on normalised image coordinates.
+         * The still's distortion in the detector's OpenCV order (k1, k2, p1,
+         * p2, k3), as the capability query reports it since coordinate frame
+         * migration U7; null when not reported (all zero).
          */
         fun distortionOf(camera: StillCameraModel): DoubleArray? {
             val d = camera.distortion
             if (d.all { it == 0.0 }) return null
-            return doubleArrayOf(d[0], d[1], d[3], d[4], d[2])
+            return d.copyOf()
         }
     }
 }

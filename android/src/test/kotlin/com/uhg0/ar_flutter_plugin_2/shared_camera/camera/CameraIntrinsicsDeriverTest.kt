@@ -3,7 +3,21 @@ package com.uhg0.ar_flutter_plugin_2.shared_camera.camera
 import org.junit.Assert.assertEquals
 import org.junit.Test
 
+/**
+ * Pixel centres are at integer coordinates (OpenCV; coordinate frame
+ * migration U7): a principal point maps as (c - crop + 0.5) * s - 0.5.
+ */
 class CameraIntrinsicsDeriverTest {
+    @Test
+    fun `Camera2 lens distortion is reordered to the OpenCV order`() {
+        assertEquals(
+            listOf(0.5, 0.25, 0.0625, 0.03125, 0.125),
+            openCvDistortion(floatArrayOf(0.5f, 0.25f, 0.125f, 0.0625f, 0.03125f)),
+        )
+        assertEquals(listOf(0.0, 0.0, 0.0, 0.0, 0.0), openCvDistortion(null))
+        assertEquals(listOf(0.0, 0.0, 0.0, 0.0, 0.0), openCvDistortion(floatArrayOf(0.1f)))
+    }
+
     @Test
     fun `zero vendor principal point falls back to active array center`() {
         val intrinsics =
@@ -22,8 +36,8 @@ class CameraIntrinsicsDeriverTest {
             )
 
         val principalPoint = intrinsics["principalPoint"] as Map<*, *>
-        assertEquals(1000.0, principalPoint["cx"] as Double, 0.0001)
-        assertEquals(750.0, principalPoint["cy"] as Double, 0.0001)
+        assertEquals(999.75, principalPoint["cx"] as Double, 0.0001)
+        assertEquals(749.75, principalPoint["cy"] as Double, 0.0001)
     }
 
     @Test
@@ -52,8 +66,8 @@ class CameraIntrinsicsDeriverTest {
 
         assertEquals(2053.6, focalLength["fx"] as Double, 0.0001)
         assertEquals(1848.66, focalLength["fy"] as Double, 0.01)
-        assertEquals(1008.0, principalPoint["cx"] as Double, 0.0001)
-        assertEquals(756.0, principalPoint["cy"] as Double, 0.0001)
+        assertEquals(1512.5 * 2016.0 / 3024.0 - 0.5, principalPoint["cx"] as Double, 0.0001)
+        assertEquals(1260.5 * 1512.0 / 2520.0 - 0.5, principalPoint["cy"] as Double, 0.0001)
         assertEquals(2016, resolution["width"])
         assertEquals(1512, resolution["height"])
         assertEquals(504, cropRegion["left"])
@@ -86,8 +100,8 @@ class CameraIntrinsicsDeriverTest {
 
         assertEquals(770.1, focalLength["fx"] as Double, 0.0001)
         assertEquals(770.275, focalLength["fy"] as Double, 0.0001)
-        assertEquals(504.0, principalPoint["cx"] as Double, 0.0001)
-        assertEquals(378.0, principalPoint["cy"] as Double, 0.0001)
+        assertEquals(503.625, principalPoint["cx"] as Double, 0.0001)
+        assertEquals(377.625, principalPoint["cy"] as Double, 0.0001)
         assertEquals(0, cropRegion["left"])
         assertEquals(0, cropRegion["top"])
         assertEquals(4032, cropRegion["width"])
