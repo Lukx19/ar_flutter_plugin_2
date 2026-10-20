@@ -31,7 +31,6 @@ import androidx.compose.runtime.key
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.ComposeView
 import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.findViewTreeLifecycleOwner
 import androidx.lifecycle.ViewModelStoreOwner
@@ -769,26 +768,27 @@ internal class SceneViewHost(
             composeView.disposeComposition()
             (composeView.parent as? ViewGroup)?.removeView(composeView)
             sceneRenderLifecycle.destroyAfterComposition()
+            // Terminal: the Activity lifecycle must no longer reach (and so
+            // retain) this disposed host, neither through the host's own
+            // teardown observer nor through the Compose strategy's observer.
+            composeView.setViewCompositionStrategy(releasedSceneViewCompositionStrategy())
+            parentTeardown.release()
         },
     )
-    private val parentLifecycleTeardownObserver: LifecycleEventObserver =
-        LifecycleEventObserver { _, event ->
-            if (event != Lifecycle.Event.ON_DESTROY) return@LifecycleEventObserver
-            rendererProvenance("parent-lifecycle-destroy")
-            coveragePublications.close()
-            coveragePresentationRefreshPending.set(false)
-            cancelCoverageUploadFrame()
-            // Dispose the child ARSceneView composition before destroying the
-            // host-owned renderer. This ordering is required when the activity
-            // lifecycle destroys the view tree without an explicit Flutter dispose.
-            composeView.disposeComposition()
-            (composeView.parent as? ViewGroup)?.removeView(composeView)
-            sceneRenderLifecycle.destroyAfterComposition()
-            lifecycle.removeObserver(parentLifecycleTeardownObserver)
-        }
+    private val parentTeardown = SceneViewParentTeardown(lifecycle) {
+        rendererProvenance("parent-lifecycle-destroy")
+        coveragePublications.close()
+        coveragePresentationRefreshPending.set(false)
+        cancelCoverageUploadFrame()
+        // Dispose the child ARSceneView composition before destroying the
+        // host-owned renderer. This ordering is required when the activity
+        // lifecycle destroys the view tree without an explicit Flutter dispose.
+        composeView.disposeComposition()
+        (composeView.parent as? ViewGroup)?.removeView(composeView)
+        sceneRenderLifecycle.destroyAfterComposition()
+    }
 
     init {
-        lifecycle.addObserver(parentLifecycleTeardownObserver)
         ownership.onCreate()
     }
 
@@ -1542,6 +1542,7 @@ internal class SceneViewHost(
     fun dispose() {
         bindNativeFrameAttribution(null)
         if (!ownership.onDispose()) return
+        SceneViewHostRetentionCensus.active?.recordDisposed(this)
         visibilityGridRenderer.detach()
         rendererProvenance("dispose-request")
         disposed = true

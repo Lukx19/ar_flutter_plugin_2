@@ -243,6 +243,18 @@ internal fun sceneViewCompositionStrategy(): ViewCompositionStrategy =
     ViewCompositionStrategy.DisposeOnViewTreeLifecycleDestroyed
 
 /**
+ * Installed once the host's composition is terminally disposed. Replacing
+ * [sceneViewCompositionStrategy] runs its disposer, which removes the observer
+ * it added to the Activity lifecycle; [androidx.compose.ui.platform.AbstractComposeView.disposeComposition]
+ * alone leaves that observer (and through the composition content the whole
+ * disposed host) reachable from the Activity. Installs nothing itself.
+ */
+internal fun releasedSceneViewCompositionStrategy(): ViewCompositionStrategy =
+    object : ViewCompositionStrategy {
+        override fun installFor(view: androidx.compose.ui.platform.AbstractComposeView): () -> Unit = {}
+    }
+
+/**
  * Gives ARSceneView a lifecycle that is paused before its Compose resources
  * are released. The SceneView frame loop checks its resumed state immediately
  * before calling Filament; mirroring the host lifecycle through this owner
@@ -325,6 +337,39 @@ internal class SceneViewRenderLifecycle(
             "source=$source event=$event before=$before after=$after " +
                 "parent=${parentLifecycle.currentState}",
         )
+    }
+}
+
+/**
+ * Activity-lifecycle teardown of one host. The parent lifecycle outlives every
+ * capture view, so the observer (and with it the host, its ComposeView and its
+ * HDR environment) stays reachable until [release]: the host releases it when
+ * its terminal composition disposal ran, and the ON_DESTROY path releases it
+ * after [onParentDestroy].
+ */
+internal class SceneViewParentTeardown(
+    private val parentLifecycle: Lifecycle,
+    onParentDestroy: () -> Unit,
+) {
+    private var released = false
+    private val observer = LifecycleEventObserver { _, event ->
+        if (event != Lifecycle.Event.ON_DESTROY || released) return@LifecycleEventObserver
+        onParentDestroy()
+        release()
+    }
+
+    init {
+        parentLifecycle.addObserver(observer)
+    }
+
+    val isRegistered: Boolean
+        get() = !released
+
+    /** Removes the observer; later parent events no longer reach the host. */
+    fun release() {
+        if (released) return
+        released = true
+        parentLifecycle.removeObserver(observer)
     }
 }
 
