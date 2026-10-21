@@ -699,6 +699,7 @@ final class ARNativeCaptureShotImageV2 {
     List<double>? cameraToWorld,
     this.cameraToWorldConvention = arkitCameraToWorldConvention,
     List<double>? intrinsics,
+    this.intrinsicsConvention,
   })  : cameraToWorld =
             cameraToWorld == null ? null : List.unmodifiable(cameraToWorld),
         intrinsics = intrinsics == null ? null : List.unmodifiable(intrinsics);
@@ -716,6 +717,7 @@ final class ARNativeCaptureShotImageV2 {
       if (map.containsKey('cameraToWorld')) 'cameraToWorld',
       if (map.containsKey('cameraToWorldConvention')) 'cameraToWorldConvention',
       if (map.containsKey('intrinsics')) 'intrinsics',
+      if (map.containsKey('intrinsicsConvention')) 'intrinsicsConvention',
     });
     List<double>? numbers(String key, int count) {
       if (!map.containsKey(key)) return null;
@@ -746,6 +748,14 @@ final class ARNativeCaptureShotImageV2 {
         !isArCameraConvention(convention as String?)) {
       throw const FormatException('Unknown shot image camera convention.');
     }
+    // Photo store layout 5 names the intrinsics convention; intrinsics of an
+    // older shot record arrive untagged (convention not recorded).
+    final intrinsicsConvention = map['intrinsicsConvention'];
+    if (intrinsicsConvention != null &&
+        (intrinsicsConvention != openCvPinholeIntrinsicsConvention ||
+            intrinsics == null)) {
+      throw const FormatException('Unknown shot image intrinsics convention.');
+    }
     return ARNativeCaptureShotImageV2(
       index: _positiveInteger(map, 'index'),
       captureId: captureId,
@@ -758,6 +768,7 @@ final class ARNativeCaptureShotImageV2 {
       cameraToWorld: numbers('cameraToWorld', 16),
       cameraToWorldConvention: convention as String,
       intrinsics: intrinsics,
+      intrinsicsConvention: intrinsicsConvention as String?,
     );
   }
 
@@ -781,6 +792,11 @@ final class ARNativeCaptureShotImageV2 {
   /// 4, `arkit_c2w_v1` (untagged) before.
   final String cameraToWorldConvention;
   final List<double>? intrinsics;
+
+  /// Convention of [intrinsics]: `opencv_pinhole_v1` from photo store layout
+  /// 5; null when the shot record did not name one (layout 3 and 4, whose
+  /// principal point may be scaled as `c * s`) or without intrinsics.
+  final String? intrinsicsConvention;
 
   /// Photo credit and picture delivery may use this image: its frame was
   /// tracking normally and has a pose.

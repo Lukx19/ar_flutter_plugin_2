@@ -136,6 +136,31 @@ void main() {
       );
     });
 
+    test('the image intrinsics convention: tagged opencv_pinhole_v1 from '
+        'photo store layout 5, untagged intrinsics have none', () {
+      final tagged = image(1)
+        ..['intrinsicsConvention'] = openCvPinholeIntrinsicsConvention;
+      final event = ARNativeCaptureEventV2.fromMap(
+          committed(shot([tagged, image(2)])));
+      expect(event.shot!.images[0].intrinsicsConvention,
+          openCvPinholeIntrinsicsConvention);
+      expect(event.shot!.images[1].intrinsicsConvention, isNull);
+      expect(
+        () => ARNativeCaptureEventV2.fromMap(committed(shot(
+            [image(1)..['intrinsicsConvention'] = 'colmap_pinhole_v1']))),
+        throwsFormatException,
+      );
+      expect(
+        () => ARNativeCaptureEventV2.fromMap(committed(shot([
+              image(1)
+                ..remove('intrinsics')
+                ..['intrinsicsConvention'] = openCvPinholeIntrinsicsConvention
+            ]))),
+        throwsFormatException,
+        reason: 'a convention without intrinsics',
+      );
+    });
+
     test('an image without a frame pose decodes as not creditable', () {
       final unposed = image(1)..remove('cameraToWorld');
       final event = ARNativeCaptureEventV2.fromMap(committed(shot([unposed])));

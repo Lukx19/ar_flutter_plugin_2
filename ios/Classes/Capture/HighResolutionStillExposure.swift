@@ -9,6 +9,9 @@ import simd
 /// at integer coordinates (OpenCV; docs/02-architecture.md, Coordinate
 /// frames), so the principal point scales as `(c + 0.5) * s - 0.5`.
 enum StillIntrinsics {
+  /// Name of this convention in stored records and on the wire.
+  static let convention = "opencv_pinhole_v1"
+
   /// fx, fy, cx, cy of [intrinsics] (column-major K) for [imageResolution]
   /// scaled to a still of [width] x [height].
   static func scaled(_ intrinsics: simd_float3x3, imageResolution: CGSize, width: Int, height: Int) -> simd_float4? {

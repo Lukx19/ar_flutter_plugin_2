@@ -21,6 +21,10 @@ const String arcoreGlCameraToWorldConvention = 'arcore_gl_c2w_v1';
 /// ARKit `ARCamera.transform` camera-to-world (the same AR camera axes).
 const String arkitCameraToWorldConvention = 'arkit_c2w_v1';
 
+/// Pinhole intrinsics with pixel centres at integer coordinates (OpenCV),
+/// sensor orientation, OpenCV distortion order k1, k2, p1, p2, k3.
+const String openCvPinholeIntrinsicsConvention = 'opencv_pinhole_v1';
+
 /// Whether [convention] names a camera-to-world in the AR camera axes.
 bool isArCameraConvention(String? convention) =>
     convention == arcoreGlCameraToWorldConvention ||

@@ -56,6 +56,7 @@ final class StillQualityTests: XCTestCase {
     XCTAssertEqual(still.z, 960.5 * 2.1 - 0.5, accuracy: 1e-3)
     XCTAssertEqual(still.w, 720.5 * 2.1 - 0.5, accuracy: 1e-3)
     XCTAssertNil(StillIntrinsics.scaled(k, imageResolution: .zero, width: 4032, height: 3024))
+    XCTAssertEqual(StillIntrinsics.convention, "opencv_pinhole_v1")
   }
 
   /// The capture intrinsics map reports the field of view in radians, as

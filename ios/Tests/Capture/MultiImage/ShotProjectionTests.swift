@@ -80,6 +80,7 @@ final class ShotProjectionTests: XCTestCase {
       let pose = try XCTUnwrap(image.cameraToWorld)
       XCTAssertEqual(pose[12], Double(source.metadata.cameraToWorld!.columns.3.x), accuracy: 1e-6, "its own frame's pose")
       XCTAssertEqual(image.intrinsics, [2940, 2940, 2016, 1512])
+      XCTAssertEqual(image.intrinsicsConvention, "opencv_pinhole_v1")
     }
     XCTAssertTrue(reported.images[0].creditable)
     XCTAssertFalse(reported.images[1].creditable, "the limited-tracking image is kept, never credited")
@@ -124,14 +125,21 @@ final class ShotProjectionTests: XCTestCase {
     XCTAssertEqual(decoded.images.map { $0.index }, [0, 1, 2])
     XCTAssertEqual(decoded.images[2].flags, .trackingNotNormal)
     var json = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(encoded)) as? [String: Any])
-    XCTAssertEqual(json["schema"] as? String, "capture3d-shot-v2")
+    XCTAssertEqual(json["schema"] as? String, "capture3d-shot-v3")
     XCTAssertEqual(json["cameraConvention"] as? String, "opencv_c2w_v1")
-    json["schema"] = "capture3d-shot-v3"
+    XCTAssertEqual(json["intrinsicsConvention"] as? String, "opencv_pinhole_v1")
+    XCTAssertEqual(decoded.images.map { $0.intrinsicsConvention }, Array(repeating: "opencv_pinhole_v1", count: 3))
+    json["schema"] = "capture3d-shot-v4"
     XCTAssertNil(ShotRecord.decode([UInt8](try JSONSerialization.data(withJSONObject: json))), "unknown schema")
     json["schema"] = ShotRecord.schema
     json["cameraConvention"] = "arkit_c2w_v1"
     XCTAssertNil(ShotRecord.decode([UInt8](try JSONSerialization.data(withJSONObject: json))), "unknown convention")
     json["cameraConvention"] = ShotRecord.cameraConvention
+    json["intrinsicsConvention"] = "colmap_pinhole_v1"
+    XCTAssertNil(ShotRecord.decode([UInt8](try JSONSerialization.data(withJSONObject: json))), "unknown intrinsics convention")
+    json.removeValue(forKey: "intrinsicsConvention")
+    XCTAssertNil(ShotRecord.decode([UInt8](try JSONSerialization.data(withJSONObject: json))), "v3 names its intrinsics convention")
+    json["intrinsicsConvention"] = ShotRecord.intrinsicsConvention
     var images = try XCTUnwrap(json["images"] as? [[String: Any]])
     images.swapAt(0, 1)
     json["images"] = images
@@ -175,6 +183,42 @@ final class ShotProjectionTests: XCTestCase {
       1, 0, 0, 0, -0.0, -1, -0.0, -0.0, -0.0, -0.0, -1, -0.0, 1.0099999904632568, 2, 3, 1,
     ])
     XCTAssertNil(decoded.images[2].cameraToWorld)
+    // Its intrinsics were scaled as `c * s`: no convention is claimed.
+    XCTAssertEqual(decoded.images[1].intrinsics, [2940, 2940, 2016, 1512])
+    XCTAssertEqual(decoded.images.map { $0.intrinsicsConvention }, [nil, nil, nil])
+  }
+
+  /// A layout 4 record (`capture3d-shot-v2`: `T_world_cam`, intrinsics
+  /// without a named convention) is read with its poses as written and its
+  /// intrinsics of unrecorded convention.
+  func testALayoutFourShotRecordReadsItsIntrinsicsWithoutAConvention() throws {
+    let source = shot()
+    var json = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(ShotRecord.encode(source))) as? [String: Any])
+    json["schema"] = "capture3d-shot-v2"
+    json.removeValue(forKey: "intrinsicsConvention")
+    let decoded = try XCTUnwrap(ShotRecord.decode([UInt8](try JSONSerialization.data(withJSONObject: json))))
+    XCTAssertEqual(decoded.images[1].cameraToWorld, ShotRecord.decode(ShotRecord.encode(source))?.images[1].cameraToWorld)
+    XCTAssertEqual(decoded.images[1].intrinsics, [2940, 2940, 2016, 1512])
+    XCTAssertEqual(decoded.images.map { $0.intrinsicsConvention }, [nil, nil, nil])
+    json["cameraConvention"] = "arkit_c2w_v1"
+    XCTAssertNil(ShotRecord.decode([UInt8](try JSONSerialization.data(withJSONObject: json))), "unknown convention")
+  }
+
+  /// Intrinsics of an older shot record reach the session untagged, so the
+  /// session never labels them `opencv_pinhole_v1`.
+  func testTheWireTagsShotIntrinsicsOnlyWhenTheRecordNamesTheirConvention() throws {
+    let image = CommittedShotImage(
+      index: 1, captureId: String(repeating: "a", count: 64), jpegSizeBytes: 10, exposureTimestampNs: 1,
+      width: 4032, height: 3024, trackingNormal: true, flags: 0, cameraToWorld: nil,
+      intrinsics: [2940, 2940, 2016, 1512], intrinsicsConvention: nil)
+    var tagged = image
+    tagged.intrinsicsConvention = ShotRecord.intrinsicsConvention
+    let shot = CommittedShot(
+      shotId: "s", mode: "burst", imageCount: 3, firstExposureTimestampNs: 0, images: [image, tagged])
+    let images = try XCTUnwrap(NativeCaptureWire.shotMap(shot)["images"] as? [[String: Any]])
+    XCTAssertNil(images[0]["intrinsicsConvention"])
+    XCTAssertEqual(images[0]["intrinsics"] as? [Double], [2940, 2940, 2016, 1512])
+    XCTAssertEqual(images[1]["intrinsicsConvention"] as? String, "opencv_pinhole_v1")
   }
 
   func testTheWireCarriesTheShotOfACommittedTerminal() throws {
@@ -189,7 +233,7 @@ final class ShotProjectionTests: XCTestCase {
     XCTAssertEqual(images.count, 2)
     XCTAssertEqual(Set(images[0].keys), [
       "index", "captureId", "jpegSizeBytes", "exposureTimestampNs", "width", "height", "trackingNormal", "flags",
-      "cameraToWorld", "cameraToWorldConvention", "intrinsics",
+      "cameraToWorld", "cameraToWorldConvention", "intrinsics", "intrinsicsConvention",
     ])
     XCTAssertEqual(images[0]["cameraToWorldConvention"] as? String, "opencv_c2w_v1")
     XCTAssertEqual((images[0]["cameraToWorld"] as? [Double])?.count, 16)

@@ -219,7 +219,9 @@ enum NativeCaptureWire {
   /// per image after the first one its index, capture id, JPEG size,
   /// exposure time, size, tracking, flag bits and, when known, its
   /// column-major `T_world_cam` (OpenCV camera axes, tagged
-  /// `cameraToWorldConvention: opencv_c2w_v1`) and fx, fy, cx, cy.
+  /// `cameraToWorldConvention: opencv_c2w_v1`) and fx, fy, cx, cy (tagged
+  /// `intrinsicsConvention: opencv_pinhole_v1` when the shot record names
+  /// it; untagged intrinsics are of unrecorded convention).
   static func shotMap(_ value: CommittedShot) -> [String: Any] {
     [
       "shotId": value.shotId, "mode": value.mode, "imageCount": value.imageCount,
@@ -234,7 +236,10 @@ enum NativeCaptureWire {
           map["cameraToWorld"] = pose
           map["cameraToWorldConvention"] = ShotRecord.cameraConvention
         }
-        if let k = image.intrinsics { map["intrinsics"] = k }
+        if let k = image.intrinsics {
+          map["intrinsics"] = k
+          if let convention = image.intrinsicsConvention { map["intrinsicsConvention"] = convention }
+        }
         return map
       },
     ]

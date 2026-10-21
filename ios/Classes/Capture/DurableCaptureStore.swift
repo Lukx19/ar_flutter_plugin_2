@@ -945,7 +945,8 @@ final class DurableCaptureStore {
         index: rooted.index, captureId: ShotRecord.imageCaptureId(captureId, index: rooted.index),
         jpegSizeBytes: rooted.length, exposureTimestampNs: image.exposureTimestampNs, width: image.width,
         height: image.height, trackingNormal: image.trackingNormal, flags: image.flags.rawValue,
-        cameraToWorld: image.cameraToWorld, intrinsics: image.intrinsics))
+        cameraToWorld: image.cameraToWorld, intrinsics: image.intrinsics,
+        intrinsicsConvention: image.intrinsicsConvention))
     }
     return CommittedShot(
       shotId: shot.shotId, mode: decoded.mode, imageCount: decoded.images.count,
