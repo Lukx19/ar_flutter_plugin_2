@@ -218,6 +218,12 @@ final class ARNativeCaptureRecoveryContextV2 {
       projectionMatrix,
       groupFromWorld,
       worldFromGroup;
+
+  /// The admitted capture pose `T_world_cam` (column-major, `opencv_c2w_v1`),
+  /// carried under the wire and store key `viewMatrix` (a camera-to-world,
+  /// not a view matrix; the key predates the canonical frame).
+  List<double> get worldFromCamera => viewMatrix;
+
   Map<String, Object?> toMap() => {
         'sessionId': sessionId,
         'groupId': groupId,
