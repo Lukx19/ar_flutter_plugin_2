@@ -48,7 +48,7 @@ class ArFlutterPlugin: FlutterPlugin, ActivityAware {
                 }
                 if (call.method !in setOf("materializeNativeCapturePreview", "beginNativeCapturePreviewDeletion",
                         "commitNativeCapturePreviewDeletion", "rollbackNativeCapturePreviewDeletion",
-                        "reconcileNativeCapturePreviews")) {
+                        "reconcileNativeCapturePreviews", "deleteNativeCaptureSession")) {
                     result.notImplemented()
                     return@setMethodCallHandler
                 }
@@ -63,6 +63,10 @@ class ArFlutterPlugin: FlutterPlugin, ActivityAware {
                                 requireNotNull(call.argument<String>("captureId")),
                                 cancelled,
                                 if (call.argument<Boolean>("detailed") == true) 1024 else 512,
+                            )
+                            // Replies the bytes reclaimed from the native storage budget.
+                            "deleteNativeCaptureSession" -> previewOwner.deleteSession(
+                                call.argument<String>("sessionId").orEmpty(),
                             )
                             "beginNativeCapturePreviewDeletion" -> previewOwner.beginDeletion(
                                 requireNotNull(call.argument<List<String>>("references")),

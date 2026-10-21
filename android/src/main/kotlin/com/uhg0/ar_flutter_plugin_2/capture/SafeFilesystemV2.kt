@@ -405,6 +405,7 @@ class SafeFilesystemV2(
     fun allocateExclusive(file: File, bytes: Long) {
         require(bytes > 0); prepareParent(file); backend.allocateExclusive(relative(file), bytes); check(length(file) == bytes); syncParent(file)
     }
+    fun syncDirectory(directory: File) = backend.syncDirectory(relative(directory))
     fun delete(file: File, point: DurableStoreFaultPointV2) { fault.at(point); backend.delete(relative(file)); backend.syncDirectory(parentSegments(file)) }
     fun deleteTree(directory: File, point: DurableStoreFaultPointV2) {
         fault.at(point); if (!backend.isDirectory(relative(directory))) { backend.delete(relative(directory)); return }

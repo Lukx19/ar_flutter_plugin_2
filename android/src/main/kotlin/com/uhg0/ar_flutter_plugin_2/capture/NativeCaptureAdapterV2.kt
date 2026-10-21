@@ -561,7 +561,6 @@ internal class NativeCaptureBindingV2(
         createNativeCaptureRootResourcesV2(context)
     }
     private val rootResources by rootResourcesDelegate
-    private val rootAuthority get() = rootResources.authority
     private val budget get() = rootResources.budget
     private val store get() = rootResources.store
     private var sharedCamera: SharedCameraManager? = null
@@ -571,9 +570,13 @@ internal class NativeCaptureBindingV2(
     private var resourcesClosed = false
     private val durableRootCloserDelegate = lazy {
         NativeCaptureDurableRootCloserV2(
-            closeStore = store::close,
+            closeStore = {
+                // Unregistered first: a session deletion running on this store finishes before it closes.
+                NativeCaptureOpenRootStoresV2.unregister(rootResources.leaseKey, store)
+                store.close()
+            },
             closeBudget = budget::close,
-            releaseLease = rootAuthority::close,
+            releaseLease = rootResources.lease::close,
             onClosed = { synchronized(lock) { resourcesClosed = true } },
         )
     }
@@ -761,50 +764,10 @@ internal class NativeCaptureBindingV2(
         synchronized(lock) { resourcesClosed = durableRootCloser.isClosed() }
     }
 
-    private class NativeCaptureRootAuthorityV2(
-        val root: java.io.File,
-        private val lease: NativeCaptureDurableRootLeaseV2,
-    ) : AutoCloseable {
-        override fun close() = lease.close()
-    }
-
-    private class NativeCaptureRootResourcesV2(
-        val authority: NativeCaptureRootAuthorityV2,
-        val budget: StorageBudgetCoordinatorV2,
-        val store: DurableSessionStoreV2,
-    )
-
-    private fun createNativeCaptureRootResourcesV2(context: Context): NativeCaptureRootResourcesV2 {
-        val authority = acquireNativeCaptureRootV2(context)
-        var budget: StorageBudgetCoordinatorV2? = null
-        try {
-            budget = StorageBudgetCoordinatorV2(
-                java.io.File(authority.root, "budget"),
-                // Half of free plus held bytes, measured at each check, at least the coexistence floor.
-                StorageBudgetPolicyV2(StorageBudgetQuotaV2.CaptureShare(CAPTURE_COEXISTENCE_BYTES), 0),
-            )
-            val store = DurableSessionStoreV2(java.io.File(authority.root, "store"), budget)
-            return NativeCaptureRootResourcesV2(authority, budget, store)
-        } catch (error: Throwable) {
-            runCatching { budget?.close() }
-            authority.close()
-            throw error
+    private fun createNativeCaptureRootResourcesV2(context: Context): NativeCaptureDurableRootV2 =
+        NativeCaptureDurableRootV2.open(java.io.File(context.filesDir, NATIVE_CAPTURE_ROOT_DIRECTORY)).also { opened ->
+            NativeCaptureOpenRootStoresV2.register(opened.leaseKey, opened.store)
         }
-    }
-
-    private fun acquireNativeCaptureRootV2(context: Context): NativeCaptureRootAuthorityV2 {
-        val root = java.io.File(context.filesDir, "capture-v2-native")
-        val lease = NativeCaptureDurableRootLeaseV2.acquire(root)
-        try {
-            AndroidDescriptorFilesystemV2().use { unbound ->
-                unbound.bind(root).use { }
-            }
-            return NativeCaptureRootAuthorityV2(root, lease)
-        } catch (error: Throwable) {
-            lease.close()
-            throw error
-        }
-    }
 
 }
 
