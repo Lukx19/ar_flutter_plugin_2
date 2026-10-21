@@ -57,7 +57,11 @@ internal class MarkerDetectionMessageWriter(val maxRecords: Int = 64) {
         b.put(IngestMessageLayout.POSE_MATCH, header.poseMatch.toByte())
         b.putShort(IngestMessageLayout.GROUP_EPOCH, header.groupEpoch.toShort())
         b.putInt(IngestMessageLayout.POSE_GAP_US, header.poseGapUs)
-        for (i in 0 until 16) b.putFloat(IngestMessageLayout.CAMERA_TO_WORLD + 4 * i, header.cameraToWorld[i])
+        // Contract version 2: T_world_cam, the ARCore camera Y and Z columns negated.
+        for (i in 0 until 16) {
+            val v = header.cameraToWorld[i]
+            b.putFloat(IngestMessageLayout.CAMERA_TO_WORLD + 4 * i, if (i in 4..11) -v else v)
+        }
         b.putFloat(IngestMessageLayout.INTRINSICS, header.fx)
         b.putFloat(IngestMessageLayout.INTRINSICS + 4, header.fy)
         b.putFloat(IngestMessageLayout.INTRINSICS + 8, header.cx)

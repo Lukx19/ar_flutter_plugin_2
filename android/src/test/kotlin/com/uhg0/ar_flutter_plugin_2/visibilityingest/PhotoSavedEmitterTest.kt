@@ -219,7 +219,7 @@ class PhotoSavedEmitterTest {
     }
 
     @Test
-    fun `missing frame pose falls back to the OpenCV shutter pose converted to OpenGL`() {
+    fun `missing frame pose falls back to the OpenCV shutter pose`() {
         shell.start(IngestShellConfig(0, 0, 0, 0, 0f, 3))
         stillCamera()
         // OpenCV camera: 180 degrees about x relative to the OpenGL camera, so identity in OpenGL.
@@ -229,7 +229,8 @@ class PhotoSavedEmitterTest {
         shell.pull.onPull(pullRequest(), reply)
         val payload = ByteBuffer.wrap(reply.bytes()).order(ByteOrder.LITTLE_ENDIAN)
         val rows = IngestMessageLayout.HEADER_BYTES + PhotoSavedLayout.CAMERA_TO_WORLD_ROWS
-        val expected = floatArrayOf(1f, 0f, 0f, 0.1f, 0f, 1f, 0f, 0.2f, 0f, 0f, 1f, 0.3f)
+        // Contract version 2 rows are T_world_cam: the shutter's OpenCV pose.
+        val expected = floatArrayOf(1f, 0f, 0f, 0.1f, 0f, -1f, 0f, 0.2f, 0f, 0f, -1f, 0.3f)
         for (i in 0 until 12) assertEquals("row-major element $i", expected[i], payload.getFloat(rows + 4 * i), 1e-6f)
         assertEquals(0, payload.get(IngestMessageLayout.HEADER_BYTES + PhotoSavedLayout.FLAGS).toInt())
     }

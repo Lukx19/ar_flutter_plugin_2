@@ -6,9 +6,17 @@ import 'ingest_message.dart';
 /// Ingest recording file: a 32 B header followed by `u32 length` plus one
 /// ingest message, repeated. Recordings are the replay fixtures for host
 /// tests.
+///
+/// Version 2 (coordinate frame migration U4b) records ingest contract
+/// version 2 messages (camera poses as `T_world_cam`); version 1 recordings
+/// hold contract version 1 messages (AR camera axes) and stay readable: each
+/// message names its own contract version, which the readers convert.
 abstract final class IngestRecordingLayout {
   static final int magic = contractMagic('C3IR');
-  static const int version = 1;
+  static const int version = 2;
+
+  /// Recordings of contract version 1 messages.
+  static const int arCameraPoseVersion = 1;
   static const int headerBytes = 32;
   static const int deviceModelHashOffset = 8; // u64
   static const int createdTimeNsOffset = 16; // i64, wall clock
@@ -20,13 +28,22 @@ final class IngestRecordingHeaderView extends ContractRecordView {
   @override
   int get recordBytes => IngestRecordingLayout.headerBytes;
 
-  ContractStatus validate(int available) => validateMagicAndVersion(
-      data,
-      offset,
-      available,
-      IngestRecordingLayout.headerBytes,
-      IngestRecordingLayout.magic,
-      IngestRecordingLayout.version);
+  ContractStatus validate(int available) {
+    final status = validateMagicAndVersion(
+        data,
+        offset,
+        available,
+        IngestRecordingLayout.headerBytes,
+        IngestRecordingLayout.magic,
+        IngestRecordingLayout.version);
+    return status == ContractStatus.badVersion &&
+            version == IngestRecordingLayout.arCameraPoseVersion
+        ? ContractStatus.ok
+        : status;
+  }
+
+  /// Recording format version (1 or 2).
+  int get version => u16(4);
 
   void write(int deviceModelHash, int createdTimeNs, int messageCount) {
     clear();

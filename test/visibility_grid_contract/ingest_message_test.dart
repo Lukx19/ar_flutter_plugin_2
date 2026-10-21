@@ -1,3 +1,4 @@
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:ar_flutter_plugin_2/visibility_grid_contract/visibility_grid_contract.dart';
@@ -101,8 +102,7 @@ void main() {
     expect(p.groupEpochLow, fixtureGroupEpoch);
   });
 
-  test('photo saved shot image golden decodes the event and its extension',
-      () {
+  test('photo saved shot image golden decodes the event and its extension', () {
     expectGoldenBytes(
         'ingest_photo_saved_shot_image.bin', buildPhotoSavedShotImageMessage());
     final data = readGolden('ingest_photo_saved_shot_image.bin');
@@ -118,8 +118,7 @@ void main() {
     expect([p.widthDiv8, p.heightDiv8, p.sharpness], [504, 378, 640]);
     expect(p.automatic, isFalse);
     expect(p.hasCamera, isTrue);
-    expect(
-        PhotoShotImageView.present(data, h.payloadOffset, h.payloadBytes),
+    expect(PhotoShotImageView.present(data, h.payloadOffset, h.payloadBytes),
         isTrue);
     final s = PhotoShotImageView()
       ..attach(data, h.payloadOffset + PhotoSavedLayout.bytes);
@@ -136,8 +135,7 @@ void main() {
   test('a 128 B photo saved event has no shot image extension', () {
     final data = readGolden('ingest_photo_saved.bin');
     final h = IngestMessageView()..attach(data);
-    expect(
-        PhotoShotImageView.present(data, h.payloadOffset, h.payloadBytes),
+    expect(PhotoShotImageView.present(data, h.payloadOffset, h.payloadBytes),
         isFalse);
     // A 224 B payload with another magic is not an extension either.
     final shot = buildPhotoSavedShotImageMessage();
@@ -178,15 +176,72 @@ void main() {
     expect(idle.hasMatchedPose, isFalse);
   });
 
+  test(
+      'version 1 goldens (AR camera axes, recordings before contract '
+      'version 2) validate and read as T_world_cam', () {
+    for (final name in [
+      'ingest_depth_u16.bin',
+      'ingest_points.bin',
+      'ingest_markers.bin',
+      'ingest_photo_saved.bin',
+      'ingest_session_event.bin',
+    ]) {
+      final old = ByteData.sublistView(
+          File('test_assets/ingest_contract_v1/$name').readAsBytesSync());
+      final now = readGolden(name);
+      final v1 = IngestMessageView()..attach(old);
+      final v2 = IngestMessageView()..attach(now);
+      expect(v1.validate(old.lengthInBytes), ContractStatus.ok, reason: name);
+      expect(v1.version, 1, reason: name);
+      expect(v2.version, 2, reason: name);
+      final a = List<double>.filled(16, 0), b = List<double>.filled(16, 0);
+      v1.readWorldFromCamera(a);
+      v2.readWorldFromCamera(b);
+      expect(a, b, reason: '$name canonical pose');
+      v1.readCameraToWorld(a);
+      v2.readCameraToWorld(b);
+      expect(a, b, reason: '$name AR camera pose');
+    }
+    // The raw version 2 pose is the version 1 pose with camera Y and Z
+    // negated.
+    final old = ByteData.sublistView(
+        File('test_assets/ingest_contract_v1/ingest_points.bin')
+            .readAsBytesSync());
+    final now = readGolden('ingest_points.bin');
+    for (var i = 0; i < 16; i++) {
+      final at = IngestHeaderLayout.cameraToWorldOffset + 4 * i;
+      final sign = i >= 4 && i < 12 ? -1.0 : 1.0;
+      expect(now.getFloat32(at, Endian.little),
+          sign * old.getFloat32(at, Endian.little));
+    }
+    // A version 1 photo saved event reads the same T_world_cam rows.
+    final photoOld = PhotoSavedView()
+      ..attach(
+          ByteData.sublistView(
+              File('test_assets/ingest_contract_v1/ingest_photo_saved.bin')
+                  .readAsBytesSync()),
+          IngestHeaderLayout.bytes)
+      ..contractVersion = 1;
+    final photoNow = PhotoSavedView()
+      ..attach(readGolden('ingest_photo_saved.bin'), IngestHeaderLayout.bytes);
+    final r1 = List<double>.filled(12, 0), r2 = List<double>.filled(12, 0);
+    photoOld.readWorldFromCameraRows(r1);
+    photoNow.readWorldFromCameraRows(r2);
+    expect(r1, r2);
+  });
+
   test('validation rejects magic, version, kind, truncation and size', () {
     final bytes = buildPointCloudMessage();
     final data = ByteData.sublistView(bytes);
     final h = IngestMessageView()..attach(data);
     expect(h.validate(bytes.length - 1), ContractStatus.badLength);
     expect(h.validate(100), ContractStatus.tooShort);
-    data.setUint16(4, 2, Endian.little);
+    data.setUint16(4, 3, Endian.little);
     expect(h.validate(bytes.length), ContractStatus.badVersion);
+    // Version 1 (AR camera axes poses) stays readable.
     data.setUint16(4, 1, Endian.little);
+    expect(h.validate(bytes.length), ContractStatus.ok);
+    data.setUint16(4, 2, Endian.little);
     h.kind = 9;
     expect(h.validate(bytes.length), ContractStatus.badKind);
     h.kind = IngestKind.pointCloud;
@@ -205,7 +260,8 @@ void main() {
     expect(view.acceptedKindMask, 0x7e);
   });
 
-  test('pull request carries kind 8 in the high mask byte; an 8-bit mask '
+  test(
+      'pull request carries kind 8 in the high mask byte; an 8-bit mask '
       'reads as before', () {
     final bytes = Uint8List(IngestPullRequestView.bytes);
     final view = IngestPullRequestView()..attach(ByteData.sublistView(bytes));

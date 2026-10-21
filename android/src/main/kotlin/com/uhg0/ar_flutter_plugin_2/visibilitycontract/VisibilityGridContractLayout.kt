@@ -20,7 +20,13 @@ internal object VisibilityGridChannels {
 
 internal object IngestMessageLayout {
     val MAGIC = contractMagic("C3VI")
-    const val VERSION = 1
+
+    /**
+     * 2 (coordinate frame migration U4b): the header camera pose and the
+     * photo saved rows are `T_world_cam` (OpenCV camera axes,
+     * `opencv_c2w_v1`); version 1 carried the ARCore camera pose axes.
+     */
+    const val VERSION = 2
     const val HEADER_BYTES = 160
     const val MAX_MESSAGE_BYTES = 262_144
 
@@ -291,7 +297,9 @@ internal object ShellControlLayout {
 
 internal object IngestRecordingLayout {
     val MAGIC = contractMagic("C3IR")
-    const val VERSION = 1
+
+    /** 2: recordings of ingest contract version 2 messages. */
+    const val VERSION = 2
     const val HEADER_BYTES = 32
     const val DEVICE_MODEL_HASH = 8
     const val CREATED_TIME_NS = 16

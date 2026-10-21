@@ -150,8 +150,13 @@ internal class AnchorPoseUpdateProducer(
         synchronized(photoRows) {
             val subject = readLong(e, PhotoSavedLayout.PHOTO_ID)
             val exposureNs = readLong(e, PhotoSavedLayout.EXPOSURE_TIMESTAMP_NS)
+            // The event rows are T_world_cam (contract version 2); photo
+            // anchors keep the ARCore camera axes orientation their pose
+            // table rows always had, so camera Y and Z change back.
             for (k in 0 until 12) {
-                photoRows[k] = java.lang.Float.intBitsToFloat(readInt(e, PhotoSavedLayout.CAMERA_TO_WORLD_ROWS + 4 * k))
+                val v = java.lang.Float.intBitsToFloat(readInt(e, PhotoSavedLayout.CAMERA_TO_WORLD_ROWS + 4 * k))
+                val col = k % 4
+                photoRows[k] = if (col == 1 || col == 2) -v else v
             }
             val valid = AnchorPoseTracker.rowsToPose(photoRows, 0, photoTq)
             tracker.enqueuePhoto(subject, exposureNs, photoTq, valid)

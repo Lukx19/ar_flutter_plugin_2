@@ -22,7 +22,10 @@ enum VisibilityGridChannels {
 
 enum IngestMessageLayout {
   static let magic = contractMagic("C3VI")
-  static let version = 1
+  /// 2 (coordinate frame migration U4b): the header camera pose and the
+  /// photo saved rows are `T_world_cam` (OpenCV camera axes,
+  /// `opencv_c2w_v1`); version 1 carried the ARKit camera transform axes.
+  static let version = 2
   static let headerBytes = 160
   static let maxMessageBytes = 262_144
 
@@ -166,7 +169,8 @@ enum ShellControlLayout {
 
 enum IngestRecordingLayout {
   static let magic = contractMagic("C3IR")
-  static let version = 1
+  /// 2: recordings of ingest contract version 2 messages.
+  static let version = 2
   static let headerBytes = 32
   static let deviceModelHash = 8
   static let createdTimeNs = 16

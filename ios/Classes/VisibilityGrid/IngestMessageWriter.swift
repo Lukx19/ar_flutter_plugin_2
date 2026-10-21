@@ -77,6 +77,8 @@ enum IngestMessageWriter {
   static func dropped(_ b: IngestMessageBuffer, _ count: UInt32) { b.u32(IngestMessageLayout.dropped, count) }
 
   /// Pose fields; [cameraToWorld] is written column-major (simd's storage order).
+  /// Header pose from the ARKit camera transform [m]; written as
+  /// `T_world_cam` (contract version 2).
   static func pose(
     _ b: IngestMessageBuffer, trackingState: Int, poseMatch: Int, groupEpoch: Int, poseGapUs: Int32,
     cameraToWorld m: simd_float4x4
@@ -85,7 +87,19 @@ enum IngestMessageWriter {
     b.u8(IngestMessageLayout.poseMatch, poseMatch)
     b.u16(IngestMessageLayout.groupEpoch, groupEpoch)
     b.i32(IngestMessageLayout.poseGapUs, poseGapUs)
-    writeColumnMajor(b, IngestMessageLayout.cameraToWorld, rigidBottomRow(m))
+    writeColumnMajor(b, IngestMessageLayout.cameraToWorld, openCv(rigidBottomRow(m)))
+  }
+
+  /// `T_world_arcam * diag(1, -1, -1, 1)`: the header pose of contract
+  /// version 2 from the ARKit camera transform [m] (camera Y and Z columns
+  /// negated, as `PoseBatchWire` and the Android writer).
+  static func openCv(_ m: simd_float4x4) -> simd_float4x4 {
+    // Multiply rather than negate: simd's vector negation can produce +0 for
+    // a 0 lane, and the contract (as Android and Dart) stores -0.
+    var r = m
+    r.columns.1 = m.columns.1 * Float(-1)
+    r.columns.2 = m.columns.2 * Float(-1)
+    return r
   }
 
   /// The contract's camera-to-world is a rigid transform with an exact

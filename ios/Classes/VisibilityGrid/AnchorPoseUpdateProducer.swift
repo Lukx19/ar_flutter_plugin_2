@@ -70,9 +70,13 @@ final class AnchorPoseUpdateProducer: DurablePhotoListener {
       let subject = Int64(littleEndian: raw.loadUnaligned(fromByteOffset: PhotoSavedLayout.photoId, as: Int64.self))
       let exposureNs = Int64(littleEndian: raw.loadUnaligned(fromByteOffset: PhotoSavedLayout.exposureTimestampNs, as: Int64.self))
       var rows = [Float](repeating: 0, count: 12)
+      // The event rows are T_world_cam (contract version 2); photo anchors
+      // keep the ARKit camera axes orientation their pose table rows always
+      // had, so camera Y and Z change back.
       for k in 0..<12 {
-        rows[k] = Float(bitPattern: UInt32(littleEndian: raw.loadUnaligned(
+        let value = Float(bitPattern: UInt32(littleEndian: raw.loadUnaligned(
           fromByteOffset: PhotoSavedLayout.cameraToWorldRows + 4 * k, as: UInt32.self)))
+        rows[k] = k % 4 == 1 || k % 4 == 2 ? -value : value
       }
       var tq = [Float](repeating: 0, count: 7)
       let valid = rows.withUnsafeBufferPointer { r in

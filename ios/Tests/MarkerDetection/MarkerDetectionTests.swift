@@ -211,7 +211,11 @@ final class MarkerDetectionTests: XCTestCase {
     let header = golden.withUnsafeBytes { raw -> MarkerDetectionHeader in
       func f(_ o: Int) -> Float { raw.loadUnaligned(fromByteOffset: o, as: Float.self) }
       var m = simd_float4x4()
-      for c in 0..<4 { for r in 0..<4 { m[c][r] = f(IngestMessageLayout.cameraToWorld + 4 * (c * 4 + r)) } }
+      // The golden stores T_world_cam (contract version 2); the header takes
+      // the ARKit camera transform, so camera Y and Z change back.
+      for c in 0..<4 {
+        for r in 0..<4 { m[c][r] = (c == 1 || c == 2 ? -1 : 1) * f(IngestMessageLayout.cameraToWorld + 4 * (c * 4 + r)) }
+      }
       return MarkerDetectionHeader(
         sampleNs: raw.loadUnaligned(fromByteOffset: IngestMessageLayout.sampleTimestampNs, as: Int64.self),
         acquireNs: raw.loadUnaligned(fromByteOffset: IngestMessageLayout.acquireTimeNs, as: Int64.self),
