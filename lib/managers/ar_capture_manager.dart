@@ -301,6 +301,9 @@ class CameraFlashState {
 /// Native release acknowledgment, distinct from a requested close.
 enum ARCaptureCloseState { active, closing, retained, disposed }
 
+/// Native refusal while a replaced capture view still owns the durable root.
+const String _nativeCaptureRootPendingCode = 'NATIVE_CAPTURE_V2_ROOT_PENDING';
+
 class ARCaptureManager {
   @visibleForTesting
   static bool? debugIsSupportedOverride;
@@ -484,9 +487,7 @@ class ARCaptureManager {
       );
       // The native owner may have completed bounded startup recovery before
       // this Dart handler existed. Pull its scalar replay after attachment.
-      for (final event in await replayNativeCaptureRecoveryV2()) {
-        _publishNativeCaptureV2Event(event);
-      }
+      await _replayStartupRecovery();
 
       debugPrint(
         'ARCaptureManager initialized with config: ${_config.toString()}',
@@ -501,6 +502,30 @@ class ARCaptureManager {
         rethrow;
       }
       throw ARCaptureException('Failed to initialize capture manager: $e');
+    }
+  }
+
+  /// Publishes the native startup recovery replay once the handler exists.
+  /// A rebuilt view can ask while the replaced view still owns the durable
+  /// root (`NATIVE_CAPTURE_V2_ROOT_PENDING`, until its close finishes a few
+  /// milliseconds later). This view's recovery has not started then: it starts
+  /// when this view first opens the root, after this handler is attached, so
+  /// its events arrive live and stay in the native replay. The refusal must
+  /// not fail the cached initialization, or every later call of this view
+  /// would repeat it.
+  Future<void> _replayStartupRecovery() async {
+    final List<ARNativeCaptureEventV2> replay;
+    try {
+      replay = await replayNativeCaptureRecoveryV2();
+    } on PlatformException catch (e) {
+      if (e.code != _nativeCaptureRootPendingCode) {
+        rethrow;
+      }
+      debugPrint('ARCaptureManager startup replay deferred: previous view still owns the durable root');
+      return;
+    }
+    for (final event in replay) {
+      _publishNativeCaptureV2Event(event);
     }
   }
 

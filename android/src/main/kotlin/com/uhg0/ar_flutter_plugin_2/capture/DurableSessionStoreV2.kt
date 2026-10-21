@@ -492,16 +492,89 @@ class DurableSessionStoreV2(
         return value
     }
 
-    /** Tombstone-first whole-session deletion fence.  It wins over later callbacks and roots. */
+    /**
+     * Tombstone-first whole-session deletion fence; it wins over later callbacks and roots.
+     * Every live reservation of the session then closes: an attempt whose committed root is
+     * published (reachable from the selected pointer) charges that root's bytes, so the session
+     * reclaim covers it; any other reservation is released (its data was never charged).
+     * Idempotent: an existing tombstone is kept. The session directory is synced first, so a
+     * pointer switch of unknown durability becomes known.
+     */
     fun tombstoneSession(sessionId: String) = synchronized(mutex) {
         val directory = files.child("sessions", safe(sessionId))
         files.ensureDirectory(directory)
         faults.at(DurableStoreFaultPointV2.TOMBSTONE_RECORD)
-        writeExclusive(path(directory, "tombstone"), "deleted\n".toByteArray(), DurableStoreFaultPointV2.TOMBSTONE_RECORD)
-        faults.at(DurableStoreFaultPointV2.TOMBSTONE_DIRECTORY_SYNC)
-        files.walk(directory).filter { it.name == "accepted.properties" }.forEach { file ->
-            readProperties(file).getProperty("reservationToken")?.let { budget.reservation(it)?.let(budget::release) }
+        val tombstone = path(directory, "tombstone")
+        if (!files.isFile(tombstone)) {
+            writeExclusive(tombstone, "deleted\n".toByteArray(), DurableStoreFaultPointV2.TOMBSTONE_RECORD)
         }
+        faults.at(DurableStoreFaultPointV2.TOMBSTONE_DIRECTORY_SYNC)
+        files.syncDirectory(directory)
+        for (slot in listOf("root-A.ptr", "root-B.ptr")) {
+            val file = path(directory, slot)
+            if (!files.isFile(file)) continue
+            files.readDescriptor(file) { rootMetadata.pointer(it::read) }?.let { uncertainRootHashes.remove(it.hash) }
+        }
+        val published = publishedRootHashes(directory)
+        files.walk(directory).filter { it.name == "accepted.properties" }.toList().forEach { file ->
+            val token = readProperties(file).getProperty("reservationToken") ?: return@forEach
+            val reservation = budget.reservation(token) ?: return@forEach
+            val bytes = publishedRecordBytes(directory, requireNotNull(file.parentFile), published)
+            if (bytes != null) budget.settle(reservation, minOf(bytes, reservation.bytes)) else budget.release(reservation)
+        }
+    }
+
+    /**
+     * Deletes one session's photos after the app deleted the session: the tombstone fence, then
+     * the bytes of the session's published commits leave the ledger exactly once (verified
+     * reclaim `verified-<id>.reclaim`, id bound to the session), then its attempts, roots,
+     * pointers and blobs are removed. The tombstone and the reclaim marker stay, so a repeated
+     * call after a crash at any step finishes the same deletion and never reclaims twice.
+     * Returns the bytes reclaimed by this call.
+     */
+    fun deleteSession(sessionId: String): Long = synchronized(mutex) {
+        require(sessionId.isNotEmpty()) { "sessionId is required" }
+        tombstoneSession(sessionId)
+        val directory = files.child("sessions", safe(sessionId))
+        val reclaimId = sessionReclaimId(sessionId)
+        var reclaimed = 0L
+        if (!budget.hasVerifiedReclaim(reclaimId)) {
+            val published = publishedRootHashes(directory)
+            var total = 0L
+            files.walk(directory).filter { it.name == "accepted.properties" }.toList().forEach { file ->
+                total = Math.addExact(total, publishedRecordBytes(directory, requireNotNull(file.parentFile), published) ?: 0L)
+            }
+            reclaimed = minOf(total, budget.committedBytes())
+            if (reclaimed > 0L) budget.reclaimVerifiedOnce(reclaimId, reclaimed)
+        }
+        files.list(directory).filter { it.name != "tombstone" }.forEach {
+            deleteTree(it, DurableStoreFaultPointV2.DELETE_RECLAIM)
+        }
+        reclaimed
+    }
+
+    /** Every root reachable from the selected pointer through `previous`. */
+    private fun publishedRootHashes(location: File): Set<String> {
+        val out = linkedSetOf<String>()
+        var hash = selectedRoot(location)?.rootHash
+        while (hash != null && hash !in out) {
+            out += hash
+            hash = rootPrevious(location, hash)
+        }
+        return out
+    }
+
+    /** Bytes of the published root an attempt's committed receipt names (its charge); null without one. */
+    private fun publishedRecordBytes(location: File, attempt: File, published: Set<String>): Long? {
+        val receipt = path(attempt, "receipt.properties")
+        if (!files.isFile(receipt)) return null
+        val bytes = files.readBytes(receipt)
+        if (!isFinishedReceipt(bytes)) return null
+        val values = parseProperties(bytes)
+        if (values.getProperty("kind") != CaptureTerminalKind.COMMITTED_PICTURE.name) return null
+        val rootHash = values.getProperty("rootHash")?.takeIf { it in published } ?: return null
+        return readRootMetadata(location, rootHash)?.components
+            ?.fold(0L) { total, component -> Math.addExact(total, component.length) }
     }
 
     /** Reconciles prepared staging and ensures only receipt/pointer backed results are visible. */
@@ -545,6 +618,8 @@ class DurableSessionStoreV2(
             val attemptHash = index.getProperty("entry.$slot.attempt") ?: continue
             if (!sessionHash.matches(SAFE_HASH) || !attemptHash.matches(SAFE_HASH)) continue
             val session = files.child("sessions", sessionHash)
+            // A deleted session projects nothing, also while an interrupted deletion is unfinished.
+            if (tombstone(session) != null) continue
             val accepted = path(session, "attempts", attemptHash, "accepted.properties")
             if (!files.isFile(accepted)) continue
             val acceptedBytes = files.readBytes(accepted)
@@ -803,6 +878,8 @@ class DurableSessionStoreV2(
      * Any other lineage stays unknown. Returns true when a pointer was published.
      */
     private fun adoptUnpublishedRoot(session: File, accepted: File): Boolean {
+        // A deleted session never gains a published root after its reclaim.
+        if (tombstone(session) != null) return false
         val receipt = path(requireNotNull(accepted.parentFile), "receipt.properties")
         if (!files.isFile(receipt)) return false
         val receiptBytes = files.readBytes(receipt)
@@ -1199,9 +1276,12 @@ class DurableSessionStoreV2(
     private fun List<Int>.hex() = toCaptureHashHex()
     private data class Staged(val kind: CaptureComponentKind, val file: File, val descriptor: CaptureComponentDescriptor)
     private data class RootPointer(val revision: Long, val rootHash: String, val commitId: String, val slot: String = "", val previousHash: String? = null)
-    private companion object {
-        const val RECOVERY_INDEX_CAPACITY = 3
-        fun logStoreWarning(message: String) { android.util.Log.w("Capture3DStore", message) }
-        val SAFE_HASH = Regex("[0-9a-f]{64}")
+    companion object {
+        /** Reclaim identity of one deleted session; the same derivation as the iOS store. */
+        fun sessionReclaimId(sessionId: String): String =
+            MessageDigest.getInstance("SHA-256").digest("native-capture-session-reclaim|$sessionId".toByteArray()).toCaptureHashHex()
+        private const val RECOVERY_INDEX_CAPACITY = 3
+        internal fun logStoreWarning(message: String) { android.util.Log.w("Capture3DStore", message) }
+        internal val SAFE_HASH = Regex("[0-9a-f]{64}")
     }
 }

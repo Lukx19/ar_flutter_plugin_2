@@ -28,6 +28,28 @@ class StorageBudgetCoordinatorV2Test {
         }
     }
 
+    @Test fun `verified reclaim is reported applied once its marker exists, also after a pending cut`() {
+        val root = directory(); val policy = StorageBudgetPolicyV2(64 * 1024, 0)
+        val id = "ef".repeat(32)
+        var cut = true
+        StorageBudgetCoordinatorV2(root, policy, physicalFilesystem(), DurableStoreFaultInjectorV2 {
+            if (it == DurableStoreFaultPointV2.LEDGER_REPLACE && cut && File(root, "reclaims-v2/verified-$id.reclaim").exists()) {
+                cut = false
+                throw IllegalStateException("ledger cut")
+            }
+        }) { 1_000_000 }.use { first ->
+            val reservation = requireNotNull(first.reserve("capture:test:test", 4_096))
+            first.commit(reservation, 4_096)
+            assertFalse(first.hasVerifiedReclaim(id))
+            assertThrows(IllegalStateException::class.java) { first.reclaimVerifiedOnce(id, 4_096) }
+        }
+        StorageBudgetCoordinatorV2(root, policy, physicalFilesystem()) { 1_000_000 }.use { reopened ->
+            assertTrue(reopened.hasVerifiedReclaim(id))
+            assertEquals(0L, reopened.committedBytes())
+            assertTrue(File(root, "reclaims-v2/verified-$id.reclaim").readText().startsWith("DONE\n"))
+        }
+    }
+
     @Test fun `deterministic candidate target admits one durable winner across coordinators`() {
         val root = directory(); val policy = StorageBudgetPolicyV2(1_000_000, 0)
         val first = StorageBudgetCoordinatorV2(root, policy, physicalFilesystem()) { 10_000_000 }

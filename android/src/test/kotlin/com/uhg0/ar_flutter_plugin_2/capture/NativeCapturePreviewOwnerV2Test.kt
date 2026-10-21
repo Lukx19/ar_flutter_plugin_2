@@ -23,6 +23,14 @@ class NativeCapturePreviewOwnerV2Test {
     @Before fun initialize() { owner().reconcile(emptyList()) }
     @After fun cleanup() { root.deleteRecursively() }
 
+    @Test fun `session deletion reaches the durable store with the session id and refuses an empty id`() {
+        val deleted = mutableListOf<String>()
+        val owner = NativeCapturePreviewOwnerV2(root, { deleted += it; 7L }) { _, _, _, _, _ -> false }
+        assertEquals(7L, owner.deleteSession("session-1"))
+        assertThrows(IllegalArgumentException::class.java) { owner.deleteSession("") }
+        assertEquals(listOf("session-1"), deleted)
+    }
+
     @Test fun `committed deletion survives owner restart and isolates other captures`() {
         val owner = owner()
         val path = requireNotNull(owner.materialize(manifest, capture))

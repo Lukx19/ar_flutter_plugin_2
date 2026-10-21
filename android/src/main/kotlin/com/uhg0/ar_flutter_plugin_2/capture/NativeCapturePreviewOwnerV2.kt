@@ -7,6 +7,9 @@ import java.util.UUID
 /** Owns only the persistent JPEG display copies named by immutable V2 references. */
 internal class NativeCapturePreviewOwnerV2(
     appFiles: File,
+    private val deleteDurableSession: (String) -> Long = { sessionId ->
+        NativeCaptureSessionDeletionV2.deleteFromAppFiles(appFiles, sessionId)
+    },
     private val copyPreview: (String, String, File, () -> Boolean, Int) -> Boolean =
         NativeCapturePreviewReaderV2(File(appFiles, "capture-v2-native/store"))::materializeJpegPreview,
 ) {
@@ -25,6 +28,16 @@ internal class NativeCapturePreviewOwnerV2(
         if (!copyPreview(manifestId, captureId, target, cancelled, edge)) return@synchronized null
         if (edge == 1024) trimDetailedCopies(target)
         target.absolutePath
+    }
+
+    /**
+     * Deletes the durable photos of a session the app deleted: tombstone, one verified budget
+     * reclaim and blob removal in the native store. Display copies follow the reference
+     * deletion transaction above. Returns the bytes reclaimed by this call.
+     */
+    fun deleteSession(sessionId: String): Long {
+        require(sessionId.isNotEmpty()) { "sessionId is required" }
+        return deleteDurableSession(sessionId)
     }
 
     /** Resolves each interrupted deletion using successfully loaded persisted references. */

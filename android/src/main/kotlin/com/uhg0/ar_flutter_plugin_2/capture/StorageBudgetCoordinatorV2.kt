@@ -374,6 +374,12 @@ class StorageBudgetCoordinatorV2(
         )
     }
 
+    /** True once [reclaimId] was applied; recovery has already finished a pending marker. */
+    fun hasVerifiedReclaim(reclaimId: String): Boolean = withAuthority {
+        require(reclaimId.matches(RECLAIM_ID))
+        files.isFile(verifiedReclaimFile(reclaimId))
+    }
+
     fun forgetVerifiedReclaim(reclaimId: String) = withAuthority {
         require(reclaimId.matches(RECLAIM_ID))
         val marker = verifiedReclaimFile(reclaimId)

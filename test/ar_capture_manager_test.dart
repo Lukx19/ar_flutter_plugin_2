@@ -53,6 +53,7 @@ void main() {
   List<Map<String, dynamic>> nativeRecoveryResponse = <Map<String, dynamic>>[];
   Map<String, dynamic>? syntheticPoseResponse;
   bool debugSyntheticRouteInstalled = true;
+  var replayRootPendingCalls = 0;
 
   setUp(() {
     ARCaptureManager.debugIsSupportedOverride = true;
@@ -93,6 +94,7 @@ void main() {
       'sequence': 1,
     };
     debugSyntheticRouteInstalled = true;
+    replayRootPendingCalls = 0;
     SharedPreferences.setMockInitialValues(<String, Object>{});
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(captureChannel, (call) async {
@@ -452,6 +454,13 @@ void main() {
         case 'admitNativeCaptureV2':
           return nativeAdmissionResponse;
         case 'replayNativeCaptureRecoveryV2':
+          if (replayRootPendingCalls > 0) {
+            replayRootPendingCalls--;
+            throw PlatformException(
+              code: 'NATIVE_CAPTURE_V2_ROOT_PENDING',
+              message: 'The previous capture view still owns the durable root',
+            );
+          }
           return nativeRecoveryResponse;
         default:
           return null;
@@ -787,6 +796,40 @@ void main() {
     ARCaptureManager.debugIsSupportedOverride = null;
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(captureChannel, null);
+  });
+
+  test(
+      'a startup replay refused while the replaced view owns the root does not '
+      'fail initialization', () async {
+    replayRootPendingCalls = 1;
+    final manager = ARCaptureManager(
+      ARSessionManager(42, _FakeBuildContext(), PlaneDetectionConfig.horizontal),
+      captureConfig,
+      _FakeBuildContext(),
+    );
+
+    final first = await manager.captureImage();
+    final second = await manager.captureImage();
+
+    expect(first?.imageId, 'img-1');
+    expect(second, isNotNull);
+    expect(manager.initializationResult, isNotNull);
+    expect(methodCalls.where((call) => call.method == 'initializeCapture'), hasLength(1));
+    expect(methodCalls.where((call) => call.method == 'replayNativeCaptureRecoveryV2'), hasLength(1));
+    // The native replay is still served once the root is free.
+    expect(await manager.replayNativeCaptureRecoveryV2(), isEmpty);
+  });
+
+  test('any other startup replay failure still fails initialization', () async {
+    failingMethodName = 'replayNativeCaptureRecoveryV2';
+    failingMethodCode = 'NATIVE_CAPTURE_V2_REPLAY_INVALID';
+    final manager = ARCaptureManager(
+      ARSessionManager(42, _FakeBuildContext(), PlaneDetectionConfig.horizontal),
+      captureConfig,
+      _FakeBuildContext(),
+    );
+
+    await expectLater(manager.captureImage(), throwsA(isA<ARCaptureException>()));
   });
 
   test('uses the per-view capture channel and initializes natively', () async {
