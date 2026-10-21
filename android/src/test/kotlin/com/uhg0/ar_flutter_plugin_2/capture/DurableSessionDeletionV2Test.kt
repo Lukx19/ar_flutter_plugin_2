@@ -95,7 +95,17 @@ class DurableSessionDeletionV2Test {
         assertEquals(0L, budget.reservedBytes())
     }
 
-    @Test fun `session deletion converges after a crash at every step`() {
+    @Test fun `session deletion converges after a crash at every step`() = crashMatrix(recoverBeforeRetry = true)
+
+    /** The retry runs on a reopened store with no binding-open recovery in between. */
+    @Test fun `session deletion converges after a crash at every step without startup recovery`() =
+        crashMatrix(recoverBeforeRetry = false)
+
+    /**
+     * Cuts every visit of each deletion write (up to [MAX_VISITS]), then retries twice. Every cut
+     * point must fire at least once and every visit must be cut before the deletion completes.
+     */
+    private fun crashMatrix(recoverBeforeRetry: Boolean) {
         val cuts = listOf(
             "budget" to DurableStoreFaultPointV2.RESERVATION_COMMIT_REPLACE,
             "budget" to DurableStoreFaultPointV2.LEDGER_REPLACE,
@@ -106,9 +116,12 @@ class DurableSessionDeletionV2Test {
             "store" to DurableStoreFaultPointV2.TOMBSTONE_DIRECTORY_SYNC,
             "store" to DurableStoreFaultPointV2.DELETE_RECLAIM,
         )
-        var exercised = 0
+        val fired = linkedMapOf<String, Int>()
+        val completedAfter = linkedMapOf<String, Int>()
         for ((side, point) in cuts) {
-            for (nth in 1..12) {
+            val cutPoint = "$side $point"
+            fired[cutPoint] = 0
+            for (nth in 1..MAX_VISITS) {
                 val root = directory()
                 val setup = store(root, budget(root))
                 commit(setup, "kept", 1, JPEG_KEPT)
@@ -126,27 +139,30 @@ class DurableSessionDeletionV2Test {
 
                 var visits = 0
                 val cut = DurableStoreFaultInjectorV2 {
-                    if (it == point && ++visits == nth) throw IllegalStateException("injected $side $point #$nth")
+                    if (it == point && ++visits == nth) throw IllegalStateException("injected $cutPoint #$nth")
                 }
                 val poisoned = if (side == "budget") store(root, budget(root, cut)) else store(root, budget(root), cut)
-                val label = "$side $point #$nth"
+                val label = "$cutPoint #$nth (recovery before retry: $recoverBeforeRetry)"
                 try {
                     poisoned.deleteSession("deleted")
                     assertTrue("$label completed although its cut was reached", visits < nth)
+                    completedAfter[cutPoint] = nth
                     break
                 } catch (error: IllegalStateException) {
                     // A cut directory sync surfaces wrapped as an unknown pointer sync.
                     val messages = generateSequence<Throwable>(error) { it.cause }.map { it.message }.toList()
-                    assertTrue("$label: $messages", "injected $side $point #$nth" in messages)
-                    exercised++
+                    assertTrue("$label: $messages", "injected $cutPoint #$nth" in messages)
+                    fired[cutPoint] = fired.getValue(cutPoint) + 1
                 }
-                // A restart between the crash and the retry: binding-open recovery projects
-                // nothing of the deleted session, publishes no root in it and never fails.
                 val reopenedBudget = budget(root)
                 val reopened = store(root, reopenedBudget)
-                val tombstoned = File(sessionDirectory(root, "deleted"), "tombstone").isFile
-                val projected = reopened.recoverAtOpen(log = { throw AssertionError("$label: $it") })
-                if (tombstoned) assertTrue(label, projected.none { it.attemptId.startsWith("deleted") })
+                if (recoverBeforeRetry) {
+                    // A restart between the crash and the retry: binding-open recovery projects
+                    // nothing of the deleted session, publishes no root in it and never fails.
+                    val tombstoned = File(sessionDirectory(root, "deleted"), "tombstone").isFile
+                    val projected = reopened.recoverAtOpen(log = { throw AssertionError("$label: $it") })
+                    if (tombstoned) assertTrue(label, projected.none { it.attemptId.startsWith("deleted") })
+                }
                 reopened.deleteSession("deleted")
                 reopened.deleteSession("deleted")
                 val budget = budget(root)
@@ -158,7 +174,8 @@ class DurableSessionDeletionV2Test {
                     store(root, budget).queryReceipt(request("kept-commit-1", "kept-attempt-1", session = "kept").accepted.identity)?.phase)
             }
         }
-        assertTrue("the crash matrix reached every deletion step ($exercised)", exercised >= 20)
+        assertEquals("every cut point fired: $fired", emptyList<String>(), fired.filterValues { it == 0 }.keys.toList())
+        assertEquals("every visit was cut before completion: $completedAfter", fired.keys.toList(), completedAfter.keys.toList())
     }
 
     @Test fun `deletion reaches the open view's store and opens the root once the view closed`() {
@@ -251,6 +268,7 @@ class DurableSessionDeletionV2Test {
     private fun sha256Hex(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
 
     private companion object {
+        const val MAX_VISITS = 16
         val JPEG_A = byteArrayOf(1, 2, 3)
         val JPEG_B = byteArrayOf(4, 5, 6, 7)
         val JPEG_C = byteArrayOf(8, 8, 8, 8, 8)
