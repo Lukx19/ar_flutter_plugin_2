@@ -30,7 +30,7 @@ done
 # ARSessionHost keeps the staged world map of a restarted session, which
 # reports to the native session log.
 for f in WorldMap/WorldMapRelocalization WorldMap/WorldMapArchive SessionLog/NativeSessionLogEmitter \
-         SessionLog/NativeSessionLogBuffer SessionLog/NativeAnomalyEmitter; do
+         SessionLog/NativeSessionLogBuffer SessionLog/NativeAnomalyEmitter SessionLog/NativeSessionLogCodes; do
   ln -s "$ios/Classes/$f.swift" "$swift/${f:t}.swift"
 done
 for f in "$ios"/Classes/VisibilityGrid/*.swift; do
