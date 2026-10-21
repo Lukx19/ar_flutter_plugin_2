@@ -10,6 +10,7 @@ import io.flutter.plugin.common.MethodChannel
 import com.uhg0.ar_flutter_plugin_2.capabilities.MethodChannelARCameraCapabilities
 import com.uhg0.ar_flutter_plugin_2.capture.NativeCapturePreviewOwnerV2
 import com.uhg0.ar_flutter_plugin_2.capture.CapturePreviewWorkQueue
+import com.uhg0.ar_flutter_plugin_2.sceneview.SceneViewHostRetentionCensus
 import com.uhg0.ar_flutter_plugin_2.sessionlog.NativeSessionLogEmitter
 import com.uhg0.ar_flutter_plugin_2.storeversion.NativeStoreFormatVersions
 import com.uhg0.ar_flutter_plugin_2.visibilityingest.VisibilityGridShellRegistry
@@ -23,6 +24,7 @@ class ArFlutterPlugin: FlutterPlugin, ActivityAware {
     private var nativeCapturePreviewChannel: MethodChannel? = null
     private var storeFormatVersionsChannel: MethodChannel? = null
     private var sessionLogChannel: MethodChannel? = null
+    private var sceneViewRetentionChannel: MethodChannel? = null
     private var nativeCapturePreviewWorker: CapturePreviewWorkQueue? = null
     private val CommittedBaselineAuthority = CommittedBaselineAuthority()
 
@@ -32,6 +34,11 @@ class ArFlutterPlugin: FlutterPlugin, ActivityAware {
         VisibilityGridShellRegistry.register(binding.binaryMessenger, binding.applicationContext)
         storeFormatVersionsChannel = NativeStoreFormatVersions.register(binding.binaryMessenger)
         sessionLogChannel = NativeSessionLogEmitter.register(binding.binaryMessenger, binding.applicationContext)
+        sceneViewRetentionChannel = SceneViewHostRetentionCensus.register(
+            binding.binaryMessenger,
+            binding.applicationContext.applicationInfo.flags and
+                android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0,
+        )
         val previewOwner = NativeCapturePreviewOwnerV2(binding.applicationContext.filesDir)
         val previewWorker = CapturePreviewWorkQueue {
             android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
@@ -91,6 +98,8 @@ class ArFlutterPlugin: FlutterPlugin, ActivityAware {
         storeFormatVersionsChannel = null
         NativeSessionLogEmitter.unregister(sessionLogChannel)
         sessionLogChannel = null
+        SceneViewHostRetentionCensus.unregister(sceneViewRetentionChannel)
+        sceneViewRetentionChannel = null
         nativeCapturePreviewChannel = null
         nativeCapturePreviewWorker?.close()
         nativeCapturePreviewWorker = null

@@ -1,6 +1,18 @@
 import Foundation
 import simd
 
+/// What the marker tap follows: the grid shell's marker detection settings
+/// (control start or set marker detection) while the shell runs. Defined
+/// with the shell so the ARKit-free host package compiles it.
+struct MarkerDetectionSettings: Equatable {
+  var enabled: Bool
+  /// Detections per second; 0 means [MarkerFrameTap.defaultHz].
+  var hz: Int
+  /// Free marker size; 0 keeps the detector's size.
+  var markerSizeMetres: Float
+  var groupEpoch: Int
+}
+
 /// The iOS visibility grid ingest shell, one per Flutter engine; the Swift
 /// twin of the Android `VisibilityGridIngestShell`. Idle (each frame returns
 /// after one locked flag read) until the UI isolate sends a control start

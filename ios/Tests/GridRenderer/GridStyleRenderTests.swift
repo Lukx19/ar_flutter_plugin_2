@@ -385,10 +385,10 @@ final class GridStyleRenderTests: XCTestCase {
     mode(GridDisplayCodes.basePoints)
     try render()
     XCTAssertNotNil(host.target.metalBuffer(.surfaces))
-    var reasons: [String] = []
-    host.onFailure = { reasons.append($0) }
-    host.rendererDidFail("test")
-    XCTAssertEqual(reasons, ["test"])
+    var failures: [GridRendererFailure] = []
+    host.onFailure = { failures.append($0) }
+    host.rendererDidFail(stage: "upload", error: "test")
+    XCTAssertEqual(failures, [GridRendererFailure(stage: "upload", error: "test", failures: 1)])
     XCTAssertTrue(host.rendererFailed)
     XCTAssertEqual(host.failureCount, 1)
     XCTAssertNil(host.target.metalBuffer(.surfaces))

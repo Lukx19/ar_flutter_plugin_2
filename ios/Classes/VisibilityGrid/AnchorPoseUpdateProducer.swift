@@ -10,7 +10,9 @@ import Foundation
 /// group epoch, tracker diagnostics in the reserved words) followed by up to
 /// 1024 dirty anchor updates and up to 64 creation records. A malformed
 /// query, a query after close or a failing tracker is answered with the
-/// 4-byte status [statusQueryRefused], never with nil.
+/// 4-byte status [statusQueryRefused], never with nil. A refused query is
+/// recorded in the native session log as `POSE_REFUSED` (variant
+/// `anchorQuery`, data `reason`, `queriesRefused`), as on Android.
 ///
 /// Anchors are created for the query's keyframe and submap requests and,
 /// while tracking is active, for every durable photo. The reply is written
@@ -25,11 +27,13 @@ final class AnchorPoseUpdateProducer: DurablePhotoListener {
   private let query = IngestMessageBuffer(capacity: AnchorPoseUpdateProducer.maxQueryBytes)
   private let reply = IngestMessageBuffer(capacity: AnchorPoseUpdateLayout.maxMessageBytes)
   private var sequence: UInt32 = 0
+  private let sessionLog: NativeSessionLogEmitter
 
   private(set) var queriesRefused = 0
 
   init(backend: AnchorBackend, clock: IngestClock, readTimer: IngestClock = UptimeRawClock(),
-       initialCapacity: Int = AnchorPoseTracker.defaultCapacity) {
+       initialCapacity: Int = AnchorPoseTracker.defaultCapacity, sessionLog: NativeSessionLogEmitter = .shared) {
+    self.sessionLog = sessionLog
     tracker = AnchorPoseTracker(backend: backend, clock: clock, readTimer: readTimer, initialCapacity: initialCapacity)
   }
 
@@ -49,6 +53,12 @@ final class AnchorPoseUpdateProducer: DurablePhotoListener {
     }
     if length < 0 {
       queriesRefused += 1
+      if length == AnchorPoseTracker.queryMalformed {
+        let refused = queriesRefused
+        sessionLog.failure(NativeSessionLogCodes.poseRefused, variant: "anchorQuery", message: "Anchor pose query refused") {
+          ["reason": "malformedOrClosed", "queriesRefused": refused]
+        }
+      }
       send(ChannelStatusReply.data(Self.statusQueryRefused))
       return
     }

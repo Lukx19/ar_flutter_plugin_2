@@ -299,6 +299,124 @@ final class MarkerDetectionTests: XCTestCase {
     XCTAssertEqual(first, 10_000_000_000)
   }
 
+  /// A tap with marker detection on at 5 Hz writing to [log], fed frames of [buffer].
+  private func failureTap(
+    _ log: NativeSessionLogEmitter, queue: DispatchQueue, makeDetector: @escaping () -> MarkerFrameDetector?
+  ) -> (tap: MarkerFrameTap, sink: CapturingSink) {
+    let sink = CapturingSink()
+    let settings = MarkerDetectionSettings(enabled: true, hz: 5, markerSizeMetres: 0, groupEpoch: 1)
+    let tap = MarkerFrameTap(
+      makeDetector: makeDetector, settings: { settings }, sink: { sink }, clock: FakeIngestClock(42), queue: queue,
+      sessionLog: log)
+    return (tap, sink)
+  }
+
+  private func feed(_ tap: MarkerFrameTap, _ buffer: CVPixelBuffer, at times: [TimeInterval], queue: DispatchQueue) {
+    let k = simd_float3x3(simd_float3(50, 0, 0), simd_float3(0, 50, 0), simd_float3(32, 24, 1))
+    let width = CVPixelBufferGetWidth(buffer), height = CVPixelBufferGetHeight(buffer)
+    for t in times {
+      tap.frameSource(FakeSource(), didUpdate: FakeFrame(
+        timestamp: t, cameraTransform: matrix_identity_float4x4, intrinsics: k,
+        imageResolution: CGSize(width: width, height: height), capturedImage: buffer))
+      queue.sync {}
+    }
+  }
+
+  /// A detector whose every detection fails with [status].
+  final class FailingDetector: MarkerFrameDetector {
+    let status: Int32
+    var detections = 0
+    private let empty = UnsafeMutableRawPointer.allocate(byteCount: 64, alignment: 8)
+    init(status: Int32) { self.status = status }
+    deinit { empty.deallocate() }
+    func setFrameQuality() {}
+    func setFrameMarkerSize(_ metres: Double) {}
+    func setFrameCamera(fx: Double, fy: Double, cx: Double, cy: Double) {}
+    func detect(_ grey: UnsafePointer<UInt8>, width: Int, height: Int, stride: Int) -> Int32 {
+      detections += 1
+      return status
+    }
+    func estimatePose() -> Int32 { 0 }
+    var records: UnsafeRawPointer { UnsafeRawPointer(empty) }
+  }
+
+  func testAnUnavailableDetectorSkipsImagesSilentlyAsOnAndroid() throws {
+    let buffer = try Self.pixelBuffer([UInt8](repeating: 0, count: 64 * 48), width: 64, height: 48)
+    let log = NativeSessionLogEmitter(buffer: NativeSessionLogBuffer(nowNs: { 1 }))
+    log.setActive(true)
+    let queue = DispatchQueue(label: "test.markers.unavailable")
+    let (tap, sink) = failureTap(log, queue: queue, makeDetector: { nil })
+    feed(tap, buffer, at: [10.0, 10.25, 10.5], queue: queue)
+    XCTAssertTrue(sink.messages.isEmpty)
+    XCTAssertEqual(tap.snapshot.detectorUnavailable, 3)
+    XCTAssertEqual(tap.snapshot.failures, 0)
+    XCTAssertEqual(tap.snapshot.detectionFailures, 0)
+    XCTAssertEqual(tap.snapshot.images, 0)
+    XCTAssertTrue(log.buffer.drain().isEmpty, "no session log record without a detector")
+  }
+
+  func testAnUnsupportedPixelFormatIsACaptureFailure() throws {
+    var made: CVPixelBuffer?
+    XCTAssertEqual(CVPixelBufferCreate(nil, 64, 48, kCVPixelFormatType_32BGRA, nil, &made), kCVReturnSuccess)
+    let buffer = try XCTUnwrap(made)
+    let log = NativeSessionLogEmitter(buffer: NativeSessionLogBuffer(nowNs: { 1 }))
+    log.setActive(true)
+    let queue = DispatchQueue(label: "test.markers.format")
+    let detector = FailingDetector(status: 0)
+    let (tap, sink) = failureTap(log, queue: queue, makeDetector: { detector })
+    // 10.1 is within the 1/5 s period of the failed attempt at 10.0: skipped.
+    feed(tap, buffer, at: [10.0, 10.1, 10.25, 10.5], queue: queue)
+    XCTAssertTrue(sink.messages.isEmpty)
+    XCTAssertEqual(detector.detections, 0)
+    XCTAssertEqual(tap.snapshot.captureFailures, 3)
+    XCTAssertEqual(tap.snapshot.failures, 3)
+    let records = log.buffer.drain()
+    XCTAssertEqual(records.count, 2)
+    let full = records[0]
+    XCTAssertEqual(full[0] as? String, "F")
+    XCTAssertEqual(full[1] as? String, "MARKER_DETECTION_FAILED")
+    XCTAssertEqual(full[3] as? String, "Marker image capture failed")
+    XCTAssertEqual(full[5] as? String, "capture/UnsupportedFormat")
+    let data = try XCTUnwrap(full[4] as? [String: Any])
+    XCTAssertEqual(data["stage"] as? String, "capture")
+    XCTAssertEqual(data["captureFailures"] as? Int, 1)
+    XCTAssertEqual(data["error"] as? String, "BGRA")
+    XCTAssertEqual(records[1][0] as? String, "C", "repeats within the flood interval are counted")
+    XCTAssertEqual(records[1][2] as? Int, 2)
+    log.setActive(false)
+    feed(tap, buffer, at: [11.0], queue: queue)
+    XCTAssertEqual(tap.snapshot.captureFailures, 4, "still counted while no log is open")
+    XCTAssertTrue(log.buffer.drain().isEmpty)
+  }
+
+  func testAFailingDetectionIsADetectFailure() throws {
+    let buffer = try Self.pixelBuffer([UInt8](repeating: 0, count: 64 * 48), width: 64, height: 48)
+    let log = NativeSessionLogEmitter(buffer: NativeSessionLogBuffer(nowNs: { 1 }))
+    log.setActive(true)
+    let queue = DispatchQueue(label: "test.markers.detect")
+    let detector = FailingDetector(status: -2)
+    let (tap, sink) = failureTap(log, queue: queue, makeDetector: { detector })
+    feed(tap, buffer, at: [10.0, 10.25, 10.5], queue: queue)
+    XCTAssertTrue(sink.messages.isEmpty)
+    XCTAssertEqual(detector.detections, 3)
+    XCTAssertEqual(tap.snapshot.detectionFailures, 3)
+    XCTAssertEqual(tap.snapshot.failures, 3)
+    XCTAssertEqual(tap.snapshot.images, 3)
+    let records = log.buffer.drain()
+    XCTAssertEqual(records.count, 2)
+    let full = records[0]
+    XCTAssertEqual(full[0] as? String, "F")
+    XCTAssertEqual(full[1] as? String, "MARKER_DETECTION_FAILED")
+    XCTAssertEqual(full[3] as? String, "Marker detection failed")
+    XCTAssertEqual(full[5] as? String, "detect/DetectFailed")
+    let data = try XCTUnwrap(full[4] as? [String: Any])
+    XCTAssertEqual(data["stage"] as? String, "detect")
+    XCTAssertEqual(data["detectionFailures"] as? Int, 1)
+    XCTAssertEqual(data["error"] as? String, "detector returned -2")
+    XCTAssertEqual(records[1][0] as? String, "C", "repeats within the flood interval are counted")
+    XCTAssertEqual(records[1][2] as? Int, 2)
+  }
+
   func testPhotoTiePointsTravelAsKindEight() throws {
     let goldens = try Self.goldens()
     let image = goldens.images[0]
