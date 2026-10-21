@@ -99,6 +99,34 @@ final class AnchorPoseTrackerTests: XCTestCase {
     XCTAssertEqual(producer.queriesRefused, 4)
   }
 
+  func testRefusedQueriesAreRecordedAsPoseRefusedWithTheAndroidKeys() throws {
+    let log = NativeSessionLogEmitter(buffer: NativeSessionLogBuffer(nowNs: { 1 }))
+    let logged = AnchorPoseUpdateProducer(
+      backend: backend, clock: clock, readTimer: FakeIngestClock(0), sessionLog: log)
+    logged.onQuery(nil) { _ in }
+    XCTAssertTrue(log.buffer.drain().isEmpty, "nothing is recorded without an open session log")
+    log.setActive(true)
+    logged.onQuery(Data([1, 2, 3])) { _ in }
+    logged.close()
+    logged.onQuery(query()) { _ in }
+    let records = log.buffer.drain()
+    XCTAssertEqual(records.count, 2)
+    let full = records[0]
+    XCTAssertEqual(full[0] as? String, "F")
+    XCTAssertEqual(full[1] as? String, "POSE_REFUSED")
+    XCTAssertEqual(full[2] as? String, "warning")
+    XCTAssertEqual(full[3] as? String, "Anchor pose query refused")
+    XCTAssertEqual(full[5] as? String, "anchorQuery")
+    let data = try XCTUnwrap(full[4] as? [String: Any])
+    XCTAssertEqual(data["reason"] as? String, "malformedOrClosed")
+    XCTAssertEqual(data["queriesRefused"] as? Int, 2)
+    // The repeat (the closed tracker) within the flood interval is counted, not written in full.
+    XCTAssertEqual(records[1][0] as? String, "C")
+    XCTAssertEqual(records[1][1] as? String, "POSE_REFUSED")
+    XCTAssertEqual(records[1][2] as? Int, 1)
+    XCTAssertEqual(logged.queriesRefused, 3)
+  }
+
   func testKeyframeRequestCreatesAnAnchorAndReportsCreationAndUpdate() {
     var reply = send(query(requests: [1, 2]))
     XCTAssertEqual(reply.ingestKind, IngestMessageLayout.kindAnchorPoseUpdate)

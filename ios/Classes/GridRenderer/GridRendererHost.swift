@@ -44,8 +44,8 @@ final class GridRendererHost {
   /// Marker outlines (`C3MO` from the grid isolate marker stage).
   let markerOverlay = MarkerOutlineOverlay()
 
-  /// Called with a failure description for the session log (any thread).
-  var onFailure: ((String) -> Void)?
+  /// Called with each failure for the session log (any thread).
+  var onFailure: ((GridRendererFailure) -> Void)?
 
   init(device: MTLDevice, frameBudgetBytes: Int = DeltaUploadScheduler.defaultFrameBudgetBytes) throws {
     self.device = device
@@ -120,7 +120,7 @@ final class GridRendererHost {
     } catch {
       draws = nil
       preparedFormats = nil
-      rendererDidFail("pipelines: \(error)")
+      rendererDidFail(stage: "pipelines", error: "\(error)")
       return false
     }
     recoverIfFailed()
@@ -140,7 +140,7 @@ final class GridRendererHost {
       draws?.syncDisplayResources(core.display, target: target)
     } catch {
       target.endFrame()
-      rendererDidFail("upload: \(error)")
+      rendererDidFail(stage: "upload", error: "\(error)")
       return 0
     }
     target.endFrame()
@@ -265,18 +265,20 @@ final class GridRendererHost {
     if resync { core.scheduler.requireReset() }
   }
 
-  /// The renderer failed (pipelines or a buffer allocation): buffers are
-  /// released and render messages refused until a working [prepare].
-  func rendererDidFail(_ reason: String) {
+  /// The renderer failed at [stage] (`pipelines` or `upload`, a buffer
+  /// allocation): buffers are released and render messages refused until a
+  /// working [prepare].
+  func rendererDidFail(stage: String, error: String) {
     stateLock.lock()
     failed = true
     failures += 1
+    let failure = GridRendererFailure(stage: stage, error: error, failures: failures)
     stateLock.unlock()
     // Drop anything queued; the next working frame starts from a reset.
     target.releaseBuffers()
     core.store.forgetGpuBuffers()
     core.scheduler.requireReset()
-    onFailure?(reason)
+    onFailure?(failure)
   }
 
   private func recoverIfFailed() {
@@ -286,6 +288,14 @@ final class GridRendererHost {
     stateLock.unlock()
     if wasFailed { core.scheduler.requireReset() }
   }
+}
+
+/// One renderer failure: the [stage] that failed, the [error] and the
+/// renderer's failure count including this one.
+struct GridRendererFailure: Equatable {
+  let stage: String
+  let error: String
+  let failures: Int
 }
 
 extension GridFrameView {

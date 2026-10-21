@@ -295,6 +295,54 @@ final class MarkerDetectionTests: XCTestCase {
     XCTAssertEqual(first, 10_000_000_000)
   }
 
+  func testDetectionFailuresAreCountedAndRecordedInTheSessionLog() throws {
+    let buffer = try Self.pixelBuffer([UInt8](repeating: 0, count: 64 * 48), width: 64, height: 48)
+    let log = NativeSessionLogEmitter(buffer: NativeSessionLogBuffer(nowNs: { 1 }))
+    log.setActive(true)
+    let sink = CapturingSink()
+    let settings = MarkerDetectionSettings(enabled: true, hz: 5, markerSizeMetres: 0, groupEpoch: 1)
+    let queue = DispatchQueue(label: "test.markers.failing")
+    // The injected detector factory fails: every due image is a detection failure.
+    let tap = MarkerFrameTap(
+      makeDetector: { nil }, settings: { settings }, sink: { sink }, clock: FakeIngestClock(42), queue: queue,
+      sessionLog: log)
+    let k = simd_float3x3(simd_float3(50, 0, 0), simd_float3(0, 50, 0), simd_float3(32, 24, 1))
+    let source = FakeSource()
+    func frame(_ t: TimeInterval) -> FakeFrame {
+      FakeFrame(timestamp: t, cameraTransform: matrix_identity_float4x4, intrinsics: k,
+                imageResolution: CGSize(width: 64, height: 48), capturedImage: buffer)
+    }
+    for t in [10.0, 10.25, 10.5] {
+      tap.frameSource(source, didUpdate: frame(t))
+      queue.sync {}
+    }
+    XCTAssertTrue(sink.messages.isEmpty)
+    XCTAssertEqual(tap.snapshot.failures, 3)
+    XCTAssertEqual(tap.snapshot.detectionFailures, 3)
+    XCTAssertEqual(tap.snapshot.captureFailures, 0)
+    let records = log.buffer.drain()
+    XCTAssertEqual(records.count, 2)
+    let full = records[0]
+    XCTAssertEqual(full[0] as? String, "F")
+    XCTAssertEqual(full[1] as? String, "MARKER_DETECTION_FAILED")
+    XCTAssertEqual(full[3] as? String, "Marker detection failed")
+    XCTAssertEqual(full[5] as? String, "detect/DetectorUnavailable")
+    let data = try XCTUnwrap(full[4] as? [String: Any])
+    XCTAssertEqual(data["stage"] as? String, "detect")
+    XCTAssertEqual(data["detectionFailures"] as? Int, 1)
+    XCTAssertNotNil(data["error"] as? String)
+    // Repeats within the flood interval are counted by the session log.
+    XCTAssertEqual(records[1][0] as? String, "C")
+    XCTAssertEqual(records[1][1] as? String, "MARKER_DETECTION_FAILED")
+    XCTAssertEqual(records[1][2] as? Int, 2)
+    // Nothing is recorded once the session log closes; the tap still counts.
+    log.setActive(false)
+    tap.frameSource(source, didUpdate: frame(11.0))
+    queue.sync {}
+    XCTAssertEqual(tap.snapshot.detectionFailures, 4)
+    XCTAssertTrue(log.buffer.drain().isEmpty)
+  }
+
   func testPhotoTiePointsTravelAsKindEight() throws {
     let goldens = try Self.goldens()
     let image = goldens.images[0]

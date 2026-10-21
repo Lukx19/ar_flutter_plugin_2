@@ -21,7 +21,8 @@ done
 # monitor logs through the native session log (SessionLog/); the Flutter
 # channel files stay out.
 for f in WorldMap/WorldMapRelocalization WorldMap/WorldMapArchive \
-         SessionLog/NativeSessionLogBuffer SessionLog/NativeSessionLogEmitter SessionLog/NativeAnomalyEmitter; do
+         SessionLog/NativeSessionLogBuffer SessionLog/NativeSessionLogEmitter SessionLog/NativeAnomalyEmitter \
+         SessionLog/NativeSessionLogCodes; do
   ln -s "${classes:h}/$f.swift" "$work/Sources/ar_flutter_plugin_2/${f:t}.swift"
 done
 # Test files that need Flutter (the capture view) or the render loop with its

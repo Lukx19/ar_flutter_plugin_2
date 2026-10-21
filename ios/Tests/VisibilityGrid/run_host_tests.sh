@@ -3,11 +3,13 @@
 #
 # The shell's logic files use only Foundation, simd and CryptoKit; the ARKit
 # and Flutter adapters (ARKitIngestAdapters.swift,
-# VisibilityGridShellRegistry.swift) are left out. A temporary Swift package
-# links the logic files and these tests by symlink, so nothing is copied and
-# the iOS sources stay the single source. Usage: run_host_tests.sh [swift test
-# arguments, for example --filter IngestGoldenTests]. The run stops after 14
-# minutes.
+# VisibilityGridShellRegistry.swift) are left out. The pose tracking producer
+# records refusals in the native session log, so its Foundation-only files
+# (SessionLog/NativeSessionLog{Emitter,Buffer,Codes}.swift) are linked too.
+# A temporary Swift package links the logic files and these tests by
+# symlink, so nothing is copied and the iOS sources stay the single source.
+# Usage: run_host_tests.sh [swift test arguments, for example --filter
+# IngestGoldenTests]. The run stops after 14 minutes.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -22,6 +24,9 @@ for file in "$classes"/*.swift; do
     ARKitIngestAdapters.swift | VisibilityGridShellRegistry.swift) ;;
     *) ln -s "$file" "$work/Sources/ar_flutter_plugin_2/" ;;
   esac
+done
+for name in NativeSessionLogEmitter NativeSessionLogBuffer NativeSessionLogCodes; do
+  ln -s "$classes/../SessionLog/$name.swift" "$work/Sources/ar_flutter_plugin_2/"
 done
 for file in "$here"/*.swift; do
   ln -s "$file" "$work/Tests/VisibilityGridTests/"

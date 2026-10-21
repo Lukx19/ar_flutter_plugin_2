@@ -6,7 +6,8 @@ import UIKit
 /// Process-wide grid renderer: the render and display channel handlers and
 /// the capture view's overlay slot share it. Created on first registration
 /// with the system Metal device; without Metal there is no renderer and the
-/// render channel answers 3 (no renderer attached).
+/// render channel answers 3 (no renderer attached) and records why
+/// ([recordUnavailable]).
 final class GridRendererRegistry {
   static let shared = GridRendererRegistry()
 
@@ -14,6 +15,22 @@ final class GridRendererRegistry {
   private var created = false
   private var current: GridRendererHost?
   private var overlay: GridRendererOverlay?
+  private var unavailable: String?
+  private let makeHost: () throws -> GridRendererHost?
+  private let sessionLog: NativeSessionLogEmitter
+
+  /// [makeHost] returns nil without a Metal device (tests inject a failing one).
+  init(makeHost: @escaping () throws -> GridRendererHost? = GridRendererRegistry.systemHost,
+       sessionLog: NativeSessionLogEmitter = .shared) {
+    self.makeHost = makeHost
+    self.sessionLog = sessionLog
+  }
+
+  /// The renderer on the system Metal device, nil without one.
+  static func systemHost() throws -> GridRendererHost? {
+    guard let device = MTLCreateSystemDefaultDevice() else { return nil }
+    return try GridRendererHost(device: device)
+  }
 
   /// The renderer, nil when the device has no Metal or creation failed.
   var host: GridRendererHost? {
@@ -30,21 +47,48 @@ final class GridRendererRegistry {
     }
     created = true
     var made: GridRendererHost?
-    if let device = MTLCreateSystemDefaultDevice() {
-      do {
-        made = try GridRendererHost(device: device)
-      } catch {
-        NSLog("[GridRenderer] renderer unavailable: %@", "\(error)")
-      }
+    do {
+      made = try makeHost()
+      if made == nil { unavailable = "no Metal device" }
+    } catch {
+      unavailable = "\(error)"
+      NSLog("[GridRenderer] renderer unavailable: %@", "\(error)")
     }
     current = made
     let adapter = made.map { GridRendererOverlay(host: $0) }
     overlay = adapter
     lock.unlock()
-    made?.onFailure = { reason in NSLog("[GridRenderer] renderer failed: %@", reason) }
+    if let made { Self.recordFailures(of: made, sessionLog: sessionLog) }
     guard let adapter = adapter else { return }
     let install = { GridOverlayRegistry.shared.setOverlay(adapter) }
     if Thread.isMainThread { install() } else { DispatchQueue.main.async(execute: install) }
+  }
+
+  /// Reports every failure of [host] to the system log and to the native
+  /// session log as `RENDERER_FAILED` (variant: the failed stage; data
+  /// `stage`, `rendererFailures`, `error`), the counterpart of the Android
+  /// render thread failure. Repeats are counted by the flood policy.
+  static func recordFailures(of host: GridRendererHost, sessionLog: NativeSessionLogEmitter) {
+    host.onFailure = { failure in
+      NSLog("[GridRenderer] renderer failed at %@: %@", failure.stage, failure.error)
+      sessionLog.failure(NativeSessionLogCodes.rendererFailed, variant: failure.stage, message: "Grid renderer failed") {
+        ["stage": failure.stage, "rendererFailures": failure.failures, "error": failure.error]
+      }
+    }
+  }
+
+  /// A render message found no renderer because creation failed: recorded as
+  /// `RENDERER_FAILED` (variant and stage `create`) while a session log is
+  /// open, so a grid that never draws is explained; the flood policy counts
+  /// the repeats. Nothing is recorded before creation or with a renderer.
+  func recordUnavailable() {
+    lock.lock()
+    let reason = current == nil ? unavailable : nil
+    lock.unlock()
+    guard let reason else { return }
+    sessionLog.failure(NativeSessionLogCodes.rendererFailed, variant: "create", message: "Grid renderer unavailable") {
+      ["stage": "create", "rendererFailures": 1, "error": reason]
+    }
   }
 }
 
@@ -81,7 +125,9 @@ final class GridRendererChannels {
     let render = FlutterBasicMessageChannel(
       name: GridRendererChannelNames.render, binaryMessenger: messenger, codec: codec, taskQueue: queue)
     render.setMessageHandler { message, reply in
-      reply(ChannelStatusReply.data(GridRendererChannels.renderStatus(message as? Data, host: registry.host)))
+      let status = GridRendererChannels.renderStatus(message as? Data, host: registry.host)
+      if status == GridRendererStatus.noRenderer { registry.recordUnavailable() }
+      reply(ChannelStatusReply.data(status))
     }
     let display = FlutterBasicMessageChannel(
       name: GridRendererChannelNames.display, binaryMessenger: messenger, codec: codec, taskQueue: queue)

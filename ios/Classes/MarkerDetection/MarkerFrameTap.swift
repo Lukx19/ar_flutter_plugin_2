@@ -3,17 +3,6 @@ import CoreVideo
 import Foundation
 import simd
 
-/// What the marker tap follows: the grid shell's marker detection settings
-/// (control start or set marker detection) while the shell runs.
-struct MarkerDetectionSettings: Equatable {
-  var enabled: Bool
-  /// Detections per second; 0 means [MarkerFrameTap.defaultHz].
-  var hz: Int
-  /// Free marker size; 0 keeps the detector's size.
-  var markerSizeMetres: Float
-  var groupEpoch: Int
-}
-
 /// Live marker detection on the camera image, the iOS twin of the Android
 /// `MarkerFrameTap` and `MarkerDetectionProducer`: an [ARFrameObserver] that,
 /// at most [hz] times a second of frame time while the shell runs with marker
@@ -24,6 +13,13 @@ struct MarkerDetectionSettings: Equatable {
 /// At most one image is in flight: the tap keeps that one `CVPixelBuffer`
 /// (not the frame) until its detection ends, and a frame due while the queue
 /// is busy is skipped and counted, so the delegate queue never waits.
+///
+/// Failures are counted and recorded in the native session log as
+/// `MARKER_DETECTION_FAILED` with the Android data keys: stage `detect`
+/// (no detector, or the detector refused the image; `detectionFailures`) or
+/// stage `capture` (the Y plane could not be read; `captureFailures`), plus
+/// `error`. The variant is `<stage>/<cause>`; repeats are counted by the
+/// session log's flood policy.
 final class MarkerFrameTap: ARFrameObserver {
   static let defaultHz = 8
 
@@ -36,6 +32,7 @@ final class MarkerFrameTap: ARFrameObserver {
   private let makeDetector: () -> NativeMarkerDetector?
   private var detector: NativeMarkerDetector?
   private let writer = MarkerDetectionMessageWriter()
+  private let sessionLog: NativeSessionLogEmitter
 
   private let lock = NSLock()
   private var busy = false
@@ -50,7 +47,12 @@ final class MarkerFrameTap: ARFrameObserver {
     var refused = 0
     var skippedBusy = 0
     var unsupportedImages = 0
+    /// All failures: [detectionFailures] plus [captureFailures].
     var failures = 0
+    /// No detector, or the detector refused the image.
+    var detectionFailures = 0
+    /// The image plane could not be read.
+    var captureFailures = 0
   }
 
   /// Counters (locked copy).
@@ -59,8 +61,10 @@ final class MarkerFrameTap: ARFrameObserver {
   init(
     makeDetector: @escaping () -> NativeMarkerDetector?, settings: @escaping () -> MarkerDetectionSettings?,
     sink: @escaping () -> IngestMessageSink?, clock: IngestClock,
-    queue: DispatchQueue = DispatchQueue(label: "capture3d.markers.detect", qos: .utility)
+    queue: DispatchQueue = DispatchQueue(label: "capture3d.markers.detect", qos: .utility),
+    sessionLog: NativeSessionLogEmitter = .shared
   ) {
+    self.sessionLog = sessionLog
     self.makeDetector = makeDetector
     self.settings = settings
     self.sink = sink
@@ -136,7 +140,7 @@ final class MarkerFrameTap: ARFrameObserver {
       detector?.setQuality()
     }
     guard let detector else {
-      lock.lock(); counters.failures += 1; lock.unlock()
+      detectionFailed(cause: "DetectorUnavailable", error: "marker detector could not be created", countsImage: false)
       return
     }
     if markerSize > 0, markerSize != appliedSize {
@@ -151,7 +155,17 @@ final class MarkerFrameTap: ARFrameObserver {
     let height = planar ? CVPixelBufferGetHeightOfPlane(image, 0) : CVPixelBufferGetHeight(image)
     let stride = planar ? CVPixelBufferGetBytesPerRowOfPlane(image, 0) : CVPixelBufferGetBytesPerRow(image)
     guard let grey = base?.assumingMemoryBound(to: UInt8.self), width > 0, height > 0 else {
-      lock.lock(); counters.failures += 1; lock.unlock()
+      lock.lock()
+      counters.failures += 1
+      counters.captureFailures += 1
+      let failures = counters.captureFailures
+      lock.unlock()
+      sessionLog.failure(
+        NativeSessionLogCodes.markerDetectionFailed, variant: "capture/ImageUnreadable",
+        message: "Marker image capture failed"
+      ) {
+        ["stage": "capture", "captureFailures": failures, "error": "image plane unreadable (\(width)x\(height))"]
+      }
       return
     }
     var h = header
@@ -165,7 +179,7 @@ final class MarkerFrameTap: ARFrameObserver {
                        cy: Double(h.intrinsics.w))
     let count = detector.detect(UnsafePointer(grey), width: width, height: height, stride: stride)
     guard count >= 0 else {
-      lock.lock(); counters.images += 1; counters.failures += 1; lock.unlock()
+      detectionFailed(cause: "DetectFailed", error: "detector returned \(count)", countsImage: true)
       return
     }
     if count > 0 { detector.estimatePose() }
@@ -175,5 +189,20 @@ final class MarkerFrameTap: ARFrameObserver {
     counters.images += 1
     if offered { counters.messages += 1 } else { counters.refused += 1 }
     lock.unlock()
+  }
+
+  /// Utility queue: counts a detection failure and records it (stage `detect`).
+  private func detectionFailed(cause: String, error: String, countsImage: Bool) {
+    lock.lock()
+    if countsImage { counters.images += 1 }
+    counters.failures += 1
+    counters.detectionFailures += 1
+    let failures = counters.detectionFailures
+    lock.unlock()
+    sessionLog.failure(
+      NativeSessionLogCodes.markerDetectionFailed, variant: "detect/\(cause)", message: "Marker detection failed"
+    ) {
+      ["stage": "detect", "detectionFailures": failures, "error": error]
+    }
   }
 }
