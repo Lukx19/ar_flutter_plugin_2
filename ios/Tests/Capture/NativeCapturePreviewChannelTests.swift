@@ -14,6 +14,8 @@ final class NativeCapturePreviewChannelTests: XCTestCase {
 
   override func setUp() {
     super.setUp()
+    // The first unanswered reply ends the test instead of chaining 60 s waits.
+    continueAfterFailure = false
     appFiles = CaptureFixture.temporaryDirectory("preview-channel")
     messenger = PreviewChannelMessenger()
     _ = NativeCapturePreviewChannel.register(messenger: messenger, owner: NativeCapturePreviewOwner(appFiles: appFiles))
@@ -44,8 +46,10 @@ final class NativeCapturePreviewChannelTests: XCTestCase {
       reply = value
       done.fulfill()
     }
-    // The channel decodes on its utility queue, which a loaded host starves
-    // (load average 50 to 75: over 10 s per 1200 x 900 preview).
+    // Replies are serialized on the channel's utility queue, which a loaded
+    // host starves: a preview decode and every reply queued behind it can
+    // exceed 10 s (a 10 s wait failed after 11.9 s and 44.4 s; the first
+    // test took 40.4 s with the 60 s wait).
     wait(for: [done], timeout: 60)
     XCTAssertFalse(reply is FlutterError, "\(method): \(String(describing: reply))")
     return reply
