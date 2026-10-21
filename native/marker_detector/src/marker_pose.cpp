@@ -433,7 +433,8 @@ double reprojectionRms(const Camera& camera, int n, const double* objectXyz, con
 }
 
 bool solvePose(const Camera& camera, int n, const double* objectXyz, const double* imageXy, double* rvec,
-               double* tvec, double& rms) {
+               double* tvec, double& rms, PoseAlternative* alternative) {
+  if (alternative != nullptr) *alternative = PoseAlternative{};
   if (n < 4 || n > kMaxPosePoints) return false;
   double rays[2 * kMaxPosePoints];
   for (int i = 0; i < n; i++) {
@@ -491,6 +492,9 @@ bool solvePose(const Camera& camera, int n, const double* objectXyz, const doubl
     if (n < 6) return false;
     if (dltPose(n, objectXyz, rays, candidates[0], translations[0])) count = 1;
   }
+  // Refined minima in candidate order; the better one is the pose.
+  double refinedR[2][3], refinedT[2][3], refinedRms[2];
+  int refined = 0;
   for (int s = 0; s < count; s++) {
     double r[3], t[3];
     rvecFromRotation(candidates[s], r);
@@ -501,6 +505,11 @@ bool solvePose(const Camera& camera, int n, const double* objectXyz, const doubl
     if (dot3(R + 6, c) + t[2] <= 0) continue;
     refineLm(camera, n, objectXyz, imageXy, r, t);
     const double e = reprojectionRms(camera, n, objectXyz, imageXy, r, t);
+    if (!std::isfinite(e)) continue;
+    std::memcpy(refinedR[refined], r, sizeof r);
+    std::memcpy(refinedT[refined], t, sizeof t);
+    refinedRms[refined] = e;
+    refined++;
     if (e < best) {
       best = e;
       std::memcpy(rvec, r, sizeof r);
@@ -509,16 +518,48 @@ bool solvePose(const Camera& camera, int n, const double* objectXyz, const doubl
   }
   if (!std::isfinite(best)) return false;
   rms = best;
+  if (alternative != nullptr && refined == 2) {
+    // The minimum that was not kept (ties keep the first candidate).
+    const int other = refinedRms[0] <= refinedRms[1] ? 1 : 0;
+    double Ra[9], Rb[9];
+    rodrigues(refinedR[0], Ra);
+    rodrigues(refinedR[1], Rb);
+    double tr = 0;
+    for (int k = 0; k < 9; k++) tr += Ra[k] * Rb[k];
+    const double gap = std::acos(std::max(-1.0, std::min(1.0, (tr - 1) / 2))) * 180.0 / kPi;
+    alternative->found = true;
+    alternative->rms = refinedRms[other];
+    alternative->rotationGapDeg = gap;
+    std::memcpy(alternative->rvec, refinedR[other], sizeof alternative->rvec);
+    std::memcpy(alternative->tvec, refinedT[other], sizeof alternative->tvec);
+  }
   return true;
 }
 
 bool solveSquarePose(const Camera& camera, double halfSide, const float* corners8, double* rvec, double* tvec,
-                     double& rms) {
+                     double& rms, PoseAlternative* alternative) {
   const double h = halfSide;
   const double object[12] = {-h, h, 0, h, h, 0, h, -h, 0, -h, -h, 0};
   double image[8];
   for (int k = 0; k < 8; k++) image[k] = corners8[k];
-  return solvePose(camera, 4, object, image, rvec, tvec, rms);
+  return solvePose(camera, 4, object, image, rvec, tvec, rms, alternative);
+}
+
+double flipPerspectiveCuePx(double focalPx, double sideMetres, const double* tvec, double viewingAngleDeg) {
+  const double d2 = tvec[0] * tvec[0] + tvec[1] * tvec[1] + tvec[2] * tvec[2];
+  if (!(d2 > 0) || !(focalPx > 0)) return 0;
+  return focalPx * sideMetres * sideMetres * std::sin(viewingAngleDeg * kPi / 180.0) / d2;
+}
+
+bool squarePoseAmbiguous(double rms, const PoseAlternative& alternative, double cuePx, double viewingAngleDeg) {
+  // Both IPPE seeds refined to one minimum (or one was behind the camera):
+  // their error ratio says nothing about the mirror, only the cue decides.
+  const bool distinct = alternative.found && alternative.rotationGapDeg >= kPoseAmbiguityMinFlipDeg;
+  const double flipDeg = std::max(distinct ? alternative.rotationGapDeg : 0.0, 2 * viewingAngleDeg);
+  if (!(flipDeg >= kPoseAmbiguityMinFlipDeg)) return false;
+  // rms / alternative.rms >= ratio, written without the division (two exact fits are ambiguous).
+  if (distinct && rms >= kPoseAmbiguityErrorRatio * alternative.rms) return true;
+  return !(cuePx >= kPoseAmbiguityFlipCuePx);
 }
 
 }  // namespace c3md

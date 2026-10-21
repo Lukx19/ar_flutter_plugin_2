@@ -148,7 +148,11 @@ C3MD_API int32_t c3md_detect(C3MarkerDetector* detector, const uint8_t* grey, in
 
 /* Estimates camera-from-marker poses of the last detection, the RMS
  * reprojection error and the viewing angle, applies the quality gates and
- * fills the detection records. Returns the number of poses or an error. */
+ * fills the detection records. Sets C3_MARKER_FLAG_POSE_AMBIGUOUS when the
+ * pose may be the IPPE mirror of the true one (kept-to-alternative error
+ * ratio 0.5 or more, or a flip perspective cue below 0.25 px, for a flip of
+ * 2 deg or more; src/marker_pose.h). Returns the number of poses or an
+ * error. */
 C3MD_API int32_t c3md_estimate_pose(C3MarkerDetector* detector);
 
 /* The 64 B contract records of the last detection (count from c3md_detect).

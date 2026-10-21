@@ -22,6 +22,11 @@ enum {
   C3_MARKER_FLAG_REJECTED_SMALL = 1,
   C3_MARKER_FLAG_REJECTED_BLUR = 2,
   C3_MARKER_FLAG_REJECTED_OBLIQUE = 4,
+  /* Not a rejection: the pose may be the IPPE mirror of the true one
+   * (small marker seen nearly head-on); corners are valid, the rotation is
+   * not confident. */
+  C3_MARKER_FLAG_POSE_AMBIGUOUS = 8,
+  C3_MARKER_FLAGS_REJECTED = 7,
 
   C3_MARKER_DETECTION_RECORD_BYTES = 64,
   C3_MARKER_DETECTIONS_PREFIX_BYTES = 8

@@ -23,6 +23,15 @@ abstract final class MarkerDetectionLayout {
   static const int flagRejectedSmall = 1;
   static const int flagRejectedBlur = 2;
   static const int flagRejectedOblique = 4;
+
+  /// Not a rejection: the pose may be the IPPE mirror of the true one (a
+  /// small marker seen nearly head-on). Corners are valid; the rotation is
+  /// not confident (`marker_pose.h`, `squarePoseAmbiguous`).
+  static const int flagPoseAmbiguous = 8;
+
+  /// The rejection bits; a record with any of them is not used.
+  static const int flagsRejected =
+      flagRejectedSmall | flagRejectedBlur | flagRejectedOblique;
 }
 
 /// Reusable view over one marker detection record.
@@ -36,6 +45,13 @@ final class MarkerDetectionRecordView extends ContractRecordView {
   set dictionary(int v) => setU8(MarkerDetectionLayout.dictionaryOffset, v);
   int get flags => u8(MarkerDetectionLayout.flagsOffset);
   set flags(int v) => setU8(MarkerDetectionLayout.flagsOffset, v);
+
+  /// Whether a quality gate rejected the detection.
+  bool get rejected => flags & MarkerDetectionLayout.flagsRejected != 0;
+
+  /// Whether the pose may be the IPPE mirror of the true one.
+  bool get poseAmbiguous =>
+      flags & MarkerDetectionLayout.flagPoseAmbiguous != 0;
 
   /// Corner coordinate [index] (0-7: x0, y0, ..., x3, y3).
   double corner(int index) =>
