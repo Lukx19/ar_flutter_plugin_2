@@ -639,9 +639,11 @@ enum NativeCapturePreviewChannel {
   private static let lock = NSLock()
   private static var cancelledRequests: [String] = []
 
-  static func register(messenger: FlutterBinaryMessenger) -> FlutterMethodChannel {
+  /// [owner] defaults to the app's preview store; tests pass one rooted in
+  /// a temporary folder.
+  static func register(messenger: FlutterBinaryMessenger,
+                       owner: NativeCapturePreviewOwner = NativeCapturePreviewOwner()) -> FlutterMethodChannel {
     let channel = FlutterMethodChannel(name: name, binaryMessenger: messenger)
-    let owner = NativeCapturePreviewOwner()
     channel.setMethodCallHandler { call, result in
       let arguments = call.arguments as? [String: Any] ?? [:]
       let requestId = arguments["requestId"] as? String
