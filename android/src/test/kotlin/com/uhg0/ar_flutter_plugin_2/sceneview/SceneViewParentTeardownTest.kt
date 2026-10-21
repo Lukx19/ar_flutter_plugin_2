@@ -56,13 +56,24 @@ class SceneViewParentTeardownTest {
     @Test
     fun `parent destroy runs the teardown once and then releases it`() {
         var destroys = 0
-        val teardown = SceneViewParentTeardown(parent.lifecycle) { destroys++ }
+        var registeredDuringTeardown: Boolean? = null
+        lateinit var teardown: SceneViewParentTeardown
+        teardown = SceneViewParentTeardown(parent.lifecycle) {
+            destroys++
+            registeredDuringTeardown = teardown.isRegistered
+        }
 
         parent.lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY)
-        teardown.release()
 
+        // The ON_DESTROY dispatch itself released the observer: no explicit release.
         assertEquals(1, destroys)
+        assertEquals(true, registeredDuringTeardown)
         assertFalse(teardown.isRegistered)
+        assertEquals(0, parent.lifecycle.observerCount)
+
+        // A later terminal release (the frame-later disposal) is a no-op.
+        teardown.release()
+        assertEquals(1, destroys)
         assertEquals(0, parent.lifecycle.observerCount)
     }
 

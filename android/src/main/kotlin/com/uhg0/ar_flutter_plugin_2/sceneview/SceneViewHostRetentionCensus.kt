@@ -7,10 +7,10 @@ import io.flutter.plugin.common.MethodChannel
 import java.lang.ref.WeakReference
 
 /**
- * Debug-build census of disposed scene hosts that are still reachable. A
- * disposed host must become collectable once its terminal composition
- * disposal ran; the capture view retention integration check reads this
- * after N view rebuilds. Release builds record nothing.
+ * Census (debuggable builds: debug and profile) of disposed scene hosts still
+ * reachable. A disposed host must become collectable once its terminal
+ * composition disposal ran; the capture view retention integration check
+ * reads this after N view rebuilds. Release builds record nothing.
  */
 internal class SceneViewHostRetentionCensus(
     private val collect: () -> Unit = {
@@ -58,7 +58,7 @@ internal class SceneViewHostRetentionCensus(
         var active: SceneViewHostRetentionCensus? = null
             private set
 
-        /** Debuggable builds only; release builds register nothing and record nothing. */
+        /** Debuggable (debug, profile) builds only; release builds register and record nothing. */
         fun register(messenger: BinaryMessenger, isDebuggable: Boolean): MethodChannel? {
             if (!isDebuggable) return null
             val census = active ?: SceneViewHostRetentionCensus().also { active = it }

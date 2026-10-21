@@ -342,9 +342,9 @@ internal class SceneViewRenderLifecycle(
 
 /**
  * Activity-lifecycle teardown of one host. The parent lifecycle outlives every
- * capture view, so the observer (and with it the host, its ComposeView and its
- * HDR environment) stays reachable until [release]: the host releases it when
- * its terminal composition disposal ran, and the ON_DESTROY path releases it
+ * view, so the observer keeps the host, its ComposeView, ArView and grid buffers
+ * (about 9.3 MB per rebuild) reachable until [release]: the host releases it at
+ * its terminal composition disposal, and the ON_DESTROY path releases it
  * after [onParentDestroy].
  */
 internal class SceneViewParentTeardown(

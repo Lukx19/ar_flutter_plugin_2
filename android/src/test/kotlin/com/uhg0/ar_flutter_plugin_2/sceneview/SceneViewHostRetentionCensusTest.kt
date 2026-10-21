@@ -2,11 +2,28 @@ package com.uhg0.ar_flutter_plugin_2.sceneview
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class SceneViewHostRetentionCensusTest {
     private class Host
+
+    private object UnusedMessenger : io.flutter.plugin.common.BinaryMessenger {
+        override fun send(channel: String, message: java.nio.ByteBuffer?) =
+            error("release builds must not touch the messenger")
+
+        override fun send(
+            channel: String,
+            message: java.nio.ByteBuffer?,
+            callback: io.flutter.plugin.common.BinaryMessenger.BinaryReply?,
+        ) = error("release builds must not touch the messenger")
+
+        override fun setMessageHandler(
+            channel: String,
+            handler: io.flutter.plugin.common.BinaryMessenger.BinaryMessageHandler?,
+        ) = error("release builds must not touch the messenger")
+    }
 
     private fun census() = SceneViewHostRetentionCensus(collect = { System.gc() })
 
@@ -35,5 +52,13 @@ class SceneViewHostRetentionCensusTest {
         assertEquals(1L, receipt["retainedDisposedHosts"])
         // Keeps the host strongly reachable until after the census.
         assertNotNull(kept)
+    }
+
+    @Test
+    fun `release builds register no channel and record nothing`() {
+        val channel = SceneViewHostRetentionCensus.register(UnusedMessenger, isDebuggable = false)
+
+        assertNull(channel)
+        assertNull(SceneViewHostRetentionCensus.active)
     }
 }
