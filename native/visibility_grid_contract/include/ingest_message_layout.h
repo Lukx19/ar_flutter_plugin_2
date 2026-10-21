@@ -12,9 +12,11 @@
  * camera axes (+X right, +Y down, +Z forward, sensor orientation; tag
  * opencv_c2w_v1), and `intrinsics` put pixel centres at integer coordinates.
  * Version 1 messages carried the AR camera axes (ARCore camera pose, ARKit
- * camera transform: +Y up, -Z forward) and a pixel-edge principal point
- * (their kernels sampled pixel u at u + 0.5); readers convert both (pose by
- * diag(1, -1, -1, 1), cx = cx_v1 - 0.5, cy = cy_v1 - 0.5). See
+ * camera transform: +Y up, -Z forward); readers convert the pose by
+ * diag(1, -1, -1, 1). The version 1 principal point is converted
+ * (cx = cx_v1 - 0.5, cy = cy_v1 - 0.5) only for depth image headers and the
+ * photo saved payload, whose kernels sampled pixel u at u + 0.5; version 1
+ * marker detections were read as pixel centres and keep their value. See
  * docs/02-architecture.md, Coordinate frames.
  */
 #ifndef CAPTURE3D_INGEST_MESSAGE_LAYOUT_H

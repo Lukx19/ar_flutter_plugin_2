@@ -1893,7 +1893,8 @@ void main() {
   });
 
   for (final platform in [TargetPlatform.android, TargetPlatform.iOS]) {
-    test('packed pose batches tag the ${platform.name} tracking pose', () async {
+    test('packed pose batches tag the ${platform.name} tracking pose',
+        () async {
       debugDefaultTargetPlatformOverride = platform;
       addTearDown(() => debugDefaultTargetPlatformOverride = null);
       final sessionManager = ARSessionManager(

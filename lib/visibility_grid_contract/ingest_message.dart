@@ -115,10 +115,13 @@ abstract final class IngestHeaderLayout {
   /// photo saved rows are `T_world_cam` (OpenCV camera axes,
   /// `opencv_c2w_v1`), and principal points put pixel centres at integer
   /// coordinates. Version 1 messages (recordings made before) carry the AR
-  /// camera axes (ARCore camera pose, ARKit camera transform) and principal
-  /// points of the pixel-edge convention (their kernels sampled pixel `u` at
-  /// `u + 0.5`); readers accept both and convert by the message's version
-  /// (pose by `F`, `c = c_v1 - 0.5`).
+  /// camera axes (ARCore camera pose, ARKit camera transform); readers
+  /// accept both and convert by the message's version (pose by `F`). The
+  /// version 1 principal point is converted (`c = c_v1 - 0.5`) only where
+  /// its consumers used the pixel-edge reading (sampling pixel `u` at
+  /// `u + 0.5`): the header of a depth image and the photo saved payload.
+  /// Version 1 marker detections (their tape solver read `cx` as a pixel
+  /// centre) and every other kind keep their stored value.
   static const int version = 2;
 
   /// The version whose camera poses use the AR camera axes.
@@ -280,18 +283,24 @@ final class IngestMessageView extends ContractRecordView {
     }
   }
 
-  /// Stored minus read principal point: 0.5 for a version 1 message, whose
-  /// kernels sampled pixel `u` at `u + 0.5` (so `c = c_v1 - 0.5` gives the
-  /// same rays exactly), 0 for version 2.
+  /// Stored minus read principal point: 0.5 for a version 1 depth image,
+  /// whose depth kernels sampled pixel `u` at `u + 0.5` (so `c = c_v1 - 0.5`
+  /// gives the same rays exactly); 0 for every other version 1 kind (marker
+  /// detections were already read as pixel centres; points, voxels, photo
+  /// saved headers, session events, anchor replies and tie points have no
+  /// header intrinsics consumer) and for version 2.
   double get _storedPrincipalPointOffset =>
-      version == IngestHeaderLayout.arCameraPoseVersion ? 0.5 : 0;
+      version == IngestHeaderLayout.arCameraPoseVersion &&
+              kind == IngestKind.depthImage
+          ? 0.5
+          : 0;
 
   double get fx => f32(IngestHeaderLayout.intrinsicsOffset);
   double get fy => f32(IngestHeaderLayout.intrinsicsOffset + 4);
 
   /// Principal point with pixel centres at integer coordinates (OpenCV,
-  /// docs/02-architecture.md, Coordinate frames); a version 1 value is
-  /// converted.
+  /// docs/02-architecture.md, Coordinate frames); a version 1 depth image's
+  /// value is converted (see [IngestHeaderLayout.version]).
   double get cx =>
       f32(IngestHeaderLayout.intrinsicsOffset + 8) -
       _storedPrincipalPointOffset;
@@ -299,8 +308,8 @@ final class IngestMessageView extends ContractRecordView {
       f32(IngestHeaderLayout.intrinsicsOffset + 12) -
       _storedPrincipalPointOffset;
 
-  /// Stores pixel-centre intrinsics in this message's version. Set the
-  /// version first.
+  /// Stores pixel-centre intrinsics in this message's version and kind. Set
+  /// the version and kind first.
   void setIntrinsics(double fx, double fy, double cx, double cy) {
     setF32(IngestHeaderLayout.intrinsicsOffset, fx);
     setF32(IngestHeaderLayout.intrinsicsOffset + 4, fy);

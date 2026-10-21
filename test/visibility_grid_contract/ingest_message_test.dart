@@ -212,11 +212,22 @@ void main() {
       v1.readCameraToWorld(a);
       v2.readCameraToWorld(b);
       expect(a, b, reason: '$name AR camera pose');
-      // Both goldens store the same intrinsics bytes; version 1 meant the
-      // pixel-edge convention, so its principal point reads half a pixel
-      // lower (the same rays its kernels sampled).
+      // Both goldens store the same intrinsics bytes. A version 1 depth
+      // image meant the pixel-edge reading, so its principal point reads
+      // half a pixel lower (the same rays its kernels sampled); a version 1
+      // marker message (read as pixel centres by the tape solver) and the
+      // other kinds keep their value.
+      final shift = v1.kind == IngestKind.depthImage ? 0.5 : 0.0;
       expect([v1.fx, v1.fy], [v2.fx, v2.fy], reason: name);
-      expect([v1.cx, v1.cy], [v2.cx - 0.5, v2.cy - 0.5], reason: name);
+      expect([v1.cx, v1.cy], [v2.cx - shift, v2.cy - shift], reason: name);
+      if (name == 'ingest_markers.bin') {
+        expect(v1.kind, IngestKind.markerDetections);
+        expect(
+            v1.cx,
+            old.getFloat32(
+                IngestHeaderLayout.intrinsicsOffset + 8, Endian.little),
+            reason: 'a version 1 marker principal point is not shifted');
+      }
     }
     // The raw version 2 pose is the version 1 pose with camera Y and Z
     // negated.

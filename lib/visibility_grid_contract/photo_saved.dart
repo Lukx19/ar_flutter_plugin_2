@@ -143,8 +143,7 @@ final class PhotoSavedView extends ContractRecordView {
   double get cx =>
       f32(PhotoSavedLayout.intrinsicsOffset + 8) - _storedPrincipalPointOffset;
   double get cy =>
-      f32(PhotoSavedLayout.intrinsicsOffset + 12) -
-      _storedPrincipalPointOffset;
+      f32(PhotoSavedLayout.intrinsicsOffset + 12) - _storedPrincipalPointOffset;
 
   /// Stores pixel-centre intrinsics in [contractVersion]'s convention.
   void setIntrinsics(double fx, double fy, double cx, double cy) {

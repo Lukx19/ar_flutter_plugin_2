@@ -53,48 +53,74 @@ void main() {
     expect(cursor.message.kind, IngestKind.idle);
   });
 
-  test('a version 1 recording replays as the version 2 golden in the '
+  test(
+      'a version 1 recording replays as the version 2 golden in the '
       'canonical frame', () {
-    final old = ByteData.sublistView(
+    final versionOneBytes = ByteData.sublistView(
         File('test_assets/ingest_contract_v1/ingest_recording.bin')
             .readAsBytesSync());
-    final now = readGolden('ingest_recording.bin');
-    final v1 = IngestRecordingCursor(), v2 = IngestRecordingCursor();
-    expect(v1.open(old, old.lengthInBytes), ContractStatus.ok);
-    expect(v2.open(now, now.lengthInBytes), ContractStatus.ok);
-    expect((IngestRecordingHeaderView()..attach(old)).version, 1);
-    final a = List<double>.filled(16, 0), b = List<double>.filled(16, 0);
-    final photo1 = PhotoSavedView(), photo2 = PhotoSavedView();
-    final r1 = List<double>.filled(12, 0), r2 = List<double>.filled(12, 0);
+    final versionTwoBytes = readGolden('ingest_recording.bin');
+    final versionOneCursor = IngestRecordingCursor();
+    final versionTwoCursor = IngestRecordingCursor();
+    expect(
+        versionOneCursor.open(versionOneBytes, versionOneBytes.lengthInBytes),
+        ContractStatus.ok);
+    expect(
+        versionTwoCursor.open(versionTwoBytes, versionTwoBytes.lengthInBytes),
+        ContractStatus.ok);
+    expect((IngestRecordingHeaderView()..attach(versionOneBytes)).version, 1);
+    final versionOnePose = List<double>.filled(16, 0);
+    final versionTwoPose = List<double>.filled(16, 0);
+    final versionOnePhoto = PhotoSavedView();
+    final versionTwoPhoto = PhotoSavedView();
+    final versionOneRows = List<double>.filled(12, 0);
+    final versionTwoRows = List<double>.filled(12, 0);
+    final kinds = <int>{};
     var messages = 0;
-    while (v1.moveNext()) {
-      expect(v2.moveNext(), isTrue);
-      final m1 = v1.message, m2 = v2.message;
-      expect([m1.version, m2.version], [1, 2]);
-      expect(m1.kind, m2.kind);
-      expect(m1.sequence, m2.sequence);
-      m1.readWorldFromCamera(a);
-      m2.readWorldFromCamera(b);
-      expect(a, b, reason: 'message ${m1.sequence} pose');
-      expect([m1.fx, m1.fy], [m2.fx, m2.fy]);
-      // Same stored bytes, version 1 meaning the pixel-edge convention.
-      expect([m1.cx, m1.cy], [m2.cx - 0.5, m2.cy - 0.5]);
-      if (m1.kind == IngestKind.photoSaved) {
-        photo1
-          ..attach(old, m1.payloadOffset)
-          ..contractVersion = m1.version;
-        photo2
-          ..attach(now, m2.payloadOffset)
-          ..contractVersion = m2.version;
-        photo1.readWorldFromCameraRows(r1);
-        photo2.readWorldFromCameraRows(r2);
-        expect(r1, r2);
-        expect([photo1.cx, photo1.cy], [photo2.cx - 0.5, photo2.cy - 0.5]);
+    while (versionOneCursor.moveNext()) {
+      expect(versionTwoCursor.moveNext(), isTrue);
+      final versionOneMessage = versionOneCursor.message;
+      final versionTwoMessage = versionTwoCursor.message;
+      expect([versionOneMessage.version, versionTwoMessage.version], [1, 2]);
+      expect(versionOneMessage.kind, versionTwoMessage.kind);
+      expect(versionOneMessage.sequence, versionTwoMessage.sequence);
+      kinds.add(versionOneMessage.kind);
+      versionOneMessage.readWorldFromCamera(versionOnePose);
+      versionTwoMessage.readWorldFromCamera(versionTwoPose);
+      expect(versionOnePose, versionTwoPose,
+          reason: 'message ${versionOneMessage.sequence} pose');
+      expect([versionOneMessage.fx, versionOneMessage.fy],
+          [versionTwoMessage.fx, versionTwoMessage.fy]);
+      // Same stored bytes. Only a version 1 depth image meant the
+      // pixel-edge reading; marker detections and the other kinds keep
+      // their value.
+      final shift = versionOneMessage.kind == IngestKind.depthImage ? 0.5 : 0.0;
+      expect([
+        versionOneMessage.cx,
+        versionOneMessage.cy
+      ], [
+        versionTwoMessage.cx - shift,
+        versionTwoMessage.cy - shift
+      ], reason: 'kind ${versionOneMessage.kind}');
+      if (versionOneMessage.kind == IngestKind.photoSaved) {
+        versionOnePhoto
+          ..attach(versionOneBytes, versionOneMessage.payloadOffset)
+          ..contractVersion = versionOneMessage.version;
+        versionTwoPhoto
+          ..attach(versionTwoBytes, versionTwoMessage.payloadOffset)
+          ..contractVersion = versionTwoMessage.version;
+        versionOnePhoto.readWorldFromCameraRows(versionOneRows);
+        versionTwoPhoto.readWorldFromCameraRows(versionTwoRows);
+        expect(versionOneRows, versionTwoRows);
+        expect([versionOnePhoto.cx, versionOnePhoto.cy],
+            [versionTwoPhoto.cx - 0.5, versionTwoPhoto.cy - 0.5]);
       }
       messages++;
     }
-    expect(v2.moveNext(), isFalse);
+    expect(versionTwoCursor.moveNext(), isFalse);
     expect(messages, 10);
+    expect(kinds,
+        containsAll([IngestKind.depthImage, IngestKind.markerDetections]));
   });
 
   test('truncated recording stops with a length error', () {
