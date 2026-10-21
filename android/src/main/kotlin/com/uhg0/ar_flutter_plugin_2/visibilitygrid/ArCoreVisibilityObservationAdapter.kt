@@ -497,37 +497,6 @@ internal class ArCoreVisibilityObservationAdapter(
             depthCapability = depthCapability,
         )
     }
-
-    private fun rawDepthMetadata(
-        frame: Frame,
-        ownership: VisibilityObservationOwnership,
-        width: Int,
-        height: Int,
-    ): RawDepthFrameMetadata {
-        val intrinsics = frame.camera.imageIntrinsics
-        val focal = intrinsics.focalLength
-        val principal = intrinsics.principalPoint
-        val dimensions = intrinsics.imageDimensions
-        val pose = FloatArray(16)
-        frame.camera.pose.toMatrix(pose, 0)
-        val scaleX = width.toDouble() / dimensions[0]
-        val scaleY = height.toDouble() / dimensions[1]
-        return RawDepthFrameMetadata(
-            timestampNs = frame.timestamp,
-            groupGeneration = ownership.groupGeneration,
-            sessionGeneration = ownership.sessionGeneration,
-            tracking = frame.camera.trackingState == TrackingState.TRACKING,
-            width = width,
-            height = height,
-            intrinsics = DepthIntrinsics(
-                fx = focal[0] * scaleX,
-                fy = focal[1] * scaleY,
-                cx = principal[0] * scaleX,
-                cy = principal[1] * scaleY,
-            ),
-            worldFromCameraGl = DoubleArray(16) { pose[it].toDouble() },
-        )
-    }
 }
 
 /**
