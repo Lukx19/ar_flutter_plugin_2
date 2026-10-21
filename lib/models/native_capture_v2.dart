@@ -1,3 +1,4 @@
+import 'frame_convention.dart';
 import 'capture_intent_contract.dart';
 
 const nativeCaptureV2WireVersion = 'native_capture_v2';
@@ -217,6 +218,12 @@ final class ARNativeCaptureRecoveryContextV2 {
       projectionMatrix,
       groupFromWorld,
       worldFromGroup;
+
+  /// The admitted capture pose `T_world_cam` (column-major, `opencv_c2w_v1`),
+  /// carried under the wire and store key `viewMatrix` (a camera-to-world,
+  /// not a view matrix; the key predates the canonical frame).
+  List<double> get worldFromCamera => viewMatrix;
+
   Map<String, Object?> toMap() => {
         'sessionId': sessionId,
         'groupId': groupId,
@@ -676,8 +683,9 @@ final class ARNativeCaptureEventV2 {
 /// One image after the first one of a committed iOS burst shot: its own
 /// durable capture id (SHA-256 hex of `<first capture id>#<index>`, the id
 /// the session manifest and the photo saved event use), JPEG size, exposure
-/// time, size and, when the frame had them, its ARKit camera-to-world
-/// (column-major, GL camera axes) and fx, fy, cx, cy at the image size.
+/// time, size and, when the frame had them, its camera-to-world
+/// (column-major, tagged [cameraToWorldConvention]) and fx, fy, cx, cy at the
+/// image size.
 final class ARNativeCaptureShotImageV2 {
   ARNativeCaptureShotImageV2({
     required this.index,
@@ -689,7 +697,9 @@ final class ARNativeCaptureShotImageV2 {
     required this.trackingNormal,
     required this.flags,
     List<double>? cameraToWorld,
+    this.cameraToWorldConvention = arkitCameraToWorldConvention,
     List<double>? intrinsics,
+    this.intrinsicsConvention,
   })  : cameraToWorld =
             cameraToWorld == null ? null : List.unmodifiable(cameraToWorld),
         intrinsics = intrinsics == null ? null : List.unmodifiable(intrinsics);
@@ -705,7 +715,9 @@ final class ARNativeCaptureShotImageV2 {
       'trackingNormal',
       'flags',
       if (map.containsKey('cameraToWorld')) 'cameraToWorld',
+      if (map.containsKey('cameraToWorldConvention')) 'cameraToWorldConvention',
       if (map.containsKey('intrinsics')) 'intrinsics',
+      if (map.containsKey('intrinsicsConvention')) 'intrinsicsConvention',
     });
     List<double>? numbers(String key, int count) {
       if (!map.containsKey(key)) return null;
@@ -728,6 +740,22 @@ final class ARNativeCaptureShotImageV2 {
     }
     final flags = _integer(map, 'flags');
     if (flags > 3) throw const FormatException('Unknown shot image flags.');
+    // Photo store layout 4 tags the pose; earlier plugins sent the ARKit
+    // camera transform untagged.
+    final convention =
+        map['cameraToWorldConvention'] ?? arkitCameraToWorldConvention;
+    if (convention != openCvCameraToWorldConvention &&
+        !isArCameraConvention(convention as String?)) {
+      throw const FormatException('Unknown shot image camera convention.');
+    }
+    // Photo store layout 5 names the intrinsics convention; intrinsics of an
+    // older shot record arrive untagged (convention not recorded).
+    final intrinsicsConvention = map['intrinsicsConvention'];
+    if (intrinsicsConvention != null &&
+        (intrinsicsConvention != openCvPinholeIntrinsicsConvention ||
+            intrinsics == null)) {
+      throw const FormatException('Unknown shot image intrinsics convention.');
+    }
     return ARNativeCaptureShotImageV2(
       index: _positiveInteger(map, 'index'),
       captureId: captureId,
@@ -738,7 +766,9 @@ final class ARNativeCaptureShotImageV2 {
       trackingNormal: trackingNormal,
       flags: flags,
       cameraToWorld: numbers('cameraToWorld', 16),
+      cameraToWorldConvention: convention as String,
       intrinsics: intrinsics,
+      intrinsicsConvention: intrinsicsConvention as String?,
     );
   }
 
@@ -757,7 +787,16 @@ final class ARNativeCaptureShotImageV2 {
   final bool trackingNormal;
   final int flags;
   final List<double>? cameraToWorld;
+
+  /// Camera axes of [cameraToWorld]: `opencv_c2w_v1` from photo store layout
+  /// 4, `arkit_c2w_v1` (untagged) before.
+  final String cameraToWorldConvention;
   final List<double>? intrinsics;
+
+  /// Convention of [intrinsics]: `opencv_pinhole_v1` from photo store layout
+  /// 5; null when the shot record did not name one (layout 3 and 4, whose
+  /// principal point may be scaled as `c * s`) or without intrinsics.
+  final String? intrinsicsConvention;
 
   /// Photo credit and picture delivery may use this image: its frame was
   /// tracking normally and has a pose.

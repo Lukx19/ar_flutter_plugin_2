@@ -55,7 +55,10 @@ final class ContractGoldenFileTests: XCTestCase {
       XCTAssertEqual(golden.count, expected.bytes, "\(name) size")
       guard golden.count >= 8 else { continue }
       XCTAssertEqual(golden.u32(0), GoldenFixture.magic(expected.tag), "\(name) magic")
-      XCTAssertEqual(golden.u16(4), 1, "\(name) version")
+      // Ingest messages and recordings are version 2 (camera poses as
+      // T_world_cam); the other contract records are version 1.
+      let version = name.hasPrefix("ingest_") && name != "ingest_pull_request.bin" ? 2 : 1
+      XCTAssertEqual(Int(golden.u16(4)), version, "\(name) version")
       if let kind = expected.kind {
         XCTAssertEqual(golden.u8(6), kind, "\(name) kind")
       }
@@ -129,7 +132,7 @@ final class ContractGoldenFileTests: XCTestCase {
     XCTAssertGreaterThanOrEqual(message.count, header, "\(name) shorter than the header")
     guard message.count >= header else { return }
     XCTAssertEqual(message.u32(0), GoldenFixture.magic("C3VI"), "\(name) magic")
-    XCTAssertEqual(message.u16(4), 1, "\(name) version")
+    XCTAssertEqual(Int(message.u16(4)), 2, "\(name) version (T_world_cam poses)")
     let kind = message.u8(6)
     let payload = message.u32(12)
     XCTAssertEqual(message.count, header + payload, "\(name) payload length")

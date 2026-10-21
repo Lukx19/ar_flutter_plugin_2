@@ -11,7 +11,8 @@ class ARCameraIntrinsics {
   /// Camera focal length in pixels (fx, fy)
   final FocalLength focalLength;
 
-  /// Camera principal point in pixels (cx, cy) - image center
+  /// Camera principal point in pixels (cx, cy), sensor orientation; pixel
+  /// centres at integer coordinates (OpenCV)
   final PrincipalPoint principalPoint;
 
   /// Image resolution these intrinsics apply to
@@ -20,8 +21,9 @@ class ARCameraIntrinsics {
   /// Crop region in active-array coordinates that was applied to derive these intrinsics
   final CropRegion? cropRegion;
 
-  /// Radial and tangential distortion coefficients (optional)
-  /// Format: [k1, k2, p1, p2, k3] following OpenCV convention
+  /// Radial and tangential distortion coefficients (optional), OpenCV order
+  /// [k1, k2, p1, p2, k3] on both platforms (Android reorders Camera2's
+  /// `LENS_DISTORTION` at the capability query).
   final List<double>? distortionCoefficients;
 
   /// Field of view in radians (horizontal, vertical)
@@ -229,9 +231,11 @@ class ARCameraIntrinsics {
         fx: focalLength.fx * scaleX,
         fy: focalLength.fy * scaleY,
       ),
+      // Pixel centres are at integer coordinates (OpenCV;
+      // docs/02-architecture.md, Coordinate frames).
       principalPoint: PrincipalPoint(
-        cx: principalPoint.cx * scaleX,
-        cy: principalPoint.cy * scaleY,
+        cx: (principalPoint.cx + 0.5) * scaleX - 0.5,
+        cy: (principalPoint.cy + 0.5) * scaleY - 0.5,
       ),
       resolution: newResolution,
       cropRegion: cropRegion,

@@ -215,7 +215,9 @@ final class PhotoSavedEmitter {
     let uuid = attemptUuidBytes(record.attemptId)
     for i in 0..<16 { e.u8(PhotoSavedLayout.attemptUuid + i, Int(uuid[i])) }
     e.i64(PhotoSavedLayout.exposureTimestampNs, record.exposureTimestampNs)
-    if let m = record.cameraToWorld {
+    if let arkit = record.cameraToWorld {
+      // Contract version 2 rows: T_world_cam (ARKit camera Y and Z negated).
+      let m = IngestMessageWriter.openCv(arkit)
       for row in 0..<3 {
         for col in 0..<4 { e.f32(PhotoSavedLayout.cameraToWorldRows + 4 * (row * 4 + col), m[col][row]) }
       }

@@ -2,7 +2,11 @@ import 'dart:typed_data';
 
 import 'package:vector_math/vector_math_64.dart';
 
-const String arcoreGlCameraToWorldConvention = 'arcore_gl_c2w_v1';
+import 'frame_convention.dart';
+
+export 'frame_convention.dart'
+    show arcoreGlCameraToWorldConvention, arkitCameraToWorldConvention;
+
 const String poseBatchWireVersion = 'pose_batch_v1';
 const String packedPoseBatchWireVersion = 'pose_batch_v2';
 const int packedPoseSampleBytes = 236;
@@ -132,7 +136,18 @@ class ARFramePose {
   }
 
   /// Decodes native float32 values without changing coordinate conversion precision.
-  factory ARFramePose.fromPacked(ByteData bytes, int offset) {
+  ///
+  /// [trackingConvention] tags the tracking pose: the wire carries no
+  /// platform, so the caller names it (ARCore [arcoreGlCameraToWorldConvention]
+  /// or ARKit [arkitCameraToWorldConvention]; both are the AR camera axes).
+  factory ARFramePose.fromPacked(
+    ByteData bytes,
+    int offset, {
+    String trackingConvention = arcoreGlCameraToWorldConvention,
+  }) {
+    if (!isArCameraConvention(trackingConvention)) {
+      throw ArgumentError.value(trackingConvention, 'trackingConvention');
+    }
     if (offset < 0 || offset + packedPoseSampleBytes > bytes.lengthInBytes) {
       throw const FormatException('Truncated packed pose.');
     }
@@ -165,12 +180,12 @@ class ARFramePose {
       rotation: rotation(64),
       transform: matrix(80),
       timestamp: DateTime.fromMillisecondsSinceEpoch(integer(8)),
-      convention: 'opencv_c2w_v1',
+      convention: openCvCameraToWorldConvention,
       trackingPose: ARPoseTransform(
         position: position(144),
         rotation: rotation(156),
         cameraToWorld: matrix(172),
-        convention: arcoreGlCameraToWorldConvention,
+        convention: trackingConvention,
       ),
       sensorTimestampNs: integer(16),
       confidence: scalar(40),

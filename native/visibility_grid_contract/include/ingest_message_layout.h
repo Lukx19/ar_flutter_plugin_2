@@ -6,6 +6,18 @@
  *
  * The header pose is the camera pose at the sample timestamp (depth image or
  * point cloud), matched from a pose history, never the current frame pose.
+ *
+ * Version 2 (canonical coordinate frame): `camera_to_world` and the photo
+ * saved `camera_to_world_rows` are T_world_cam, camera-to-world in the OpenCV
+ * camera axes (+X right, +Y down, +Z forward, sensor orientation; tag
+ * opencv_c2w_v1), and `intrinsics` put pixel centres at integer coordinates.
+ * Version 1 messages carried the AR camera axes (ARCore camera pose, ARKit
+ * camera transform: +Y up, -Z forward); readers convert the pose by
+ * diag(1, -1, -1, 1). The version 1 principal point is converted
+ * (cx = cx_v1 - 0.5, cy = cy_v1 - 0.5) only for depth image headers and the
+ * photo saved payload, whose kernels sampled pixel u at u + 0.5; version 1
+ * marker detections were read as pixel centres and keep their value. See
+ * docs/02-architecture.md, Coordinate frames.
  */
 #ifndef CAPTURE3D_INGEST_MESSAGE_LAYOUT_H
 #define CAPTURE3D_INGEST_MESSAGE_LAYOUT_H
@@ -19,7 +31,7 @@ extern "C" {
 
 /* 'C3VI' little-endian. */
 #define C3_INGEST_MAGIC 0x49563343u
-#define C3_INGEST_VERSION 1u
+#define C3_INGEST_VERSION 2u
 #define C3_INGEST_MAX_MESSAGE_BYTES 262144u
 
 enum {
@@ -64,7 +76,7 @@ typedef struct C3IngestHeader {
   uint8_t pose_match;
   uint16_t group_epoch;
   int32_t pose_gap_us;
-  float camera_to_world[16]; /* column-major, at the sample timestamp */
+  float camera_to_world[16]; /* T_world_cam, column-major, at the sample timestamp */
   float intrinsics[4];       /* fx fy cx cy at the payload image size */
   uint16_t width;
   uint16_t height;
@@ -94,7 +106,7 @@ typedef struct C3PhotoSavedEvent {
   uint8_t photo_id_sha256[32];
   uint8_t attempt_uuid[16];
   int64_t exposure_timestamp_ns;
-  float camera_to_world_rows[12]; /* rows 0-2, row 3 implied */
+  float camera_to_world_rows[12]; /* T_world_cam rows 0-2, row 3 implied */
   float intrinsics[4];            /* at the still resolution */
   uint16_t width_div_8;
   uint16_t height_div_8;

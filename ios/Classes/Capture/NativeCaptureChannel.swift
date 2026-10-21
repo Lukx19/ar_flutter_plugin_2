@@ -523,8 +523,10 @@ final class NativeCaptureChannel: CaptureChannelExtension {
       "resolution": ["width": width, "height": height],
       "distortionCoefficients": [Double](),
       "fieldOfView": [
-        "horizontal": 2 * atan(Double(width) / (2 * fx)) * 180 / .pi,
-        "vertical": 2 * atan(Double(height) / (2 * fy)) * 180 / .pi,
+        // Radians, as Android and the Dart `ARCameraIntrinsics` (degrees
+        // before the OpenCV pinhole convention).
+        "horizontal": 2 * atan(Double(width) / (2 * fx)),
+        "vertical": 2 * atan(Double(height) / (2 * fy)),
       ],
     ]
   }

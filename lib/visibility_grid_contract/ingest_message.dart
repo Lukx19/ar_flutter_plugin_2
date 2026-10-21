@@ -110,7 +110,22 @@ abstract final class TrackingResetCause {
 /// mirrored by `IngestMessageLayout.kt` and `ingest_message_layout.h`.
 abstract final class IngestHeaderLayout {
   static final int magic = contractMagic('C3VI');
-  static const int version = 1;
+
+  /// Version 2 (canonical coordinate frame): the header camera pose and the
+  /// photo saved rows are `T_world_cam` (OpenCV camera axes,
+  /// `opencv_c2w_v1`), and principal points put pixel centres at integer
+  /// coordinates. Version 1 messages (recordings made before) carry the AR
+  /// camera axes (ARCore camera pose, ARKit camera transform); readers
+  /// accept both and convert by the message's version (pose by `F`). The
+  /// version 1 principal point is converted (`c = c_v1 - 0.5`) only where
+  /// its consumers used the pixel-edge reading (sampling pixel `u` at
+  /// `u + 0.5`): the header of a depth image and the photo saved payload.
+  /// Version 1 marker detections (their tape solver read `cx` as a pixel
+  /// centre) and every other kind keep their stored value.
+  static const int version = 2;
+
+  /// The version whose camera poses use the AR camera axes.
+  static const int arCameraPoseVersion = 1;
   static const int bytes = 160;
 
   /// Largest whole message (header plus payload).
@@ -152,7 +167,7 @@ final class IngestMessageView extends ContractRecordView {
   /// Validates magic, version, kind and declared payload length against
   /// [available] bytes from [offset].
   ContractStatus validate(int available) {
-    final status = validateMagicAndVersion(
+    var status = validateMagicAndVersion(
       data,
       offset,
       available,
@@ -160,6 +175,10 @@ final class IngestMessageView extends ContractRecordView {
       IngestHeaderLayout.magic,
       IngestHeaderLayout.version,
     );
+    if (status == ContractStatus.badVersion &&
+        version == IngestHeaderLayout.arCameraPoseVersion) {
+      status = ContractStatus.ok;
+    }
     if (status != ContractStatus.ok) return status;
     if (kind >= IngestKind.count) return ContractStatus.badKind;
     final total = IngestHeaderLayout.bytes + payloadBytes;
@@ -177,6 +196,15 @@ final class IngestMessageView extends ContractRecordView {
     setU16(IngestHeaderLayout.versionOffset, IngestHeaderLayout.version);
     this.kind = kind;
   }
+
+  /// Contract version of this message (1 or 2; see [IngestHeaderLayout]).
+  int get version => u16(IngestHeaderLayout.versionOffset);
+  set version(int v) => setU16(IngestHeaderLayout.versionOffset, v);
+
+  /// Whether the stored camera pose is `T_world_cam` (version 2) rather
+  /// than the AR camera axes (version 1).
+  bool get storesOpenCvPose =>
+      version != IngestHeaderLayout.arCameraPoseVersion;
 
   int get kind => u8(IngestHeaderLayout.kindOffset);
   set kind(int v) => setU8(IngestHeaderLayout.kindOffset, v);
@@ -205,24 +233,91 @@ final class IngestMessageView extends ContractRecordView {
   int get poseGapUs => i32(IngestHeaderLayout.poseGapUsOffset);
   set poseGapUs(int v) => setI32(IngestHeaderLayout.poseGapUsOffset, v);
 
-  /// Camera-to-world element [index] (column-major) at the sample timestamp.
-  double cameraToWorld(int index) =>
-      f32(IngestHeaderLayout.cameraToWorldOffset + 4 * index);
-  void readCameraToWorld(List<double> out, [int outOffset = 0]) =>
-      readF32s(IngestHeaderLayout.cameraToWorldOffset, 16, out, outOffset);
-  void writeCameraToWorld(List<double> values, [int valuesOffset = 0]) =>
-      writeF32s(
-          IngestHeaderLayout.cameraToWorldOffset, 16, values, valuesOffset);
+  /// Camera-to-world element [index] (column-major) at the sample timestamp
+  /// in the AR camera axes (+Y up, -Z forward; ARCore camera pose, ARKit
+  /// camera transform), whatever the message version stores. Consumers that
+  /// work in the canonical frame read [readWorldFromCamera].
+  double cameraToWorld(int index) {
+    final value = f32(IngestHeaderLayout.cameraToWorldOffset + 4 * index);
+    return storesOpenCvPose && index >= 4 && index < 12 ? -value : value;
+  }
+
+  /// The AR camera axes camera-to-world into [out] at [outOffset].
+  void readCameraToWorld(List<double> out, [int outOffset = 0]) {
+    readF32s(IngestHeaderLayout.cameraToWorldOffset, 16, out, outOffset);
+    if (storesOpenCvPose) _flipCameraYZ(out, outOffset);
+  }
+
+  /// Stores the AR camera axes camera-to-world [values] in this message's
+  /// version (version 2: as `T_world_cam`). Set the version first.
+  void writeCameraToWorld(List<double> values, [int valuesOffset = 0]) {
+    writeF32s(IngestHeaderLayout.cameraToWorldOffset, 16, values, valuesOffset);
+    if (storesOpenCvPose) _flipStoredCameraYZ();
+  }
+
+  /// `T_world_cam` (column-major, OpenCV camera axes, `opencv_c2w_v1`) of the
+  /// header pose into [out] at [outOffset] (docs/02-architecture.md,
+  /// Coordinate frames); a version 1 pose is converted. Exact: only the
+  /// signs of the camera Y and Z axis columns change.
+  void readWorldFromCamera(List<double> out, [int outOffset = 0]) {
+    readF32s(IngestHeaderLayout.cameraToWorldOffset, 16, out, outOffset);
+    if (!storesOpenCvPose) _flipCameraYZ(out, outOffset);
+  }
+
+  /// Stores `T_world_cam` [values] in this message's version.
+  void writeWorldFromCamera(List<double> values, [int valuesOffset = 0]) {
+    writeF32s(IngestHeaderLayout.cameraToWorldOffset, 16, values, valuesOffset);
+    if (!storesOpenCvPose) _flipStoredCameraYZ();
+  }
+
+  static void _flipCameraYZ(List<double> m, int o) {
+    for (var r = 0; r < 4; r++) {
+      m[o + 4 + r] = -m[o + 4 + r];
+      m[o + 8 + r] = -m[o + 8 + r];
+    }
+  }
+
+  void _flipStoredCameraYZ() {
+    for (var i = 4; i < 12; i++) {
+      final at = IngestHeaderLayout.cameraToWorldOffset + 4 * i;
+      setF32(at, -f32(at));
+    }
+  }
+
+  /// Stored minus read principal point: 0.5 for a version 1 depth image,
+  /// whose depth kernels sampled pixel `u` at `u + 0.5` (so `c = c_v1 - 0.5`
+  /// gives the same rays exactly); 0 for every other version 1 kind (marker
+  /// detections were already read as pixel centres; points, voxels, photo
+  /// saved headers, session events, anchor replies and tie points have no
+  /// header intrinsics consumer) and for version 2.
+  double get _storedPrincipalPointOffset =>
+      version == IngestHeaderLayout.arCameraPoseVersion &&
+              kind == IngestKind.depthImage
+          ? 0.5
+          : 0;
 
   double get fx => f32(IngestHeaderLayout.intrinsicsOffset);
   double get fy => f32(IngestHeaderLayout.intrinsicsOffset + 4);
-  double get cx => f32(IngestHeaderLayout.intrinsicsOffset + 8);
-  double get cy => f32(IngestHeaderLayout.intrinsicsOffset + 12);
+
+  /// Principal point with pixel centres at integer coordinates (OpenCV,
+  /// docs/02-architecture.md, Coordinate frames); a version 1 depth image's
+  /// value is converted (see [IngestHeaderLayout.version]).
+  double get cx =>
+      f32(IngestHeaderLayout.intrinsicsOffset + 8) -
+      _storedPrincipalPointOffset;
+  double get cy =>
+      f32(IngestHeaderLayout.intrinsicsOffset + 12) -
+      _storedPrincipalPointOffset;
+
+  /// Stores pixel-centre intrinsics in this message's version and kind. Set
+  /// the version and kind first.
   void setIntrinsics(double fx, double fy, double cx, double cy) {
     setF32(IngestHeaderLayout.intrinsicsOffset, fx);
     setF32(IngestHeaderLayout.intrinsicsOffset + 4, fy);
-    setF32(IngestHeaderLayout.intrinsicsOffset + 8, cx);
-    setF32(IngestHeaderLayout.intrinsicsOffset + 12, cy);
+    setF32(IngestHeaderLayout.intrinsicsOffset + 8,
+        cx + _storedPrincipalPointOffset);
+    setF32(IngestHeaderLayout.intrinsicsOffset + 12,
+        cy + _storedPrincipalPointOffset);
   }
 
   int get width => u16(IngestHeaderLayout.widthOffset);

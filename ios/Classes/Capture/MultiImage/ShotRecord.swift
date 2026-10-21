@@ -15,16 +15,35 @@ struct DurableShotPayload {
   var shotId: UUID
   /// Images 1... in index order (index 0 is the JPEG component).
   var images: [Image]
-  /// `capture3d-shot-v1` JSON ([ShotRecord]).
+  /// `capture3d-shot-v3` JSON ([ShotRecord]).
   var record: [UInt8]
 }
 
 /// The shot record stored with a burst shot (`shot-record.<sha>.blob`):
 /// per image its index, size, content hash, exposure time, own
-/// camera-to-world (ARKit, column-major), intrinsics, flags and sharpness.
-/// JSON with sorted keys.
+/// camera-to-world, intrinsics, flags and sharpness. JSON with sorted keys.
+///
+/// Schema `capture3d-shot-v3` (photo store layout 5) stores each image's
+/// `cameraToWorld` as `T_world_cam` (column-major, OpenCV camera axes,
+/// `opencv_c2w_v1`; docs/02-architecture.md, Coordinate frames) named in
+/// `cameraConvention`, and its intrinsics in the OpenCV pinhole convention
+/// ([StillIntrinsics]) named in `intrinsicsConvention`. Older records are
+/// read and never rewritten:
+/// - `capture3d-shot-v2` (layout 4): `T_world_cam`, intrinsics of unrecorded
+///   convention;
+/// - `capture3d-shot-v1` (layout 3): the ARKit camera transform (AR camera
+///   axes), converted by [decode], intrinsics scaled as `c * s`.
+/// Intrinsics of an older record carry no convention, so the session never
+/// labels them `opencv_pinhole_v1`.
 enum ShotRecord {
-  static let schema = "capture3d-shot-v1"
+  static let schema = "capture3d-shot-v3"
+  /// The layout 4 schema: `T_world_cam` per image, intrinsics convention
+  /// not recorded.
+  static let schemaUnnamedIntrinsics = "capture3d-shot-v2"
+  /// The layout 3 schema: ARKit camera-to-world per image.
+  static let schemaArkitCameraToWorld = "capture3d-shot-v1"
+  static let cameraConvention = "opencv_c2w_v1"
+  static let intrinsicsConvention = StillIntrinsics.convention
   /// Role of every image after the first in the shot root.
   static let burstRole = "BURST"
   static let roles: Set<String> = [burstRole]
@@ -41,7 +60,7 @@ enum ShotRecord {
         "exposureTimestampNs": m.exposureTimestampNs, "trackingNormal": image.trackingNormal,
         "highResolution": m.highResolution, "flags": flagNames(image.flags),
       ]
-      if let pose = m.cameraToWorld { value["cameraToWorld"] = matrix(pose) }
+      if let pose = m.cameraToWorld { value["cameraToWorld"] = openCv(matrix(pose)) }
       if let k = m.intrinsics {
         value["intrinsics"] = ["fx": Double(k.x), "fy": Double(k.y), "cx": Double(k.z), "cy": Double(k.w)]
       }
@@ -49,10 +68,22 @@ enum ShotRecord {
       return value
     }
     let record: [String: Any] = [
-      "schema": schema, "shotId": shot.shotId.uuidString.lowercased(), "mode": shot.mode.storedName, "images": images,
+      "schema": schema, "cameraConvention": cameraConvention, "intrinsicsConvention": intrinsicsConvention,
+      "shotId": shot.shotId.uuidString.lowercased(), "mode": shot.mode.storedName, "images": images,
     ]
     let data = (try? JSONSerialization.data(withJSONObject: record, options: [.sortedKeys])) ?? Data()
     return [UInt8](data)
+  }
+
+  /// `T_world_arcam * diag(1, -1, -1, 1)` of a column-major camera-to-world:
+  /// the camera Y and Z columns change sign (as `PoseBatchWire`).
+  static func openCv(_ m: [Double]) -> [Double] {
+    var out = m
+    for row in 0..<4 {
+      out[4 + row] = -out[4 + row]
+      out[8 + row] = -out[8 + row]
+    }
+    return out
   }
 
   static func flagNames(_ flags: ShotImageFlags) -> [String] {
@@ -80,10 +111,14 @@ enum ShotRecord {
     var exposureTimestampNs: Int64
     var trackingNormal: Bool
     var flags: ShotImageFlags
-    /// ARKit camera-to-world, column-major; nil when the frame had none.
+    /// `T_world_cam` (column-major, OpenCV camera axes); nil when the frame
+    /// had none.
     var cameraToWorld: [Double]?
     /// fx, fy, cx, cy at the image size; nil when unknown.
     var intrinsics: [Double]?
+    /// Convention of [intrinsics]: `opencv_pinhole_v1` from schema
+    /// `capture3d-shot-v3`; nil for older records or without intrinsics.
+    var intrinsicsConvention: String?
   }
 
   struct Decoded: Equatable {
@@ -92,12 +127,33 @@ enum ShotRecord {
     var images: [DecodedImage]
   }
 
-  /// The record written by [encode]; nil for anything else (unknown
-  /// schema, missing or mistyped field, unknown flag, image indices that
-  /// are not 0...n-1 in order).
+  /// The record written by [encode], a `capture3d-shot-v2` record (its
+  /// intrinsics without a convention) or a `capture3d-shot-v1` record whose
+  /// ARKit poses are converted to `T_world_cam`; nil for anything else
+  /// (unknown schema, camera or intrinsics convention, missing or mistyped
+  /// field, unknown flag, image indices that are not 0...n-1 in order).
   static func decode(_ bytes: [UInt8]) -> Decoded? {
     guard let root = (try? JSONSerialization.jsonObject(with: Data(bytes))) as? [String: Any],
-          root["schema"] as? String == schema, let shotId = root["shotId"] as? String,
+          let storedSchema = root["schema"] as? String else { return nil }
+    let arkitPoses: Bool
+    let recordIntrinsicsConvention: String?
+    switch storedSchema {
+    case schema:
+      guard root["cameraConvention"] as? String == cameraConvention,
+            root["intrinsicsConvention"] as? String == intrinsicsConvention else { return nil }
+      arkitPoses = false
+      recordIntrinsicsConvention = intrinsicsConvention
+    case schemaUnnamedIntrinsics:
+      guard root["cameraConvention"] as? String == cameraConvention else { return nil }
+      arkitPoses = false
+      recordIntrinsicsConvention = nil
+    case schemaArkitCameraToWorld:
+      arkitPoses = true
+      recordIntrinsicsConvention = nil
+    default:
+      return nil
+    }
+    guard let shotId = root["shotId"] as? String,
           let uuid = UUID(uuidString: shotId), uuid.uuidString.lowercased() == shotId,
           let mode = root["mode"] as? String, ["single", "burst", "quality"].contains(mode),
           let list = root["images"] as? [Any], !list.isEmpty else { return nil }
@@ -128,7 +184,7 @@ enum ShotRecord {
         guard let values = value as? [Any], values.count == 16 else { return nil }
         let parsed = values.compactMap(number)
         guard parsed.count == 16 else { return nil }
-        pose = parsed
+        pose = arkitPoses ? openCv(parsed) : parsed
       }
       var intrinsics: [Double]?
       if let value = image["intrinsics"] {
@@ -139,7 +195,7 @@ enum ShotRecord {
       images.append(DecodedImage(
         index: Int(index), width: Int(width), height: Int(height), byteLength: length, sha256: sha,
         exposureTimestampNs: exposure, trackingNormal: tracking.boolValue, flags: flags, cameraToWorld: pose,
-        intrinsics: intrinsics))
+        intrinsics: intrinsics, intrinsicsConvention: intrinsics == nil ? nil : recordIntrinsicsConvention))
     }
     return Decoded(shotId: shotId, mode: mode, images: images)
   }
@@ -159,10 +215,14 @@ struct CommittedShotImage: Hashable {
   var trackingNormal: Bool
   /// [ShotImageFlags] raw bits.
   var flags: Int
-  /// ARKit camera-to-world, column-major; nil when the frame had none.
+  /// `T_world_cam` (column-major, OpenCV camera axes, `opencv_c2w_v1`); nil
+  /// when the frame had none.
   var cameraToWorld: [Double]?
   /// fx, fy, cx, cy at the image size; nil when unknown.
   var intrinsics: [Double]?
+  /// Convention of [intrinsics] (`opencv_pinhole_v1`); nil when the record
+  /// did not name one (photo store layout 3 and 4) or without intrinsics.
+  var intrinsicsConvention: String?
 
   /// Photo credit and the session's picture delivery may use this image.
   var creditable: Bool { trackingNormal && cameraToWorld != nil }

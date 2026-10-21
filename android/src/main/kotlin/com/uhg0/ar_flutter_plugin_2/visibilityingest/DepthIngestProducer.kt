@@ -199,8 +199,9 @@ internal class DepthIngestProducer(
         val th = texture[5]
         val fx = texture[0] * (width / tw)
         val fy = texture[1] * (height / th)
-        val cx = texture[2] * (width / tw)
-        val cy = texture[3] * (height / th)
+        // Pixel centres at integer coordinates (OpenCV): (c + 0.5) * s - 0.5.
+        val cx = (texture[2] + 0.5f) * (width / tw) - 0.5f
+        val cy = (texture[3] + 0.5f) * (height / th) - 0.5f
         if (!(fx.isFinite() && fx > 0f && fy.isFinite() && fy > 0f && cx.isFinite() && cy.isFinite())) {
             calibrationUnavailable++
             sink.countSourceDrop(IngestMessageLayout.KIND_DEPTH_IMAGE)

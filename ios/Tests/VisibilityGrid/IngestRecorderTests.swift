@@ -23,7 +23,7 @@ final class IngestRecorderTests: XCTestCase {
     let path = try XCTUnwrap(recorder.path)
     let bytes = try Data(contentsOf: URL(fileURLWithPath: path))
     XCTAssertEqual(bytes.u32(0), IngestRecordingLayout.magic)
-    XCTAssertEqual(bytes.u16(4), 1)
+    XCTAssertEqual(Int(bytes.u16(4)), IngestRecordingLayout.version)
     XCTAssertEqual(bytes.i64(IngestRecordingLayout.deviceModelHash), IngestRecorder.deviceModelHash("iPhone13,3"))
     XCTAssertEqual(bytes.i64(IngestRecordingLayout.createdTimeNs), 42)
     // The recording started event, then the tracking lost event (the stop event follows the last reply).

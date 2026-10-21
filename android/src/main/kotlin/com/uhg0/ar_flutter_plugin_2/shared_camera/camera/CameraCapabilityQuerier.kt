@@ -646,8 +646,7 @@ class CameraCapabilityQuerier(private val context: Context) {
         val lensCalibration =
             characteristics.get(CameraCharacteristics.LENS_INTRINSIC_CALIBRATION)
         val distortionCoefficients =
-            characteristics.get(CameraCharacteristics.LENS_DISTORTION)?.toList()
-                ?: listOf(0.0, 0.0, 0.0, 0.0, 0.0)
+            openCvDistortion(characteristics.get(CameraCharacteristics.LENS_DISTORTION))
         val fx =
             ((focalLength / sensorSize.width) * activeArraySize.width()).toDouble()
         val fy =

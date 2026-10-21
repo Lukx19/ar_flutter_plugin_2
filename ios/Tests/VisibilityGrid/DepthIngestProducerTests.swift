@@ -101,11 +101,12 @@ final class DepthIngestProducerTests: XCTestCase {
     XCTAssertEqual(m.i64(IngestMessageLayout.acquireTimeNs), 4_000)
     XCTAssertEqual(m.u16(IngestMessageLayout.groupEpoch), 2)
     XCTAssertEqual(m.f32(IngestMessageLayout.cameraToWorld + 13 * 4), 2, "column-major translation y")
-    // 1440 x 128 / 1920 = 96; 960 x 128 / 1920 = 64; 720 x 96 / 1440 = 48.
+    // 1440 x 128 / 1920 = 96; pixel centres at integers (OpenCV):
+    // (960 + 0.5) x 128 / 1920 - 0.5 and (720 + 0.5) x 96 / 1440 - 0.5.
     XCTAssertEqual(m.f32(IngestMessageLayout.intrinsics), 96)
     XCTAssertEqual(m.f32(IngestMessageLayout.intrinsics + 4), 96)
-    XCTAssertEqual(m.f32(IngestMessageLayout.intrinsics + 8), 64)
-    XCTAssertEqual(m.f32(IngestMessageLayout.intrinsics + 12), 48)
+    XCTAssertEqual(m.f32(IngestMessageLayout.intrinsics + 8), 960.5 * 128 / 1920 - 0.5, accuracy: 1e-4)
+    XCTAssertEqual(m.f32(IngestMessageLayout.intrinsics + 12), 720.5 * 96 / 1440 - 0.5, accuracy: 1e-4)
   }
 
   func testFullResolutionWhenDownscaleIsOne() {

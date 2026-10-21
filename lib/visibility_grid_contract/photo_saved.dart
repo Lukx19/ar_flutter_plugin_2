@@ -23,10 +23,23 @@ abstract final class PhotoSavedLayout {
   static const int flagBlurRejected = 2;
 }
 
+/// Ingest contract version from which photo saved rows are `T_world_cam`
+/// (`IngestHeaderLayout.version` 2).
+const int photoSavedOpenCvPoseVersion = 2;
+
 /// Reusable view over a photo saved event.
 final class PhotoSavedView extends ContractRecordView {
   @override
   int get recordBytes => PhotoSavedLayout.bytes;
+
+  /// Ingest contract version of the message the event came in: 2 stores the
+  /// camera rows as `T_world_cam` (OpenCV camera axes) and a pixel-centre
+  /// principal point; 1 (recordings made before the canonical frame) the AR
+  /// camera axes and a pixel-edge principal point (`c_v1 = c + 0.5`). Set it
+  /// from the message header when attaching to a received event.
+  int contractVersion = photoSavedOpenCvPoseVersion;
+
+  bool get _storesOpenCvPose => contractVersion >= photoSavedOpenCvPoseVersion;
 
   void readPhotoId(List<int> out, [int outOffset = 0]) => readBytes(
       PhotoSavedLayout.photoIdOffset,
@@ -56,23 +69,90 @@ final class PhotoSavedView extends ContractRecordView {
   set exposureTimestampNs(int v) =>
       setI64(PhotoSavedLayout.exposureTimestampNsOffset, v);
 
-  /// Camera-to-world element at [row] (0-2) and [column] (0-3).
-  double cameraToWorld(int row, int column) =>
-      f32(PhotoSavedLayout.cameraToWorldRowsOffset + 4 * (row * 4 + column));
-  void readCameraToWorldRows(List<double> out, [int outOffset = 0]) =>
-      readF32s(PhotoSavedLayout.cameraToWorldRowsOffset, 12, out, outOffset);
-  void writeCameraToWorldRows(List<double> rows, [int rowsOffset = 0]) =>
-      writeF32s(PhotoSavedLayout.cameraToWorldRowsOffset, 12, rows, rowsOffset);
+  /// Camera-to-world element at [row] (0-2) and [column] (0-3) in the AR
+  /// camera axes (+Y up, -Z forward), whatever [contractVersion] stores.
+  double cameraToWorld(int row, int column) {
+    final value =
+        f32(PhotoSavedLayout.cameraToWorldRowsOffset + 4 * (row * 4 + column));
+    return _storesOpenCvPose && (column == 1 || column == 2) ? -value : value;
+  }
+
+  /// Rows 0-2 of the AR camera axes camera-to-world into [out].
+  void readCameraToWorldRows(List<double> out, [int outOffset = 0]) {
+    readF32s(PhotoSavedLayout.cameraToWorldRowsOffset, 12, out, outOffset);
+    if (_storesOpenCvPose) _flipColumns(out, outOffset);
+  }
+
+  /// Stores AR camera axes [rows] in [contractVersion]'s convention.
+  void writeCameraToWorldRows(List<double> rows, [int rowsOffset = 0]) {
+    writeF32s(PhotoSavedLayout.cameraToWorldRowsOffset, 12, rows, rowsOffset);
+    if (_storesOpenCvPose) _flipStoredColumns();
+  }
+
+  /// Rows 0-2 (row-major 3x4) of `T_world_cam` (OpenCV camera axes,
+  /// `opencv_c2w_v1`; docs/02-architecture.md, Coordinate frames) into
+  /// [out] at [outOffset]; version 1 rows are converted. Exact.
+  void readWorldFromCameraRows(List<double> out, [int outOffset = 0]) {
+    readF32s(PhotoSavedLayout.cameraToWorldRowsOffset, 12, out, outOffset);
+    if (!_storesOpenCvPose) _flipColumns(out, outOffset);
+  }
+
+  /// Stores `T_world_cam` [rows] in [contractVersion]'s convention.
+  void writeWorldFromCameraRows(List<double> rows, [int rowsOffset = 0]) {
+    writeF32s(PhotoSavedLayout.cameraToWorldRowsOffset, 12, rows, rowsOffset);
+    if (!_storesOpenCvPose) _flipStoredColumns();
+  }
+
+  /// Rewrites a version 1 event as version 2 (`T_world_cam` rows, pixel
+  /// centre principal point) and sets [contractVersion]; a no-op for
+  /// version 2. For owned copies only.
+  void normalizeToCurrentVersion() {
+    if (!_storesOpenCvPose) {
+      final fx = this.fx, fy = this.fy, cx = this.cx, cy = this.cy;
+      _flipStoredColumns();
+      contractVersion = photoSavedOpenCvPoseVersion;
+      setIntrinsics(fx, fy, cx, cy);
+    }
+  }
+
+  static void _flipColumns(List<double> rows, int o) {
+    for (var r = 0; r < 3; r++) {
+      rows[o + r * 4 + 1] = -rows[o + r * 4 + 1];
+      rows[o + r * 4 + 2] = -rows[o + r * 4 + 2];
+    }
+  }
+
+  void _flipStoredColumns() {
+    for (var r = 0; r < 3; r++) {
+      for (final c in const [1, 2]) {
+        final at = PhotoSavedLayout.cameraToWorldRowsOffset + 4 * (r * 4 + c);
+        setF32(at, -f32(at));
+      }
+    }
+  }
+
+  /// Stored minus read principal point: 0.5 for version 1 (pixel-edge
+  /// convention, `c = c_v1 - 0.5` exactly), 0 for version 2.
+  double get _storedPrincipalPointOffset => _storesOpenCvPose ? 0 : 0.5;
 
   double get fx => f32(PhotoSavedLayout.intrinsicsOffset);
   double get fy => f32(PhotoSavedLayout.intrinsicsOffset + 4);
-  double get cx => f32(PhotoSavedLayout.intrinsicsOffset + 8);
-  double get cy => f32(PhotoSavedLayout.intrinsicsOffset + 12);
+
+  /// Principal point with pixel centres at integer coordinates (OpenCV);
+  /// a version 1 value is converted.
+  double get cx =>
+      f32(PhotoSavedLayout.intrinsicsOffset + 8) - _storedPrincipalPointOffset;
+  double get cy =>
+      f32(PhotoSavedLayout.intrinsicsOffset + 12) - _storedPrincipalPointOffset;
+
+  /// Stores pixel-centre intrinsics in [contractVersion]'s convention.
   void setIntrinsics(double fx, double fy, double cx, double cy) {
     setF32(PhotoSavedLayout.intrinsicsOffset, fx);
     setF32(PhotoSavedLayout.intrinsicsOffset + 4, fy);
-    setF32(PhotoSavedLayout.intrinsicsOffset + 8, cx);
-    setF32(PhotoSavedLayout.intrinsicsOffset + 12, cy);
+    setF32(PhotoSavedLayout.intrinsicsOffset + 8,
+        cx + _storedPrincipalPointOffset);
+    setF32(PhotoSavedLayout.intrinsicsOffset + 12,
+        cy + _storedPrincipalPointOffset);
   }
 
   int get widthDiv8 => u16(PhotoSavedLayout.widthDiv8Offset);

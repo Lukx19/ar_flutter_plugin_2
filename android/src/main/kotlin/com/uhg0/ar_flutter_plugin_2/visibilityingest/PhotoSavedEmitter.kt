@@ -33,7 +33,7 @@ internal class StillCameraModel {
     var width = 0
     var height = 0
 
-    /** Camera2 `LENS_DISTORTION` (k1, k2, k3, p1, p2), zeros when not reported. */
+    /** OpenCV distortion (k1, k2, p1, p2, k3), zeros when not reported. */
     val distortion = DoubleArray(5)
 
     val valid: Boolean
@@ -359,8 +359,11 @@ internal class PhotoSavedEmitter(
         lastPoseMatch = match
         lastPoseGapUs = gapUs
         if (posed) {
+            // Contract version 2 rows: T_world_cam, the ARCore camera Y and
+            // Z columns negated.
             for (row in 0 until 3) for (col in 0 until 4) {
-                b.putFloat(PhotoSavedLayout.CAMERA_TO_WORLD_ROWS + 4 * (row * 4 + col), matched[col * 4 + row])
+                val v = matched[col * 4 + row]
+                b.putFloat(PhotoSavedLayout.CAMERA_TO_WORLD_ROWS + 4 * (row * 4 + col), if (col == 1 || col == 2) -v else v)
             }
         }
         val hasCamera = try {
@@ -486,7 +489,8 @@ internal class PhotoSavedIngestWriter(
         IngestMessageWriter.begin(b, IngestMessageLayout.KIND_PHOTO_SAVED)
         IngestMessageWriter.payloadBytes(b, PhotoSavedLayout.BYTES)
         IngestMessageWriter.timing(b, exposureNs, exposureNs, clock.nowNs())
-        IngestMessageWriter.pose(b, trackingState(), poseMatch(), groupEpoch(), poseGapUs(), pose)
+        // The event rows are already T_world_cam (contract version 2).
+        IngestMessageWriter.poseWorldFromCamera(b, trackingState(), poseMatch(), groupEpoch(), poseGapUs(), pose)
         IngestMessageWriter.intrinsics(b, e.getFloat(PhotoSavedLayout.INTRINSICS), e.getFloat(PhotoSavedLayout.INTRINSICS + 4),
             e.getFloat(PhotoSavedLayout.INTRINSICS + 8), e.getFloat(PhotoSavedLayout.INTRINSICS + 12))
         val w = (e.getShort(PhotoSavedLayout.WIDTH_DIV_8).toInt() and 0xffff) * 8

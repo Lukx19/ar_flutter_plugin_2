@@ -568,7 +568,8 @@ final class AnchorPoseTracker {
     b.u8(IngestMessageLayout.poseMatch, IngestMessageLayout.poseMatchExact)
     b.u16(IngestMessageLayout.groupEpoch, epoch)
     b.i32(IngestMessageLayout.poseGapUs, 0)
-    for i in 0..<16 { b.f32(IngestMessageLayout.cameraToWorld + 4 * i, cameraMatrix[i]) }
+    // Contract version 2: T_world_cam, the ARKit camera Y and Z columns negated.
+    for i in 0..<16 { b.f32(IngestMessageLayout.cameraToWorld + 4 * i, (4..<12).contains(i) ? -cameraMatrix[i] : cameraMatrix[i]) }
     b.u32(AnchorPoseUpdateLayout.trackedAnchorsOffset, UInt32(attached))
     b.u32(AnchorPoseUpdateLayout.anchorReadMaxMicrosOffset, UInt32(Self.micros(maxReadNs)))
     b.u32(AnchorPoseUpdateLayout.frameIntervalMaxMicrosOffset, UInt32(Self.micros(maxIntervalNs)))

@@ -52,9 +52,20 @@ final class StillQualityTests: XCTestCase {
     let still = try XCTUnwrap(StillIntrinsics.scaled(k, imageResolution: CGSize(width: 1920, height: 1440), width: 4032, height: 3024))
     XCTAssertEqual(still.x, 2940, accuracy: 1e-3)
     XCTAssertEqual(still.y, 2940, accuracy: 1e-3)
-    XCTAssertEqual(still.z, 2016, accuracy: 1e-3)
-    XCTAssertEqual(still.w, 1512, accuracy: 1e-3)
+    // Pixel centres at integer coordinates (OpenCV): (c + 0.5) * s - 0.5.
+    XCTAssertEqual(still.z, 960.5 * 2.1 - 0.5, accuracy: 1e-3)
+    XCTAssertEqual(still.w, 720.5 * 2.1 - 0.5, accuracy: 1e-3)
     XCTAssertNil(StillIntrinsics.scaled(k, imageResolution: .zero, width: 4032, height: 3024))
+    XCTAssertEqual(StillIntrinsics.convention, "opencv_pinhole_v1")
+  }
+
+  /// The capture intrinsics map reports the field of view in radians, as
+  /// Android and the Dart `ARCameraIntrinsics`.
+  func testIntrinsicsMapFieldOfViewIsInRadians() throws {
+    let map = NativeCaptureChannel.intrinsicsMap(simd_float4(1000, 1000, 959.5, 719.5), width: 1920, height: 1440)
+    let fov = try XCTUnwrap(map["fieldOfView"] as? [String: Double])
+    XCTAssertEqual(try XCTUnwrap(fov["horizontal"]), 2 * atan(1920.0 / 2000.0), accuracy: 1e-12)
+    XCTAssertEqual(try XCTUnwrap(fov["vertical"]), 2 * atan(1440.0 / 2000.0), accuracy: 1e-12)
   }
 
   func testCaptureConfigUsesTheAndroidBoundsAndRefusesRaw() {

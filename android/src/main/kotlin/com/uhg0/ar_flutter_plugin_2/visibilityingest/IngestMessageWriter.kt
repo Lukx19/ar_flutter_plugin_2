@@ -51,12 +51,37 @@ internal object IngestMessageWriter {
         b.putInt(IngestMessageLayout.DROPPED, count)
     }
 
+    /**
+     * Header pose from the ARCore camera pose [cameraToWorld] (column-major,
+     * AR camera axes): written as `T_world_cam`, the camera Y and Z columns
+     * negated (contract version 2).
+     */
     fun pose(b: ByteBuffer, trackingState: Int, poseMatch: Int, groupEpoch: Int, poseGapUs: Int, cameraToWorld: FloatArray) {
+        poseFields(b, trackingState, poseMatch, groupEpoch, poseGapUs)
+        for (i in 0 until 16) {
+            val v = cameraToWorld[i]
+            b.putFloat(IngestMessageLayout.CAMERA_TO_WORLD + 4 * i, if (i in 4..11) -v else v)
+        }
+    }
+
+    /** Header pose from a `T_world_cam` [worldFromCamera], written as is. */
+    fun poseWorldFromCamera(
+        b: ByteBuffer,
+        trackingState: Int,
+        poseMatch: Int,
+        groupEpoch: Int,
+        poseGapUs: Int,
+        worldFromCamera: FloatArray,
+    ) {
+        poseFields(b, trackingState, poseMatch, groupEpoch, poseGapUs)
+        for (i in 0 until 16) b.putFloat(IngestMessageLayout.CAMERA_TO_WORLD + 4 * i, worldFromCamera[i])
+    }
+
+    private fun poseFields(b: ByteBuffer, trackingState: Int, poseMatch: Int, groupEpoch: Int, poseGapUs: Int) {
         b.put(IngestMessageLayout.TRACKING_STATE, trackingState.toByte())
         b.put(IngestMessageLayout.POSE_MATCH, poseMatch.toByte())
         b.putShort(IngestMessageLayout.GROUP_EPOCH, groupEpoch.toShort())
         b.putInt(IngestMessageLayout.POSE_GAP_US, poseGapUs)
-        for (i in 0 until 16) b.putFloat(IngestMessageLayout.CAMERA_TO_WORLD + 4 * i, cameraToWorld[i])
     }
 
     fun intrinsics(b: ByteBuffer, fx: Float, fy: Float, cx: Float, cy: Float) {

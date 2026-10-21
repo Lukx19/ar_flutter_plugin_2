@@ -169,7 +169,9 @@ class VisibilityGridContractGoldenTest {
         event.put(IngestMessageLayout.POSE_MATCH, IngestMessageLayout.POSE_MATCH_INTERPOLATED.toByte())
         event.putShort(IngestMessageLayout.GROUP_EPOCH, 3)
         event.putInt(IngestMessageLayout.POSE_GAP_US, -1250)
-        val pose = floatArrayOf(1f, 0f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 0f, 1f, 0f, 0.5f, 1.25f, -2f, 1f)
+        // Contract version 2: T_world_cam of the identity ARCore camera pose
+        // (camera Y and Z columns negated, bottom row zeros included).
+        val pose = floatArrayOf(1f, 0f, 0f, 0f, -0f, -1f, -0f, -0f, -0f, -0f, -1f, -0f, 0.5f, 1.25f, -2f, 1f)
         pose.forEachIndexed { i, v -> event.putFloat(IngestMessageLayout.CAMERA_TO_WORLD + 4 * i, v) }
         event.putInt(IngestMessageLayout.DROPPED, 2)
         val p = IngestMessageLayout.HEADER_BYTES

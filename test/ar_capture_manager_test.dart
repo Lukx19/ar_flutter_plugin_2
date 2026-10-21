@@ -14,6 +14,8 @@ import 'package:ar_flutter_plugin_2/models/capture_capacity.dart';
 import 'package:ar_flutter_plugin_2/models/capture_intent_contract.dart';
 import 'package:ar_flutter_plugin_2/models/capture_quality_policy.dart';
 import 'package:ar_flutter_plugin_2/models/native_capture_v2.dart';
+import 'package:flutter/foundation.dart'
+    show debugDefaultTargetPlatformOverride;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -1932,6 +1934,44 @@ void main() {
     expect(poses.single.wireVersion, packedPoseBatchWireVersion);
     await subscription.cancel();
   });
+
+  for (final platform in [TargetPlatform.android, TargetPlatform.iOS]) {
+    test('packed pose batches tag the ${platform.name} tracking pose',
+        () async {
+      debugDefaultTargetPlatformOverride = platform;
+      addTearDown(() => debugDefaultTargetPlatformOverride = null);
+      final sessionManager = ARSessionManager(
+          42, _FakeBuildContext(), PlaneDetectionConfig.horizontal);
+      final manager =
+          ARCaptureManager(sessionManager, captureConfig, _FakeBuildContext());
+      final poses = <ARFramePose>[];
+      final subscription = manager.poseDataStream.listen(poses.add);
+      final bytes = ByteData(packedPoseSampleBytes);
+      bytes.setFloat32(40, 1, Endian.little);
+      bytes.setInt32(44, 257, Endian.little);
+      const codec = StandardMethodCodec();
+      await TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .handlePlatformMessage(
+        'arcapture_42',
+        codec.encodeMethodCall(MethodCall('onPoseBatch', {
+          'wireVersion': packedPoseBatchWireVersion,
+          'sampleCount': 1,
+          'sampleBytes': bytes.buffer.asUint8List(),
+          'droppedOldestCount': 0,
+        })),
+        (_) {},
+      );
+      await Future<void>.delayed(Duration.zero);
+      expect(poses.single.convention, 'opencv_c2w_v1');
+      expect(
+        poses.single.trackingPose!.convention,
+        platform == TargetPlatform.iOS
+            ? arkitCameraToWorldConvention
+            : arcoreGlCameraToWorldConvention,
+      );
+      await subscription.cancel();
+    });
+  }
 
   test('emits observed control-state updates from platform events', () async {
     final sessionManager = ARSessionManager(

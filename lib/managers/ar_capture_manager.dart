@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart'
+    show TargetPlatform, defaultTargetPlatform;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -2330,6 +2332,13 @@ class ARCaptureManager {
   /// Real-time pose data stream (empty on unsupported platforms)
   Stream<ARFramePose> get poseDataStream => _poseStreamController.stream;
 
+  /// Tag of the tracking pose in `pose_batch_v2` samples: the ARKit camera
+  /// transform on iOS, the ARCore camera pose elsewhere.
+  static String get _packedTrackingConvention =>
+      defaultTargetPlatform == TargetPlatform.iOS
+          ? arkitCameraToWorldConvention
+          : arcoreGlCameraToWorldConvention;
+
   /// Platform method call handler for incoming events
   Future<void> _platformCallHandler(MethodCall call) async {
     try {
@@ -2354,8 +2363,9 @@ class ARCaptureManager {
             }
             final bytes = ByteData.sublistView(payload);
             for (var index = 0; index < count; index++) {
-              _poseStreamController.add(
-                  ARFramePose.fromPacked(bytes, index * packedPoseSampleBytes));
+              _poseStreamController.add(ARFramePose.fromPacked(
+                  bytes, index * packedPoseSampleBytes,
+                  trackingConvention: _packedTrackingConvention));
             }
             break;
           }
