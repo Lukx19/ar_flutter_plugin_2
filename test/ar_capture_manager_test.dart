@@ -14,7 +14,8 @@ import 'package:ar_flutter_plugin_2/models/capture_capacity.dart';
 import 'package:ar_flutter_plugin_2/models/capture_intent_contract.dart';
 import 'package:ar_flutter_plugin_2/models/capture_quality_policy.dart';
 import 'package:ar_flutter_plugin_2/models/native_capture_v2.dart';
-import 'package:flutter/foundation.dart' show debugDefaultTargetPlatformOverride;
+import 'package:flutter/foundation.dart'
+    show debugDefaultTargetPlatformOverride;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';

@@ -119,43 +119,45 @@ void main() {
       expect(decoded.images[0].intrinsics, [2940.0, 2940.0, 2016.0, 1512.0]);
     });
 
-    test('the image pose convention: tagged opencv_c2w_v1 from photo store '
+    test(
+        'the image pose convention: tagged opencv_c2w_v1 from photo store '
         'layout 4, untagged images are ARKit camera transforms', () {
       final tagged = image(1)
         ..['cameraToWorldConvention'] = openCvCameraToWorldConvention;
-      final event = ARNativeCaptureEventV2.fromMap(
-          committed(shot([tagged, image(2)])));
+      final event =
+          ARNativeCaptureEventV2.fromMap(committed(shot([tagged, image(2)])));
       expect(event.shot!.images[0].cameraToWorldConvention,
           openCvCameraToWorldConvention);
       expect(event.shot!.images[1].cameraToWorldConvention,
           arkitCameraToWorldConvention);
       expect(
-        () => ARNativeCaptureEventV2.fromMap(committed(shot(
-            [image(1)..['cameraToWorldConvention'] = 'opencv_w2c_v1']))),
+        () => ARNativeCaptureEventV2.fromMap(committed(
+            shot([image(1)..['cameraToWorldConvention'] = 'opencv_w2c_v1']))),
         throwsFormatException,
       );
     });
 
-    test('the image intrinsics convention: tagged opencv_pinhole_v1 from '
+    test(
+        'the image intrinsics convention: tagged opencv_pinhole_v1 from '
         'photo store layout 5, untagged intrinsics have none', () {
       final tagged = image(1)
         ..['intrinsicsConvention'] = openCvPinholeIntrinsicsConvention;
-      final event = ARNativeCaptureEventV2.fromMap(
-          committed(shot([tagged, image(2)])));
+      final event =
+          ARNativeCaptureEventV2.fromMap(committed(shot([tagged, image(2)])));
       expect(event.shot!.images[0].intrinsicsConvention,
           openCvPinholeIntrinsicsConvention);
       expect(event.shot!.images[1].intrinsicsConvention, isNull);
       expect(
-        () => ARNativeCaptureEventV2.fromMap(committed(shot(
-            [image(1)..['intrinsicsConvention'] = 'colmap_pinhole_v1']))),
+        () => ARNativeCaptureEventV2.fromMap(committed(
+            shot([image(1)..['intrinsicsConvention'] = 'colmap_pinhole_v1']))),
         throwsFormatException,
       );
       expect(
         () => ARNativeCaptureEventV2.fromMap(committed(shot([
-              image(1)
-                ..remove('intrinsics')
-                ..['intrinsicsConvention'] = openCvPinholeIntrinsicsConvention
-            ]))),
+          image(1)
+            ..remove('intrinsics')
+            ..['intrinsicsConvention'] = openCvPinholeIntrinsicsConvention
+        ]))),
         throwsFormatException,
         reason: 'a convention without intrinsics',
       );

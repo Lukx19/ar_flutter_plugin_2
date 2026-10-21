@@ -23,7 +23,7 @@ internal data class CropRegionSpec(
 
 /**
  * Camera2 `LENS_DISTORTION` (k1, k2, k3, p1, p2) in the OpenCV order (k1, k2,
- * p1, p2, k3) every capture consumer uses (coordinate frame migration U7);
+ * p1, p2, k3) every capture consumer uses (OpenCV pinhole convention);
  * zeros when not reported. Both act on normalised image coordinates.
  */
 internal fun openCvDistortion(lensDistortion: FloatArray?): List<Double> {
@@ -82,8 +82,8 @@ internal object CameraIntrinsicsDeriver {
                 ?: baseIntrinsics.activeArrayHeight / 2.0
         val correctedFx = baseIntrinsics.fx * scaleX
         val correctedFy = baseIntrinsics.fy * scaleY
-        // Pixel centres at integer coordinates (OpenCV; coordinate frame
-        // migration U7): the principal point scales as (c + 0.5) * s - 0.5.
+        // Pixel centres at integer coordinates (OpenCV pinhole convention,
+        // docs/02-architecture.md): the principal point scales as (c + 0.5) * s - 0.5.
         val correctedCx = (baseCx - appliedCrop.left + 0.5) * scaleX - 0.5
         val correctedCy = (baseCy - appliedCrop.top + 0.5) * scaleY - 0.5
         val fovHorizontal = 2.0 * atan(outputWidth.toDouble() / (2.0 * correctedFx))

@@ -4,8 +4,8 @@ import org.junit.Assert.assertEquals
 import org.junit.Test
 
 /**
- * Pixel centres are at integer coordinates (OpenCV; coordinate frame
- * migration U7): a principal point maps as (c - crop + 0.5) * s - 0.5.
+ * Pixel centres are at integer coordinates (OpenCV pinhole convention,
+ * docs/02-architecture.md): a principal point maps as (c - crop + 0.5) * s - 0.5.
  */
 class CameraIntrinsicsDeriverTest {
     @Test

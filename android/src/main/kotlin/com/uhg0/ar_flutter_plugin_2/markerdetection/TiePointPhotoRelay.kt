@@ -49,8 +49,8 @@ internal class TiePointPhotoRelay(
     companion object {
         /**
          * The still's distortion in the detector's OpenCV order (k1, k2, p1,
-         * p2, k3), as the capability query reports it since coordinate frame
-         * migration U7; null when not reported (all zero).
+         * p2, k3), as the capability query reports it (OpenCV pinhole
+         * convention); null when not reported (all zero).
          */
         fun distortionOf(camera: StillCameraModel): DoubleArray? {
             val d = camera.distortion

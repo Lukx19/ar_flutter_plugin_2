@@ -22,7 +22,7 @@ internal object IngestMessageLayout {
     val MAGIC = contractMagic("C3VI")
 
     /**
-     * 2 (coordinate frame migration U4b): the header camera pose and the
+     * 2 (canonical coordinate frame): the header camera pose and the
      * photo saved rows are `T_world_cam` (OpenCV camera axes,
      * `opencv_c2w_v1`); version 1 carried the ARCore camera pose axes.
      */
