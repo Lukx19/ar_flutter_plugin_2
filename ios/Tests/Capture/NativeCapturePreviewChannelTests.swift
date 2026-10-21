@@ -44,7 +44,9 @@ final class NativeCapturePreviewChannelTests: XCTestCase {
       reply = value
       done.fulfill()
     }
-    wait(for: [done], timeout: 10)
+    // The channel decodes on its utility queue, which a loaded host starves
+    // (load average 50 to 75: over 10 s per 1200 x 900 preview).
+    wait(for: [done], timeout: 60)
     XCTAssertFalse(reply is FlutterError, "\(method): \(String(describing: reply))")
     return reply
   }
