@@ -270,7 +270,8 @@ void main() {
     normalized.readWorldFromCameraRows(r1);
     expect(r1, r2);
     expect([normalized.cx, normalized.cy], [photoOld.cx, photoOld.cy]);
-    expect(owned.getFloat32(PhotoSavedLayout.intrinsicsOffset + 8, Endian.little),
+    expect(
+        owned.getFloat32(PhotoSavedLayout.intrinsicsOffset + 8, Endian.little),
         photoOld.cx);
   });
 

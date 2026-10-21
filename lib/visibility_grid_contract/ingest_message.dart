@@ -203,7 +203,8 @@ final class IngestMessageView extends ContractRecordView {
 
   /// Whether the stored camera pose is `T_world_cam` (version 2) rather
   /// than the AR camera axes (version 1).
-  bool get storesOpenCvPose => version != IngestHeaderLayout.arCameraPoseVersion;
+  bool get storesOpenCvPose =>
+      version != IngestHeaderLayout.arCameraPoseVersion;
 
   int get kind => u8(IngestHeaderLayout.kindOffset);
   set kind(int v) => setU8(IngestHeaderLayout.kindOffset, v);
