@@ -7,10 +7,11 @@ import 'ingest_message.dart';
 /// ingest message, repeated. Recordings are the replay fixtures for host
 /// tests.
 ///
-/// Version 2 (coordinate frame migration U4b) records ingest contract
-/// version 2 messages (camera poses as `T_world_cam`); version 1 recordings
-/// hold contract version 1 messages (AR camera axes) and stay readable: each
-/// message names its own contract version, which the readers convert.
+/// Version 2 (canonical coordinate frame) records ingest contract version 2
+/// messages (camera poses as `T_world_cam`, pixel-centre principal points);
+/// version 1 recordings hold contract version 1 messages (AR camera axes,
+/// pixel-edge principal points) and stay readable: each message names its
+/// own contract version, which the readers convert.
 abstract final class IngestRecordingLayout {
   static final int magic = contractMagic('C3IR');
   static const int version = 2;

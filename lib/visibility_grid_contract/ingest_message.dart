@@ -111,11 +111,14 @@ abstract final class TrackingResetCause {
 abstract final class IngestHeaderLayout {
   static final int magic = contractMagic('C3VI');
 
-  /// Version 2 (coordinate frame migration U4b): the header camera pose and
-  /// the photo saved rows are `T_world_cam` (OpenCV camera axes,
-  /// `opencv_c2w_v1`). Version 1 messages (recordings made before) carry the
-  /// AR camera axes (ARCore camera pose, ARKit camera transform); readers
-  /// accept both and convert by the message's version.
+  /// Version 2 (canonical coordinate frame): the header camera pose and the
+  /// photo saved rows are `T_world_cam` (OpenCV camera axes,
+  /// `opencv_c2w_v1`), and principal points put pixel centres at integer
+  /// coordinates. Version 1 messages (recordings made before) carry the AR
+  /// camera axes (ARCore camera pose, ARKit camera transform) and principal
+  /// points of the pixel-edge convention (their kernels sampled pixel `u` at
+  /// `u + 0.5`); readers accept both and convert by the message's version
+  /// (pose by `F`, `c = c_v1 - 0.5`).
   static const int version = 2;
 
   /// The version whose camera poses use the AR camera axes.
@@ -277,15 +280,34 @@ final class IngestMessageView extends ContractRecordView {
     }
   }
 
+  /// Stored minus read principal point: 0.5 for a version 1 message, whose
+  /// kernels sampled pixel `u` at `u + 0.5` (so `c = c_v1 - 0.5` gives the
+  /// same rays exactly), 0 for version 2.
+  double get _storedPrincipalPointOffset =>
+      version == IngestHeaderLayout.arCameraPoseVersion ? 0.5 : 0;
+
   double get fx => f32(IngestHeaderLayout.intrinsicsOffset);
   double get fy => f32(IngestHeaderLayout.intrinsicsOffset + 4);
-  double get cx => f32(IngestHeaderLayout.intrinsicsOffset + 8);
-  double get cy => f32(IngestHeaderLayout.intrinsicsOffset + 12);
+
+  /// Principal point with pixel centres at integer coordinates (OpenCV,
+  /// docs/02-architecture.md, Coordinate frames); a version 1 value is
+  /// converted.
+  double get cx =>
+      f32(IngestHeaderLayout.intrinsicsOffset + 8) -
+      _storedPrincipalPointOffset;
+  double get cy =>
+      f32(IngestHeaderLayout.intrinsicsOffset + 12) -
+      _storedPrincipalPointOffset;
+
+  /// Stores pixel-centre intrinsics in this message's version. Set the
+  /// version first.
   void setIntrinsics(double fx, double fy, double cx, double cy) {
     setF32(IngestHeaderLayout.intrinsicsOffset, fx);
     setF32(IngestHeaderLayout.intrinsicsOffset + 4, fy);
-    setF32(IngestHeaderLayout.intrinsicsOffset + 8, cx);
-    setF32(IngestHeaderLayout.intrinsicsOffset + 12, cy);
+    setF32(IngestHeaderLayout.intrinsicsOffset + 8,
+        cx + _storedPrincipalPointOffset);
+    setF32(IngestHeaderLayout.intrinsicsOffset + 12,
+        cy + _storedPrincipalPointOffset);
   }
 
   int get width => u16(IngestHeaderLayout.widthOffset);

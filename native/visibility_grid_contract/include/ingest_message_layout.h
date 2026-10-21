@@ -7,12 +7,15 @@
  * The header pose is the camera pose at the sample timestamp (depth image or
  * point cloud), matched from a pose history, never the current frame pose.
  *
- * Version 2 (coordinate frame migration U4b): `camera_to_world` and the photo
+ * Version 2 (canonical coordinate frame): `camera_to_world` and the photo
  * saved `camera_to_world_rows` are T_world_cam, camera-to-world in the OpenCV
  * camera axes (+X right, +Y down, +Z forward, sensor orientation; tag
- * opencv_c2w_v1). Version 1 messages carried the AR camera axes (ARCore
- * camera pose, ARKit camera transform: +Y up, -Z forward); readers convert
- * them. See docs/02-architecture.md, Coordinate frames.
+ * opencv_c2w_v1), and `intrinsics` put pixel centres at integer coordinates.
+ * Version 1 messages carried the AR camera axes (ARCore camera pose, ARKit
+ * camera transform: +Y up, -Z forward) and a pixel-edge principal point
+ * (their kernels sampled pixel u at u + 0.5); readers convert both (pose by
+ * diag(1, -1, -1, 1), cx = cx_v1 - 0.5, cy = cy_v1 - 0.5). See
+ * docs/02-architecture.md, Coordinate frames.
  */
 #ifndef CAPTURE3D_INGEST_MESSAGE_LAYOUT_H
 #define CAPTURE3D_INGEST_MESSAGE_LAYOUT_H

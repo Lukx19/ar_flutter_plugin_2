@@ -33,8 +33,9 @@ final class PhotoSavedView extends ContractRecordView {
   int get recordBytes => PhotoSavedLayout.bytes;
 
   /// Ingest contract version of the message the event came in: 2 stores the
-  /// camera rows as `T_world_cam` (OpenCV camera axes), 1 (recordings made
-  /// before coordinate frame migration U4b) as the AR camera axes. Set it
+  /// camera rows as `T_world_cam` (OpenCV camera axes) and a pixel-centre
+  /// principal point; 1 (recordings made before the canonical frame) the AR
+  /// camera axes and a pixel-edge principal point (`c_v1 = c + 0.5`). Set it
   /// from the message header when attaching to a received event.
   int contractVersion = photoSavedOpenCvPoseVersion;
 
@@ -102,12 +103,15 @@ final class PhotoSavedView extends ContractRecordView {
     if (!_storesOpenCvPose) _flipStoredColumns();
   }
 
-  /// Rewrites version 1 rows as version 2 (`T_world_cam`) and sets
-  /// [contractVersion]; a no-op for version 2. For owned copies only.
-  void normalizeToOpenCvPose() {
+  /// Rewrites a version 1 event as version 2 (`T_world_cam` rows, pixel
+  /// centre principal point) and sets [contractVersion]; a no-op for
+  /// version 2. For owned copies only.
+  void normalizeToCurrentVersion() {
     if (!_storesOpenCvPose) {
+      final fx = this.fx, fy = this.fy, cx = this.cx, cy = this.cy;
       _flipStoredColumns();
       contractVersion = photoSavedOpenCvPoseVersion;
+      setIntrinsics(fx, fy, cx, cy);
     }
   }
 
@@ -127,15 +131,29 @@ final class PhotoSavedView extends ContractRecordView {
     }
   }
 
+  /// Stored minus read principal point: 0.5 for version 1 (pixel-edge
+  /// convention, `c = c_v1 - 0.5` exactly), 0 for version 2.
+  double get _storedPrincipalPointOffset => _storesOpenCvPose ? 0 : 0.5;
+
   double get fx => f32(PhotoSavedLayout.intrinsicsOffset);
   double get fy => f32(PhotoSavedLayout.intrinsicsOffset + 4);
-  double get cx => f32(PhotoSavedLayout.intrinsicsOffset + 8);
-  double get cy => f32(PhotoSavedLayout.intrinsicsOffset + 12);
+
+  /// Principal point with pixel centres at integer coordinates (OpenCV);
+  /// a version 1 value is converted.
+  double get cx =>
+      f32(PhotoSavedLayout.intrinsicsOffset + 8) - _storedPrincipalPointOffset;
+  double get cy =>
+      f32(PhotoSavedLayout.intrinsicsOffset + 12) -
+      _storedPrincipalPointOffset;
+
+  /// Stores pixel-centre intrinsics in [contractVersion]'s convention.
   void setIntrinsics(double fx, double fy, double cx, double cy) {
     setF32(PhotoSavedLayout.intrinsicsOffset, fx);
     setF32(PhotoSavedLayout.intrinsicsOffset + 4, fy);
-    setF32(PhotoSavedLayout.intrinsicsOffset + 8, cx);
-    setF32(PhotoSavedLayout.intrinsicsOffset + 12, cy);
+    setF32(PhotoSavedLayout.intrinsicsOffset + 8,
+        cx + _storedPrincipalPointOffset);
+    setF32(PhotoSavedLayout.intrinsicsOffset + 12,
+        cy + _storedPrincipalPointOffset);
   }
 
   int get widthDiv8 => u16(PhotoSavedLayout.widthDiv8Offset);

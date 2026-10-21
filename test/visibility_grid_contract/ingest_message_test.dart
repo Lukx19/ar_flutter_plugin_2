@@ -212,6 +212,11 @@ void main() {
       v1.readCameraToWorld(a);
       v2.readCameraToWorld(b);
       expect(a, b, reason: '$name AR camera pose');
+      // Both goldens store the same intrinsics bytes; version 1 meant the
+      // pixel-edge convention, so its principal point reads half a pixel
+      // lower (the same rays its kernels sampled).
+      expect([v1.fx, v1.fy], [v2.fx, v2.fy], reason: name);
+      expect([v1.cx, v1.cy], [v2.cx - 0.5, v2.cy - 0.5], reason: name);
     }
     // The raw version 2 pose is the version 1 pose with camera Y and Z
     // negated.
@@ -239,6 +244,23 @@ void main() {
     photoOld.readWorldFromCameraRows(r1);
     photoNow.readWorldFromCameraRows(r2);
     expect(r1, r2);
+    expect([photoOld.fx, photoOld.fy], [photoNow.fx, photoNow.fy]);
+    expect([photoOld.cx, photoOld.cy], [photoNow.cx - 0.5, photoNow.cy - 0.5]);
+    // An owned copy rewritten as version 2 keeps every reading.
+    final owned = ByteData(PhotoSavedLayout.bytes);
+    for (var i = 0; i < PhotoSavedLayout.bytes; i++) {
+      owned.setUint8(i, photoOld.data.getUint8(photoOld.offset + i));
+    }
+    final normalized = PhotoSavedView()
+      ..attach(owned)
+      ..contractVersion = 1
+      ..normalizeToCurrentVersion();
+    expect(normalized.contractVersion, 2);
+    normalized.readWorldFromCameraRows(r1);
+    expect(r1, r2);
+    expect([normalized.cx, normalized.cy], [photoOld.cx, photoOld.cy]);
+    expect(owned.getFloat32(PhotoSavedLayout.intrinsicsOffset + 8, Endian.little),
+        photoOld.cx);
   });
 
   test('validation rejects magic, version, kind, truncation and size', () {
