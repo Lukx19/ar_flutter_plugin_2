@@ -16,10 +16,12 @@ import simd
 ///
 /// Failures are counted and recorded in the native session log as
 /// `MARKER_DETECTION_FAILED` with the Android data keys: stage `detect`
-/// (no detector, or the detector refused the image; `detectionFailures`) or
-/// stage `capture` (the Y plane could not be read; `captureFailures`), plus
-/// `error`. The variant is `<stage>/<cause>`; repeats are counted by the
-/// session log's flood policy.
+/// (the detector refused the image; `detectionFailures`) or stage `capture`
+/// (an unsupported pixel format or an unreadable Y plane; `captureFailures`),
+/// plus `error`. The variant is `<stage>/<cause>` with a named iOS cause
+/// where Android names the exception class; repeats are counted by the
+/// session log's flood policy. As on Android, an image is skipped silently
+/// while no detector is available (counted only in `detectorUnavailable`).
 final class MarkerFrameTap: ARFrameObserver {
   static let defaultHz = 8
 
@@ -29,8 +31,8 @@ final class MarkerFrameTap: ARFrameObserver {
   private let queue: DispatchQueue
   /// Created on the detection queue at the first image (AprilTag's decode
   /// table of ARUCO_MIP_36h12 takes about 8 MB).
-  private let makeDetector: () -> NativeMarkerDetector?
-  private var detector: NativeMarkerDetector?
+  private let makeDetector: () -> MarkerFrameDetector?
+  private var detector: MarkerFrameDetector?
   private let writer = MarkerDetectionMessageWriter()
   private let sessionLog: NativeSessionLogEmitter
 
@@ -46,12 +48,13 @@ final class MarkerFrameTap: ARFrameObserver {
     var messages = 0
     var refused = 0
     var skippedBusy = 0
-    var unsupportedImages = 0
+    /// Images skipped because no detector could be created (not a failure, as on Android).
+    var detectorUnavailable = 0
     /// All failures: [detectionFailures] plus [captureFailures].
     var failures = 0
-    /// No detector, or the detector refused the image.
+    /// The detector refused the image.
     var detectionFailures = 0
-    /// The image plane could not be read.
+    /// The image could not be read (unsupported pixel format or no Y plane).
     var captureFailures = 0
   }
 
@@ -59,7 +62,7 @@ final class MarkerFrameTap: ARFrameObserver {
   var snapshot: Counters { lock.lock(); defer { lock.unlock() }; return counters }
 
   init(
-    makeDetector: @escaping () -> NativeMarkerDetector?, settings: @escaping () -> MarkerDetectionSettings?,
+    makeDetector: @escaping () -> MarkerFrameDetector?, settings: @escaping () -> MarkerDetectionSettings?,
     sink: @escaping () -> IngestMessageSink?, clock: IngestClock,
     queue: DispatchQueue = DispatchQueue(label: "capture3d.markers.detect", qos: .utility),
     sessionLog: NativeSessionLogEmitter = .shared
@@ -96,9 +99,19 @@ final class MarkerFrameTap: ARFrameObserver {
       || format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
       || format == kCVPixelFormatType_OneComponent8
     else {
-      counters.unsupportedImages += 1
+      // An image the tap cannot read: Android's capture failure. The failed
+      // attempt waits one period; the session log is called after unlocking.
+      counters.failures += 1
+      counters.captureFailures += 1
+      let failures = counters.captureFailures
       lastStartNs = ts
       lock.unlock()
+      sessionLog.failure(
+        NativeSessionLogCodes.markerDetectionFailed, variant: "capture/UnsupportedFormat",
+        message: "Marker image capture failed"
+      ) {
+        ["stage": "capture", "captureFailures": failures, "error": fourCharacterCode(format)]
+      }
       return
     }
     busy = true
@@ -137,14 +150,15 @@ final class MarkerFrameTap: ARFrameObserver {
   func detect(_ image: CVPixelBuffer, header: MarkerDetectionHeader, markerSize: Float) {
     if detector == nil {
       detector = makeDetector()
-      detector?.setQuality()
+      detector?.setFrameQuality()
     }
     guard let detector else {
-      detectionFailed(cause: "DetectorUnavailable", error: "marker detector could not be created", countsImage: false)
+      // Skipped silently, as Android skips while the detector is unavailable.
+      lock.lock(); counters.detectorUnavailable += 1; lock.unlock()
       return
     }
     if markerSize > 0, markerSize != appliedSize {
-      detector.setMarkerSize(Double(markerSize))
+      detector.setFrameMarkerSize(Double(markerSize))
       appliedSize = markerSize
     }
     CVPixelBufferLockBaseAddress(image, .readOnly)
@@ -175,11 +189,11 @@ final class MarkerFrameTap: ARFrameObserver {
     h.intrinsics = simd_float4(k.x * sx, k.y * sy, (k.z + 0.5) * sx - 0.5, (k.w + 0.5) * sy - 0.5)
     h.imageWidth = width
     h.imageHeight = height
-    detector.setCamera(fx: Double(h.intrinsics.x), fy: Double(h.intrinsics.y), cx: Double(h.intrinsics.z),
-                       cy: Double(h.intrinsics.w))
+    detector.setFrameCamera(fx: Double(h.intrinsics.x), fy: Double(h.intrinsics.y), cx: Double(h.intrinsics.z),
+                            cy: Double(h.intrinsics.w))
     let count = detector.detect(UnsafePointer(grey), width: width, height: height, stride: stride)
     guard count >= 0 else {
-      detectionFailed(cause: "DetectFailed", error: "detector returned \(count)", countsImage: true)
+      detectionFailed(cause: "DetectFailed", error: "detector returned \(count)")
       return
     }
     if count > 0 { detector.estimatePose() }
@@ -192,9 +206,9 @@ final class MarkerFrameTap: ARFrameObserver {
   }
 
   /// Utility queue: counts a detection failure and records it (stage `detect`).
-  private func detectionFailed(cause: String, error: String, countsImage: Bool) {
+  private func detectionFailed(cause: String, error: String) {
     lock.lock()
-    if countsImage { counters.images += 1 }
+    counters.images += 1
     counters.failures += 1
     counters.detectionFailures += 1
     let failures = counters.detectionFailures
@@ -205,4 +219,32 @@ final class MarkerFrameTap: ARFrameObserver {
       ["stage": "detect", "detectionFailures": failures, "error": error]
     }
   }
+}
+
+/// The detector calls of the frame tap ([NativeMarkerDetector] in
+/// production; tests inject a fake to drive detection failures).
+protocol MarkerFrameDetector: AnyObject {
+  /// Applies the tap's default quality thresholds.
+  func setFrameQuality()
+  func setFrameMarkerSize(_ metres: Double)
+  func setFrameCamera(fx: Double, fy: Double, cx: Double, cy: Double)
+  /// Detects on a grey image read in place; returns the count or a negative status.
+  func detect(_ grey: UnsafePointer<UInt8>, width: Int, height: Int, stride: Int) -> Int32
+  @discardableResult
+  func estimatePose() -> Int32
+  /// The 64 B contract records of the last detection.
+  var records: UnsafeRawPointer { get }
+}
+
+extension NativeMarkerDetector: MarkerFrameDetector {
+  func setFrameQuality() { setQuality() }
+  func setFrameMarkerSize(_ metres: Double) { setMarkerSize(metres) }
+  func setFrameCamera(fx: Double, fy: Double, cx: Double, cy: Double) { setCamera(fx: fx, fy: fy, cx: cx, cy: cy) }
+}
+
+/// The four-character code of a pixel format (for example `BGRA`), or its number.
+func fourCharacterCode(_ format: OSType) -> String {
+  let bytes = [24, 16, 8, 0].map { UInt8((format >> $0) & 0xff) }
+  guard bytes.allSatisfy({ $0 >= 0x20 && $0 < 0x7f }) else { return "\(format)" }
+  return String(decoding: bytes, as: UTF8.self)
 }

@@ -7,7 +7,8 @@ import UIKit
 /// the capture view's overlay slot share it. Created on first registration
 /// with the system Metal device; without Metal there is no renderer and the
 /// render channel answers 3 (no renderer attached) and records why
-/// ([recordUnavailable]).
+/// ([recordUnavailable]). A failed creation is retried by the next engine
+/// registration.
 final class GridRendererRegistry {
   static let shared = GridRendererRegistry()
 
@@ -16,6 +17,8 @@ final class GridRendererRegistry {
   private var current: GridRendererHost?
   private var overlay: GridRendererOverlay?
   private var unavailable: String?
+  /// Failed renderer creations so far (registry lock).
+  private var creationFailures = 0
   private let makeHost: () throws -> GridRendererHost?
   private let sessionLog: NativeSessionLogEmitter
 
@@ -38,21 +41,27 @@ final class GridRendererRegistry {
     return current
   }
 
-  /// Creates the renderer once and installs it in the capture view overlay slot.
+  /// Creates the renderer once and installs it in the capture view overlay
+  /// slot; after a failed creation the next call tries again.
   func ensureHost() {
     lock.lock()
     if created {
       lock.unlock()
       return
     }
-    created = true
     var made: GridRendererHost?
     do {
       made = try makeHost()
       if made == nil { unavailable = "no Metal device" }
     } catch {
       unavailable = "\(error)"
-      NSLog("[GridRenderer] renderer unavailable: %@", "\(error)")
+    }
+    if made == nil {
+      creationFailures += 1
+      NSLog("[GridRenderer] renderer unavailable: %@", unavailable ?? "")
+    } else {
+      created = true
+      unavailable = nil
     }
     current = made
     let adapter = made.map { GridRendererOverlay(host: $0) }
@@ -64,30 +73,34 @@ final class GridRendererRegistry {
     if Thread.isMainThread { install() } else { DispatchQueue.main.async(execute: install) }
   }
 
-  /// Reports every failure of [host] to the system log and to the native
-  /// session log as `RENDERER_FAILED` (variant: the failed stage; data
-  /// `stage`, `rendererFailures`, `error`), the counterpart of the Android
-  /// render thread failure. Repeats are counted by the flood policy.
+  /// Reports every failure of [host] to the system log (with the error) and
+  /// to the native session log as `RENDERER_FAILED`, the counterpart of the
+  /// Android render thread failure: the variant is the failed stage (iOS has
+  /// no render thread) and the data is Android's only key,
+  /// `renderThreadFailures`, the host's running failure count. Repeats are
+  /// counted by the flood policy.
   static func recordFailures(of host: GridRendererHost, sessionLog: NativeSessionLogEmitter) {
     host.onFailure = { failure in
       NSLog("[GridRenderer] renderer failed at %@: %@", failure.stage, failure.error)
       sessionLog.failure(NativeSessionLogCodes.rendererFailed, variant: failure.stage, message: "Grid renderer failed") {
-        ["stage": failure.stage, "rendererFailures": failure.failures, "error": failure.error]
+        ["renderThreadFailures": failure.failures]
       }
     }
   }
 
   /// A render message found no renderer because creation failed: recorded as
-  /// `RENDERER_FAILED` (variant and stage `create`) while a session log is
-  /// open, so a grid that never draws is explained; the flood policy counts
-  /// the repeats. Nothing is recorded before creation or with a renderer.
+  /// `RENDERER_FAILED` (variant `create`, data `renderThreadFailures`: the
+  /// running count of failed creations) while a session log is open, so a
+  /// grid that never draws is explained; creation can precede the open log.
+  /// The flood policy counts the repeats. Nothing is recorded before a
+  /// creation or with a renderer.
   func recordUnavailable() {
     lock.lock()
-    let reason = current == nil ? unavailable : nil
+    let failures = current == nil ? creationFailures : 0
     lock.unlock()
-    guard let reason else { return }
+    guard failures > 0 else { return }
     sessionLog.failure(NativeSessionLogCodes.rendererFailed, variant: "create", message: "Grid renderer unavailable") {
-      ["stage": "create", "rendererFailures": 1, "error": reason]
+      ["renderThreadFailures": failures]
     }
   }
 }

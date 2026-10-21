@@ -69,7 +69,7 @@ final class GridRendererChannelTests: XCTestCase {
     XCTAssertEqual(GridRendererChannels.renderStatus(reset, host: host), GridRendererStatus.rendererFailed)
   }
 
-  func testRendererFailuresAreRecordedAsRendererFailedPerStage() throws {
+  func testRendererFailuresAreRecordedPerStageWithTheAndroidKeyOnly() throws {
     guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("no Metal device") }
     let host = try GridRendererHost(device: device)
     let log = NativeSessionLogEmitter(buffer: NativeSessionLogBuffer(nowNs: { 1 }))
@@ -84,25 +84,33 @@ final class GridRendererChannelTests: XCTestCase {
     XCTAssertEqual(records.count, 3)
     XCTAssertEqual(records.map { $0[0] as? String }, ["F", "F", "C"])
     XCTAssertEqual(records.map { $0[1] as? String }, Array(repeating: "RENDERER_FAILED", count: 3))
-    XCTAssertEqual(records[0][5] as? String, "upload")
+    XCTAssertEqual(records[0][3] as? String, "Grid renderer failed")
+    XCTAssertEqual(records[0][5] as? String, "upload", "the variant is the failed stage")
     XCTAssertEqual(records[1][5] as? String, "pipelines", "a new stage is a new variant, written in full")
-    let data = try XCTUnwrap(records[0][4] as? [String: Any])
-    XCTAssertEqual(data["stage"] as? String, "upload")
-    XCTAssertEqual(data["rendererFailures"] as? Int, 2)
-    XCTAssertEqual(data["error"] as? String, "allocation failed")
+    for (record, count) in zip(records[0...1], [2, 3]) {
+      let data = try XCTUnwrap(record[4] as? [String: Any])
+      // Android's only RENDERER_FAILED key; the error text goes to the system log only.
+      XCTAssertEqual(Set(data.keys), ["renderThreadFailures"])
+      XCTAssertEqual(data["renderThreadFailures"] as? Int, count, "running failure count")
+      for absent in ["stage", "rendererFailures", "error"] { XCTAssertNil(data[absent]) }
+    }
     XCTAssertEqual(records[2][2] as? Int, 1, "the repeated stage within the flood interval is counted")
   }
 
-  func testARendererThatCouldNotBeCreatedIsRecordedOnRenderMessages() throws {
+  func testFailedRendererCreationsAreCountedAndRecordedOnRenderMessages() throws {
     struct CreationFailed: Error {}
     let log = NativeSessionLogEmitter(buffer: NativeSessionLogBuffer(nowNs: { 1 }))
     log.setActive(true)
-    let registry = GridRendererRegistry(makeHost: { throw CreationFailed() }, sessionLog: log)
+    var attempts = 0
+    let registry = GridRendererRegistry(makeHost: { attempts += 1; throw CreationFailed() }, sessionLog: log)
     let channels = GridRendererChannels(registry: registry)
-    let messenger = TaskQueueRecordingMessenger()
-    channels.register(messenger: messenger)
+    let first = TaskQueueRecordingMessenger()
+    let second = TaskQueueRecordingMessenger()
+    channels.register(messenger: first)
+    channels.register(messenger: second)
+    XCTAssertEqual(attempts, 2, "a failed creation is retried by the next engine registration")
     XCTAssertNil(registry.host)
-    let render = try XCTUnwrap(messenger.handlers[GridRendererChannelNames.render])
+    let render = try XCTUnwrap(second.handlers[GridRendererChannelNames.render])
     writer.begin(RendererDeltaLayout.kindReset, firstSlot: 0, records: 0, capacity: 64, brickKey: 0)
     let reset = writer.message
     var replies: [Data?] = []
@@ -115,10 +123,10 @@ final class GridRendererChannelTests: XCTestCase {
     XCTAssertEqual(records[0][3] as? String, "Grid renderer unavailable")
     XCTAssertEqual(records[0][5] as? String, "create")
     let data = try XCTUnwrap(records[0][4] as? [String: Any])
-    XCTAssertEqual(data["stage"] as? String, "create")
-    XCTAssertEqual(data["error"] as? String, "CreationFailed()")
+    XCTAssertEqual(Set(data.keys), ["renderThreadFailures"])
+    XCTAssertEqual(data["renderThreadFailures"] as? Int, 2, "running count of failed creations")
     XCTAssertEqual(records[1][0] as? String, "C")
-    channels.unregister(messenger: messenger)
+    channels.unregister(messenger: second)
   }
 
   func testDetachingAnEngineReleasesOnlyItsOwnHandlers() {
