@@ -64,16 +64,18 @@ class PoseBatchDispatcherTest {
         assertEquals(1, sent.size)
         assertEquals(2, sent[0]["sampleCount"])
         assertEquals(listOf(1L, 2L), sequences(sent[0]["sampleBytes"] as ByteArray))
-
-        // The flush scheduled for sample 1 finds nothing pending.
-        flushes.removeAt(0).run()
-        assertEquals(1, sent.size)
+        // Sending the pair cancels the flush scheduled for sample 1.
+        assertEquals(0, flushes.size)
 
         results[0].success(null)
         dispatcher.offer(sample(3))
+        // Sample 3 is held with a newly scheduled, full hold delay.
+        assertEquals(1, flushes.size)
+        assertEquals(1, sent.size)
         dispatcher.offer(sample(4))
         assertEquals(2, sent.size)
         assertEquals(listOf(3L, 4L), sequences(sent[1]["sampleBytes"] as ByteArray))
+        assertEquals(0, flushes.size)
     }
 
     @Test

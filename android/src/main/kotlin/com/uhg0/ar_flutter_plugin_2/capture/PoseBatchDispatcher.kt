@@ -10,7 +10,8 @@ import io.flutter.plugin.common.MethodChannel
  * one, an idle dispatcher holds samples until that many are pending, which
  * divides the number of pose-channel sends by [samplesPerSend]. A held sample
  * is sent at most one [scheduleFlush] delay after it was held: the flush sends
- * whatever is pending. Samples keep their order and the drop-oldest and
+ * whatever is pending, and every send cancels a scheduled flush so each held
+ * sample waits a full delay for its pair. Samples keep their order and the drop-oldest and
  * one-in-flight rules are unchanged. All calls run on one thread (the main
  * looper in `ArView`).
  */
@@ -74,6 +75,11 @@ internal class PoseBatchDispatcher(
                 scheduleFlush!!(flushTask)
             }
             return
+        }
+        if (flushScheduled) {
+            // The next held sample gets its own full hold delay.
+            flushScheduled = false
+            cancelFlush!!(flushTask)
         }
         val count = pending.size
         val batch = if (count == 1) pending.removeFirst() else {
