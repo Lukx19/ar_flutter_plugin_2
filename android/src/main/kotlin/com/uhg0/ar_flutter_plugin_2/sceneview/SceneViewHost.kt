@@ -84,6 +84,8 @@ import io.github.sceneview.model.model
 import io.github.sceneview.node.Node
 import io.github.sceneview.node.RenderableNode
 import io.github.sceneview.node.MeshNode
+import io.github.sceneview.createARView
+import io.github.sceneview.rememberARView
 import io.github.sceneview.rememberEngine
 import io.github.sceneview.rememberEnvironmentLoader
 import io.github.sceneview.rememberMaterialLoader
@@ -473,6 +475,9 @@ internal class SceneViewHost(
             val materialLoader = rememberMaterialLoader(engine)
             val environmentLoader = rememberEnvironmentLoader(engine)
             val cameraStream = rememberARCameraStream(materialLoader)
+            val filamentView = rememberARView(engine) {
+                createARView(engine).also(::configureCapturePresentation)
+            }
             val config = configState.value
             val environment = remember(environmentLoader) {
                 checkNotNull(
@@ -508,6 +513,7 @@ internal class SceneViewHost(
                 environmentLoader = environmentLoader,
                 environment = environment,
                 cameraStream = cameraStream,
+                view = filamentView,
                 renderer = renderer,
                 lifecycle = sceneRenderLifecycle.lifecycle,
                 sessionFeatures = sessionFeatures,
@@ -532,7 +538,7 @@ internal class SceneViewHost(
                             depthSupportForInput(depthInputEnabled, session::isDepthModeSupported),
                         )
                     arConfig.instantPlacementMode = Config.InstantPlacementMode.DISABLED
-                    arConfig.lightEstimationMode = Config.LightEstimationMode.ENVIRONMENTAL_HDR
+                    arConfig.lightEstimationMode = CAPTURE_LIGHT_ESTIMATION_MODE
                     arConfig.focusMode = Config.FocusMode.AUTO
                     arConfig.planeFindingMode = config.planeFindingMode
                     arConfig.cloudAnchorMode = if (config.cloudAnchorEnabled) {
@@ -2393,6 +2399,33 @@ internal data class SceneRendererPressureSnapshot(
     val renderer: RendererPressureSnapshot,
     val pages: RendererPageFramePressureSnapshot,
 )
+
+/**
+ * Light estimation the capture session asks ARCore for. The production
+ * capture screen draws only unlit content (camera background, unlit coverage
+ * and origin markers, the grid renderer's own GL overlay) and nothing reads
+ * the estimate. ENVIRONMENTAL_HDR cost ARCore an HDR estimate and SceneView a
+ * light and indirect-light update on the main thread every frame (Galaxy A40
+ * profile: `LightEstimator.update` and `LightNode` samples in
+ * `.scratch/workflow/a40-perf2/runs/A-still-perf`). Re-enable it if the
+ * plugin's lit paths are wired into capture: `addNode` glTF models,
+ * `ImageNode` plane textures or SceneView planes (`showPlanes`).
+ */
+internal val CAPTURE_LIGHT_ESTIMATION_MODE: Config.LightEstimationMode = Config.LightEstimationMode.DISABLED
+
+/**
+ * Filament view settings for the capture preview: SceneView's AR view
+ * defaults without the FXAA pass and shadow maps, which the unlit capture
+ * content does not use (Galaxy A40 paired runs AB, AB3 and RB in
+ * `.scratch/workflow/a40-perf2/table.md`: fewer >100 ms camera gaps and a
+ * lower p95 interval). Post-processing itself stays on: the camera stream
+ * material inverts the Filmic tone mapper and needs it for correct colors.
+ * Restore shadows if shadow-receiving planes (`showPlanes`) are used.
+ */
+internal fun configureCapturePresentation(view: com.google.android.filament.View) {
+    view.antiAliasing = com.google.android.filament.View.AntiAliasing.NONE
+    view.setShadowingEnabled(false)
+}
 
 internal fun selectVisibilityGridDepthMode(
     isSupported: (Config.DepthMode) -> Boolean,
