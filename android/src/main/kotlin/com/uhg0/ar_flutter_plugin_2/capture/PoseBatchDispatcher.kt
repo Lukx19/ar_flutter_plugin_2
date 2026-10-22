@@ -11,9 +11,9 @@ import io.flutter.plugin.common.MethodChannel
  * divides the number of pose-channel sends by [samplesPerSend]. A held sample
  * is sent at most one [scheduleFlush] delay after it was held: the flush sends
  * whatever is pending, and every send cancels a scheduled flush so each held
- * sample waits a full delay for its pair. Samples keep their order and the drop-oldest and
- * one-in-flight rules are unchanged. All calls run on one thread (the main
- * looper in `ArView`).
+ * sample waits a full delay for its pair. Samples keep their order and the
+ * drop-oldest and one-in-flight rules are unchanged. All calls run on one
+ * thread (the main looper in `ArView`).
  */
 internal class PoseBatchDispatcher(
     private val send: (String, Map<String, Any?>, MethodChannel.Result) -> Unit,
