@@ -3,6 +3,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import '../models/camera_resolution.dart';
 import '../models/ar_capture_config.dart';
+import '../models/ar_session_inputs.dart';
 import '../models/ar_camera_intrinsics.dart';
 import '../datatypes/image_format.dart';
 
@@ -83,6 +84,29 @@ class ARCameraCapabilities {
           ),
         )
         .toList(growable: false);
+  }
+
+  /// AR camera tiers of rear camera [cameraId] (null: ARCore's default):
+  /// the ARCore configs of the running or last AR session when known,
+  /// otherwise a temporary ARCore session (call it then only while no AR
+  /// view is active). [ARCameraResolutionChoices.unknown] off Android or
+  /// when ARCore cannot answer.
+  Future<ARCameraResolutionChoices> getArCameraResolutions({
+    String? cameraId,
+  }) async {
+    if (!isSupported) return ARCameraResolutionChoices.unknown;
+    try {
+      return ARCameraResolutionChoices.fromArCoreReply(
+        await _channel.invokeMethod<Object?>(
+          'getArCameraResolutions',
+          <String, dynamic>{'cameraId': cameraId},
+        ),
+      );
+    } on PlatformException {
+      return ARCameraResolutionChoices.unknown;
+    } on MissingPluginException {
+      return ARCameraResolutionChoices.unknown;
+    }
   }
 
   Future<void> saveSharedCameraUnsupported(String reason) async {

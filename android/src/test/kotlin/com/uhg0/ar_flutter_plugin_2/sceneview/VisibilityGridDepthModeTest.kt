@@ -90,4 +90,17 @@ class VisibilityGridDepthModeTest {
         }
         assertEquals(4, probes)
     }
+
+    @Test
+    fun `depth input off selects DISABLED on a depth-capable device`() {
+        val all: (com.google.ar.core.Config.DepthMode) -> Boolean = { true }
+        assertEquals(
+            com.google.ar.core.Config.DepthMode.AUTOMATIC,
+            selectVisibilityGridDepthMode(depthSupportForInput(true, all)),
+        )
+        assertEquals(
+            com.google.ar.core.Config.DepthMode.DISABLED,
+            selectVisibilityGridDepthMode(depthSupportForInput(false, all)),
+        )
+    }
 }

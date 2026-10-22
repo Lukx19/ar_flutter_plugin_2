@@ -42,6 +42,8 @@ class MethodChannelARCameraCapabilities(private val context: Context) : MethodCa
                     result.success(capabilityQuerier.getDeviceCapabilityProfile())
                 "getSelectableRearCameras" ->
                     result.success(capabilityQuerier.getSelectableRearCameras())
+                "getArCameraResolutions" ->
+                    result.success(capabilityQuerier.getArCameraResolutions(call.argument<String>("cameraId")))
                 "getARCoreAvailability" -> {
                     val availability = ArCoreApk.getInstance().checkAvailability(context)
                     result.success(

@@ -91,6 +91,56 @@ final class ARCameraCapabilitiesTests: XCTestCase {
     XCTAssertNil(fallback.videoFormat)
   }
 
+  func testPlanChoosesTheCameraTierFormatUnlessStillsNeedTheRecommendedOne() {
+    func format(_ width: Int, _ height: Int, _ fps: Int, device: String = ARSessionConfigurationPlan.wideAngleDeviceType)
+      -> ARVideoFormatDescription {
+      ARVideoFormatDescription(
+        width: width, height: height, framesPerSecond: fps, captureDeviceType: device,
+        isRecommendedForHighResolutionFrameCapturing: false, isVideoHDRSupported: false)
+    }
+    let p1080 = format(1920, 1080, 60)
+    let p720 = format(1280, 720, 60)
+    let p720Slow = format(1280, 720, 30)
+    let fourThree1080 = format(1440, 1080, 60)
+    let ultraWide = format(640, 480, 60, device: "AVCaptureDeviceTypeBuiltInUltraWideCamera")
+    var capabilities = ARCameraCapabilitiesTests.capabilities(lidar: true, highResolution: true)
+    capabilities.videoFormats = [
+      ARCameraCapabilitiesTests.highResolutionFormat, p1080, p720Slow, p720, fourThree1080, ultraWide,
+    ]
+
+    // Points-only (no scene depth): any aspect.
+    var options = ARSessionOptions(creationParams: ["maxCameraImageHeight": 720, "sceneDepth": false])
+    XCTAssertEqual(options.maxVideoHeight, 720)
+    XCTAssertEqual(ARSessionConfigurationPlan(options: options, capabilities: capabilities).videoFormat, p720)
+    options.maxVideoHeight = 1080
+    XCTAssertEqual(ARSessionConfigurationPlan(options: options, capabilities: capabilities).videoFormat, p1080)
+    options.maxVideoHeight = 480
+    XCTAssertNil(
+      ARSessionConfigurationPlan(options: options, capabilities: capabilities).videoFormat,
+      "no wide-angle format fits: ARKit's default stays")
+
+    // Scene depth on: only the default's 4:3 aspect.
+    var depth = ARSessionOptions()
+    depth.maxVideoHeight = 1080
+    XCTAssertEqual(ARSessionConfigurationPlan(options: depth, capabilities: capabilities).videoFormat, fourThree1080)
+    depth.maxVideoHeight = 720
+    XCTAssertNil(ARSessionConfigurationPlan(options: depth, capabilities: capabilities).videoFormat)
+
+    // A tier never raises the format above ARKit's default.
+    var smallDefault = capabilities
+    smallDefault.videoFormats = [p720Slow, p1080]
+    options.maxVideoHeight = 1080
+    XCTAssertNil(ARSessionConfigurationPlan(options: options, capabilities: smallDefault).videoFormat)
+
+    // High-resolution stills keep the recommended format and ignore the tier.
+    var stills = options
+    stills.highResolutionFrameCapture = true
+    let plan = ARSessionConfigurationPlan(options: stills, capabilities: capabilities)
+    XCTAssertEqual(plan.videoFormat, ARCameraCapabilitiesTests.highResolutionFormat)
+    XCTAssertTrue(plan.highResolutionFrameCapture)
+    XCTAssertEqual(ARSessionOptions(creationParams: ["maxCameraImageHeight": 0]).maxVideoHeight, 0)
+  }
+
   func testPlanConfigurationIsGravityAlignedWithoutPlanes() {
     var options = ARSessionOptions()
     options.sceneDepth = false

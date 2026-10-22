@@ -3,6 +3,7 @@ import 'package:ar_flutter_plugin_2/datatypes/image_format.dart';
 import 'package:ar_flutter_plugin_2/managers/ar_session_manager.dart';
 import 'package:ar_flutter_plugin_2/models/ar_capture_config.dart';
 import 'package:ar_flutter_plugin_2/models/ar_playback_config.dart';
+import 'package:ar_flutter_plugin_2/models/ar_session_inputs.dart';
 import 'package:ar_flutter_plugin_2/models/camera_resolution.dart';
 import 'package:ar_flutter_plugin_2/widgets/ar_view.dart';
 import 'package:flutter/material.dart';
@@ -70,6 +71,8 @@ void main() {
         'enableHighResCapture': true,
         'retainAssessedOriginals': false,
         'rearCameraId': '0',
+        'depthInputEnabled': true,
+        'maxCameraImageHeight': 0,
       });
       expect(createdIds, [arguments['id']]);
       final surface =
@@ -111,6 +114,27 @@ void main() {
   }, variant: TargetPlatformVariant.only(TargetPlatform.android));
 
   testWidgets(
+      'Android session inputs reach native creation and a change recreates the view',
+      (tester) async {
+    final ids = <int>[];
+    await tester.pumpWidget(_view(AndroidARView(), ids));
+    await tester.pumpAndSettle();
+    const inputs = ARSessionInputs(
+        depthInputEnabled: false, cameraResolution: ARCameraResolution.p720);
+    await tester.pumpWidget(_view(AndroidARView(), ids, sessionInputs: inputs));
+    await tester.pumpAndSettle();
+    expect(ids, hasLength(2), reason: 'a new AR session');
+    final params = const StandardMessageCodec().decodeMessage(ByteData.sublistView(
+      (calls.where((call) => call.method == 'create').last.arguments
+          as Map<Object?, Object?>)['params']! as Uint8List,
+    )) as Map<Object?, Object?>;
+    expect(params['depthInputEnabled'], isFalse);
+    expect(params['maxCameraImageHeight'], 720);
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pumpAndSettle();
+  }, variant: TargetPlatformVariant.only(TargetPlatform.android));
+
+  testWidgets(
       'Android playback passes the dataset and a restart generation recreates the view',
       (tester) async {
     final ids = <int>[];
@@ -129,6 +153,8 @@ void main() {
       'enableHighResCapture': true,
       'retainAssessedOriginals': false,
       'rearCameraId': '0',
+      'depthInputEnabled': true,
+      'maxCameraImageHeight': 0,
       'arcorePlaybackDataset': 'recordings/walk1.mp4',
       'arcorePlaybackRestart': 'view',
       'arcorePlaybackRestartGeneration': 0,
@@ -201,6 +227,7 @@ void main() {
 Widget _view(AndroidARView view, List<int> createdIds,
         {bool retainAssessedOriginals = false,
         ARPlaybackConfig? playback,
+        ARSessionInputs sessionInputs = const ARSessionInputs(),
         void Function(ARSessionManager session)? onSession}) =>
     MaterialApp(
       home: Builder(
@@ -215,6 +242,7 @@ Widget _view(AndroidARView view, List<int> createdIds,
                 ),
                 rearCameraId: '0',
                 playback: playback,
+                sessionInputs: sessionInputs,
                 arViewCreatedCallback: (session, objects, anchors, location) {
                   createdIds.add(session.channelId);
                   onSession?.call(session);

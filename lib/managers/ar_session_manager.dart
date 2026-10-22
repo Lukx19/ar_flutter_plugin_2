@@ -747,6 +747,22 @@ class ARSessionManager {
         const <String, Object?>{};
   }
 
+  /// Returns only the camera frame cadence of this AR view
+  /// (`cameraMedianFps`, `cameraMedianFrameIntervalMs`, `cameraFrameSampleCount`,
+  /// `cameraFrameGapsOver50Ms`, `cameraFrameGapsOver100Ms`). Much cheaper
+  /// than [getRendererPerformanceSnapshot] on the platform thread, for
+  /// periodic diagnostics. Android only; other platforms reply empty.
+  Future<Map<String, Object?>> getCameraCadenceSnapshot() async {
+    try {
+      return await _channel.invokeMapMethod<String, Object?>(
+            'getCameraCadenceSnapshot',
+          ) ??
+          const <String, Object?>{};
+    } on MissingPluginException {
+      return const <String, Object?>{};
+    }
+  }
+
   /// Returns the given anchor pose in Matrix4 format with respect to the world coordinate system of the [ARView]
   Future<Matrix4?> getPose(ARAnchor anchor) async {
     try {
