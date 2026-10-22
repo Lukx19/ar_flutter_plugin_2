@@ -69,9 +69,11 @@ class ARCameraCapabilities {
 
   /// Enumerates rear cameras that ARCore itself permits for a new session.
   ///
-  /// This expensive Android-only probe must only be called while no AR view is
-  /// active; it is intentionally exposed for the Settings route rather than
-  /// included in the background capability profile.
+  /// This expensive Android-only probe opens a temporary ARCore session only
+  /// while no AR view is open; with one open (Settings pushed over a running
+  /// capture) the native side returns the last enumeration, or none. It is
+  /// exposed for the Settings route rather than included in the background
+  /// capability profile.
   Future<List<RearCameraOption>> getSelectableRearCameras() async {
     if (!isSupported) return const [];
     final result = await _channel.invokeListMethod<dynamic>(
@@ -88,8 +90,9 @@ class ARCameraCapabilities {
 
   /// AR camera tiers of rear camera [cameraId] (null: ARCore's default):
   /// the ARCore configs of the running or last AR session when known,
-  /// otherwise a temporary ARCore session (call it then only while no AR
-  /// view is active). [ARCameraResolutionChoices.unknown] off Android or
+  /// otherwise a temporary ARCore session, which the native side opens only
+  /// while no AR view is open. [ARCameraResolutionChoices.unknown] (Auto
+  /// only) off Android, over a running capture without recorded configs, or
   /// when ARCore cannot answer.
   Future<ARCameraResolutionChoices> getArCameraResolutions({
     String? cameraId,
