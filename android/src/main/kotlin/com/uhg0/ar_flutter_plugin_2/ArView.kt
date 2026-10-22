@@ -127,6 +127,7 @@ internal class ArView(
         },
         samplesPerSend = POSE_SAMPLES_PER_SEND,
         scheduleFlush = { flush -> poseFlushHandler.postDelayed(flush, POSE_MAX_HOLD_MS) },
+        cancelFlush = poseFlushHandler::removeCallbacks,
     )
     private val nodeRecords = mutableMapOf<String, PluginNodeRecord>()
     private val nodeAnchorIds = mutableMapOf<String, String>()
@@ -510,7 +511,7 @@ internal class ArView(
     }
 
     private fun disposeAfterResumeDrained() {
-        poseBatchDispatcher.clear()
+        poseBatchDispatcher.close()
         prepareForDispose { result ->
             if (result.isFailure) {
                 Log.e("ArView", "Disposal drain failed; AR session and owners retained", result.exceptionOrNull())
@@ -1614,12 +1615,13 @@ internal class ArView(
 
     private companion object {
         /**
-         * Two 30 Hz camera poses per pose-channel send halve the main-thread
-         * channel cost; the first pose of a pair arrives one camera frame later.
+         * Two camera poses per pose-channel send halve the number of sends. At
+         * 30 Hz the first pose of a pair normally reaches Dart one camera frame
+         * later; below about 20 Hz each pose waits the full hold and goes alone.
          */
         const val POSE_SAMPLES_PER_SEND = 2
 
-        /** A held pose is sent alone after this delay (1.5 camera frames at 30 Hz). */
+        /** A held pose is sent at most this long after it is held (1.5 camera frames at 30 Hz). */
         const val POSE_MAX_HOLD_MS = 50L
 
         fun defaultSessionConfig() = PluginSessionConfig(

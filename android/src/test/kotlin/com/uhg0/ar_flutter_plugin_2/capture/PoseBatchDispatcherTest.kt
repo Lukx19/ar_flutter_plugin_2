@@ -2,6 +2,7 @@ package com.uhg0.ar_flutter_plugin_2.capture
 
 import io.flutter.plugin.common.MethodChannel
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertThrows
 import org.junit.Test
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -30,19 +31,18 @@ class PoseBatchDispatcherTest {
     }
 
     @Test
-    fun `clear drops pending samples while old acknowledged payload remains immutable`() {
+    fun `close drops pending samples and later acknowledgements send nothing`() {
         val sent = mutableListOf<Map<String, Any?>>()
         val results = mutableListOf<MethodChannel.Result>()
         val dispatcher = PoseBatchDispatcher({ _, arguments, result -> sent += arguments; results += result })
         dispatcher.offer(sample(1))
         dispatcher.offer(sample(2))
-        dispatcher.clear()
+        val inFlightPayload = sent[0]["sampleBytes"] as ByteArray
+        dispatcher.close()
         dispatcher.offer(sample(3))
         results[0].error("cancelled", null, null)
-        assertEquals(2, sent.size)
-        assertEquals(3L, sequence(sent[1]["sampleBytes"] as ByteArray))
-        assertEquals(1L, sequence(sent[0]["sampleBytes"] as ByteArray))
-        assertEquals(0L, sent[1]["droppedOldestCount"])
+        assertEquals(1, sent.size)
+        assertEquals(1L, sequence(inFlightPayload))
     }
 
     @Test
@@ -54,6 +54,7 @@ class PoseBatchDispatcherTest {
             { _, arguments, result -> sent += arguments; results += result },
             samplesPerSend = 2,
             scheduleFlush = { flushes += it },
+            cancelFlush = { flushes -= it },
         )
 
         dispatcher.offer(sample(1))
@@ -84,6 +85,7 @@ class PoseBatchDispatcherTest {
             { _, arguments, result -> sent += arguments; results += result },
             samplesPerSend = 2,
             scheduleFlush = { flushes += it },
+            cancelFlush = { flushes -= it },
         )
 
         dispatcher.offer(sample(1))
@@ -112,6 +114,7 @@ class PoseBatchDispatcherTest {
             { _, arguments, result -> sent += arguments; results += result },
             samplesPerSend = 2,
             scheduleFlush = {},
+            cancelFlush = {},
         )
 
         dispatcher.offer(sample(1))
@@ -124,9 +127,38 @@ class PoseBatchDispatcherTest {
         assertEquals((4L..11L).toList(), sequences(sent[1]["sampleBytes"] as ByteArray))
     }
 
-    @Test(expected = IllegalArgumentException::class)
-    fun `paired sends require a flush scheduler`() {
-        PoseBatchDispatcher({ _, _, _ -> }, samplesPerSend = 2)
+    @Test
+    fun `close cancels a scheduled flush and refuses later offers`() {
+        val sent = mutableListOf<Map<String, Any?>>()
+        val flushes = mutableListOf<Runnable>()
+        val cancelled = mutableListOf<Runnable>()
+        val dispatcher = PoseBatchDispatcher(
+            { _, arguments, _ -> sent += arguments },
+            samplesPerSend = 2,
+            scheduleFlush = { flushes += it },
+            cancelFlush = { cancelled += it },
+        )
+
+        dispatcher.offer(sample(1))
+        val flush = flushes.single()
+        dispatcher.close()
+        assertEquals(listOf(flush), cancelled)
+        // A flush that already left the queue sends nothing after close.
+        flush.run()
+        dispatcher.offer(sample(2))
+        dispatcher.offer(sample(3))
+        assertEquals(0, sent.size)
+        assertEquals(1, flushes.size)
+    }
+
+    @Test
+    fun `paired sends require flush schedule and cancel hooks`() {
+        assertThrows(IllegalArgumentException::class.java) {
+            PoseBatchDispatcher({ _, _, _ -> }, samplesPerSend = 2)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            PoseBatchDispatcher({ _, _, _ -> }, samplesPerSend = 2, scheduleFlush = {})
+        }
     }
 
     private fun sample(sequence: Long): ByteArray = ByteArray(PackedPoseWireV2.SAMPLE_BYTES).also {

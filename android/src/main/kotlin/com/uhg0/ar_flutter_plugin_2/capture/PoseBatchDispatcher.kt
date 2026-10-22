@@ -7,11 +7,12 @@ import io.flutter.plugin.common.MethodChannel
  *
  * Each send costs a platform-channel encode and engine post on the Android
  * main thread, plus a Dart dispatch and reply. With [samplesPerSend] above
- * one, an idle dispatcher holds samples until that many are pending, so a
- * 30 Hz pose stream crosses the channel at a fraction of the frame rate. A
- * held sample waits at most one [scheduleFlush] delay after it was held: the
- * flush sends whatever is pending. Samples keep their order and the
- * drop-oldest and one-in-flight rules are unchanged.
+ * one, an idle dispatcher holds samples until that many are pending, which
+ * divides the number of pose-channel sends by [samplesPerSend]. A held sample
+ * is sent at most one [scheduleFlush] delay after it was held: the flush sends
+ * whatever is pending. Samples keep their order and the drop-oldest and
+ * one-in-flight rules are unchanged. All calls run on one thread (the main
+ * looper in `ArView`).
  */
 internal class PoseBatchDispatcher(
     private val send: (String, Map<String, Any?>, MethodChannel.Result) -> Unit,
@@ -19,17 +20,21 @@ internal class PoseBatchDispatcher(
     private val samplesPerSend: Int = 1,
     /** Runs the task once after the maximum hold delay; required when [samplesPerSend] is above one. */
     private val scheduleFlush: ((Runnable) -> Unit)? = null,
+    /** Removes a task passed to [scheduleFlush]; required together with it. */
+    private val cancelFlush: ((Runnable) -> Unit)? = null,
 ) {
     init {
         require(capacity > 0)
         require(samplesPerSend in 1..capacity)
         require(samplesPerSend == 1 || scheduleFlush != null)
+        require((scheduleFlush == null) == (cancelFlush == null))
     }
 
     private val pending = ArrayDeque<ByteArray>(capacity)
     private var inFlight = false
     private var droppedSinceLastBatch = 0L
     private var flushScheduled = false
+    private var closed = false
     private val flushTask = Runnable {
         flushScheduled = false
         dispatchIfIdle(holdPartialBatch = false)
@@ -37,6 +42,7 @@ internal class PoseBatchDispatcher(
 
     fun offer(sample: ByteArray) {
         require(sample.size == PackedPoseWireV2.SAMPLE_BYTES)
+        if (closed) return
         if (pending.size == capacity) {
             pending.removeFirst()
             droppedSinceLastBatch++
@@ -45,13 +51,23 @@ internal class PoseBatchDispatcher(
         dispatchIfIdle(holdPartialBatch = true)
     }
 
-    fun clear() {
+    /**
+     * Drops pending samples and cancels a scheduled flush. Later offers,
+     * flushes and acknowledgements send nothing; a batch already in flight
+     * keeps its immutable payload.
+     */
+    fun close() {
+        closed = true
         pending.clear()
         droppedSinceLastBatch = 0L
+        if (flushScheduled) {
+            flushScheduled = false
+            cancelFlush!!(flushTask)
+        }
     }
 
     private fun dispatchIfIdle(holdPartialBatch: Boolean) {
-        if (inFlight || pending.isEmpty()) return
+        if (closed || inFlight || pending.isEmpty()) return
         if (holdPartialBatch && pending.size < samplesPerSend) {
             if (!flushScheduled) {
                 flushScheduled = true
