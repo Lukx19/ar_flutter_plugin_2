@@ -107,6 +107,10 @@ internal class SceneViewHost(
     private val lifecycle: Lifecycle,
     private val sessionFeatures: Set<Session.Feature>,
     private val requestedRearCameraId: String? = null,
+    /** Off: ARCore depth stays DISABLED (the grid runs points-only). */
+    private val depthInputEnabled: Boolean = true,
+    /** AR camera tier: highest CPU image height, 0 for the default config. */
+    private val maxCameraImageHeight: Int = 0,
     private val onSessionCreated: (Session) -> Unit = {},
     private val onSessionUpdated: (Session, Frame) -> Unit = { _, _ -> },
     private val onTrackingFailureChanged: (String?) -> Unit = {},
@@ -525,7 +529,7 @@ internal class SceneViewHost(
                     arConfig.depthMode =
                         visibilityGridDepthModeCache.configure(
                             session,
-                            session::isDepthModeSupported,
+                            depthSupportForInput(depthInputEnabled, session::isDepthModeSupported),
                         )
                     arConfig.instantPlacementMode = Config.InstantPlacementMode.DISABLED
                     arConfig.lightEstimationMode = Config.LightEstimationMode.ENVIRONMENTAL_HDR
@@ -803,12 +807,18 @@ internal class SceneViewHost(
                     it.cameraId == requestedId &&
                         it.facingDirection == CameraConfig.FacingDirection.BACK
                 }
-        val selectedConfig = preferHighestFpsConfig(matchingConfigs) { it.fpsRange.upper }
+        ArCameraConfigCatalog.record(requestedId, matchingConfigs.map(::cameraConfigShape))
+        val selectedConfig = selectConfigForMaxImageHeight(matchingConfigs, maxCameraImageHeight, ::cameraConfigShape)
         if (selectedConfig == null) {
             Log.w("SceneViewHost", "Requested ARCore rear camera $requestedId is unavailable")
         } else {
             session.cameraConfig = selectedConfig
-            Log.i("SceneViewHost", "Selected ARCore rear camera $requestedId at ${selectedConfig.fpsRange} fps")
+            Log.i(
+                "SceneViewHost",
+                "Selected ARCore rear camera $requestedId ${cameraConfigShape(selectedConfig)} " +
+                    "(tier ${if (maxCameraImageHeight > 0) "${maxCameraImageHeight}p" else "auto"}, " +
+                    "depth input ${if (depthInputEnabled) "on" else "off"})",
+            )
         }
         return selectedConfig
     }
@@ -1280,6 +1290,22 @@ internal class SceneViewHost(
     fun depthIntakeFrameHealthy(): Boolean =
         frameCadenceTracker.healthyForDepthIntake() &&
             cameraFrameCadenceTracker.healthyForDepthIntake()
+
+    /**
+     * Camera frame cadence only: the periodic developer diagnostics read it
+     * on the platform thread, so it skips the renderer, shape and budget
+     * snapshots of [rendererPerformanceSnapshot].
+     */
+    fun cameraCadenceSnapshot(): Map<String, Any> {
+        val cameraCadence = cameraFrameCadenceTracker.snapshot()
+        return mapOf(
+            "cameraFrameSampleCount" to cameraCadence.getValue("sampleCount"),
+            "cameraMedianFrameIntervalMs" to cameraCadence.getValue("medianFrameIntervalMs"),
+            "cameraMedianFps" to cameraCadence.getValue("medianFps"),
+            "cameraFrameGapsOver50Ms" to cameraCadence.getValue("frameGapsOver50Ms"),
+            "cameraFrameGapsOver100Ms" to cameraCadence.getValue("frameGapsOver100Ms"),
+        )
+    }
 
     fun rendererPerformanceSnapshot(
         beginMeasurementWindow: Boolean = false,
@@ -2372,6 +2398,26 @@ internal fun selectVisibilityGridDepthMode(
         rawDepthSupported = isSupported(Config.DepthMode.RAW_DEPTH_ONLY),
         automaticDepthSupported = isSupported(Config.DepthMode.AUTOMATIC),
     ).activeMode
+
+/**
+ * Depth support as the session should see it: with depth input off every
+ * depth mode reads unsupported, so the controller selects DISABLED and no
+ * depth image is ever acquired.
+ */
+internal fun depthSupportForInput(
+    depthInputEnabled: Boolean,
+    isSupported: (Config.DepthMode) -> Boolean,
+): (Config.DepthMode) -> Boolean =
+    if (depthInputEnabled) isSupported else { mode -> mode == Config.DepthMode.DISABLED }
+
+internal fun cameraConfigShape(config: com.google.ar.core.CameraConfig): ArCameraConfigShape =
+    ArCameraConfigShape(
+        imageWidth = config.imageSize.width,
+        imageHeight = config.imageSize.height,
+        textureWidth = config.textureSize.width,
+        textureHeight = config.textureSize.height,
+        maxFps = config.fpsRange.upper,
+    )
 
 internal class VisibilityGridDepthModeCache {
     @Volatile

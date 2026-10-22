@@ -3,6 +3,7 @@ import 'package:ar_flutter_plugin_2/managers/ar_location_manager.dart';
 import 'package:ar_flutter_plugin_2/models/ar_capture_config.dart';
 import 'package:ar_flutter_plugin_2/models/ar_capture_view_config.dart';
 import 'package:ar_flutter_plugin_2/models/ar_playback_config.dart';
+import 'package:ar_flutter_plugin_2/models/ar_session_inputs.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
@@ -38,7 +39,8 @@ abstract class PlatformARView {
       ARCaptureConfig? captureConfig,
       String? rearCameraId,
       ARPlaybackConfig? playback,
-      ARCaptureViewConfig? captureView});
+      ARCaptureViewConfig? captureView,
+      ARSessionInputs sessionInputs = const ARSessionInputs()});
 
   /// Callback function that is executed once the view is established
   void onPlatformViewCreated(int id);
@@ -98,7 +100,8 @@ class AndroidARView implements PlatformARView {
       ARCaptureConfig? captureConfig,
       String? rearCameraId,
       ARPlaybackConfig? playback,
-      ARCaptureViewConfig? captureView}) {
+      ARCaptureViewConfig? captureView,
+      ARSessionInputs sessionInputs = const ARSessionInputs()}) {
     // [captureView] is the iOS capture view; Android ignores it.
     _context = context;
     _arViewCreatedCallback = arViewCreatedCallback;
@@ -114,18 +117,22 @@ class AndroidARView implements PlatformARView {
       'enableHighResCapture': captureConfig?.enableHighResCapture ?? false,
       'retainAssessedOriginals': captureConfig?.retainAssessedOriginals ?? false,
       'rearCameraId': rearCameraId,
+      // Depth mode and camera config are fixed when the session starts.
+      ...sessionInputs.toCreationParams(),
       // Debug/profile playback test mode; absent in normal and release builds.
       ...?playback?.toCreationParams(),
     };
 
     return PlatformViewLink(
-      key: ValueKey<(bool, String?, bool, bool, ARPlaybackConfig?)>(
+      key: ValueKey<
+          (bool, String?, bool, bool, ARPlaybackConfig?, ARSessionInputs)>(
         (
           captureConfig?.enableHighResCapture ?? false,
           rearCameraId,
           useHybridComposition,
           captureConfig?.retainAssessedOriginals ?? false,
           playback,
+          sessionInputs,
         ),
       ),
       viewType: viewType,
@@ -176,7 +183,8 @@ class IosARView implements PlatformARView {
       ARCaptureConfig? captureConfig,
       String? rearCameraId,
       ARPlaybackConfig? playback,
-      ARCaptureViewConfig? captureView}) {
+      ARCaptureViewConfig? captureView,
+      ARSessionInputs sessionInputs = const ARSessionInputs()}) {
     _context = context;
     _arViewCreatedCallback = arViewCreatedCallback;
     _planeDetectionConfig = planeDetectionConfig;
@@ -251,6 +259,10 @@ class ARView extends StatefulWidget {
   /// keeps the legacy iOS view. Android ignores it.
   final ARCaptureViewConfig? captureView;
 
+  /// Depth input and camera image tier of the session (Android). On iOS
+  /// the app maps them into [captureView]. Changes rebuild the native view.
+  final ARSessionInputs sessionInputs;
+
   /// Configures whether or not to display the device's platform type above the AR view. Defaults to false
   final bool showPlatformType;
 
@@ -262,6 +274,7 @@ class ARView extends StatefulWidget {
       this.rearCameraId,
       this.playback,
       this.captureView,
+      this.sessionInputs = const ARSessionInputs(),
       this.showPlatformType = false,
       this.permissionPromptDescription =
           "Camera permission must be given to the app for AR functions to work",
@@ -378,7 +391,8 @@ class _ARViewState extends State<ARView> {
                     captureConfig: widget.captureConfig,
                     rearCameraId: widget.rearCameraId,
                     playback: widget.playback,
-                    captureView: widget.captureView)),
+                    captureView: widget.captureView,
+                    sessionInputs: widget.sessionInputs)),
           ]);
         }
       case (PermissionStatus.denied):

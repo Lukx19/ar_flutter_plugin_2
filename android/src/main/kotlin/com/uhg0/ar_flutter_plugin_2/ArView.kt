@@ -93,6 +93,8 @@ internal class ArView(
     id: Int,
     initialSessionFeatures: Set<Session.Feature> = emptySet(),
     requestedRearCameraId: String? = null,
+    depthInputEnabled: Boolean = true,
+    maxCameraImageHeight: Int = 0,
     private val retainAssessedOriginals: Boolean = false,
     CommittedBaselineAuthority: CommittedBaselineAuthority,
     /** Debug/profile ARCore playback test mode; null runs the camera. */
@@ -158,6 +160,8 @@ internal class ArView(
         lifecycle = lifecycle,
         sessionFeatures = initialSessionFeatures,
         requestedRearCameraId = requestedRearCameraId,
+        depthInputEnabled = depthInputEnabled,
+        maxCameraImageHeight = maxCameraImageHeight,
         onSessionUpdated = ::onFrame,
         onTrackingFailureChanged = { failure ->
             sessionChannel.invokeMethod("onTrackingFailure", failure)
@@ -664,6 +668,8 @@ internal class ArView(
                 "getAnchorPose" -> result.success(
                     anchorRecords[call.argument<String>("anchorId")]?.transform?.matrix,
                 )
+                "getCameraCadenceSnapshot" ->
+                    result.success(sceneHost.cameraCadenceSnapshot())
                 "getRendererPerformanceSnapshot" ->
                     result.success(
                         sceneHost.rendererPerformanceSnapshot(

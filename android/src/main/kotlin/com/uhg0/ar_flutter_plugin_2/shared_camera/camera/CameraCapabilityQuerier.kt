@@ -13,6 +13,9 @@ import com.google.ar.core.Session
 import kotlin.math.atan
 import kotlin.math.abs
 import kotlin.math.PI
+import com.uhg0.ar_flutter_plugin_2.sceneview.ArCameraConfigCatalog
+import com.uhg0.ar_flutter_plugin_2.sceneview.arCameraResolutionChoices
+import com.uhg0.ar_flutter_plugin_2.sceneview.cameraConfigShape
 
 data class CameraResolution(val width: Int, val height: Int)
 
@@ -174,6 +177,36 @@ class CameraCapabilityQuerier(private val context: Context) {
                     .remove("profile_png_status")
             }
             editor.apply()
+        }
+    }
+
+    /**
+     * AR camera tiers of rear camera [cameraId] (null: ARCore's default rear
+     * camera): `auto` with the default config's shape and `tiers` with the
+     * tiers that select another config (`arCameraResolutionChoices`). Uses
+     * the configs of the running or last AR session when known; otherwise
+     * opens a temporary ARCore session, so call it only while no AR session
+     * is active then.
+     */
+    fun getArCameraResolutions(cameraId: String?): Map<String, Any> {
+        ArCameraConfigCatalog.shapes(cameraId)?.let {
+            return arCameraResolutionChoices(it)
+        }
+        return runCatching {
+            val session = Session(context, setOf(Session.Feature.SHARED_CAMERA))
+            try {
+                val wanted = cameraId ?: session.cameraConfig.cameraId
+                val shapes = session.getSupportedCameraConfigs(CameraConfigFilter(session))
+                    .filter { it.cameraId == wanted && it.facingDirection == CameraConfig.FacingDirection.BACK }
+                    .map { cameraConfigShape(it) }
+                ArCameraConfigCatalog.record(wanted, shapes)
+                arCameraResolutionChoices(shapes)
+            } finally {
+                session.close()
+            }
+        }.getOrElse { error ->
+            Log.w(TAG, "Unable to enumerate ARCore camera configs", error)
+            emptyMap()
         }
     }
 

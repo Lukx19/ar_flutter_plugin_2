@@ -93,6 +93,11 @@ internal class VisibilityGridRendererHost(
     val questOverlay = QuestLineOverlay().also { core.lineOverlays.addIfAbsent(it) }
     val poseFrustumStyle = PoseFrustumStyle().also { core.lineOverlays.addIfAbsent(it) }
 
+    /** Raw ARCore feature points while the display mode asks for them (points-only grid). */
+    val rawFeaturePoints = RawFeaturePointLayer(
+        RawFeaturePointBuffer(log = { Log.i(TAG, it) }),
+    ) { pxPerDp }.also { overlays.add(it) }
+
     /** Marker outlines (C3MO from the grid isolate marker stage) on the same line overlay hook. */
     val markerOverlay = MarkerOutlineOverlay().also { core.lineOverlays.addIfAbsent(it) }
 
@@ -151,6 +156,7 @@ internal class VisibilityGridRendererHost(
             ) { mapOf("channel" to "frame", "method" to "gridCameraUpdate", "cameraUpdateFailures" to cameraUpdateFailures, "error" to (e.message ?: "")) }
             return
         }
+        rawFeaturePoints.points.offer(frame)
         renderThread?.requestRender()
     }
 

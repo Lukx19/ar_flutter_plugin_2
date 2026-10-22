@@ -77,6 +77,9 @@ enum ARCaptureViewParameter {
   static let depthHeight = "depthHeight"
   static let highResolutionFrameCapture = "highResolutionFrameCapture"
   static let videoHdr = "videoHdr"
+  /// Highest video format image height (`ARCameraResolution`); absent or 0
+  /// keeps ARKit's default format.
+  static let maxCameraImageHeight = "maxCameraImageHeight"
 }
 
 /// Size of the depth map sent to the visibility grid ingest.
@@ -176,6 +179,8 @@ struct ARSessionOptions: Equatable {
   /// Allow video HDR on a video format that supports it (the quality still
   /// mode; measured at 60 fps with depth on the iPhone 12 Pro).
   var videoHdr = false
+  /// Highest video format image height; 0 keeps ARKit's default format.
+  var maxVideoHeight = 0
 
   init() {}
 
@@ -188,6 +193,7 @@ struct ARSessionOptions: Equatable {
       highResolutionFrameCapture = value
     }
     if let value = map[ARCaptureViewParameter.videoHdr] as? Bool { videoHdr = value }
+    if let value = map[ARCaptureViewParameter.maxCameraImageHeight] as? Int, value > 0 { maxVideoHeight = value }
     if let width = map[ARCaptureViewParameter.depthWidth] as? Int,
        let height = map[ARCaptureViewParameter.depthHeight] as? Int,
        width > 0, height > 0 {
@@ -203,13 +209,50 @@ struct ARSessionConfigurationPlan: Equatable {
   var videoFormat: ARVideoFormatDescription?
   var depthOutputSize: ARDepthOutputSize
   var videoHdr = false
+  /// The video format is the one recommended for high-resolution stills.
+  var highResolutionFrameCapture = false
 
   var deliversSceneDepth: Bool { sceneDepth }
+
+  /// Wide-angle camera format of at most [maxHeight] image rows and no
+  /// larger than ARKit's default (the first of [formats]; a tier only
+  /// lowers the session): highest frame rate first, then the largest
+  /// image; nil when none fits or the default already fits. With
+  /// [keepDefaultAspect] (scene depth on) only formats of the default's
+  /// aspect ratio qualify: the depth intrinsics scaling to the 256x192 depth
+  /// map is verified for that aspect only.
+  static func videoFormat(
+    in formats: [ARVideoFormatDescription], maxHeight: Int, keepDefaultAspect: Bool = false
+  ) -> ARVideoFormatDescription? {
+    guard let defaultFormat = formats.first, defaultFormat.height > maxHeight else { return nil }
+    return formats
+      .filter {
+        $0.height <= maxHeight && $0.height <= defaultFormat.height
+          && $0.captureDeviceType == wideAngleDeviceType
+          && (!keepDefaultAspect || $0.width * defaultFormat.height == defaultFormat.width * $0.height)
+      }
+      .max { a, b in
+        (a.framesPerSecond, a.height, a.width) < (b.framesPerSecond, b.height, b.width)
+      }
+  }
+
+  /// `AVCaptureDevice.DeviceType.builtInWideAngleCamera.rawValue`.
+  static let wideAngleDeviceType = "AVCaptureDeviceTypeBuiltInWideAngleCamera"
 
   init(options: ARSessionOptions, capabilities: ARCameraCapabilities) {
     sceneDepth = options.sceneDepth && capabilities.sceneDepthSupported
     smoothedSceneDepth = options.smoothedSceneDepth && capabilities.smoothedSceneDepthSupported
-    videoFormat = options.highResolutionFrameCapture ? capabilities.highResolutionFrameCaptureFormat : nil
+    // High-resolution stills need the format ARKit recommends for them; a
+    // lower AR camera tier would lower the stills, so it is not applied then.
+    if options.highResolutionFrameCapture {
+      videoFormat = capabilities.highResolutionFrameCaptureFormat
+      highResolutionFrameCapture = capabilities.highResolutionFrameCaptureFormat != nil
+    } else if options.maxVideoHeight > 0 {
+      videoFormat = ARSessionConfigurationPlan.videoFormat(
+        in: capabilities.videoFormats, maxHeight: options.maxVideoHeight, keepDefaultAspect: sceneDepth)
+    } else {
+      videoFormat = nil
+    }
     depthOutputSize = options.depthOutputSize
     videoHdr = options.videoHdr
   }
@@ -223,8 +266,13 @@ struct ARSessionConfigurationPlan: Equatable {
     configuration.isAutoFocusEnabled = true
     if sceneDepth { configuration.frameSemantics.insert(.sceneDepth) }
     if smoothedSceneDepth { configuration.frameSemantics.insert(.smoothedSceneDepth) }
-    if videoFormat != nil,
+    if highResolutionFrameCapture,
        let format = ARWorldTrackingConfiguration.recommendedVideoFormatForHighResolutionFrameCapturing {
+      configuration.videoFormat = format
+    } else if let wanted = videoFormat,
+              let format = ARWorldTrackingConfiguration.supportedVideoFormats.first(where: {
+                ARVideoFormatDescription($0) == wanted
+              }) {
       configuration.videoFormat = format
     }
     if videoHdr, #available(iOS 16.0, *), configuration.videoFormat.isVideoHDRSupported {

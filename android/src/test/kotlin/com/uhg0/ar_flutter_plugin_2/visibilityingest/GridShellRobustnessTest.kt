@@ -82,7 +82,11 @@ class GridShellRobustnessTest {
         }
         assertEquals(3, lines.size)
         assertTrue(lines[0], lines[0].startsWith("[grid-depth] published="))
-        for (key in listOf("duplicate=", "staleDropped=", "identityRefused=", "staleAutomatic=", "lastImageAgeMs=")) {
+        for (key in listOf(
+            "duplicate=", "staleDropped=", "identityRefused=", "staleAutomatic=", "lastImageAgeMs=",
+            // ARCore point clouds, so a missing-points report can tell ingest from drawing.
+            "pointClouds=", "pointsIn=", "pointsSent=",
+        )) {
             assertTrue(key, lines[2].contains(key))
         }
         assertTrue(lines[0], lines[0].contains("lastImageAgeMs=none"))

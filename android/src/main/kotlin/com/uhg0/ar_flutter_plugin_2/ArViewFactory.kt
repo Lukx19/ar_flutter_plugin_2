@@ -28,6 +28,8 @@ class ArViewFactory(
             creationParams?.get("enableHighResCapture") as? Boolean ?: false
         val retainAssessedOriginals = selectRetainAssessedOriginals(creationParams)
         val requestedRearCameraId = creationParams?.get("rearCameraId") as? String
+        val depthInputEnabled = creationParams?.get("depthInputEnabled") as? Boolean ?: true
+        val maxCameraImageHeight = (creationParams?.get("maxCameraImageHeight") as? Number)?.toInt() ?: 0
         val requestedSessionFeatures =
             if (enableHighResCapture) setOf(Session.Feature.SHARED_CAMERA) else emptySet()
         val playback = ArPlaybackSelector.select(
@@ -48,6 +50,8 @@ class ArViewFactory(
             id = viewId,
             initialSessionFeatures = initialSessionFeatures,
             requestedRearCameraId = requestedRearCameraId,
+            depthInputEnabled = depthInputEnabled,
+            maxCameraImageHeight = maxCameraImageHeight,
             retainAssessedOriginals = retainAssessedOriginals,
             CommittedBaselineAuthority = CommittedBaselineAuthority,
             playbackConfig = (playback as? ArPlaybackSelection.Enabled)?.config,

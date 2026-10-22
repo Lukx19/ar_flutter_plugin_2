@@ -19,6 +19,9 @@ internal object GridDisplayCodes {
     const val OVERLAY_TARGETS = 8
     const val OVERLAY_MARKERS = 16
 
+    /** Raw feature points of each frame (app-driven, points-only grid). */
+    const val OVERLAY_RAW_FEATURE_POINTS = 32
+
     const val COLOUR_COVERAGE = 0
     const val COLOUR_CONFIDENCE = 1
     const val COLOUR_AGE = 2

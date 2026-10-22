@@ -116,14 +116,18 @@ enum PoseBatchWire {
   }
 }
 
-/// At most one pose sample per 33.3 ms of sensor time (30 Hz), strictly
+/// About one pose sample per 33.3 ms of sensor time (30 Hz), strictly
 /// increasing timestamps; mirrors the Android `PoseUpdateRateLimiter`.
+/// A sample is emitted once 80% of the nominal period has passed, so frame
+/// intervals jittering just under the period are not rejected (which would
+/// halve a 30 fps stream), while the second frame of a 60 fps pair still is.
 struct PoseRateLimiter {
+  static let tolerancePercent: Int64 = 80
   let minimumIntervalNs: Int64
   private var lastTimestampNs: Int64?
 
   init(maximumRateHz: Int64 = 30) {
-    minimumIntervalNs = 1_000_000_000 / maximumRateHz
+    minimumIntervalNs = 1_000_000_000 * PoseRateLimiter.tolerancePercent / (100 * maximumRateHz)
   }
 
   mutating func shouldEmit(_ timestampNs: Int64) -> Bool {
