@@ -6,6 +6,8 @@ import com.uhg0.ar_flutter_plugin_2.diagnostics.measureNativeFrame
 import android.app.Activity
 import android.content.Context
 import android.content.pm.ApplicationInfo
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.view.MotionEvent
 import android.view.View
@@ -118,10 +120,13 @@ internal class ArView(
     private val objectChannel = MethodChannel(messenger, "arobjects_$id")
     private val anchorChannel = MethodChannel(messenger, "aranchors_$id")
     private val captureChannel = MethodChannel(messenger, "arcapture_$id")
+    private val poseFlushHandler = Handler(Looper.getMainLooper())
     private val poseBatchDispatcher = PoseBatchDispatcher(
         send = { method, arguments, result ->
             captureChannel.invokeMethod(method, arguments, result)
         },
+        samplesPerSend = POSE_SAMPLES_PER_SEND,
+        scheduleFlush = { flush -> poseFlushHandler.postDelayed(flush, POSE_MAX_HOLD_MS) },
     )
     private val nodeRecords = mutableMapOf<String, PluginNodeRecord>()
     private val nodeAnchorIds = mutableMapOf<String, String>()
@@ -1608,6 +1613,15 @@ internal class ArView(
     }
 
     private companion object {
+        /**
+         * Two 30 Hz camera poses per pose-channel send halve the main-thread
+         * channel cost; the first pose of a pair arrives one camera frame later.
+         */
+        const val POSE_SAMPLES_PER_SEND = 2
+
+        /** A held pose is sent alone after this delay (1.5 camera frames at 30 Hz). */
+        const val POSE_MAX_HOLD_MS = 50L
+
         fun defaultSessionConfig() = PluginSessionConfig(
             showPlanes = true,
             showFeaturePoints = false,
