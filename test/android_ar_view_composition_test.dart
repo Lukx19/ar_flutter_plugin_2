@@ -25,7 +25,7 @@ void main() {
       final arguments = call.arguments as Map<Object?, Object?>?;
       switch (call.method) {
         case 'create':
-          return arguments?['hybrid'] == true ? null : 17;
+          return 17;
         case 'resize':
           return {
             'width': arguments!['width'],
@@ -41,57 +41,42 @@ void main() {
     messenger.setMockMethodCallHandler(SystemChannels.platform_views, null);
   });
 
-  test('Android AR factory uses the declared default-off composition route',
-      () {
-    final view = PlatformARView(TargetPlatform.android) as AndroidARView;
-    expect(
-        view.useHybridComposition,
-        const bool.fromEnvironment('CAPTURE3D_AR_HYBRID_COMPOSITION',
-            defaultValue: false));
-  });
-
-  for (final hybrid in [false, true]) {
-    testWidgets(
-        'Android AR ${hybrid ? 'hybrid' : 'surface'} route preserves creation parameters and listeners',
-        (tester) async {
-      final createdIds = <int>[];
-      final view = AndroidARView(useHybridComposition: hybrid);
-      await tester.pumpWidget(_view(view, createdIds));
-      await tester.pumpAndSettle();
-      final creates = calls.where((call) => call.method == 'create').toList();
-      expect(creates, hasLength(1));
-      final arguments = creates.single.arguments as Map<Object?, Object?>;
-      expect(arguments['viewType'], 'ar_flutter_plugin_2');
-      expect(arguments['direction'], 0);
-      expect(arguments['hybrid'] == true, hybrid);
-      expect(arguments['hybridFallback'] == true, !hybrid);
-      final parameters = const StandardMessageCodec().decodeMessage(
-          ByteData.sublistView(arguments['params']! as Uint8List));
-      expect(parameters, {
-        'enableHighResCapture': true,
-        'retainAssessedOriginals': false,
-        'rearCameraId': '0',
-        'depthInputEnabled': true,
-        'maxCameraImageHeight': 0,
-      });
-      expect(createdIds, [arguments['id']]);
-      final surface =
-          tester.widget<AndroidViewSurface>(find.byType(AndroidViewSurface));
-      expect(
-          surface.controller,
-          hybrid
-              ? isA<ExpensiveAndroidViewController>()
-              : isA<SurfaceAndroidViewController>());
-      expect(surface.hitTestBehavior, PlatformViewHitTestBehavior.opaque);
-      expect(surface.gestureRecognizers, isEmpty);
-      await tester.pumpWidget(const SizedBox.shrink());
-      await tester.pumpAndSettle();
-      final disposed = calls.where((call) => call.method == 'dispose');
-      expect(disposed, hasLength(1));
-      expect((disposed.single.arguments as Map<Object?, Object?>)['id'],
-          arguments['id']);
-    }, variant: TargetPlatformVariant.only(TargetPlatform.android));
-  }
+  testWidgets(
+      'Android AR texture surface route preserves creation parameters and listeners',
+      (tester) async {
+    final createdIds = <int>[];
+    final view = AndroidARView();
+    await tester.pumpWidget(_view(view, createdIds));
+    await tester.pumpAndSettle();
+    final creates = calls.where((call) => call.method == 'create').toList();
+    expect(creates, hasLength(1));
+    final arguments = creates.single.arguments as Map<Object?, Object?>;
+    expect(arguments['viewType'], 'ar_flutter_plugin_2');
+    expect(arguments['direction'], 0);
+    expect(arguments['hybrid'] == true, isFalse);
+    expect(arguments['hybridFallback'] == true, isTrue);
+    final parameters = const StandardMessageCodec().decodeMessage(
+        ByteData.sublistView(arguments['params']! as Uint8List));
+    expect(parameters, {
+      'enableHighResCapture': true,
+      'retainAssessedOriginals': false,
+      'rearCameraId': '0',
+      'depthInputEnabled': true,
+      'maxCameraImageHeight': 0,
+    });
+    expect(createdIds, [arguments['id']]);
+    final surface =
+        tester.widget<AndroidViewSurface>(find.byType(AndroidViewSurface));
+    expect(surface.controller, isA<SurfaceAndroidViewController>());
+    expect(surface.hitTestBehavior, PlatformViewHitTestBehavior.opaque);
+    expect(surface.gestureRecognizers, isEmpty);
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pumpAndSettle();
+    final disposed = calls.where((call) => call.method == 'dispose');
+    expect(disposed, hasLength(1));
+    expect((disposed.single.arguments as Map<Object?, Object?>)['id'],
+        arguments['id']);
+  }, variant: TargetPlatformVariant.only(TargetPlatform.android));
 
   testWidgets('Android review mode recreates the view and reaches native creation with the same manager config', (tester) async {
     final ids = <int>[];
@@ -196,32 +181,6 @@ void main() {
             .restart,
         ARPlaybackRestart.off);
   });
-
-  testWidgets(
-      'Android AR composition change recreates rather than reuses the platform view',
-      (tester) async {
-    final createdIds = <int>[];
-    await tester.pumpWidget(
-        _view(AndroidARView(useHybridComposition: false), createdIds));
-    await tester.pumpAndSettle();
-    final surfaceKey =
-        tester.widget<PlatformViewLink>(find.byType(PlatformViewLink)).key;
-    await tester.pumpWidget(
-        _view(AndroidARView(useHybridComposition: true), createdIds));
-    await tester.pumpAndSettle();
-    final hybridKey =
-        tester.widget<PlatformViewLink>(find.byType(PlatformViewLink)).key;
-    expect(hybridKey, isNot(surfaceKey));
-    expect(createdIds, hasLength(2));
-    expect(createdIds[1], isNot(createdIds[0]));
-    final disposed = calls.where((call) => call.method == 'dispose').toList();
-    expect(disposed, hasLength(1));
-    expect((disposed.single.arguments as Map<Object?, Object?>)['id'],
-        createdIds.first);
-    await tester.pumpWidget(const SizedBox.shrink());
-    await tester.pumpAndSettle();
-    expect(calls.where((call) => call.method == 'dispose'), hasLength(2));
-  }, variant: TargetPlatformVariant.only(TargetPlatform.android));
 }
 
 Widget _view(AndroidARView view, List<int> createdIds,

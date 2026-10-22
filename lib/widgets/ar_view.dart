@@ -67,19 +67,9 @@ createManagers(
 }
 
 /// Android-specific implementation of [PlatformARView]
-/// Uses the surface-controller route unless hybrid composition is explicitly requested.
+/// Uses the texture-based surface-controller platform view route.
 /// Native SceneView rendering is independent of this outer composition choice.
 class AndroidARView implements PlatformARView {
-  AndroidARView({
-    this.useHybridComposition = const bool.fromEnvironment(
-      'CAPTURE3D_AR_HYBRID_COMPOSITION',
-      defaultValue: false,
-    ),
-  });
-
-  /// Experimental outer Android composition route; defaults to the existing route.
-  final bool useHybridComposition;
-
   late BuildContext? _context;
   late ARViewCreatedCallback? _arViewCreatedCallback;
   late PlaneDetectionConfig? _planeDetectionConfig;
@@ -124,12 +114,10 @@ class AndroidARView implements PlatformARView {
     };
 
     return PlatformViewLink(
-      key: ValueKey<
-          (bool, String?, bool, bool, ARPlaybackConfig?, ARSessionInputs)>(
+      key: ValueKey<(bool, String?, bool, ARPlaybackConfig?, ARSessionInputs)>(
         (
           captureConfig?.enableHighResCapture ?? false,
           rearCameraId,
-          useHybridComposition,
           captureConfig?.retainAssessedOriginals ?? false,
           playback,
           sessionInputs,
@@ -142,9 +130,8 @@ class AndroidARView implements PlatformARView {
         gestureRecognizers: const {},
       ),
       onCreatePlatformView: (params) {
-        final AndroidViewController controller = (useHybridComposition
-            ? PlatformViewsService.initExpensiveAndroidView
-            : PlatformViewsService.initSurfaceAndroidView)(
+        final AndroidViewController controller =
+            PlatformViewsService.initSurfaceAndroidView(
           id: params.id,
           viewType: viewType,
           layoutDirection: TextDirection.ltr,
