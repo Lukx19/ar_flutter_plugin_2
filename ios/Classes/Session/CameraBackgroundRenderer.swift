@@ -119,6 +119,9 @@ struct GridOverlayFrameContext {
   /// `CaptureFrame.timestamp` of the drawn camera image, seconds.
   let frameTimestamp: TimeInterval
   let trackingState: ARCamera.TrackingState
+  /// World-space raw feature points of the drawn frame; read only by an
+  /// overlay that draws them.
+  var featurePoints: () -> [simd_float3]? = { nil }
 }
 
 /// Draws over the camera background inside the same render pass. The pass

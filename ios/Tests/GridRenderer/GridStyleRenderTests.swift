@@ -64,7 +64,7 @@ final class GridStyleRenderTests: XCTestCase {
 
   /// Runs one frame: uploads, the grid styles and line overlays; returns uploaded bytes.
   @discardableResult
-  private func render() throws -> Int {
+  private func render(frameTimestamp: TimeInterval = 0, featurePoints: [SIMD3<Float>]? = nil) throws -> Int {
     let commandBuffer = try XCTUnwrap(queue.makeCommandBuffer())
     let uploaded = host.encodeUploads(into: commandBuffer)
     let pass = MTLRenderPassDescriptor()
@@ -77,7 +77,7 @@ final class GridStyleRenderTests: XCTestCase {
     pass.depthAttachment.clearDepth = 1
     pass.depthAttachment.storeAction = .dontCare
     let encoder = try XCTUnwrap(commandBuffer.makeRenderCommandEncoder(descriptor: pass))
-    host.encode(into: encoder, view: view)
+    host.encode(into: encoder, view: view, frameTimestamp: frameTimestamp, featurePoints: { featurePoints })
     encoder.endEncoding()
     let size = GridStyleRenderTests.size
     let blit = try XCTUnwrap(commandBuffer.makeBlitCommandEncoder())
@@ -172,6 +172,43 @@ final class GridStyleRenderTests: XCTestCase {
     XCTAssertTrue(c.r > 60 && c.g < 40 && c.a > 0, "centre \(c)")
     XCTAssertEqual(probe(4, 4).a, 0)
     XCTAssertEqual(host.drawCounters?.visibleSurfaceSlices, 1)
+  }
+
+  func testRawFeaturePointsDrawOnlyWithTheirOverlayBit() throws {
+    // Base layer none: only the raw points can draw. A point at the upper
+    // left, away from the surface patch.
+    let p = SIMD3<Float>(-0.6, 0.6, -2)
+    let (x, y) = pixel(of: p)
+    mode(GridDisplayCodes.baseNone)
+    try render(frameTimestamp: 1, featurePoints: [p])
+    XCTAssertEqual(probe(x, y).a, 0, "no overlay bit, no raw points")
+    XCTAssertEqual(host.drawCounters?.rawFeaturePoints, 0)
+
+    mode(GridDisplayCodes.baseNone, overlays: GridDisplayCodes.overlayRawFeaturePoints)
+    try render(frameTimestamp: 2, featurePoints: [p, SIMD3(.nan, 0, -2)])
+    let c = probe(x, y)
+    XCTAssertTrue(c.r > 200 && c.g > 150 && c.b < 80, "raw point \(c)")
+    XCTAssertEqual(host.drawCounters?.rawFeaturePoints, 1)
+    XCTAssertEqual(host.rawFeaturePoints.clouds, 1)
+
+    // The same frame is not read again; turning the bit off forgets the points.
+    try render(frameTimestamp: 2, featurePoints: [])
+    XCTAssertEqual(host.rawFeaturePoints.clouds, 1)
+    mode(GridDisplayCodes.baseNone)
+    try render(frameTimestamp: 3, featurePoints: [p])
+    XCTAssertEqual(probe(x, y).a, 0)
+    XCTAssertTrue(host.rawFeaturePoints.points.isEmpty)
+  }
+
+  func testRawFeaturePointCountsAreLoggedAtMostEveryTwoSeconds() {
+    var lines: [String] = []
+    let cache = RawFeaturePointCache { lines.append($0) }
+    for frame in 0..<180 { // 3 s at 60 Hz
+      cache.update(frameTimestamp: Double(frame) / 60) { [SIMD3(0, 0, -1), SIMD3(1, 0, -1)] }
+    }
+    XCTAssertEqual(lines.count, 2)
+    XCTAssertEqual(lines.first, "[grid-raw-points] clouds=1 pointsIn=2 pointsKept=2 last=2")
+    XCTAssertEqual(cache.clouds, 180)
   }
 
   func testSplatsCoverThePatchWithoutHoles() throws {

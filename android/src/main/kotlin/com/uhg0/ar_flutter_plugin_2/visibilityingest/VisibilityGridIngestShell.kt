@@ -484,7 +484,8 @@ internal class VisibilityGridIngestShell(
                 "imageLeadMs=${depth.lastImageLeadNs / 1_000_000L} " +
                 "failures=${depth.failures} acquired=${depth.acquired} lastImageAgeMs=$ageMs " +
                 "reapplied=$depthReapplyRequests resumes=$resumes trackingResets=$trackingResets " +
-                "mode=$lastDepthMode tracking=$tracking epoch=${session.groupEpoch}",
+                "mode=$lastDepthMode tracking=$tracking epoch=${session.groupEpoch} " +
+                "pointClouds=${points.clouds} pointsIn=${points.pointsIn} pointsSent=${points.pointsSent}",
         )
     }
 

@@ -15,6 +15,11 @@ abstract final class DisplayOverlay {
   static const int regions = 4;
   static const int targets = 8;
   static const int markers = 16;
+
+  /// Raw ARCore/ARKit feature points of the current frame, drawn by the
+  /// platform renderer from its own frames. Set by the app while the grid
+  /// samples tracking points only (no depth), never part of a preset.
+  static const int rawFeaturePoints = 32;
 }
 
 /// Surface attribute mapped through a colour table.

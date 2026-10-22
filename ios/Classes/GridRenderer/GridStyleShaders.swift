@@ -237,6 +237,24 @@ enum GridStyleShaders {
 
   fragment float4 grid_line_fs(VOut in [[stage_in]]) { return in.color; }
 
+  // Raw ARKit feature points: screen-sized round dots (fixedPx), yellow with
+  // a dark rim, drawn on top while the grid samples tracking points only.
+  vertex POut grid_raw_points_vs(uint vid [[vertex_id]], const device packed_float3* p [[buffer(0)]],
+                                 constant GridUniforms& u [[buffer(1)]]) {
+    POut o;
+    o.pos = u.viewProj * float4(float3(p[vid]), 1);
+    o.psize = u.fixedPx;
+    o.color = float4(1.0, 0.86, 0.1, 1.0);
+    return o;
+  }
+
+  fragment float4 grid_raw_points_fs(POut in [[stage_in]], float2 pc [[point_coord]]) {
+    float2 d = pc * 2.0 - 1.0;
+    float r = dot(d, d);
+    if (r > 1.0) discard_fragment();
+    return r > 0.55 ? float4(0.1, 0.1, 0.1, 0.9) : in.color;
+  }
+
   // Planner targets: an arrow from the standpoint along the view direction
   // (line list, 6 vertices per target).
   vertex VOut grid_target_vs(uint vid [[vertex_id]], uint iid [[instance_id]], constant float4* targets [[buffer(0)]],

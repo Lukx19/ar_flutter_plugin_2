@@ -230,6 +230,7 @@ final class GridRendererOverlay: GridOverlayRenderer, GridOverlayFrameUploader {
     let view = GridFrameView(
       view: context.viewMatrix, projection: context.projectionMatrix, cameraPosition: SIMD3(t.x, t.y, t.z),
       drawableWidth: Int(context.drawableSize.width), drawableHeight: Int(context.drawableSize.height), pxPerDp: scale)
-    host.encode(into: encoder, view: view)
+    host.encode(
+      into: encoder, view: view, frameTimestamp: context.frameTimestamp, featurePoints: context.featurePoints)
   }
 }

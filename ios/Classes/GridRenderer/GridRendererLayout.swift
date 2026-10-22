@@ -144,6 +144,8 @@ enum GridDisplayCodes {
   static let overlayRegions = 4
   static let overlayTargets = 8
   static let overlayMarkers = 16
+  /// Raw feature points of each frame (app-driven, points-only grid).
+  static let overlayRawFeaturePoints = 32
 
   static let colourCoverage = 0
   static let colourConfidence = 1

@@ -109,7 +109,8 @@ final class CaptureRenderLoop: NSObject, MTKViewDelegate {
           drawableSize: view.drawableSize,
           orientation: orientation,
           frameTimestamp: frame.timestamp,
-          trackingState: frame.trackingState)
+          trackingState: frame.trackingState,
+          featurePoints: { frame.featurePoints?.points })
         encoder.pushDebugGroup("grid overlay")
         overlay.encodeOverlay(into: encoder, context: context)
         encoder.popDebugGroup()

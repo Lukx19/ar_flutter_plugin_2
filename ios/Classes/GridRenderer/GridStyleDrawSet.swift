@@ -23,6 +23,7 @@ struct StyleDrawCounters {
   /// Voxel instances drawn (padding entries included; they collapse in the shader).
   var voxelInstances = 0
   var lineSegments = 0
+  var rawFeaturePoints = 0
 }
 
 /// Uniforms of every grid program, matching `GridUniforms` in [GridStyleShaders].
@@ -79,6 +80,7 @@ final class GridStyleDrawSet {
   private let boxFill: MTLRenderPipelineState
   private let targets: MTLRenderPipelineState
   private let lines: MTLRenderPipelineState
+  private let rawPoints: MTLRenderPipelineState
   private let depthLessWrite: MTLDepthStencilState?
   private let depthLessEqualRead: MTLDepthStencilState?
   private let depthLessRead: MTLDepthStencilState?
@@ -94,6 +96,9 @@ final class GridStyleDrawSet {
   private var lineRing: [MTLBuffer]
   private var lineRingValue: [UInt64]
   private var lineSlot = 0
+  private var rawPointRing: [MTLBuffer]
+  private var rawPointRingValue: [UInt64]
+  private var rawPointSlot = 0
 
   // Visible runs per slice table, reused per frame.
   private var runKeys = [UInt64](repeating: 0, count: 1024)
@@ -151,6 +156,7 @@ final class GridStyleDrawSet {
     boxFill = try pipeline("box fill", "grid_box_fill_vs", "grid_box_fs", blend: true)
     targets = try pipeline("targets", "grid_target_vs", "grid_flat_fs")
     lines = try pipeline("lines", "grid_line_vs", "grid_line_fs", blend: true)
+    rawPoints = try pipeline("raw feature points", "grid_raw_points_vs", "grid_raw_points_fs", blend: true)
     func depth(_ compare: MTLCompareFunction, write: Bool) -> MTLDepthStencilState? {
       guard depthPixelFormat != .invalid else { return nil }
       let d = MTLDepthStencilDescriptor()
@@ -183,6 +189,17 @@ final class GridStyleDrawSet {
     }
     lineRing = ring
     lineRingValue = Array(repeating: 0, count: GridStyleDrawSet.lineRingSlots)
+    var pointRing: [MTLBuffer] = []
+    let pointBytes = GridStyleDrawSet.maxRawFeaturePoints * GridStyleDrawSet.rawPointBytes
+    for s in 0..<GridStyleDrawSet.lineRingSlots {
+      guard let b = device.makeBuffer(length: pointBytes, options: [.storageModeShared, .cpuCacheModeWriteCombined]) else {
+        throw GridRendererAllocationError(buffer: "raw feature points", bytes: pointBytes)
+      }
+      b.label = "grid raw feature points \(s)"
+      pointRing.append(b)
+    }
+    rawPointRing = pointRing
+    rawPointRingValue = Array(repeating: 0, count: GridStyleDrawSet.lineRingSlots)
   }
 
   /// Uploads colour tables (through the staging ring) and takes planner
@@ -299,6 +316,44 @@ final class GridStyleDrawSet {
       counters.drawCalls += 1
     }
     counters.lineSegments = batch.segments
+  }
+
+  /// Raw feature points drawn at most (ARKit reports a few hundred).
+  static let maxRawFeaturePoints = 2048
+  /// One packed float3 per point.
+  static let rawPointBytes = 12
+  /// Raw point dot diameter in points (dp).
+  static let rawPointDp: Float = 5
+
+  /// Draws [points] (world frame) as round dots on top of everything, from
+  /// a ring slot that [completion] reports free; a frame with every slot in
+  /// flight skips them. At most [maxRawFeaturePoints] are drawn.
+  func drawRawPoints(_ encoder: MTLRenderCommandEncoder, points: [simd_float3], view: GridFrameView,
+                     completion: GridFrameCompletion, frameValue: UInt64) {
+    let count = min(points.count, GridStyleDrawSet.maxRawFeaturePoints)
+    if count == 0 { return }
+    rawPointSlot = (rawPointSlot + 1) % rawPointRing.count
+    if completion.completedValue < rawPointRingValue[rawPointSlot] { return }
+    let buffer = rawPointRing[rawPointSlot]
+    let out = buffer.contents()
+    let stride = GridStyleDrawSet.rawPointBytes
+    for i in 0..<count {
+      let p = points[i]
+      out.storeBytes(of: p.x, toByteOffset: i * stride, as: Float.self)
+      out.storeBytes(of: p.y, toByteOffset: i * stride + 4, as: Float.self)
+      out.storeBytes(of: p.z, toByteOffset: i * stride + 8, as: Float.self)
+    }
+    rawPointRingValue[rawPointSlot] = frameValue
+    var u = GridStyleUniforms()
+    u.viewProj = view.viewProjection
+    u.fixedPx = GridStyleDrawSet.rawPointDp * view.pxPerDp
+    encoder.setRenderPipelineState(rawPoints)
+    encoder.setVertexBuffer(buffer, offset: 0, index: 0)
+    setUniforms(encoder, &u)
+    if let d = depthAlways { encoder.setDepthStencilState(d) }
+    encoder.drawPrimitives(type: .point, vertexStart: 0, vertexCount: count)
+    counters.drawCalls += 1
+    counters.rawFeaturePoints = count
   }
 
   // MARK: styles

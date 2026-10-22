@@ -147,9 +147,13 @@ final class GridRendererHost {
     return uploaded
   }
 
-  /// Draws the grid styles and line overlays of the current display mode.
-  /// Main thread, inside the render pass, after [encodeUploads] of the same frame.
-  func encode(into encoder: MTLRenderCommandEncoder, view: GridFrameView) {
+  /// Draws the grid styles and line overlays of the current display mode,
+  /// and the raw feature points of the drawn frame ([frameTimestamp],
+  /// [featurePoints] read only when the mode asks for them and the frame is
+  /// new). Main thread, inside the render pass, after [encodeUploads] of the
+  /// same frame.
+  func encode(into encoder: MTLRenderCommandEncoder, view: GridFrameView,
+              frameTimestamp: TimeInterval = 0, featurePoints: () -> [simd_float3]? = { nil }) {
     guard let draws = draws, let frameValue = frameValue, !rendererFailed else { return }
     self.frameValue = nil
     encoder.pushDebugGroup("grid styles")
@@ -160,8 +164,18 @@ final class GridRendererHost {
       camX: cam.x, camY: cam.y, camZ: cam.z, batch: lineBatch, focalPx: view.focalPx, pxPerDp: view.pxPerDp) > 0 {
       draws.drawLines(encoder, batch: lineBatch, view: view, completion: completion, frameValue: frameValue)
     }
+    if core.mode.has(GridDisplayCodes.overlayRawFeaturePoints) {
+      rawFeaturePoints.update(frameTimestamp: frameTimestamp, read: featurePoints)
+      draws.drawRawPoints(
+        encoder, points: rawFeaturePoints.points, view: view, completion: completion, frameValue: frameValue)
+    } else {
+      rawFeaturePoints.clear()
+    }
     encoder.popDebugGroup()
   }
+
+  /// Raw feature points of the last drawn frame (main thread).
+  let rawFeaturePoints = RawFeaturePointCache()
 
   /// Draw statistics of the last encoded frame.
   var drawCounters: StyleDrawCounters? { draws?.counters }
@@ -311,5 +325,52 @@ extension GridFrameView {
     heightPx = max(drawableHeight, 1)
     focalPx = projection.columns.1.y * Float(heightPx) * 0.5
     self.pxPerDp = pxPerDp
+  }
+}
+
+/// Raw feature points of the drawn frame, read once per new frame while the
+/// display mode asks for them, with counts logged at most every two seconds
+/// of frame time. Main thread.
+final class RawFeaturePointCache {
+  private(set) var points: [simd_float3] = []
+  private var timestamp: TimeInterval = -1
+  private(set) var clouds = 0
+  private(set) var pointsIn = 0
+  private(set) var pointsKept = 0
+  private var lastLogTimestamp: TimeInterval = -1
+  private let log: (String) -> Void
+
+  static let logIntervalS: TimeInterval = 2
+
+  init(log: @escaping (String) -> Void = { NSLog("%@", $0) }) {
+    self.log = log
+  }
+
+  /// Reads [read] when [frameTimestamp] is new; keeps the previous points
+  /// when it returns nil.
+  func update(frameTimestamp: TimeInterval, read: () -> [simd_float3]?) {
+    if frameTimestamp == timestamp { return }
+    timestamp = frameTimestamp
+    guard let next = read() else { return }
+    // Finite points only, at most what the draw takes.
+    points.removeAll(keepingCapacity: true)
+    for p in next where p.x.isFinite && p.y.isFinite && p.z.isFinite {
+      if points.count == GridStyleDrawSet.maxRawFeaturePoints { break }
+      points.append(p)
+    }
+    let kept = points.count
+    clouds += 1
+    pointsIn += next.count
+    pointsKept += kept
+    if lastLogTimestamp < 0 || frameTimestamp - lastLogTimestamp >= RawFeaturePointCache.logIntervalS {
+      lastLogTimestamp = frameTimestamp
+      log("[grid-raw-points] clouds=\(clouds) pointsIn=\(pointsIn) pointsKept=\(pointsKept) last=\(kept)")
+    }
+  }
+
+  func clear() {
+    if points.isEmpty && timestamp < 0 { return }
+    points.removeAll(keepingCapacity: true)
+    timestamp = -1
   }
 }
