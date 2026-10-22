@@ -300,6 +300,10 @@ internal class SceneViewHost(
     // ARCore/Filament session. See [SceneViewSessionLease].
     private val sceneSessionGeneration = sceneSessionGenerationCounter.incrementAndGet()
     private val ownsSceneSession = mutableStateOf(false)
+
+    /** True until the previous view's session closed and this view owns the scene session. */
+    override val waitingForSceneSession: Boolean
+        get() = !disposed && !ownsSceneSession.value
     // ARSceneView's frame coroutine must observe a pause before Compose
     // releases its Filament renderer. The activity lifecycle remains the
     // source of truth, while this owner provides the ordered teardown fence.
@@ -1600,11 +1604,44 @@ internal class SceneViewHost(
         anchors.clear()
         detectedPlanes.clear()
         frameRef.set(null)
-        sessionRef.set(null)
+        val closingSession = sessionRef.getAndSet(null) as? ARSession
         visibilityGridDepthModeCache.reset()
         cameraStreamRef.set(null)
         engineRef.set(null)
-        compositionDisposalGate.request()
+        requestCompositionDisposalAfterSessionClose(closingSession)
+    }
+
+    /**
+     * Closes the paused ARCore session on [ArSessionCloseWorker] and only then
+     * disposes the composition (SceneView's own close is then a no-op through
+     * its close gate). The scene session lease is released by that disposal,
+     * so the next view still starts after this session is gone, while the
+     * main thread stays free: ARCore's Session.close can block for about
+     * 10 s (Galaxy A40 live camera, a session paused right after it resumed)
+     * or longer (tablet playback).
+     */
+    private fun requestCompositionDisposalAfterSessionClose(session: ARSession?) {
+        if (session == null || session.isClosed) {
+            compositionDisposalGate.request()
+            return
+        }
+        if (session.isResumed) {
+            runCatching { session.pause() }
+                .onFailure { Log.w("SceneViewHost", "ARCore pause before close failed", it) }
+        }
+        val generation = sceneSessionGeneration
+        ArSessionCloseWorker.close(session) { closeMs, failure ->
+            compositionHandler.post {
+                if (failure != null) {
+                    Log.e("SceneViewHost", "ARCore session close failed", failure)
+                }
+                Log.i(
+                    "SceneViewHost",
+                    "[RENDERER-LIFETIME] event=session-closed generation=$generation closeMs=$closeMs",
+                )
+                compositionDisposalGate.request()
+            }
+        }
     }
 
     /** Emits sparse lifetime evidence; this must never run from the frame hot path. */
@@ -2519,4 +2556,23 @@ private class ArSessionPlaybackPort(private val session: Session) : ArPlaybackSe
     override fun setCameraTextureNames(textureIds: IntArray) = session.setCameraTextureNames(textureIds)
     override fun pause() = session.pause()
     override fun resume() = session.resume()
+}
+
+/**
+ * One process-wide thread for ARCore Session.close: closes run in order and
+ * never on the main thread. [onClosed] runs on this thread with the close
+ * duration and any failure.
+ */
+internal object ArSessionCloseWorker {
+    private val executor = java.util.concurrent.Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "capture3d-arcore-close").apply { isDaemon = true }
+    }
+
+    fun close(session: Session, onClosed: (closeMs: Long, failure: Throwable?) -> Unit) {
+        executor.execute {
+            val started = SystemClock.elapsedRealtime()
+            val failure = runCatching { session.close() }.exceptionOrNull()
+            onClosed(SystemClock.elapsedRealtime() - started, failure)
+        }
+    }
 }

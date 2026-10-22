@@ -195,6 +195,9 @@ internal interface SceneViewCaptureHost {
     val cameraTextureIds: IntArray
     val cameraTexture: Texture?
 
+    /** The previous view's ARCore session is still closing; this view has none yet. */
+    val waitingForSceneSession: Boolean get() = false
+
     /** Releases a capture-owned Filament stream while the renderer is still alive. */
     fun destroyCaptureStream(stream: Stream): Boolean {
         engine.destroyStream(stream)
