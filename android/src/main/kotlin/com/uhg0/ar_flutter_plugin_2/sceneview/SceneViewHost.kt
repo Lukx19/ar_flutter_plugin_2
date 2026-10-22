@@ -301,7 +301,12 @@ internal class SceneViewHost(
     private val sceneSessionGeneration = sceneSessionGenerationCounter.incrementAndGet()
     private val ownsSceneSession = mutableStateOf(false)
 
-    /** True until the previous view's session closed and this view owns the scene session. */
+    /**
+     * This view does not own the scene session yet: normally the previous
+     * view's session is still closing. A live duplicate holder also keeps it
+     * true, so such a view now fails at the startup gate's 60 s predecessor
+     * bound instead of its 10 s deadline.
+     */
     override val waitingForSceneSession: Boolean
         get() = !disposed && !ownsSceneSession.value
     // ARSceneView's frame coroutine must observe a pause before Compose
@@ -315,7 +320,7 @@ internal class SceneViewHost(
         )
     }
     private val compositionHandler = Handler(Looper.getMainLooper())
-    private var disposed = false
+    @Volatile private var disposed = false
     @Volatile private var futureResumesBlocked = false
     // SceneView dispatches session updates on its render callback while the
     // platform channel pauses from the Android main thread. A volatile gate
@@ -1580,7 +1585,14 @@ internal class SceneViewHost(
         }.onFailure { Log.w("SceneViewHost", "Depth mode re-application failed", it) }.getOrDefault(false)
     }
 
-    fun dispose() {
+    /**
+     * Terminal disposal. [onSessionClosed] runs once on the main thread after
+     * this host's ARCore session is closed (at once without a session); a
+     * repeated dispose returns without calling it. A close that never
+     * finishes never calls it, so the view stays counted as open while its
+     * session is alive.
+     */
+    fun dispose(onSessionClosed: () -> Unit = {}) {
         bindNativeFrameAttribution(null)
         if (!ownership.onDispose()) return
         SceneViewHostRetentionCensus.active?.recordDisposed(this)
@@ -1590,7 +1602,7 @@ internal class SceneViewHost(
         coveragePublications.close()
         coveragePresentationRefreshPending.set(false)
         rendererPaused = true
-        sceneRenderLifecycle.pauseForTeardown()
+        sceneRenderLifecycle.pauseForDisposal()
         coverageMeshRef.getAndSet(null)?.disposeForReplacement()
         coverageResourceFactory.clear()
         coverageRendererOwner.dispose()
@@ -1608,7 +1620,7 @@ internal class SceneViewHost(
         visibilityGridDepthModeCache.reset()
         cameraStreamRef.set(null)
         engineRef.set(null)
-        requestCompositionDisposalAfterSessionClose(closingSession)
+        requestCompositionDisposalAfterSessionClose(closingSession, onSessionClosed)
     }
 
     /**
@@ -1619,10 +1631,22 @@ internal class SceneViewHost(
      * main thread stays free: ARCore's Session.close can block for about
      * 10 s (Galaxy A40 live camera, a session paused right after it resumed)
      * or longer (tablet playback).
+     *
+     * Exception: an Activity destroy during the close disposes the composition
+     * at once through [parentTeardown]; the next view's lease is then released
+     * before the close, and a close still queued on the worker runs in
+     * SceneView's composition disposal on the main thread (the worker's later
+     * close is a no-op). The late [compositionDisposalGate] request after that
+     * is harmless: Compose disposal, view removal, the terminal render
+     * lifecycle and the teardown release are all idempotent.
      */
-    private fun requestCompositionDisposalAfterSessionClose(session: ARSession?) {
+    private fun requestCompositionDisposalAfterSessionClose(
+        session: ARSession?,
+        onSessionClosed: () -> Unit,
+    ) {
         if (session == null || session.isClosed) {
             compositionDisposalGate.request()
+            onSessionClosed()
             return
         }
         if (session.isResumed) {
@@ -1640,6 +1664,7 @@ internal class SceneViewHost(
                     "[RENDERER-LIFETIME] event=session-closed generation=$generation closeMs=$closeMs",
                 )
                 compositionDisposalGate.request()
+                onSessionClosed()
             }
         }
     }
