@@ -1,0 +1,55 @@
+// Full-screen AR camera background for a Filament View with post-processing
+// disabled (capture preview, `configureCapturePresentation`).
+//
+// Replaces SceneView 4.47.0's `camera_stream_flat` as ARCameraStream's
+// standard material. Same vertex stage, parameters and render state; only the
+// fragment differs. SceneView's material decodes the sRGB camera texel to
+// linear and applies the inverse Filmic tone curve, relying on the View's
+// post-processing (Filmic tone mapping, then the sRGB output transform) to
+// re-encode it. With post-processing off Filament writes the shader output
+// unchanged to a non-sRGB swap chain, so this material writes the
+// sRGB-encoded camera texel itself.
+//
+// Parameters (names fixed by ARCameraStream):
+//   cameraTexture - samplerExternal, live ARCore camera image
+//   uvTransform   - float4x4, ARCore display-rotation UV transform
+//
+// Compile with Filament 1.72.1 matc (material format 72) through
+// `android/tools/compile_filament_materials.py`.
+material {
+    name : "Capture3D Camera Stream Passthrough",
+    vertexDomain : device,
+    shadingModel : unlit,
+    blending : opaque,
+    culling : none,
+    parameters : [
+        {
+            type : samplerExternal,
+            name : cameraTexture
+        },
+        {
+            type : float4x4,
+            name : uvTransform
+        }
+    ],
+    requires : [
+        uv0
+    ]
+}
+
+fragment {
+    void material(inout MaterialInputs material) {
+        prepareMaterial(material);
+        material.baseColor.rgb = texture(materialParams_cameraTexture, getUV0()).rgb;
+        material.baseColor.a = 1.0;
+    }
+}
+
+vertex {
+    void materialVertex(inout MaterialVertexInputs material) {
+        material.uv0 = mulMat4x4Float3(materialParams.uvTransform, vec3(material.uv0.x, material.uv0.y, 0.0)).xy;
+        vec4 clip = getPosition();
+        clip.z = 0.9999;
+        material.worldPosition = mulMat4x4Float3(getWorldFromClipMatrix(), clip.xyz);
+    }
+}
