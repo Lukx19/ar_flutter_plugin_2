@@ -103,4 +103,21 @@ class VisibilityGridDepthModeTest {
             selectVisibilityGridDepthMode(depthSupportForInput(false, all)),
         )
     }
+
+    @Test
+    fun `depth input on a device without depth selects the same depth mode as depth input off`() {
+        // A device without the Depth API (Galaxy A40) answers false for every
+        // depth mode; the depth setting reaches the session only through this
+        // mode, so both settings must select DISABLED.
+        val unsupported: (Config.DepthMode) -> Boolean = { mode -> mode == Config.DepthMode.DISABLED }
+        val depthOn = selectVisibilityGridDepthMode(depthSupportForInput(true, unsupported))
+
+        var offProbes = 0
+        val counted: (Config.DepthMode) -> Boolean = { offProbes++; true }
+        val depthOff = selectVisibilityGridDepthMode(depthSupportForInput(false, counted))
+
+        assertEquals(Config.DepthMode.DISABLED, depthOn)
+        assertEquals(depthOn, depthOff)
+        assertEquals("depth input off never probes ARCore", 0, offProbes)
+    }
 }
