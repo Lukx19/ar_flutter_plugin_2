@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""Compile the coverage point and cube Filament materials
+"""Compile the plugin's Filament materials: the coverage point and cube
+materials and the capture preview's camera stream passthrough material
 (macOS, Linux and Windows hosts; Python 3.9+ standard library only).
 
-Usage: `python3 android/tools/compile_coverage_materials.py --matc <matc>`
+Usage: `python3 android/tools/compile_filament_materials.py --matc <matc>`
 (`python` on Windows, where the compiler is `matc.exe`).
 
 The compiler must report Filament binary material format `72` (Filament
-1.72.1's `matc --version` prints the format, not its patch version). Each of
-`src/main/materials/{coverage_points,coverage_cubes}.mat` is compiled for
+1.72.1's `matc --version` prints the format, not its patch version), the
+Filament version SceneView 4.47.0 bundles; a material compiled by another
+version may not load. Each of
+`src/main/materials/{coverage_points,coverage_cubes,camera_stream_passthrough}.mat`
+is compiled for
 mobile with OpenGL and Vulkan shaders into
 `src/main/assets/materials/<name>.filamat`.
 
@@ -24,7 +28,7 @@ import sys
 from typing import Callable, List, Optional, Sequence
 
 REQUIRED_FORMAT = "72"
-MATERIALS = ("coverage_points", "coverage_cubes")
+MATERIALS = ("coverage_points", "coverage_cubes", "camera_stream_passthrough")
 DEFAULT_MAIN_DIR = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "main"))
 
@@ -47,7 +51,7 @@ def check_format(compiler: str, run: Runner = subprocess.run) -> None:
     reported = (result.stdout or "").strip()
     if result.returncode != 0 or reported != REQUIRED_FORMAT:
         raise MaterialCompileError(
-            f"Coverage materials require Filament material format {REQUIRED_FORMAT}; "
+            f"Plugin materials require Filament material format {REQUIRED_FORMAT}; "
             f"compiler reported '{reported}'.")
 
 
@@ -68,7 +72,7 @@ def compile_materials(compiler: str, main_dir: str = DEFAULT_MAIN_DIR,
 
 def main(argv: Optional[Sequence[str]] = None, run: Runner = subprocess.run) -> int:
     parser = argparse.ArgumentParser(
-        description="Compile the coverage Filament materials with matc (format 72).")
+        description="Compile the plugin Filament materials with matc (format 72).")
     parser.add_argument("--matc", required=True,
                         help="path to the Filament 1.72.1 matc executable")
     args = parser.parse_args(argv)

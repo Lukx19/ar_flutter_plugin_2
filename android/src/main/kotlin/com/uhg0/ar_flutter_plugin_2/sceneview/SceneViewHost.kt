@@ -474,7 +474,9 @@ internal class SceneViewHost(
             val modelLoader = rememberModelLoader(engine)
             val materialLoader = rememberMaterialLoader(engine)
             val environmentLoader = rememberEnvironmentLoader(engine)
-            val cameraStream = rememberARCameraStream(materialLoader)
+            val cameraStream = rememberARCameraStream(materialLoader) {
+                ARCameraStream(materialLoader, standardMaterialFile = CAPTURE_CAMERA_STREAM_MATERIAL)
+            }
             val filamentView = rememberARView(engine) {
                 createARView(engine).also(::configureCapturePresentation)
             }
@@ -623,13 +625,13 @@ internal class SceneViewHost(
             ) {
                 if (config.showWorldOrigin) {
                     val red = remember(materialLoader) {
-                        materialLoader.createUnlitColorInstance(android.graphics.Color.RED)
+                        materialLoader.createCapturePreviewUnlitColorInstance(android.graphics.Color.RED)
                     }
                     val green = remember(materialLoader) {
-                        materialLoader.createUnlitColorInstance(android.graphics.Color.GREEN)
+                        materialLoader.createCapturePreviewUnlitColorInstance(android.graphics.Color.GREEN)
                     }
                     val blue = remember(materialLoader) {
-                        materialLoader.createUnlitColorInstance(android.graphics.Color.BLUE)
+                        materialLoader.createCapturePreviewUnlitColorInstance(android.graphics.Color.BLUE)
                     }
                     DisposableEffect(red, green, blue) {
                         onDispose {
@@ -714,7 +716,7 @@ internal class SceneViewHost(
                 }
                 if (coverage == null && config.showFeaturePoints) {
                     val pointMaterial = remember(materialLoader) {
-                        materialLoader.createUnlitColorInstance(android.graphics.Color.CYAN)
+                        materialLoader.createCapturePreviewUnlitColorInstance(android.graphics.Color.CYAN)
                     }
                     DisposableEffect(pointMaterial) {
                         onDispose { materialLoader.destroyMaterialInstance(pointMaterial) }
@@ -2414,15 +2416,38 @@ internal data class SceneRendererPressureSnapshot(
 internal val CAPTURE_LIGHT_ESTIMATION_MODE: Config.LightEstimationMode = Config.LightEstimationMode.DISABLED
 
 /**
- * Filament view settings for the capture preview: SceneView's AR view
- * defaults without the FXAA pass and shadow maps, which the unlit capture
- * content does not use (Galaxy A40 paired runs AB, AB3 and RB in
- * `.scratch/workflow/a40-perf2/table.md`: fewer >100 ms camera gaps and a
- * lower p95 interval). Post-processing itself stays on: the camera stream
- * material inverts the Filmic tone mapper and needs it for correct colors.
- * Restore shadows if shadow-receiving planes (`showPlanes`) are used.
+ * Camera background material of the capture preview, paired with the
+ * post-processing switch in [configureCapturePresentation]. It writes the
+ * sRGB camera texel unchanged; SceneView's default `camera_stream_flat`
+ * inverts the Filmic tone mapper and is correct only with post-processing on.
+ * Source `src/main/materials/camera_stream_passthrough.mat`, compiled by
+ * `android/tools/compile_filament_materials.py` with Filament 1.72.1 matc.
+ * ARCameraStream's depth and person occlusion materials stay SceneView's;
+ * the capture preview enables neither occlusion mode.
+ */
+internal const val CAPTURE_CAMERA_STREAM_MATERIAL = "materials/camera_stream_passthrough.filamat"
+
+/**
+ * Filament view settings for the capture preview: no post-processing, no
+ * FXAA pass, no shadow maps.
+ *
+ * Post-processing (HDR color target, Filmic tone mapping, dithering and the
+ * output color transform) is the Galaxy A40 preview's largest GPU cost
+ * (`.scratch/workflow/a40-perf2/table.md`, runs P-sf against A-sf: 19.5-21.0
+ * instead of 11.3-12.7 visible fps; `.scratch/workflow/a40-smooth/table.md`).
+ * Without it Filament writes shader output straight to the non-sRGB swap
+ * chain, so the camera background must use
+ * [CAPTURE_CAMERA_STREAM_MATERIAL], and the unlit world-origin axes and
+ * SceneView feature points use [createCapturePreviewUnlitColorInstance].
+ * Legacy coverage nodes and SceneView planes are drawn without tone mapping
+ * or sRGB encoding; the production grid and raw feature points draw in the
+ * separate GLES overlay and are unaffected.
+ * FXAA and shadows: `.scratch/workflow/a40-perf2/table.md` paired runs AB,
+ * AB3 and RB. Restore shadows if shadow-receiving planes (`showPlanes`) are
+ * used.
  */
 internal fun configureCapturePresentation(view: com.google.android.filament.View) {
+    view.isPostProcessingEnabled = false
     view.antiAliasing = com.google.android.filament.View.AntiAliasing.NONE
     view.setShadowingEnabled(false)
 }

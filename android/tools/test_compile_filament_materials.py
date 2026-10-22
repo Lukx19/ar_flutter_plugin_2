@@ -1,4 +1,4 @@
-"""Host tests of compile_coverage_materials.py with fake matc compilers.
+"""Host tests of compile_filament_materials.py with fake matc compilers.
 
 Run: `python3 -m unittest discover -s android/tools -p 'test_*.py'` from the
 plugin root (no Filament download, no device).
@@ -16,7 +16,7 @@ import textwrap
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import compile_coverage_materials as tool  # noqa: E402
+import compile_filament_materials as tool  # noqa: E402
 
 
 class FakeRun:
@@ -32,7 +32,7 @@ class FakeRun:
         return subprocess.CompletedProcess(argv, code)
 
 
-class CompileCoverageMaterialsTest(unittest.TestCase):
+class CompileFilamentMaterialsTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -46,11 +46,12 @@ class CompileCoverageMaterialsTest(unittest.TestCase):
             code = tool.main(argv if argv is not None else ["--matc", self.matc], run=run)
         return code, err.getvalue()
 
-    def test_default_main_dir_is_plugin_android_sources(self):
-        self.assertTrue(os.path.isfile(os.path.join(
-            tool.DEFAULT_MAIN_DIR, "materials", "coverage_points.mat")))
+    def test_every_material_source_exists_in_plugin_android_sources(self):
+        for name in tool.MATERIALS:
+            self.assertTrue(os.path.isfile(os.path.join(
+                tool.DEFAULT_MAIN_DIR, "materials", f"{name}.mat")), name)
 
-    def test_compiles_both_materials_for_opengl_and_vulkan(self):
+    def test_compiles_every_material_for_opengl_and_vulkan(self):
         run = FakeRun()
         code, err = self.run_main(run)
         self.assertEqual((code, err), (0, ""))
@@ -61,7 +62,7 @@ class CompileCoverageMaterialsTest(unittest.TestCase):
             [compiler, "--platform", "mobile", "--api", "opengl", "--api", "vulkan",
              "--output", os.path.join(main, "assets", "materials", f"{name}.filamat"),
              os.path.join(main, "materials", f"{name}.mat")]
-            for name in ("coverage_points", "coverage_cubes")])
+            for name in ("coverage_points", "coverage_cubes", "camera_stream_passthrough")])
 
     def test_wrong_format_compiles_nothing(self):
         run = FakeRun(version="71\n")
@@ -115,11 +116,11 @@ class CompileCoverageMaterialsTest(unittest.TestCase):
                 """))
         os.chmod(self.matc, os.stat(self.matc).st_mode | stat.S_IXUSR)
         tool.compile_materials(tool.resolve_compiler(self.matc), main)
-        for name in ("coverage_points", "coverage_cubes"):
+        for name in tool.MATERIALS:
             self.assertTrue(os.path.isfile(
                 os.path.join(main, "assets", "materials", f"{name}.filamat")))
         with open(log, encoding="utf-8") as handle:
-            self.assertEqual(len(handle.read().splitlines()), 3)
+            self.assertEqual(len(handle.read().splitlines()), 1 + len(tool.MATERIALS))
 
 
 if __name__ == "__main__":
