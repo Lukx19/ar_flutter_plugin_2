@@ -46,6 +46,7 @@ import com.uhg0.ar_flutter_plugin_2.visibilitygrid.NativeRendererProjection
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.RendererPublicationTimingScope
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.CanonicalRuntimeResources
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.AndroidVisibilityGridRuntime
+import com.uhg0.ar_flutter_plugin_2.sceneview.OpenArViews
 import com.uhg0.ar_flutter_plugin_2.visibilityingest.VisibilityGridShellRegistry
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.CanonicalReadyHintOwner
 import com.uhg0.ar_flutter_plugin_2.visibilitygrid.ArCoreVisibilityObservationSource
@@ -474,6 +475,10 @@ internal class ArView(
             sceneHost::visibilityGridDepthMode,
             reapplyDepthMode = { root.post { if (!disposed) sceneHost.reapplyVisibilityGridDepthMode() } },
         ) { runCatching { captureSession.getCameraIntrinsics() }.getOrNull() }
+        // Last, so a view whose construction failed is never registered.
+        // Until disposal released the ARCore session, Settings must not open
+        // a second one (camera and tier enumeration).
+        OpenArViews.opened(this)
     }
 
     override fun getView(): View = root
@@ -558,6 +563,7 @@ internal class ArView(
         pendingCloudOperations.toList().forEach { it() }
         pendingCloudOperations.clear()
         sceneHost.dispose()
+        OpenArViews.closed(this)
         disposeCompleted = true
         settleDispose(Result.success(Unit))
         scope.cancel()

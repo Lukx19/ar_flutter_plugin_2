@@ -14,7 +14,10 @@ import kotlin.math.atan
 import kotlin.math.abs
 import kotlin.math.PI
 import com.uhg0.ar_flutter_plugin_2.sceneview.ArCameraConfigCatalog
-import com.uhg0.ar_flutter_plugin_2.sceneview.arCameraResolutionChoices
+import com.uhg0.ar_flutter_plugin_2.sceneview.ArCameraConfigProbe
+import com.uhg0.ar_flutter_plugin_2.sceneview.OpenArViews
+import com.uhg0.ar_flutter_plugin_2.sceneview.lookUpArCameraResolutions
+import com.uhg0.ar_flutter_plugin_2.sceneview.lookUpSelectableRearCameras
 import com.uhg0.ar_flutter_plugin_2.sceneview.cameraConfigShape
 
 data class CameraResolution(val width: Int, val height: Int)
@@ -184,41 +187,52 @@ class CameraCapabilityQuerier(private val context: Context) {
      * AR camera tiers of rear camera [cameraId] (null: ARCore's default rear
      * camera): `auto` with the default config's shape and `tiers` with the
      * tiers that select another config (`arCameraResolutionChoices`). Uses
-     * the configs of the running or last AR session when known; otherwise
-     * opens a temporary ARCore session, so call it only while no AR session
-     * is active then.
+     * the configs of the running or last AR session when known; otherwise a
+     * temporary ARCore session, only while no AR view is open (Settings
+     * pushed over a running capture gets an empty reply: Auto only).
      */
-    fun getArCameraResolutions(cameraId: String?): Map<String, Any> {
-        ArCameraConfigCatalog.shapes(cameraId)?.let {
-            return arCameraResolutionChoices(it)
-        }
-        return runCatching {
-            val session = Session(context, setOf(Session.Feature.SHARED_CAMERA))
-            try {
-                val wanted = cameraId ?: session.cameraConfig.cameraId
-                val shapes = session.getSupportedCameraConfigs(CameraConfigFilter(session))
-                    .filter { it.cameraId == wanted && it.facingDirection == CameraConfig.FacingDirection.BACK }
-                    .map { cameraConfigShape(it) }
-                ArCameraConfigCatalog.record(wanted, shapes)
-                arCameraResolutionChoices(shapes)
-            } finally {
-                session.close()
+    fun getArCameraResolutions(cameraId: String?): Map<String, Any> =
+        lookUpArCameraResolutions(cameraId, arViewOpen = OpenArViews.any) { wanted ->
+            runCatching {
+                val session = Session(context, setOf(Session.Feature.SHARED_CAMERA))
+                try {
+                    val defaultId = session.cameraConfig.cameraId
+                    val probedId = wanted ?: defaultId
+                    ArCameraConfigProbe(
+                        defaultCameraId = defaultId,
+                        cameraId = probedId,
+                        shapes = session.getSupportedCameraConfigs(CameraConfigFilter(session))
+                            .filter {
+                                it.cameraId == probedId &&
+                                    it.facingDirection == CameraConfig.FacingDirection.BACK
+                            }
+                            .map { cameraConfigShape(it) },
+                    )
+                } finally {
+                    session.close()
+                }
+            }.getOrElse { error ->
+                Log.w(TAG, "Unable to enumerate ARCore camera configs", error)
+                null
             }
-        }.getOrElse { error ->
-            Log.w(TAG, "Unable to enumerate ARCore camera configs", error)
-            emptyMap()
         }
-    }
 
     /**
      * Returns one representative ARCore config for every selectable rear
-     * camera. Call only while no AR session is active (the Settings route): a
-     * second ARCore session may otherwise disrupt a live shared-camera session.
+     * camera. Enumerates in a temporary ARCore session only while no AR view
+     * is open: a second ARCore session may otherwise disrupt a live
+     * shared-camera session, so Settings pushed over a running capture gets
+     * the last enumeration (or none).
      */
     fun getSelectableRearCameras(): List<Map<String, Any?>> =
+        lookUpSelectableRearCameras(arViewOpen = OpenArViews.any, enumerate = ::enumerateSelectableRearCameras)
+
+    private fun enumerateSelectableRearCameras(): List<Map<String, Any?>>? =
         runCatching {
             val session = Session(context, setOf(Session.Feature.SHARED_CAMERA))
             try {
+                // A new session runs ARCore's default rear camera.
+                ArCameraConfigCatalog.recordDefaultCameraId(session.cameraConfig.cameraId)
                 val candidates =
                     session.getSupportedCameraConfigs(CameraConfigFilter(session))
                         .asSequence()
@@ -254,7 +268,7 @@ class CameraCapabilityQuerier(private val context: Context) {
             }
         }.getOrElse { error ->
             Log.w(TAG, "Unable to enumerate ARCore rear camera configs", error)
-            emptyList()
+            null
         }
 
     private data class ArCoreRearCameraCandidate(

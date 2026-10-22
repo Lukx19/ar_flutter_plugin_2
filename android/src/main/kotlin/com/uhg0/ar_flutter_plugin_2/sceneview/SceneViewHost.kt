@@ -801,6 +801,9 @@ internal class SceneViewHost(
 
     private fun selectRearCameraConfig(session: Session): CameraConfig? {
         val requestedId = requestedRearCameraId ?: session.cameraConfig.cameraId
+        // Without a requested camera the new session runs ARCore's default
+        // rear camera: Settings looks its configs up by that id.
+        if (requestedRearCameraId == null) ArCameraConfigCatalog.recordDefaultCameraId(requestedId)
         val matchingConfigs =
             session.getSupportedCameraConfigs(CameraConfigFilter(session))
                 .filter {

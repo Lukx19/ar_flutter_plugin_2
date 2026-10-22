@@ -81,18 +81,120 @@ internal fun arCameraResolutionChoices(shapes: List<ArCameraConfigShape>): Map<S
 }
 
 /**
- * Configs of the last ARCore session per rear camera id, so Settings opened
- * over a running capture can list the tiers without a second ARCore session.
+ * Configs of the last ARCore session per rear camera id, and ARCore's
+ * default rear camera id, so Settings opened over a running capture can list
+ * the tiers without a second ARCore session.
  */
 internal object ArCameraConfigCatalog {
     private val byCamera = java.util.concurrent.ConcurrentHashMap<String, List<ArCameraConfigShape>>()
+
+    /** ARCore's default rear camera id (a new session's camera), once seen. */
+    @Volatile var defaultCameraId: String? = null
+        private set
 
     fun record(cameraId: String, shapes: List<ArCameraConfigShape>) {
         if (shapes.isNotEmpty()) byCamera[cameraId] = shapes
     }
 
-    fun shapes(cameraId: String?): List<ArCameraConfigShape>? =
-        if (cameraId != null) byCamera[cameraId] else byCamera.values.firstOrNull()
+    /** Records the camera id of a new ARCore session before its config is changed. */
+    fun recordDefaultCameraId(cameraId: String) {
+        defaultCameraId = cameraId
+    }
 
-    fun clear() = byCamera.clear()
+    /**
+     * Configs of rear camera [cameraId]; null [cameraId] is ARCore's default
+     * rear camera. Null when that camera's configs, or the default camera
+     * id, were not recorded yet.
+     */
+    fun shapes(cameraId: String?): List<ArCameraConfigShape>? =
+        (cameraId ?: defaultCameraId)?.let { byCamera[it] }
+
+    fun clear() {
+        byCamera.clear()
+        defaultCameraId = null
+    }
+}
+
+/**
+ * AR views from creation until their disposal released the ARCore session.
+ * While any is open, opening another ARCore session (the tier probe) could
+ * disrupt the live shared-camera session.
+ */
+internal object OpenArViews {
+    private val views = java.util.Collections.newSetFromMap(
+        java.util.IdentityHashMap<Any, Boolean>(),
+    )
+
+    fun opened(view: Any) {
+        synchronized(views) { views.add(view) }
+    }
+
+    fun closed(view: Any) {
+        synchronized(views) { views.remove(view) }
+    }
+
+    val any: Boolean get() = synchronized(views) { views.isNotEmpty() }
+
+    fun clear() {
+        synchronized(views) { views.clear() }
+    }
+}
+
+/** Configs a temporary ARCore session reported for one rear camera. */
+internal data class ArCameraConfigProbe(
+    /** The temporary session's own camera: ARCore's default rear camera. */
+    val defaultCameraId: String,
+    val cameraId: String,
+    val shapes: List<ArCameraConfigShape>,
+)
+
+/**
+ * AR camera tiers of rear camera [cameraId] (null: ARCore's default) for
+ * Settings: the recorded configs of a running or earlier AR session when
+ * known. Otherwise [probe] opens a temporary ARCore session for them, but
+ * only while no AR view is open ([arViewOpen]); with one open the tiers are
+ * unknown (an empty reply: Settings offers Auto only). A null probe result
+ * is unknown too.
+ */
+internal fun lookUpArCameraResolutions(
+    cameraId: String?,
+    arViewOpen: Boolean,
+    probe: (cameraId: String?) -> ArCameraConfigProbe?,
+): Map<String, Any> {
+    ArCameraConfigCatalog.shapes(cameraId)?.let { return arCameraResolutionChoices(it) }
+    if (arViewOpen) return emptyMap()
+    val probed = probe(cameraId) ?: return emptyMap()
+    ArCameraConfigCatalog.recordDefaultCameraId(probed.defaultCameraId)
+    ArCameraConfigCatalog.record(probed.cameraId, probed.shapes)
+    return arCameraResolutionChoices(probed.shapes)
+}
+
+/** Selectable rear cameras of the last enumeration (channel maps). */
+internal object RearCameraCatalog {
+    @Volatile var cameras: List<Map<String, Any?>>? = null
+        private set
+
+    fun record(cameras: List<Map<String, Any?>>) {
+        this.cameras = cameras
+    }
+
+    fun clear() {
+        cameras = null
+    }
+}
+
+/**
+ * Selectable rear cameras for Settings: [enumerate] opens a temporary ARCore
+ * session, so only while no AR view is open ([arViewOpen]); with one open,
+ * the last enumeration or none (Settings hides the choice). A null
+ * enumeration (ARCore failed) is none and is not remembered.
+ */
+internal fun lookUpSelectableRearCameras(
+    arViewOpen: Boolean,
+    enumerate: () -> List<Map<String, Any?>>?,
+): List<Map<String, Any?>> {
+    if (arViewOpen) return RearCameraCatalog.cameras ?: emptyList()
+    val cameras = enumerate() ?: return emptyList()
+    RearCameraCatalog.record(cameras)
+    return cameras
 }
