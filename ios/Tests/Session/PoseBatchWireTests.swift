@@ -120,6 +120,28 @@ final class PoseBatchWireTests: XCTestCase {
     XCTAssertTrue(limiter.shouldEmit(900_000_000))
   }
 
+  func testRateLimiterKeepsEveryFrameOfAJitteredThirtyHertzCamera() {
+    var limiter = PoseRateLimiter()
+    var timestampNs: Int64 = 1_000_000_000
+    var emitted = 0
+    for index in 0..<300 {
+      timestampNs += index % 2 == 0 ? 33_200_000 : 33_400_000
+      if limiter.shouldEmit(timestampNs) { emitted += 1 }
+    }
+    XCTAssertEqual(emitted, 300)
+  }
+
+  func testRateLimiterKeepsEveryOtherFrameOfASixtyHertzCamera() {
+    var limiter = PoseRateLimiter()
+    var timestampNs: Int64 = 1_000_000_000
+    var emitted = 0
+    for index in 0..<600 {
+      timestampNs += index % 2 == 0 ? 16_600_000 : 16_733_334
+      if limiter.shouldEmit(timestampNs) { emitted += 1 }
+    }
+    XCTAssertEqual(emitted, 300)
+  }
+
   func testDispatcherKeepsOneBatchInFlightAndDropsOldestBeyondCapacity() {
     var sent: [PoseBatch] = []
     var acknowledgements: [() -> Void] = []
