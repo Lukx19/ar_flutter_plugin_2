@@ -153,6 +153,32 @@ class NativeCaptureAdapterV2Test {
     }
 
     @Test
+    fun `pause before first use settles without the durable root another view holds`() {
+        val files = java.nio.file.Files.createTempDirectory("capture-v2-pause-before-use-").toFile()
+        val context = object : ContextWrapper(null) {
+            override fun getFilesDir(): File = files
+        }
+        val root = File(files, "capture-v2-native")
+        val replacing = NativeCaptureDurableRootLeaseV2.acquire(root)
+        val binding = NativeCaptureBindingV2(context, CaptureSafetySignalV2())
+        try {
+            // A view replaced before first use pauses while its replacement owns the root.
+            binding.onPause()
+            replacing.close()
+            binding.onPause()
+            // The paused view still holds no root: the next view can open it.
+            NativeCaptureDurableRootLeaseV2.acquire(root).close()
+            binding.close()
+            binding.onPause()
+            NativeCaptureDurableRootLeaseV2.acquire(root).close()
+        } finally {
+            replacing.close()
+            binding.close()
+            files.deleteRecursively()
+        }
+    }
+
+    @Test
     fun `normal close wins before deadline and never executes fallback`() {
         val main = Executors.newSingleThreadExecutor { runnable -> Thread(runnable, "test-main") }
         val owner = NativeCaptureSerialOwnerV2(main)

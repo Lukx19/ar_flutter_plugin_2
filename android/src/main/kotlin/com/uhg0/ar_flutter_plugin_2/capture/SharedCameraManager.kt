@@ -21,6 +21,7 @@ import com.uhg0.ar_flutter_plugin_2.diagnostics.measureNativeFrame
 import com.uhg0.ar_flutter_plugin_2.diagnostics.StillCaptureMetadata
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.Looper
 import android.os.Build
 import android.os.SystemClock
 import android.util.Log
@@ -623,6 +624,7 @@ internal class SharedCameraManager(
         get() = callbackThreads.capture
         set(value) { callbackThreads.capture = value }
     private var captureCallbackHandler: Handler? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     /** Reusable per-finalizer encoding storage; no encoded output is retained here. */
     private class JpegEncodingScratch {
@@ -1401,6 +1403,21 @@ internal class SharedCameraManager(
                     }
 
                     override fun onActive(session: CameraCaptureSession) {
+                        // Resume ARCore on the main thread, where SceneView
+                        // resumes, pauses and closes it. A Session resumed on
+                        // this camera callback thread outlives the thread (it
+                        // is joined before the Session closes), and closing it
+                        // then blocked the main thread for 10 s on the Galaxy A40.
+                        mainHandler.post { resumeArSessionOnMain(sessionOpenGeneration) }
+                    }
+
+                    private fun resumeArSessionOnMain(openGeneration: Long) {
+                        if (cleanupRequested ||
+                            sessionCallbackGeneration != openGeneration ||
+                            !repeatingRequestLifecycle.isRepeatingActive()
+                        ) {
+                            return
+                        }
                         if (!resumeArSessionAfterSharedCameraSetup()) {
                             return
                         }
