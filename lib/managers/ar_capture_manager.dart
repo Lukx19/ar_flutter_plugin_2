@@ -83,8 +83,7 @@ class CaptureInitializationResult {
       return CaptureInitializationResult(
         mode: mode,
         warning: map['warning'] as String?,
-        stillCaptureMode:
-            ARStillCaptureMode.fromWire(map['stillCaptureMode']),
+        stillCaptureMode: ARStillCaptureMode.fromWire(map['stillCaptureMode']),
         unsupportedStillCaptureMode: unsupported == null
             ? null
             : ARStillCaptureMode.fromWire(unsupported),
@@ -373,6 +372,9 @@ class ARCaptureManager {
   ARCaptureConfig _config;
   Future<void>? _initializationFuture;
   Future<void>? _stillSettingsUpdate;
+  Timer? _startupRecoveryRetry;
+  static const _startupRecoveryRetryInterval = Duration(milliseconds: 50);
+  static const _startupRecoveryRetryLimit = 60;
   ARCaptureCloseState _closeState = ARCaptureCloseState.active;
   Future<void>? _disposeAttempt;
   CaptureInitializationResult? _initializationResult;
@@ -391,9 +393,11 @@ class ARCaptureManager {
       isSupported &&
       _config.enableHighResCapture;
   bool get isDisposed => _closeState == ARCaptureCloseState.disposed;
+
   /// Whether native resources are active, closing, retained, or released.
   ARCaptureCloseState get closeState => _closeState;
   ARCaptureConfig get config => _config;
+
   /// Enable only after retained-review history and credit isolation are installed.
   final bool allowAssessedQuality;
 
@@ -507,27 +511,58 @@ class ARCaptureManager {
     }
   }
 
-  /// Publishes the native startup recovery replay once the handler exists.
-  /// A rebuilt view can ask while the replaced view still owns the durable
-  /// root (`NATIVE_CAPTURE_V2_ROOT_PENDING`, until its close finishes a few
-  /// milliseconds later). This view's recovery has not started then: it starts
-  /// when this view first opens the root, after this handler is attached, so
-  /// its events arrive live and stay in the native replay. The refusal must
-  /// not fail the cached initialization, or every later call of this view
-  /// would repeat it.
-  Future<void> _replayStartupRecovery() async {
+  /// Opens recovery again after a replaced view releases the durable root.
+  /// Initialization stays usable during the handoff. Opening the root starts
+  /// native recovery; its eventual events are delivered through this handler.
+  /// Retry only a proven root refusal, at most sixty times over three seconds.
+  Future<void> _replayStartupRecovery({
+    int retriesRemaining = _startupRecoveryRetryLimit,
+    DateTime? handoffDeadline,
+  }) async {
+    final deadline =
+        handoffDeadline ?? DateTime.now().add(const Duration(seconds: 3));
+    if (_closeState != ARCaptureCloseState.active) return;
+    if (handoffDeadline != null && !DateTime.now().isBefore(deadline)) {
+      debugPrint(
+          'ARCaptureManager startup recovery handoff timed out: $_nativeCaptureRootPendingCode');
+      return;
+    }
     final List<ARNativeCaptureEventV2> replay;
     try {
       replay = await replayNativeCaptureRecoveryV2();
-    } on PlatformException catch (e) {
-      if (e.code != _nativeCaptureRootPendingCode) {
-        rethrow;
+    } on PlatformException catch (error) {
+      if (error.code != _nativeCaptureRootPendingCode) rethrow;
+      if (_closeState != ARCaptureCloseState.active) return;
+      if (retriesRemaining == 0 || !DateTime.now().isBefore(deadline)) {
+        debugPrint(
+            'ARCaptureManager startup recovery handoff timed out: ${error.code}');
+        return;
       }
-      debugPrint('ARCaptureManager startup replay deferred: previous view still owns the durable root');
+      debugPrint(
+          'ARCaptureManager startup replay deferred: ${error.code}; retries remaining=$retriesRemaining');
+      _startupRecoveryRetry = Timer(_startupRecoveryRetryInterval, () {
+        _startupRecoveryRetry = null;
+        unawaited(_retryStartupRecovery(retriesRemaining - 1, deadline));
+      });
       return;
     }
+    // A close can overtake the platform reply; never publish into a closed
+    // stream or restart work for a replaced view.
+    if (_closeState != ARCaptureCloseState.active) return;
     for (final event in replay) {
       _publishNativeCaptureV2Event(event);
+    }
+  }
+
+  Future<void> _retryStartupRecovery(
+      int retriesRemaining, DateTime deadline) async {
+    try {
+      await _replayStartupRecovery(
+          retriesRemaining: retriesRemaining, handoffDeadline: deadline);
+    } on Object catch (error) {
+      // Background failure has no awaiting control caller. Retain a diagnostic
+      // and stop; permanent native/store failures must never be retried.
+      debugPrint('ARCaptureManager deferred startup recovery failed: $error');
     }
   }
 
@@ -751,8 +786,8 @@ class ARCaptureManager {
         code: 'NATIVE_CAPTURE_V2_HEALTH_MISSING',
       );
     }
-    final event = ARNativeCaptureEventV2.fromMap(
-      _deepCastMap(value), allowAssessedQuality: allowAssessedQuality);
+    final event = ARNativeCaptureEventV2.fromMap(_deepCastMap(value),
+        allowAssessedQuality: allowAssessedQuality);
     return event.health ??
         (throw const FormatException('Native V2 health payload was missing.'));
   }
@@ -798,8 +833,8 @@ class ARCaptureManager {
     return value.map((item) {
       if (item is! Map)
         throw const FormatException('Recovery replay entries must be maps.');
-      return ARNativeCaptureEventV2.fromMap(
-        _deepCastMap(item), allowAssessedQuality: allowAssessedQuality);
+      return ARNativeCaptureEventV2.fromMap(_deepCastMap(item),
+          allowAssessedQuality: allowAssessedQuality);
     }).toList(growable: false);
   }
 
@@ -2403,8 +2438,8 @@ class ARCaptureManager {
           break;
         case 'onNativeCaptureV2Event':
           _publishNativeCaptureV2Event(
-            ARNativeCaptureEventV2.fromMap(
-              _deepCastMap(call.arguments), allowAssessedQuality: allowAssessedQuality),
+            ARNativeCaptureEventV2.fromMap(_deepCastMap(call.arguments),
+                allowAssessedQuality: allowAssessedQuality),
           );
           break;
         case 'onExposureStateChanged':
@@ -2459,7 +2494,9 @@ class ARCaptureManager {
       'qualityDisposition': event.qualityDisposition?.name,
       'qualityAssessmentHash': event.qualityAssessmentHash,
       'qualityAssessment': event.qualityAssessment?.toMap(),
-      'reason': event.kind == ARNativeCaptureEventKindV2.committed ? null : event.reason,
+      'reason': event.kind == ARNativeCaptureEventKindV2.committed
+          ? null
+          : event.reason,
       'recoveryContext': event.recoveryContext?.toMap(),
     });
     final existing = _nativeCaptureV2TerminalLedger[attemptId];
@@ -2525,6 +2562,8 @@ class ARCaptureManager {
   }
 
   void _releaseDartSide() {
+    _startupRecoveryRetry?.cancel();
+    _startupRecoveryRetry = null;
     _channel.setMethodCallHandler(null);
     _closeState = ARCaptureCloseState.disposed;
     // Closing broadcast streams need not wait for paused consumers.
@@ -2551,6 +2590,8 @@ class ARCaptureManager {
     final completion = Completer<void>();
     _disposeAttempt = completion.future;
     _closeState = ARCaptureCloseState.closing;
+    _startupRecoveryRetry?.cancel();
+    _startupRecoveryRetry = null;
     unawaited(() async {
       try {
         await _channel.invokeMethod<void>('dispose');

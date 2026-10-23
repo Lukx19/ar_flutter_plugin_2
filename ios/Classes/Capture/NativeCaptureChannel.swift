@@ -150,7 +150,12 @@ final class NativeCaptureChannel: CaptureChannelExtension {
       result(nil)
     case "admitNativeCaptureV2":
       guard let binding = requireBinding(result, code: "NATIVE_CAPTURE_V2_CLOSED") else { return true }
-      binding.admit(call.arguments) { reply(result, $0) { $0 } }
+      binding.admit(call.arguments) { outcome in
+        if case .failure(let error) = outcome {
+          NSLog("capture3d native capture admission refused: code=%@", NativeCaptureChannel.flutterError(error).code)
+        }
+        reply(result, outcome) { $0 }
+      }
     case "replayNativeCaptureRecoveryV2":
       guard let binding = requireBinding(result, code: "NATIVE_CAPTURE_V2_CLOSED") else { return true }
       binding.replay { reply(result, $0) { $0 } }
@@ -657,7 +662,7 @@ enum NativeCapturePreviewChannel {
       }
       let known: Set<String> = ["materializeNativeCapturePreview", "beginNativeCapturePreviewDeletion",
                                 "commitNativeCapturePreviewDeletion", "rollbackNativeCapturePreviewDeletion",
-                                "reconcileNativeCapturePreviews", "deleteNativeCaptureSession"]
+                                "reconcileNativeCapturePreviews", "deleteNativeCaptureSession", "reconcileNativeCaptureSessions"]
       guard known.contains(call.method) else { return result(FlutterMethodNotImplemented) }
       queue.async {
         let cancelled: () -> Bool = {
@@ -677,6 +682,11 @@ enum NativeCapturePreviewChannel {
             }
             value = try owner.materialize(manifestId: manifestId, captureId: captureId,
                                           edge: arguments["detailed"] as? Bool == true ? 1024 : 512, cancelled: cancelled) ?? NSNull()
+          case "reconcileNativeCaptureSessions":
+            guard let sessionIds = arguments["sessionIds"] as? [String] else {
+              throw NativeCaptureWireError.invalid("sessionIds are required")
+            }
+            value = Int(try NativeCaptureSessionDeletion.reconcile(liveSessionIds: sessionIds))
           case "deleteNativeCaptureSession":
             value = Int(try NativeCaptureSessionDeletion.delete(sessionId: arguments["sessionId"] as? String ?? ""))
           case "beginNativeCapturePreviewDeletion":

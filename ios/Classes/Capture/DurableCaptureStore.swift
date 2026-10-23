@@ -446,7 +446,10 @@ final class DurableCaptureStore {
   /// Idempotent: an existing tombstone is kept. The session directory is
   /// synced first, so a pointer switch of unknown durability becomes known.
   func tombstoneSession(_ sessionId: String) throws {
-    let directory = sessionRoot + [DurableStoreEncoding.safeName(sessionId)]
+    try tombstoneDirectory(sessionRoot + [DurableStoreEncoding.safeName(sessionId)])
+  }
+
+  private func tombstoneDirectory(_ directory: [String]) throws {
     try files.ensureDirectory(directory)
     try files.at(.tombstoneRecord)
     if !files.isFile(directory + ["tombstone"]) {
@@ -460,10 +463,12 @@ final class DurableCaptureStore {
         uncertainRootHashes.remove(value.hash)
       }
     }
-    let published = try publishedRootHashes(directory)
-    for path in try files.walk(directory) where path.last == "accepted.properties" {
-      guard let token = try readProperties(path)["reservationToken"], let reservation = try budget.reservation(token: token) else { continue }
-      if let bytes = try publishedRecordBytes(directory, attempt: Array(path.dropLast()), published: published) {
+    let published = try deletionPublishedRoots(directory)
+    let prefix = "capture:\(directory.last!):"
+    for reservation in try budget.liveReservations() where reservation.owner.hasPrefix(prefix) {
+      let attemptHash = String(reservation.owner.dropFirst(prefix.count))
+      guard DurableStoreEncoding.isHash(attemptHash) else { continue }
+      if let bytes = try deletionRecordBytes(directory, attempt: directory + ["attempts", attemptHash], published: published) {
         try budget.settle(reservation, actualBytes: min(bytes, reservation.bytes))
       } else {
         try budget.release(reservation)
@@ -480,15 +485,36 @@ final class DurableCaptureStore {
   /// reclaims twice. Returns the bytes reclaimed by this call.
   @discardableResult
   func deleteSession(_ sessionId: String) throws -> Int64 {
-    try tombstoneSession(sessionId)
     let directory = sessionRoot + [DurableStoreEncoding.safeName(sessionId)]
-    let reclaimId = Self.sessionReclaimId(sessionId)
+    return try deleteSessionDirectory(directory, reclaimId: Self.sessionReclaimId(sessionId))
+  }
+
+  private func deleteSessionDirectory(_ directory: [String], reclaimId: String) throws -> Int64 {
+    try tombstoneDirectory(directory)
     var reclaimed: Int64 = 0
-    if !(try budget.hasVerifiedReclaim(reclaimId)) {
-      let published = try publishedRootHashes(directory)
+    let reclaimedSession = try budget.hasVerifiedReclaim(reclaimId)
+    let reclaimedOrphan = try budget.hasVerifiedReclaim(orphanReclaimId(directory.last!))
+    if !reclaimedSession && !reclaimedOrphan {
+      let published = try deletionPublishedRoots(directory)
       var total: Int64 = 0
-      for path in try files.walk(directory) where path.last == "accepted.properties" {
-        total += try publishedRecordBytes(directory, attempt: Array(path.dropLast()), published: published) ?? 0
+      var countedRoots = Set<String>()
+      let attempts = directory + ["attempts"]
+      if files.isDirectory(attempts) {
+        for name in try files.list(attempts) {
+          let attempt = attempts + [name]
+          guard files.isDirectory(attempt) else { continue }
+          let accepted = attempt + ["accepted.properties"]
+          if files.isFile(accepted) {
+            let bytes = try files.readBytes(accepted)
+            if !Self.isFinishedAcceptedRecord(bytes, DurableStoreEncoding.parseProperties(bytes)) {
+              try quarantineDeletionMetadata(directory, records: [accepted])
+            }
+          }
+          if let bytes = try deletionRecordBytes(directory, attempt: attempt, published: published),
+             let hash = try readProperties(attempt + ["receipt.properties"])["rootHash"], countedRoots.insert(hash).inserted {
+            total += bytes
+          }
+        }
       }
       reclaimed = min(total, try budget.committedBytes())
       if reclaimed > 0 { try budget.reclaimVerifiedOnce(reclaimId: reclaimId, bytes: reclaimed) }
@@ -499,9 +525,97 @@ final class DurableCaptureStore {
     return reclaimed
   }
 
+  /// The authoritative app index is the only authority for deleting orphan sessions.
+  /// Hash comparisons preserve live sessions without trusting their native history.
+  @discardableResult
+  func reconcileSessions(liveSessionIds: [String]) throws -> Int64 {
+    let live = Set(liveSessionIds.map(DurableStoreEncoding.safeName))
+    var reclaimed: Int64 = 0
+    for hash in try files.list(sessionRoot) where DurableStoreEncoding.isHash(hash) && !live.contains(hash) {
+      let directory = sessionRoot + [hash]
+      guard files.isDirectory(directory) else { continue }
+      let identities = try files.walk(directory).filter { $0.last == "accepted.properties" }
+        .compactMap { (try? readProperties($0))?["session"] }
+        .filter { DurableStoreEncoding.safeName($0) == hash }
+      if let sessionId = identities.first {
+        reclaimed += try deleteSession(sessionId)
+      } else if !tombstone(directory) {
+        // The tombstone is written before any reclaim. Its absence proves
+        // that a legacy orphan cannot already have a session deletion debit.
+        reclaimed += try deleteSessionDirectory(directory, reclaimId: orphanReclaimId(hash))
+      } else if tombstone(directory) {
+        // The fence does not prove quarantine/reclaim completed. Preserve all
+        // surviving metadata before removal; never invent a second budget debit.
+        try quarantineDeletionMetadata(directory, records: files.walk(directory).filter {
+          let name = $0.last ?? ""
+          return name.hasSuffix(".properties") || name.hasSuffix(".root") || name.hasSuffix(".ptr")
+        })
+        for name in try files.list(directory) where name != "tombstone" {
+          try files.deleteTree(directory + [name], .deleteReclaim)
+        }
+      }
+    }
+    return reclaimed
+  }
+
+  private func orphanReclaimId(_ sessionHash: String) -> String {
+    DurableStoreEncoding.hex(DurableStoreEncoding.sha256("native-capture-orphan-reclaim|\(sessionHash)"))
+  }
+
   /// Reclaim identity of one deleted session.
   static func sessionReclaimId(_ sessionId: String) -> String {
     DurableStoreEncoding.hex(DurableStoreEncoding.sha256("native-capture-session-reclaim|\(sessionId)"))
+  }
+
+  /// Preserve damaged metadata outside the deleted session, verified before removal.
+  private func quarantineDeletionMetadata(_ directory: [String], records: [[String]]) throws {
+    for record in records where files.isFile(record) {
+      let bytes = try files.readBytes(record)
+      let hash = DurableStoreEncoding.hex(DurableStoreEncoding.sha256(bytes))
+      let target = ["quarantine", directory.last!, "\(hash).record"]
+      if !files.isFile(target) {
+        try files.atomicReplace(target, bytes, replacePoint: nil)
+      }
+      guard try files.readBytes(target) == bytes else { throw DurableStoreConflict("Quarantine verification failed") }
+    }
+  }
+
+  private func deletionPublishedRoots(_ directory: [String]) throws -> Set<String> {
+    do {
+      for slot in ["A", "B"] {
+        let file = directory + ["root-\(slot).ptr"]
+        guard files.isFile(file) else { continue }
+        if let pointer = CaptureRootRecords.parsePointer(try files.readBytes(file)) {
+          if try !validRootHash(directory, pointer.hash, pointer.revision, 0) {
+            try quarantineDeletionMetadata(directory, records: [file])
+          }
+        } else {
+          try quarantineDeletionMetadata(directory, records: [file])
+        }
+      }
+      let objects = directory + ["objects"]
+      if files.isDirectory(objects) {
+        for name in try files.list(objects) where name.hasSuffix(".root") {
+          if try readRootMetadata(directory, String(name.dropLast(5))) == nil {
+            try quarantineDeletionMetadata(directory, records: [objects + [name]])
+          }
+        }
+      }
+      return try publishedRootHashes(directory)
+    } catch {
+      try quarantineDeletionMetadata(directory, records: files.walk(directory).filter {
+        $0.last?.hasSuffix(".root") == true || $0.last?.hasSuffix(".ptr") == true
+      })
+      return []
+    }
+  }
+
+  private func deletionRecordBytes(_ directory: [String], attempt: [String], published: Set<String>) throws -> Int64? {
+    do { return try publishedRecordBytes(directory, attempt: attempt, published: published) }
+    catch {
+      try quarantineDeletionMetadata(directory, records: [attempt + ["receipt.properties"]])
+      return nil
+    }
   }
 
   /// Every root reachable from the selected pointer through `previous`.
@@ -519,10 +633,31 @@ final class DurableCaptureStore {
   /// charge of a committed attempt); nil without one.
   private func publishedRecordBytes(_ location: [String], attempt: [String], published: Set<String>) throws -> Int64? {
     let receipt = attempt + ["receipt.properties"]
-    guard files.isFile(receipt), let values = try? readProperties(receipt),
-          values["kind"] == CaptureTerminalKind.committedPicture.storedName,
-          let rootHash = values["rootHash"], published.contains(rootHash),
-          let metadata = try readRootMetadata(location, rootHash) else { return nil }
+    guard files.isFile(receipt) else { return nil }
+    let receiptBytes = try files.readBytes(receipt)
+    guard receiptBytes.last == UInt8(ascii: "\n") else { throw DurableStoreConflict("Truncated deletion receipt") }
+    let values = try readProperties(receipt)
+    if values["kind"] == CaptureTerminalKind.abandonedAttempt.storedName {
+      guard let request = values["requestHash"], DurableStoreEncoding.isHash(request), values["rootHash"] == "abandoned",
+            values["receiptHash"] == DurableStoreEncoding.receiptHash(requestHash: request, rootHash: "abandoned") else {
+        throw DurableStoreConflict("Malformed deletion abandonment receipt")
+      }
+      return nil
+    }
+    guard values["kind"] == CaptureTerminalKind.committedPicture.storedName,
+          let rootHash = values["rootHash"], DurableStoreEncoding.isHash(rootHash),
+          let request = values["requestHash"], DurableStoreEncoding.isHash(request),
+          let captureId = values["captureId"], DurableStoreEncoding.isHash(captureId),
+          let revision = values["revision"].flatMap(Int64.init), revision > 0 else {
+      throw DurableStoreConflict("Malformed deletion committed receipt")
+    }
+    guard let metadata = try readRootMetadata(location, rootHash) else { throw DurableStoreConflict("Missing deletion receipt root") }
+    guard request == metadata.request,
+          values["receiptHash"] == DurableStoreEncoding.receiptHash(requestHash: request, rootHash: rootHash),
+          values["revision"].flatMap(Int64.init) == metadata.revision else {
+      throw DurableStoreConflict("Deletion receipt does not bind its published root")
+    }
+    guard published.contains(rootHash) else { return nil }
     return Self.rootChargeBytes(metadata)
   }
 
@@ -559,6 +694,8 @@ final class DurableCaptureStore {
       guard let sessionHash = index["entry.\(slot).session"], let attemptHash = index["entry.\(slot).attempt"],
             DurableStoreEncoding.isHash(sessionHash), DurableStoreEncoding.isHash(attemptHash) else { continue }
       let session = sessionRoot + [sessionHash]
+      // Deletion wins before reading any partially removed accepted record or asset.
+      guard !tombstone(session) else { continue }
       let accepted = session + ["attempts", attemptHash, "accepted.properties"]
       guard files.isFile(accepted) else { continue }
       try repairAcceptedCandidate(session: session, accepted: accepted)

@@ -1123,15 +1123,20 @@ internal class ArView(
                         admissionResult.fold(
                             onSuccess = result::success,
                             onFailure = { error ->
-                                when (error) {
-                                    is NativeCaptureRecoveryAdmissionExceptionV2 -> result.error(error.code, error.message, null)
-                                    is IllegalArgumentException -> result.error("NATIVE_CAPTURE_V2_INVALID", error.message, null)
-                                    else -> result.error("NATIVE_CAPTURE_V2_FAILED", error.message, null)
+                                val code = when (error) {
+                                    is NativeCaptureRecoveryAdmissionExceptionV2 -> error.code
+                                    is IllegalArgumentException -> "NATIVE_CAPTURE_V2_INVALID"
+                                    else -> "NATIVE_CAPTURE_V2_FAILED"
                                 }
+                                Log.w("ArView", "Native capture admission refused: code=$code")
+                                result.error(code, error.message, null)
                             },
                         )
                     }
-                    if (!accepted) result.error("NATIVE_CAPTURE_V2_CLOSED", "Native capture durable owner is closing", null)
+                    if (!accepted) {
+                        Log.w("ArView", "Native capture admission refused: code=NATIVE_CAPTURE_V2_CLOSED")
+                        result.error("NATIVE_CAPTURE_V2_CLOSED", "Native capture durable owner is closing", null)
+                    }
                 }
                 "getNativeCaptureHealthV2" -> result.success(captureSession.nativeCaptureHealthV2())
                 "materializeNativeCapturePreview" -> scope.launch {
@@ -1386,6 +1391,9 @@ internal class ArView(
                 else -> result.notImplemented()
             }
         } catch (error: NativeCaptureRecoveryAdmissionExceptionV2) {
+            if (call.method == "admitNativeCaptureV2") {
+                Log.w("ArView", "Native capture admission refused: code=${error.code}")
+            }
             result.error(error.code, error.message, null)
         } catch (error: CaptureSessionException) {
             result.error(error.code, error.message, null)

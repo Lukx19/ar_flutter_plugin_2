@@ -305,6 +305,24 @@ enum NativeCaptureSessionDeletion {
   static let attempts = 50
 
   @discardableResult
+  static func reconcile(liveSessionIds: [String]) throws -> Int64 {
+    let leaseKey = NativeCaptureRootLease.leaseKey(NativeCaptureStorePaths.nativeRoot())
+    for _ in 0..<attempts {
+      do {
+        let resources = try NativeCaptureBinding.productionResources()
+        defer { resources.lease.release() }
+        return try resources.store.reconcileSessions(liveSessionIds: liveSessionIds)
+      } catch NativeCaptureOwnerError.rootPending {
+        if let reclaimed = try NativeCaptureBinding.withOpenStore(leaseKey: leaseKey, {
+          try $0.reconcileSessions(liveSessionIds: liveSessionIds)
+        }) { return reclaimed }
+        usleep(NativeCaptureBinding.rootLeaseWaitMicros)
+      }
+    }
+    throw NativeCaptureOwnerError.rootPending
+  }
+
+  @discardableResult
   static func delete(
     sessionId: String,
     openResources: () throws -> NativeCaptureRootResources = { try NativeCaptureBinding.productionResources() },

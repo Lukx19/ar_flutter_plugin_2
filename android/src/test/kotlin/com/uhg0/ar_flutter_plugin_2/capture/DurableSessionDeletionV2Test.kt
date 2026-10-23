@@ -216,6 +216,154 @@ class DurableSessionDeletionV2Test {
         assertTrue(opens > NativeCaptureSessionDeletionV2.ATTEMPTS)
     }
 
+    @Test fun `authoritative reconciliation removes orphan sessions once and preserves live bytes`() {
+        val root = directory(); val budget = budget(root); val store = store(root, budget)
+        commit(store, "legacy-deleted", 1, JPEG_A)
+        commit(store, "kept", 1, JPEG_KEPT)
+        val before = snapshot(sessionDirectory(root, "kept"))
+        assertEquals(3L, store.reconcileSessions(listOf("kept")))
+        assertEquals(0L, store.reconcileSessions(listOf("kept")))
+        assertEquals(2L, budget.committedBytes())
+        assertEquals(before, snapshot(sessionDirectory(root, "kept")))
+        assertEquals(listOf("tombstone"), sessionDirectory(root, "legacy-deleted").list()!!.toList())
+    }
+
+    @Test fun `reconciliation finishes failed native deletion on restart`() {
+        val root = directory(); val setup = store(root, budget(root))
+        commit(setup, "deleted", 1, JPEG_A)
+        commit(setup, "kept", 1, JPEG_KEPT)
+        val cut = store(root, budget(root), DurableStoreFaultInjectorV2 {
+            if (it == DurableStoreFaultPointV2.DELETE_RECLAIM) throw IllegalStateException("removal cut")
+        })
+        assertThrows(IllegalStateException::class.java) { cut.deleteSession("deleted") }
+        val budget = budget(root)
+        store(root, budget).reconcileSessions(listOf("kept"))
+        assertEquals(2L, budget.committedBytes())
+        assertEquals(listOf("tombstone"), sessionDirectory(root, "deleted").list()!!.toList())
+    }
+
+    @Test fun `damaged history deletion converges without debiting other sessions`() {
+        for (damage in listOf("accepted", "receipt", "root", "fork")) {
+            val root = directory(); val setup = store(root, budget(root))
+            repeat(3) { commit(setup, "deleted", it + 1, JPEG_A) }
+            commit(setup, "kept", 1, JPEG_KEPT)
+            val directory = sessionDirectory(root, "deleted")
+            val keptBefore = snapshot(sessionDirectory(root, "kept"))
+            when (damage) {
+                "accepted", "receipt" -> directory.walkTopDown().first { it.name == "$damage.properties" }.writeText("truncated")
+                "root" -> File(directory, "objects").listFiles()!!.forEach { it.writeText("truncated") }
+                "fork" -> {
+                    val pointers = listOf(File(directory, "root-A.ptr"), File(directory, "root-B.ptr"))
+                    val prior = pointers.minBy { it.readLines().first().toLong() }
+                    val root2 = prior.readLines()[1]
+                    val root1 = File(directory, "objects/$root2.root").readLines().first { it.startsWith("previous=") }.removePrefix("previous=")
+                    val divergent = "schema=5\nrevision=3\nrequest=${"a".repeat(64)}\nprevious=$root2\nsecondPrevious=$root1\n".toByteArray()
+                    val hash = sha256Hex(divergent)
+                    File(directory, "objects/$hash.root").writeBytes(divergent)
+                    prior.writeText("3\n$hash\nbranch\n")
+                }
+            }
+            val cut = store(root, budget(root), DurableStoreFaultInjectorV2 {
+                if (it == DurableStoreFaultPointV2.DELETE_RECLAIM) throw IllegalStateException("removal cut")
+            })
+            assertThrows(IllegalStateException::class.java) { cut.deleteSession("deleted") }
+            val budget = budget(root); val restarted = store(root, budget)
+            restarted.deleteSession("deleted")
+            val remaining = budget.committedBytes()
+            assertTrue("$damage cannot debit kept bytes", remaining >= 2L)
+            assertEquals(0L, restarted.deleteSession("deleted"))
+            assertEquals(remaining, budget.committedBytes())
+            assertEquals(listOf("tombstone"), directory.list()!!.toList())
+            assertEquals(keptBefore, snapshot(sessionDirectory(root, "kept")))
+            assertTrue("$damage metadata preserved", File(root, "store/quarantine/${directory.name}").walkTopDown().any { it.extension == "record" })
+        }
+    }
+
+    @Test fun `deletion preserves exact malformed receipt and pointer bytes with a valid alternate or no slot`() {
+        for (damage in listOf("receipt", "unused-pointer", "all-pointers")) {
+            val root = directory(); val budget = budget(root); val store = store(root, budget)
+            commit(store, "deleted", 1, JPEG_A)
+            commit(store, "deleted", 2, JPEG_B)
+            commit(store, "kept", 1, JPEG_KEPT)
+            val keptBefore = snapshot(sessionDirectory(root, "kept"))
+            val directory = sessionDirectory(root, "deleted")
+            val originals = when (damage) {
+                "receipt" -> mapOf(directory.walkTopDown().first { it.name == "receipt.properties" } to "truncated\n".toByteArray())
+                "unused-pointer" -> mapOf(File(directory, "root-A.ptr") to "damaged unused slot\n".toByteArray())
+                else -> mapOf(File(directory, "root-A.ptr") to "damaged A\n".toByteArray(), File(directory, "root-B.ptr") to "damaged B\n".toByteArray())
+            }
+            originals.forEach { (file, bytes) -> file.writeBytes(bytes) }
+            store.deleteSession("deleted")
+            val restartedBudget = budget(root); val restarted = store(root, restartedBudget)
+            assertEquals(0L, restarted.deleteSession("deleted"))
+            for (bytes in originals.values) assertEquals(bytes.toList(), quarantineFile(root, "deleted", bytes).readBytes().toList())
+            assertTrue(restartedBudget.committedBytes() >= 2L)
+            assertEquals(keptBefore, snapshot(sessionDirectory(root, "kept")))
+            assertEquals(listOf("tombstone"), directory.list()!!.toList())
+        }
+    }
+
+    @Test fun `legitimate abandoned receipt deletion needs no quarantine and preserves kept charge`() {
+        val root = directory(); val budget = budget(root); val store = store(root, budget)
+        commit(store, "kept", 1, JPEG_KEPT)
+        store.acceptCaptureBeforeExposure(request("pending", "pending", session = "deleted"))
+        store.recoverAtOpen()
+        assertEquals(0L, store.deleteSession("deleted"))
+        assertEquals(2L, budget.committedBytes())
+        assertFalse(File(root, "store/quarantine").exists())
+    }
+
+    @Test fun `quarantine write or readback failure keeps exact damaged originals for retry`() {
+        for (failure in listOf("write", "readback")) {
+            val root = directory(); val setup = store(root, budget(root))
+            commit(setup, "deleted", 1, JPEG_A)
+            commit(setup, "kept", 1, JPEG_KEPT)
+            val directory = sessionDirectory(root, "deleted")
+            val original = File(directory, "root-A.ptr")
+            val bytes = "damaged pointer\n".toByteArray(); original.writeBytes(bytes)
+            val target = quarantineFile(root, "deleted", bytes)
+            target.parentFile.mkdirs()
+            if (failure == "write") target.mkdirs() else target.writeText("wrong preserved bytes")
+            assertThrows(Exception::class.java) { setup.deleteSession("deleted") }
+            assertEquals(bytes.toList(), original.readBytes().toList())
+            assertEquals(5L, budget(root).committedBytes())
+            target.deleteRecursively()
+            store(root, budget(root)).deleteSession("deleted")
+            assertEquals(bytes.toList(), target.readBytes().toList())
+            assertEquals(listOf("tombstone"), directory.list()!!.toList())
+        }
+    }
+
+    @Test fun `authoritative reconciliation preserves unreadable identity after a tombstone cut`() {
+        val root = directory(); val setup = store(root, budget(root))
+        val deleted = commit(setup, "deleted", 1, JPEG_A)
+        val kept = commit(setup, "kept", 1, JPEG_KEPT)
+        val directory = sessionDirectory(root, "deleted")
+        val keptBefore = snapshot(sessionDirectory(root, "kept"))
+        val bytes = "unreadable accepted identity\n".toByteArray()
+        directory.walkTopDown().first { it.name == "accepted.properties" }.writeBytes(bytes)
+        val cut = store(root, budget(root), DurableStoreFaultInjectorV2 {
+            if (it == DurableStoreFaultPointV2.TOMBSTONE_DIRECTORY_SYNC) throw IllegalStateException("tombstone cut")
+        })
+        assertThrows(IllegalStateException::class.java) { cut.deleteSession("deleted") }
+        assertFalse(quarantineFile(root, "deleted", bytes).exists())
+        val budget = budget(root); val restarted = store(root, budget)
+        assertEquals(0L, restarted.reconcileSessions(listOf("kept")))
+        assertEquals(bytes.toList(), quarantineFile(root, "deleted", bytes).readBytes().toList())
+        assertEquals(5L, budget.committedBytes())
+        assertEquals(keptBefore, snapshot(sessionDirectory(root, "kept")))
+        assertEquals(CaptureAttemptPhase.COMMITTED_PICTURE, restarted.queryReceipt(kept.accepted.identity)?.phase)
+        assertNull(restarted.queryReceipt(deleted.accepted.identity))
+        assertEquals(listOf("tombstone"), directory.list()!!.toList())
+        val evidence = snapshot(File(root, "store/quarantine"))
+        assertEquals(0L, restarted.reconcileSessions(listOf("kept")))
+        assertEquals(evidence, snapshot(File(root, "store/quarantine")))
+        assertEquals(5L, budget.committedBytes())
+    }
+
+    private fun quarantineFile(root: File, session: String, bytes: ByteArray) =
+        File(root, "store/quarantine/${sha256Hex(session.toByteArray())}/${sha256Hex(bytes)}.record")
+
     private fun commit(store: DurableSessionStoreV2, session: String, index: Int, jpeg: ByteArray): CaptureCommitRequest {
         val request = request("$session-commit-$index", "$session-attempt-$index", session = session, jpeg = jpeg)
         store.acceptCaptureBeforeExposure(request)

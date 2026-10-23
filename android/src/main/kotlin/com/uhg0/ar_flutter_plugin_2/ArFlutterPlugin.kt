@@ -1,5 +1,7 @@
 package com.uhg0.ar_flutter_plugin_2
 
+import com.uhg0.ar_flutter_plugin_2.capture.NativeCaptureSessionDeletionV2
+
 import android.app.Activity
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
@@ -55,12 +57,16 @@ class ArFlutterPlugin: FlutterPlugin, ActivityAware {
                 }
                 if (call.method !in setOf("materializeNativeCapturePreview", "beginNativeCapturePreviewDeletion",
                         "commitNativeCapturePreviewDeletion", "rollbackNativeCapturePreviewDeletion",
-                        "reconcileNativeCapturePreviews", "deleteNativeCaptureSession")) {
+                        "reconcileNativeCapturePreviews", "deleteNativeCaptureSession", "reconcileNativeCaptureSessions")) {
                     result.notImplemented()
                     return@setMethodCallHandler
                 }
                 previewWorker.submit(call.argument<String>("requestId"), { cancelled ->
                         when (call.method) {
+                            "reconcileNativeCaptureSessions" -> NativeCaptureSessionDeletionV2.reconcileFromAppFiles(
+                                binding.applicationContext.filesDir,
+                                requireNotNull(call.argument<List<String>>("sessionIds")),
+                            )
                             "reconcileNativeCapturePreviews" -> {
                                 previewOwner.reconcile(requireNotNull(call.argument<List<String>>("references")))
                                 null

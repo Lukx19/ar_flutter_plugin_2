@@ -21,7 +21,9 @@ enum NativeStoreFormatVersions {
   /// is `capture3d-shot-v3` and names its intrinsics convention
   /// (`intrinsicsConvention: opencv_pinhole_v1`); layout 3 and 4 records
   /// are read with intrinsics of unrecorded convention.
-  static let photoStoreLayout = 5
+  // 6: deletion preserves damaged metadata as raw bytes at
+  // store/quarantine/<sessionHash>/<sha256(bytes)>.record.
+  static let photoStoreLayout = 6
   /// Root record schema written without a quality assessment.
   static let photoRootSchemaPlain = 5
   /// Root record schema of a burst shot (schema 5 plus shot lines).

@@ -56,6 +56,20 @@ void main() {
   Map<String, dynamic>? syntheticPoseResponse;
   bool debugSyntheticRouteInstalled = true;
   var replayRootPendingCalls = 0;
+  Completer<List<Map<String, dynamic>>>? replayGate;
+
+  Future<void> waitForRecoveryCalls(int count) async {
+    final deadline = DateTime.now().add(const Duration(seconds: 5));
+    while (methodCalls
+            .where((call) => call.method == 'replayNativeCaptureRecoveryV2')
+            .length <
+        count) {
+      if (!DateTime.now().isBefore(deadline)) {
+        fail('Startup recovery replay did not reach $count calls.');
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+    }
+  }
 
   setUp(() {
     ARCaptureManager.debugIsSupportedOverride = true;
@@ -97,6 +111,7 @@ void main() {
     };
     debugSyntheticRouteInstalled = true;
     replayRootPendingCalls = 0;
+    replayGate = null;
     SharedPreferences.setMockInitialValues(<String, Object>{});
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(captureChannel, (call) async {
@@ -463,7 +478,7 @@ void main() {
               message: 'The previous capture view still owns the durable root',
             );
           }
-          return nativeRecoveryResponse;
+          return replayGate?.future ?? nativeRecoveryResponse;
         default:
           return null;
       }
@@ -543,22 +558,34 @@ void main() {
 
   for (final configured in [false, true]) {
     for (final producer in [false, true]) {
-      test('integrated ${configured ? "configured" : "legacy"} reader preserves assessed recovery with producer $producer', () async {
+      test(
+          'integrated ${configured ? "configured" : "legacy"} reader preserves assessed recovery with producer $producer',
+          () async {
         final admission = _nativeAdmission();
         final terminal = _retainedReviewTerminal(admission);
         nativeAdmissionResponse = <String, dynamic>{
-          'wireVersion': nativeCaptureV2WireVersion, 'attemptId': 'attempt',
-          'phase': 'committed_picture', 'durable': true, 'terminal': terminal,
+          'wireVersion': nativeCaptureV2WireVersion,
+          'attemptId': 'attempt',
+          'phase': 'committed_picture',
+          'durable': true,
+          'terminal': terminal,
         };
         nativeRecoveryResponse = <Map<String, dynamic>>[terminal];
-        final config = captureConfig.copyWith(retainAssessedOriginals: producer);
+        final config =
+            captureConfig.copyWith(retainAssessedOriginals: producer);
         const sessionChannel = MethodChannel('arsession_42');
-        final messenger = TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+        final messenger =
+            TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
         messenger.setMockMethodCallHandler(sessionChannel, (_) async => null);
         final session = configured
-            ? ARSessionManager.withConfig(id: 42, buildContext: _FakeBuildContext(),
-                arConfig: ARConfiguration(enableCapture: true, captureConfig: config))
-            : ARSessionManager(42, _FakeBuildContext(), PlaneDetectionConfig.horizontal, captureConfig: config);
+            ? ARSessionManager.withConfig(
+                id: 42,
+                buildContext: _FakeBuildContext(),
+                arConfig:
+                    ARConfiguration(enableCapture: true, captureConfig: config))
+            : ARSessionManager(
+                42, _FakeBuildContext(), PlaneDetectionConfig.horizontal,
+                captureConfig: config);
         final events = <ARNativeCaptureEventV2>[];
         StreamSubscription<ARNativeCaptureEventV2>? subscription;
         try {
@@ -572,18 +599,25 @@ void main() {
           await manager.getCurrentExposureState();
           await Future<void>.delayed(Duration.zero);
           final result = await manager.admitNativeCaptureV2(admission);
-          expect(result.terminal!.qualityDisposition, ARNativeCaptureQualityDispositionV1.reviewRequired);
+          expect(result.terminal!.qualityDisposition,
+              ARNativeCaptureQualityDispositionV1.reviewRequired);
           final recovered = await manager.replayNativeCaptureRecoveryV2();
-          expect(recovered.single.qualityAssessment!.toMap(), result.terminal!.qualityAssessment!.toMap());
-          expect(recovered.single.qualityAssessmentHash, result.terminal!.qualityAssessmentHash);
-          await messenger.handlePlatformMessage(captureChannel.name,
-            const StandardMethodCodec().encodeMethodCall(MethodCall('onNativeCaptureV2Event', terminal)), (_) {});
+          expect(recovered.single.qualityAssessment!.toMap(),
+              result.terminal!.qualityAssessment!.toMap());
+          expect(recovered.single.qualityAssessmentHash,
+              result.terminal!.qualityAssessmentHash);
+          await messenger.handlePlatformMessage(
+              captureChannel.name,
+              const StandardMethodCodec().encodeMethodCall(
+                  MethodCall('onNativeCaptureV2Event', terminal)),
+              (_) {});
           await Future<void>.delayed(Duration.zero);
           expect(events.where((event) => event.isTerminal), hasLength(1));
           nativeRecoveryResponse = <Map<String, dynamic>>[
             {...terminal, 'qualityAssessmentHash': 'not-a-hash'},
           ];
-          await expectLater(manager.replayNativeCaptureRecoveryV2(), throwsA(isA<FormatException>()));
+          await expectLater(manager.replayNativeCaptureRecoveryV2(),
+              throwsA(isA<FormatException>()));
           expect(manager.allowAssessedQuality, isTrue);
         } finally {
           await subscription?.cancel();
@@ -594,7 +628,9 @@ void main() {
     }
   }
 
-  test('assessed quality decode is default disabled on admission replay and live routes', () async {
+  test(
+      'assessed quality decode is default disabled on admission replay and live routes',
+      () async {
     final admission = _nativeAdmission();
     final terminal = _retainedReviewTerminal(admission);
     nativeAdmissionResponse = <String, dynamic>{
@@ -613,8 +649,10 @@ void main() {
         'reason': 'native-owner-ready',
       },
     ];
-    final sessionManager = ARSessionManager(42, _FakeBuildContext(), PlaneDetectionConfig.horizontal);
-    final manager = ARCaptureManager(sessionManager, captureConfig, _FakeBuildContext());
+    final sessionManager = ARSessionManager(
+        42, _FakeBuildContext(), PlaneDetectionConfig.horizontal);
+    final manager =
+        ARCaptureManager(sessionManager, captureConfig, _FakeBuildContext());
     final events = <ARNativeCaptureEventV2>[];
     final subscription = manager.nativeCaptureV2Events.listen(events.add);
     try {
@@ -632,17 +670,27 @@ void main() {
       ]);
       events.clear();
       nativeRecoveryResponse = <Map<String, dynamic>>[terminal];
-      await expectLater(manager.admitNativeCaptureV2(admission), throwsA(isA<FormatException>()));
+      await expectLater(manager.admitNativeCaptureV2(admission),
+          throwsA(isA<FormatException>()));
       expect(methodCalls.last.method, 'admitNativeCaptureV2');
-      await expectLater(manager.replayNativeCaptureRecoveryV2(), throwsA(isA<FormatException>()));
+      await expectLater(manager.replayNativeCaptureRecoveryV2(),
+          throwsA(isA<FormatException>()));
       expect(methodCalls.last.method, 'replayNativeCaptureRecoveryV2');
-      expect(methodCalls.where((call) => call.method == 'initializeCapture'), hasLength(1));
-      expect(methodCalls.where((call) => call.method == 'replayNativeCaptureRecoveryV2'), hasLength(2));
+      expect(methodCalls.where((call) => call.method == 'initializeCapture'),
+          hasLength(1));
+      expect(
+          methodCalls
+              .where((call) => call.method == 'replayNativeCaptureRecoveryV2'),
+          hasLength(2));
       var liveReplyDelivered = false;
-      await TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.handlePlatformMessage(
+      await TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .handlePlatformMessage(
         captureChannel.name,
-        const StandardMethodCodec().encodeMethodCall(MethodCall('onNativeCaptureV2Event', terminal)),
-        (_) { liveReplyDelivered = true; },
+        const StandardMethodCodec()
+            .encodeMethodCall(MethodCall('onNativeCaptureV2Event', terminal)),
+        (_) {
+          liveReplyDelivered = true;
+        },
       );
       await Future<void>.delayed(Duration.zero);
       expect(liveReplyDelivered, isTrue);
@@ -654,7 +702,9 @@ void main() {
     }
   });
 
-  test('explicit assessed decode carries review unchanged across admission replay and live identities', () async {
+  test(
+      'explicit assessed decode carries review unchanged across admission replay and live identities',
+      () async {
     final admission = _nativeAdmission();
     final terminal = _retainedReviewTerminal(admission);
     nativeAdmissionResponse = <String, dynamic>{
@@ -665,31 +715,41 @@ void main() {
       'terminal': terminal,
     };
     nativeRecoveryResponse = <Map<String, dynamic>>[terminal];
-    final sessionManager = ARSessionManager(42, _FakeBuildContext(), PlaneDetectionConfig.horizontal);
-    final manager = ARCaptureManager(sessionManager, captureConfig, _FakeBuildContext(), allowAssessedQuality: true);
+    final sessionManager = ARSessionManager(
+        42, _FakeBuildContext(), PlaneDetectionConfig.horizontal);
+    final manager = ARCaptureManager(
+        sessionManager, captureConfig, _FakeBuildContext(),
+        allowAssessedQuality: true);
     final events = <ARNativeCaptureEventV2>[];
     final errors = <Object>[];
-    final subscription = manager.nativeCaptureV2Events.listen(events.add, onError: errors.add);
+    final subscription =
+        manager.nativeCaptureV2Events.listen(events.add, onError: errors.add);
     try {
       final result = await manager.admitNativeCaptureV2(admission);
-      expect(result.terminal?.qualityDisposition, ARNativeCaptureQualityDispositionV1.reviewRequired);
+      expect(result.terminal?.qualityDisposition,
+          ARNativeCaptureQualityDispositionV1.reviewRequired);
       final replay = await manager.replayNativeCaptureRecoveryV2();
-      expect(replay.single.qualityAssessmentHash, result.terminal?.qualityAssessmentHash);
-      expect(replay.single.qualityAssessment?.toMap(), result.terminal?.qualityAssessment?.toMap());
+      expect(replay.single.qualityAssessmentHash,
+          result.terminal?.qualityAssessmentHash);
+      expect(replay.single.qualityAssessment?.toMap(),
+          result.terminal?.qualityAssessment?.toMap());
       for (final event in <Map<String, dynamic>>[
         terminal,
         <String, dynamic>{...terminal, 'reason': 'recovered-committed'},
         <String, dynamic>{...terminal, 'qualityAssessmentHash': 'd' * 64},
       ]) {
-        await TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.handlePlatformMessage(
+        await TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .handlePlatformMessage(
           captureChannel.name,
-          const StandardMethodCodec().encodeMethodCall(MethodCall('onNativeCaptureV2Event', event)),
+          const StandardMethodCodec()
+              .encodeMethodCall(MethodCall('onNativeCaptureV2Event', event)),
           (_) {},
         );
       }
       await Future<void>.delayed(Duration.zero);
       expect(events.where((event) => event.isTerminal), hasLength(1));
-      expect(events.single.qualityDisposition, ARNativeCaptureQualityDispositionV1.reviewRequired);
+      expect(events.single.qualityDisposition,
+          ARNativeCaptureQualityDispositionV1.reviewRequired);
       expect(errors, <Object>[isA<StateError>()]);
     } finally {
       await subscription.cancel();
@@ -805,7 +865,8 @@ void main() {
       'fail initialization', () async {
     replayRootPendingCalls = 1;
     final manager = ARCaptureManager(
-      ARSessionManager(42, _FakeBuildContext(), PlaneDetectionConfig.horizontal),
+      ARSessionManager(
+          42, _FakeBuildContext(), PlaneDetectionConfig.horizontal),
       captureConfig,
       _FakeBuildContext(),
     );
@@ -816,22 +877,148 @@ void main() {
     expect(first?.imageId, 'img-1');
     expect(second, isNotNull);
     expect(manager.initializationResult, isNotNull);
-    expect(methodCalls.where((call) => call.method == 'initializeCapture'), hasLength(1));
-    expect(methodCalls.where((call) => call.method == 'replayNativeCaptureRecoveryV2'), hasLength(1));
+    expect(methodCalls.where((call) => call.method == 'initializeCapture'),
+        hasLength(1));
+    expect(
+        methodCalls
+            .where((call) => call.method == 'replayNativeCaptureRecoveryV2'),
+        hasLength(1));
     // The native replay is still served once the root is free.
     expect(await manager.replayNativeCaptureRecoveryV2(), isEmpty);
+    await manager.dispose();
+  });
+
+  test('deferred startup recovery retries and publishes without a shutter tap',
+      () async {
+    replayRootPendingCalls = 2;
+    nativeRecoveryResponse = [
+      {
+        'wireVersion': nativeCaptureV2WireVersion,
+        'kind': 'ready',
+        'reason': 'native-owner-ready'
+      },
+    ];
+    final manager = ARCaptureManager(
+      ARSessionManager(
+          42, _FakeBuildContext(), PlaneDetectionConfig.horizontal),
+      captureConfig,
+      _FakeBuildContext(),
+    );
+    final events = <ARNativeCaptureEventV2>[];
+    final subscription = manager.nativeCaptureV2Events.listen(events.add);
+    await manager.getCurrentExposureState();
+    await waitForRecoveryCalls(3);
+    await Future<void>.delayed(Duration.zero);
+    expect(methodCalls.where((call) => call.method == 'captureHighResImage'),
+        isEmpty);
+    expect(
+        methodCalls
+            .where((call) => call.method == 'replayNativeCaptureRecoveryV2'),
+        hasLength(3));
+    expect(
+        events.map((event) => event.kind), [ARNativeCaptureEventKindV2.ready]);
+    await manager.dispose();
+    await subscription.cancel();
+  });
+
+  test('closing a view cancels deferred startup recovery', () async {
+    replayRootPendingCalls = 100;
+    final manager = ARCaptureManager(
+      ARSessionManager(
+          42, _FakeBuildContext(), PlaneDetectionConfig.horizontal),
+      captureConfig,
+      _FakeBuildContext(),
+    );
+    await manager.getCurrentExposureState();
+    await manager.dispose();
+    await Future<void>.delayed(const Duration(milliseconds: 150));
+    expect(
+        methodCalls
+            .where((call) => call.method == 'replayNativeCaptureRecoveryV2'),
+        hasLength(1));
+  });
+
+  test('detaching a view cancels deferred startup recovery', () async {
+    replayRootPendingCalls = 100;
+    final manager = ARCaptureManager(
+      ARSessionManager(
+          42, _FakeBuildContext(), PlaneDetectionConfig.horizontal),
+      captureConfig,
+      _FakeBuildContext(),
+    );
+    await manager.getCurrentExposureState();
+    manager.platformViewDetached();
+    await Future<void>.delayed(const Duration(milliseconds: 150));
+    expect(
+        methodCalls
+            .where((call) => call.method == 'replayNativeCaptureRecoveryV2'),
+        hasLength(1));
+  });
+
+  test('deferred startup recovery has a bounded retry budget', () async {
+    replayRootPendingCalls = 100;
+    final manager = ARCaptureManager(
+      ARSessionManager(
+          42, _FakeBuildContext(), PlaneDetectionConfig.horizontal),
+      captureConfig,
+      _FakeBuildContext(),
+    );
+    await manager.getCurrentExposureState();
+    await Future<void>.delayed(const Duration(milliseconds: 3250));
+    final callsAtDeadline = methodCalls
+        .where((call) => call.method == 'replayNativeCaptureRecoveryV2')
+        .length;
+    expect(
+        methodCalls
+            .where((call) => call.method == 'replayNativeCaptureRecoveryV2'),
+        hasLength(inInclusiveRange(2, 61)));
+    await Future<void>.delayed(const Duration(milliseconds: 150));
+    expect(
+        methodCalls
+            .where((call) => call.method == 'replayNativeCaptureRecoveryV2'),
+        hasLength(callsAtDeadline));
+    await manager.dispose();
+  });
+
+  test('closing a view discards an in-flight deferred recovery replay',
+      () async {
+    replayRootPendingCalls = 1;
+    final manager = ARCaptureManager(
+      ARSessionManager(
+          42, _FakeBuildContext(), PlaneDetectionConfig.horizontal),
+      captureConfig,
+      _FakeBuildContext(),
+    );
+    final events = <ARNativeCaptureEventV2>[];
+    final subscription = manager.nativeCaptureV2Events.listen(events.add);
+    await manager.getCurrentExposureState();
+    replayGate = Completer<List<Map<String, dynamic>>>();
+    await waitForRecoveryCalls(2);
+    await manager.dispose();
+    replayGate!.complete([
+      {
+        'wireVersion': nativeCaptureV2WireVersion,
+        'kind': 'ready',
+        'reason': 'native-owner-ready'
+      },
+    ]);
+    await Future<void>.delayed(Duration.zero);
+    expect(events, isEmpty);
+    await subscription.cancel();
   });
 
   test('any other startup replay failure still fails initialization', () async {
     failingMethodName = 'replayNativeCaptureRecoveryV2';
     failingMethodCode = 'NATIVE_CAPTURE_V2_REPLAY_INVALID';
     final manager = ARCaptureManager(
-      ARSessionManager(42, _FakeBuildContext(), PlaneDetectionConfig.horizontal),
+      ARSessionManager(
+          42, _FakeBuildContext(), PlaneDetectionConfig.horizontal),
       captureConfig,
       _FakeBuildContext(),
     );
 
-    await expectLater(manager.captureImage(), throwsA(isA<ARCaptureException>()));
+    await expectLater(
+        manager.captureImage(), throwsA(isA<ARCaptureException>()));
   });
 
   test('uses the per-view capture channel and initializes natively', () async {
@@ -1731,8 +1918,7 @@ void main() {
     expect(state.flashStatus, FlashStatus.ready);
   });
 
-  test(
-      'flash modes come from the camera on iOS and list every mode on Android',
+  test('flash modes come from the camera on iOS and list every mode on Android',
       () async {
     final sessionManager = ARSessionManager(
       42,
@@ -3045,27 +3231,29 @@ ARNativeCaptureAdmissionV2 _nativeAdmission() {
   );
 }
 
-Map<String, dynamic> _retainedReviewTerminal(ARNativeCaptureAdmissionV2 admission) => <String, dynamic>{
-  'wireVersion': nativeCaptureQualityV1WireVersion,
-  'kind': 'committed',
-  'attemptId': 'attempt',
-  'captureId': 'a' * 64,
-  'captureRevision': 1,
-  'manifestId': 'b' * 64,
-  'jpegSizeBytes': 1024,
-  'reason': 'committed',
-  'recoveryContext': admission.recoveryContext.toMap(),
-  'qualityDisposition': 'reviewRequired',
-  'qualityAssessmentHash': 'c' * 64,
-  'qualityAssessment': <String, dynamic>{
-    'schemaVersion': 1,
-    'policyVersion': 'jpegLaplacianVarianceV1:threshold110',
-    'disposition': 'reviewRequired',
-    'reason': 'belowThreshold',
-    'score': 58.6645,
-    'threshold': 110.0,
-    'sampleWidth': 516,
-    'sampleHeight': 387,
-    'unavailableReason': null,
-  },
-};
+Map<String, dynamic> _retainedReviewTerminal(
+        ARNativeCaptureAdmissionV2 admission) =>
+    <String, dynamic>{
+      'wireVersion': nativeCaptureQualityV1WireVersion,
+      'kind': 'committed',
+      'attemptId': 'attempt',
+      'captureId': 'a' * 64,
+      'captureRevision': 1,
+      'manifestId': 'b' * 64,
+      'jpegSizeBytes': 1024,
+      'reason': 'committed',
+      'recoveryContext': admission.recoveryContext.toMap(),
+      'qualityDisposition': 'reviewRequired',
+      'qualityAssessmentHash': 'c' * 64,
+      'qualityAssessment': <String, dynamic>{
+        'schemaVersion': 1,
+        'policyVersion': 'jpegLaplacianVarianceV1:threshold110',
+        'disposition': 'reviewRequired',
+        'reason': 'belowThreshold',
+        'score': 58.6645,
+        'threshold': 110.0,
+        'sampleWidth': 516,
+        'sampleHeight': 387,
+        'unavailableReason': null,
+      },
+    };

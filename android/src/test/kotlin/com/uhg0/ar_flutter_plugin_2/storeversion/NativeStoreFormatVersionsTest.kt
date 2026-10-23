@@ -7,7 +7,7 @@ class NativeStoreFormatVersionsTest {
     @Test
     fun reportsTheVersionsTheStoresWrite() {
         val report = NativeStoreFormatVersions.report()
-        assertEquals(2, report["nativePhotoStore"])
+        assertEquals(3, report["nativePhotoStore"])
         assertEquals(6, report["nativePhotoRootSchema"])
         assertEquals(listOf(5, 6), report["nativePhotoRootSchemasReadable"])
         assertEquals(1, report["nativePreviewCache"])

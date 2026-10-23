@@ -17,7 +17,9 @@ object NativeStoreFormatVersions {
     const val METHOD = "getStoreFormatVersions"
 
     /** Layout of `capture-v2-native/store` (sessions, attempts, assets, A/B root pointers). */
-    const val PHOTO_STORE_LAYOUT = 2
+    // 3: deletion preserves damaged metadata outside the fenced session:
+    // quarantine/<sessionHash>/<sha256(bytes)>.record (raw immutable bytes).
+    const val PHOTO_STORE_LAYOUT = 3
 
     /** Root record schema written without a quality assessment. */
     const val PHOTO_ROOT_SCHEMA_PLAIN = 5

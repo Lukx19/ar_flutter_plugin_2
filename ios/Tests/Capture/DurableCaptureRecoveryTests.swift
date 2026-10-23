@@ -300,6 +300,171 @@ final class DurableCaptureRecoveryTests: XCTestCase {
     XCTAssertThrowsError(try restarted.acceptCaptureBeforeExposure(pending), "the deleted session stays fenced")
   }
 
+  func testAuthoritativeReconciliationDeletesOnlyOrphansAndRetriesOnce() throws {
+    let (store, budget) = try CaptureFixture.store(root)
+    _ = try commit(store, session: "legacy-deleted", index: 1, bytes: [1, 2, 3])
+    let kept = try commit(store, session: "kept", index: 1, bytes: [9, 9])
+    let keptBytes = try Data(contentsOf: root.appendingPathComponent(blob(kept, [9, 9])))
+    XCTAssertEqual(try store.reconcileSessions(liveSessionIds: ["kept"]), 3)
+    XCTAssertEqual(try store.reconcileSessions(liveSessionIds: ["kept"]), 0)
+    XCTAssertEqual(try budget.committedBytes(), 2)
+    XCTAssertEqual(try Data(contentsOf: root.appendingPathComponent(blob(kept, [9, 9]))), keptBytes)
+    XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.appendingPathComponent(session("legacy-deleted")).path), ["tombstone"])
+  }
+
+  func testDamagedHistoryDeletionConvergesWithoutDebitingOtherSessions() throws {
+    for damage in ["accepted", "receipt", "root", "fork"] {
+      try FileManager.default.removeItem(at: root)
+      root = CaptureFixture.temporaryDirectory("durable-corrupt-delete")
+      let (setup, _) = try CaptureFixture.store(root)
+      for index in 1...3 { _ = try commit(setup, session: "deleted", index: index, bytes: [1, 2, 3]) }
+      let kept = try commit(setup, session: "kept", index: 1, bytes: [9, 9])
+      let directory = root.appendingPathComponent(session("deleted"))
+      if damage == "accepted" || damage == "receipt" {
+        let records = FileManager.default.enumerator(at: directory, includingPropertiesForKeys: nil)!.compactMap { $0 as? URL }
+        let record = records.first { $0.lastPathComponent == "\(damage).properties" }!
+        try Data("truncated".utf8).write(to: record)
+      } else if damage == "root" {
+        for record in try FileManager.default.contentsOfDirectory(at: directory.appendingPathComponent("objects"), includingPropertiesForKeys: nil) {
+          try Data("truncated".utf8).write(to: record)
+        }
+      } else {
+        let pointers = ["root-A.ptr", "root-B.ptr"].map { directory.appendingPathComponent($0) }
+        let prior = try pointers.min { a, b in
+          Int64(try String(contentsOf: a).split(separator: "\n").first!)! < Int64(try String(contentsOf: b).split(separator: "\n").first!)!
+        }!
+        let root2 = try String(contentsOf: prior).split(separator: "\n")[1]
+        let values = DurableStoreEncoding.parseProperties(Array(try Data(contentsOf: directory.appendingPathComponent("objects/\(root2).root"))))
+        let divergent = Array("schema=5\nrevision=3\nrequest=\(String(repeating: "a", count: 64))\nprevious=\(root2)\nsecondPrevious=\(values["previous"]!)\n".utf8)
+        let hash = DurableStoreEncoding.hex(DurableStoreEncoding.sha256(divergent))
+        try Data(divergent).write(to: directory.appendingPathComponent("objects/\(hash).root"))
+        try Data("3\n\(hash)\nbranch\n".utf8).write(to: prior)
+      }
+      let (cut, _) = try CaptureFixture.store(root, fault: PersistentFault(.deleteReclaim).injector())
+      XCTAssertThrowsError(try cut.deleteSession("deleted"), damage)
+      let (restarted, budget) = try CaptureFixture.store(root)
+      try restarted.deleteSession("deleted")
+      let remaining = try budget.committedBytes()
+      XCTAssertGreaterThanOrEqual(remaining, 2, damage)
+      XCTAssertEqual(try restarted.deleteSession("deleted"), 0, damage)
+      XCTAssertEqual(try budget.committedBytes(), remaining)
+      XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), ["tombstone"])
+      XCTAssertTrue(exists(blob(kept, [9, 9])), damage)
+      let quarantine = root.appendingPathComponent("store/quarantine/\(DurableStoreEncoding.safeName("deleted"))")
+      XCTAssertFalse(try FileManager.default.contentsOfDirectory(atPath: quarantine.path).isEmpty, damage)
+    }
+  }
+
+  func testDeletionPreservesExactMalformedReceiptAndPointerBytes() throws {
+    for damage in ["receipt", "unused-pointer", "all-pointers"] {
+      try FileManager.default.removeItem(at: root)
+      root = CaptureFixture.temporaryDirectory("durable-malformed-delete")
+      let (store, _) = try CaptureFixture.store(root)
+      let deleted = try commit(store, session: "deleted", index: 1, bytes: [1, 2, 3])
+      _ = try commit(store, session: "deleted", index: 2, bytes: [4, 5, 6, 7])
+      _ = try commit(store, session: "kept", index: 1, bytes: [9, 9])
+      let keptBefore = try treeSnapshot(root.appendingPathComponent(session("kept")))
+      let directory = root.appendingPathComponent(session("deleted"))
+      let originals: [URL: Data]
+      if damage == "receipt" {
+        originals = [root.appendingPathComponent("\(attempt(deleted))/receipt.properties"): Data("truncated\n".utf8)]
+      } else if damage == "unused-pointer" {
+        originals = [directory.appendingPathComponent("root-A.ptr"): Data("damaged unused slot\n".utf8)]
+      } else {
+        originals = [directory.appendingPathComponent("root-A.ptr"): Data("damaged A\n".utf8),
+                     directory.appendingPathComponent("root-B.ptr"): Data("damaged B\n".utf8)]
+      }
+      for (file, bytes) in originals { try bytes.write(to: file) }
+      try store.deleteSession("deleted")
+      let (restarted, budget) = try CaptureFixture.store(root)
+      XCTAssertEqual(try restarted.deleteSession("deleted"), 0)
+      for bytes in originals.values { XCTAssertEqual(try Data(contentsOf: quarantineFile("deleted", bytes)), bytes, damage) }
+      XCTAssertGreaterThanOrEqual(try budget.committedBytes(), 2, damage)
+      XCTAssertEqual(try treeSnapshot(root.appendingPathComponent(session("kept"))), keptBefore, damage)
+      XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), ["tombstone"])
+    }
+  }
+
+  func testLegitimateAbandonedReceiptDeletionNeedsNoQuarantine() throws {
+    let (store, budget) = try CaptureFixture.store(root)
+    _ = try commit(store, session: "kept", index: 1, bytes: [9, 9])
+    let pending = CaptureFixture.request(attemptId: "pending", commitId: "pending", ordinal: 1, session: "deleted")
+    _ = try store.acceptCaptureBeforeExposure(pending)
+    try store.recover()
+    XCTAssertEqual(try store.deleteSession("deleted"), 0)
+    XCTAssertEqual(try budget.committedBytes(), 2)
+    XCTAssertFalse(exists("store/quarantine"))
+  }
+
+  func testQuarantineWriteOrReadbackFailurePreservesOriginalForRetry() throws {
+    for failure in ["write", "readback"] {
+      try FileManager.default.removeItem(at: root)
+      root = CaptureFixture.temporaryDirectory("durable-quarantine-failure")
+      let (store, _) = try CaptureFixture.store(root)
+      _ = try commit(store, session: "deleted", index: 1, bytes: [1, 2, 3])
+      _ = try commit(store, session: "kept", index: 1, bytes: [9, 9])
+      let directory = root.appendingPathComponent(session("deleted"))
+      let original = directory.appendingPathComponent("root-A.ptr")
+      let bytes = Data("damaged pointer\n".utf8)
+      try bytes.write(to: original)
+      let target = quarantineFile("deleted", bytes)
+      try FileManager.default.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+      if failure == "write" {
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+      } else {
+        try Data("wrong preserved bytes".utf8).write(to: target)
+      }
+      XCTAssertThrowsError(try store.deleteSession("deleted"), failure)
+      XCTAssertEqual(try Data(contentsOf: original), bytes, failure)
+      let (_, budget) = try CaptureFixture.store(root)
+      XCTAssertEqual(try budget.committedBytes(), 5, failure)
+      try FileManager.default.removeItem(at: target)
+      try store.deleteSession("deleted")
+      XCTAssertEqual(try Data(contentsOf: target), bytes, failure)
+      XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), ["tombstone"])
+    }
+  }
+
+  func testAuthoritativeReconciliationQuarantinesUnreadableIdentityAfterTombstoneCut() throws {
+    let (setup, _) = try CaptureFixture.store(root)
+    let deleted = try commit(setup, session: "deleted", index: 1, bytes: [1, 2, 3])
+    let kept = try commit(setup, session: "kept", index: 1, bytes: [9, 9])
+    let keptBefore = try treeSnapshot(root.appendingPathComponent(session("kept")))
+    let bytes = Data("unreadable accepted identity\n".utf8)
+    try bytes.write(to: root.appendingPathComponent("\(attempt(deleted))/accepted.properties"))
+    let (cut, _) = try CaptureFixture.store(root, fault: PersistentFault(.tombstoneDirectorySync).injector())
+    XCTAssertThrowsError(try cut.deleteSession("deleted"))
+    XCTAssertFalse(FileManager.default.fileExists(atPath: quarantineFile("deleted", bytes).path))
+    let (restarted, budget) = try CaptureFixture.store(root)
+    XCTAssertEqual(try restarted.reconcileSessions(liveSessionIds: ["kept"]), 0)
+    XCTAssertEqual(try Data(contentsOf: quarantineFile("deleted", bytes)), bytes)
+    XCTAssertEqual(try budget.committedBytes(), 5)
+    XCTAssertEqual(try treeSnapshot(root.appendingPathComponent(session("kept"))), keptBefore)
+    XCTAssertEqual(try restarted.queryReceipt(kept.accepted.identity)?.phase, .committedPicture)
+    XCTAssertNil(try restarted.queryReceipt(deleted.accepted.identity))
+    let directory = root.appendingPathComponent(session("deleted"))
+    XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), ["tombstone"])
+    let evidence = try treeSnapshot(root.appendingPathComponent("store/quarantine"))
+    XCTAssertEqual(try restarted.reconcileSessions(liveSessionIds: ["kept"]), 0)
+    XCTAssertEqual(try treeSnapshot(root.appendingPathComponent("store/quarantine")), evidence)
+    XCTAssertEqual(try budget.committedBytes(), 5)
+  }
+
+  private func quarantineFile(_ sessionId: String, _ bytes: Data) -> URL {
+    let hash = DurableStoreEncoding.hex(DurableStoreEncoding.sha256(Array(bytes)))
+    return root.appendingPathComponent("store/quarantine/\(DurableStoreEncoding.safeName(sessionId))/\(hash).record")
+  }
+
+  private func treeSnapshot(_ directory: URL) throws -> [String: Data] {
+    var result: [String: Data] = [:]
+    for case let file as URL in FileManager.default.enumerator(at: directory, includingPropertiesForKeys: [.isRegularFileKey])! {
+      if try file.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true {
+        result[String(file.path.dropFirst(directory.path.count + 1))] = try Data(contentsOf: file)
+      }
+    }
+    return result
+  }
+
   func testSessionDeletionReclaimsOnceAfterACrashAtEveryStep() throws {
     let cuts: [(String, DurableStoreFaultPoint)] = [
       ("budget", .pointerSlotReplace), ("budget", .deleteReclaim),
@@ -336,6 +501,11 @@ final class DurableCaptureRecoveryTests: XCTestCase {
           exercised += 1
         }
         let (clean, budget) = try CaptureFixture.store(root)
+        let fenced = exists("\(session("deleted"))/tombstone")
+        let recovered = try clean.recoverAndProject()
+        if fenced {
+          XCTAssertFalse(recovered.contains { $0.attemptId.hasPrefix("deleted") }, label)
+        }
         try clean.deleteSession("deleted")
         try clean.deleteSession("deleted")
         XCTAssertEqual(try budget.committedBytes(), 2, "\(label): only the kept session stays charged")

@@ -501,7 +501,10 @@ class DurableSessionStoreV2(
      * pointer switch of unknown durability becomes known.
      */
     fun tombstoneSession(sessionId: String) = synchronized(mutex) {
-        val directory = files.child("sessions", safe(sessionId))
+        tombstoneDirectory(files.child("sessions", safe(sessionId)))
+    }
+
+    private fun tombstoneDirectory(directory: File) {
         files.ensureDirectory(directory)
         faults.at(DurableStoreFaultPointV2.TOMBSTONE_RECORD)
         val tombstone = path(directory, "tombstone")
@@ -515,11 +518,11 @@ class DurableSessionStoreV2(
             if (!files.isFile(file)) continue
             files.readDescriptor(file) { rootMetadata.pointer(it::read) }?.let { uncertainRootHashes.remove(it.hash) }
         }
-        val published = publishedRootHashes(directory)
-        files.walk(directory).filter { it.name == "accepted.properties" }.toList().forEach { file ->
-            val token = readProperties(file).getProperty("reservationToken") ?: return@forEach
-            val reservation = budget.reservation(token) ?: return@forEach
-            val bytes = publishedRecordBytes(directory, requireNotNull(file.parentFile), published)
+        val published = deletionPublishedRoots(directory)
+        for (reservation in budget.liveReservations().filter { it.owner.startsWith("capture:${directory.name}:") }) {
+            val attemptHash = reservation.owner.substringAfterLast(':')
+            if (!attemptHash.matches(SAFE_HASH)) continue
+            val bytes = deletionRecordBytes(directory, path(directory, "attempts", attemptHash), published)
             if (bytes != null) budget.settle(reservation, minOf(bytes, reservation.bytes)) else budget.release(reservation)
         }
     }
@@ -534,15 +537,29 @@ class DurableSessionStoreV2(
      */
     fun deleteSession(sessionId: String): Long = synchronized(mutex) {
         require(sessionId.isNotEmpty()) { "sessionId is required" }
-        tombstoneSession(sessionId)
         val directory = files.child("sessions", safe(sessionId))
-        val reclaimId = sessionReclaimId(sessionId)
+        deleteSessionDirectory(directory, sessionReclaimId(sessionId))
+    }
+
+    private fun deleteSessionDirectory(directory: File, reclaimId: String): Long {
+        tombstoneDirectory(directory)
         var reclaimed = 0L
-        if (!budget.hasVerifiedReclaim(reclaimId)) {
-            val published = publishedRootHashes(directory)
+        if (!budget.hasVerifiedReclaim(reclaimId) && !budget.hasVerifiedReclaim(orphanReclaimId(directory.name))) {
+            val published = deletionPublishedRoots(directory)
             var total = 0L
-            files.walk(directory).filter { it.name == "accepted.properties" }.toList().forEach { file ->
-                total = Math.addExact(total, publishedRecordBytes(directory, requireNotNull(file.parentFile), published) ?: 0L)
+            val countedRoots = mutableSetOf<String>()
+            val attempts = path(directory, "attempts")
+            if (files.isDirectory(attempts)) for (attempt in files.list(attempts)) {
+                if (!files.isDirectory(attempt)) continue
+                val accepted = path(attempt, "accepted.properties")
+                if (files.isFile(accepted)) {
+                    val bytes = files.readBytes(accepted)
+                    val valid = runCatching { isFinishedAcceptedRecord(bytes, parseProperties(bytes)) }.getOrDefault(false)
+                    if (!valid) quarantineDeletionMetadata(directory, listOf(accepted))
+                }
+                val bytes = deletionRecordBytes(directory, attempt, published) ?: continue
+                val hash = readProperties(path(attempt, "receipt.properties")).getProperty("rootHash")
+                if (countedRoots.add(hash)) total = Math.addExact(total, bytes)
             }
             reclaimed = minOf(total, budget.committedBytes())
             if (reclaimed > 0L) budget.reclaimVerifiedOnce(reclaimId, reclaimed)
@@ -550,7 +567,82 @@ class DurableSessionStoreV2(
         files.list(directory).filter { it.name != "tombstone" }.forEach {
             deleteTree(it, DurableStoreFaultPointV2.DELETE_RECLAIM)
         }
+        return reclaimed
+    }
+
+    private fun orphanReclaimId(sessionHash: String): String =
+        MessageDigest.getInstance("SHA-256").digest("native-capture-orphan-reclaim|$sessionHash".toByteArray()).toCaptureHashHex()
+
+    /** Reconcile only after a complete authoritative app index has loaded. */
+    fun reconcileSessions(liveSessionIds: List<String>): Long = synchronized(mutex) {
+        val live = liveSessionIds.map(::safe).toSet()
+        var reclaimed = 0L
+        files.list(files.child("sessions")).filter { it.name.matches(Regex("[0-9a-f]{64}")) && it.name !in live }
+            .forEach { directory ->
+                if (!files.isDirectory(directory)) return@forEach
+                val sessionId = files.walk(directory).filter { it.name == "accepted.properties" }
+                    .mapNotNull { runCatching { readProperties(it).getProperty("session") }.getOrNull() }
+                    .firstOrNull { safe(it) == directory.name }
+                if (sessionId != null) {
+                    reclaimed = Math.addExact(reclaimed, deleteSession(sessionId))
+                } else if (tombstone(directory) == null) {
+                    // No tombstone means no prior deletion could have charged a
+                    // reclaim. The folder hash authorizes a separate durable key.
+                    reclaimed = Math.addExact(reclaimed, deleteSessionDirectory(directory, orphanReclaimId(directory.name)))
+                } else if (tombstone(directory) != null) {
+                    // A tombstone fences writes but does not prove that quarantine
+                    // or reclaim completed. Preserve surviving metadata before removal.
+                    quarantineDeletionMetadata(directory, files.walk(directory).filter {
+                        it.name.endsWith(".properties") || it.name.endsWith(".root") || it.name.endsWith(".ptr")
+                    }.toList())
+                    files.list(directory).filter { it.name != "tombstone" }.forEach {
+                        deleteTree(it, DurableStoreFaultPointV2.DELETE_RECLAIM)
+                    }
+                }
+            }
         reclaimed
+    }
+
+    /** Preserve damaged metadata before an explicitly requested deletion removes the session. */
+    private fun quarantineDeletionMetadata(directory: File, records: List<File>) {
+        for (record in records.filter(files::isFile)) {
+            val bytes = files.readBytes(record)
+            val hash = MessageDigest.getInstance("SHA-256").digest(bytes).toCaptureHashHex()
+            val target = files.child("quarantine", directory.name, "$hash.record")
+            if (!files.isFile(target)) files.atomicReplace(target, bytes, null)
+            check(files.readBytes(target).contentEquals(bytes)) { "Quarantine verification failed" }
+        }
+    }
+
+    private fun deletionPublishedRoots(directory: File): Set<String> = try {
+        for (slot in listOf("root-A.ptr", "root-B.ptr")) {
+            val file = path(directory, slot)
+            if (!files.isFile(file)) continue
+            val pointer = files.readDescriptor(file) { rootMetadata.pointer(it::read) }
+            if (pointer == null || !validRootHash(directory, pointer.hash, pointer.revision, 0)) {
+                quarantineDeletionMetadata(directory, listOf(file))
+            }
+        }
+        val objects = path(directory, "objects")
+        if (files.isDirectory(objects)) for (record in files.list(objects).filter { it.name.endsWith(".root") }) {
+            if (readRootMetadata(directory, record.name.removeSuffix(".root")) == null) {
+                quarantineDeletionMetadata(directory, listOf(record))
+            }
+        }
+        publishedRootHashes(directory)
+    } catch (error: Exception) {
+        // No guess at a fork or damaged graph is allowed to debit another session.
+        quarantineDeletionMetadata(directory, files.walk(directory).filter {
+            it.name.endsWith(".root") || it.name.endsWith(".ptr")
+        }.toList())
+        emptySet()
+    }
+
+    private fun deletionRecordBytes(directory: File, attempt: File, published: Set<String>): Long? = try {
+        publishedRecordBytes(directory, attempt, published)
+    } catch (error: Exception) {
+        quarantineDeletionMetadata(directory, listOf(path(attempt, "receipt.properties")))
+        null
     }
 
     /** Every root reachable from the selected pointer through `previous`. */
@@ -569,12 +661,30 @@ class DurableSessionStoreV2(
         val receipt = path(attempt, "receipt.properties")
         if (!files.isFile(receipt)) return null
         val bytes = files.readBytes(receipt)
-        if (!isFinishedReceipt(bytes)) return null
+        if (!isFinishedReceipt(bytes)) throw DurableStoreConflictV2("Truncated deletion receipt")
         val values = parseProperties(bytes)
-        if (values.getProperty("kind") != CaptureTerminalKind.COMMITTED_PICTURE.name) return null
-        val rootHash = values.getProperty("rootHash")?.takeIf { it in published } ?: return null
-        return readRootMetadata(location, rootHash)?.components
-            ?.fold(0L) { total, component -> Math.addExact(total, component.length) }
+        val kind = values.getProperty("kind")
+        val request = values.getProperty("requestHash")
+        val rootHash = values.getProperty("rootHash")
+        if (kind == CaptureTerminalKind.ABANDONED_ATTEMPT.name) {
+            if (!CaptureRootMetadataReaderV2.isHash(request) || rootHash != "abandoned" ||
+                values.getProperty("receiptHash") != receiptHash(request, "abandoned")) {
+                throw DurableStoreConflictV2("Malformed deletion abandonment receipt")
+            }
+            return null
+        }
+        if (kind != CaptureTerminalKind.COMMITTED_PICTURE.name || !CaptureRootMetadataReaderV2.isHash(rootHash) ||
+            !CaptureRootMetadataReaderV2.isHash(request) || !CaptureRootMetadataReaderV2.isHash(values.getProperty("captureId")) ||
+            values.getProperty("revision")?.toLongOrNull()?.let { it > 0L } != true) {
+            throw DurableStoreConflictV2("Malformed deletion committed receipt")
+        }
+        val metadata = readRootMetadata(location, rootHash) ?: throw DurableStoreConflictV2("Missing deletion receipt root")
+        if (request != metadata.request || values.getProperty("receiptHash") != receiptHash(request, rootHash) ||
+            values.getProperty("revision")?.toLongOrNull() != metadata.revision) {
+            throw DurableStoreConflictV2("Deletion receipt does not bind its published root")
+        }
+        if (rootHash !in published) return null
+        return metadata.components.fold(0L) { total, component -> Math.addExact(total, component.length) }
     }
 
     /** Reconciles prepared staging and ensures only receipt/pointer backed results are visible. */

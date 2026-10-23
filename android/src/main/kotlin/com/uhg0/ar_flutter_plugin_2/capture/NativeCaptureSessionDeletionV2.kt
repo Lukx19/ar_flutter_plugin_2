@@ -101,6 +101,20 @@ internal object NativeCaptureSessionDeletionV2 {
         throw NativeCaptureDurableRootPendingV2()
     }
 
+    fun reconcileFromAppFiles(appFiles: File, liveSessionIds: List<String>): Long {
+        val root = File(appFiles, NATIVE_CAPTURE_ROOT_DIRECTORY)
+        val leaseKey = NativeCaptureDurableRootV2.leaseKey(root)
+        repeat(ATTEMPTS) {
+            try {
+                return NativeCaptureDurableRootV2.open(root).use { it.store.reconcileSessions(liveSessionIds) }
+            } catch (_: NativeCaptureDurableRootPendingV2) {
+                NativeCaptureOpenRootStoresV2.withOpenStore(leaseKey) { it.reconcileSessions(liveSessionIds) }?.let { return it }
+                Thread.sleep(ROOT_WAIT_MILLIS)
+            }
+        }
+        throw NativeCaptureDurableRootPendingV2()
+    }
+
     /** Production entry of the preview channel's `deleteNativeCaptureSession`. */
     fun deleteFromAppFiles(appFiles: File, sessionId: String): Long {
         val root = File(appFiles, NATIVE_CAPTURE_ROOT_DIRECTORY)
