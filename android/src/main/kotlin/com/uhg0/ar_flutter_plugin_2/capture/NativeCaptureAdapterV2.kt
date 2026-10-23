@@ -664,7 +664,7 @@ internal class NativeCaptureBindingV2(
      * commit that still completes after the cut is published as well.
      */
     fun onPause() {
-        val active = adapterForLifecycleOrNull() ?: return
+        val active = adapterForPauseOrNull() ?: return
         active.awaitExposedAttemptsSettled(PAUSE_SETTLE_MS)
         active.onLifecycle(CaptureLifecycleEvent.BACKGROUNDED)
     }
@@ -710,6 +710,18 @@ internal class NativeCaptureBindingV2(
     private fun recoveryForOperation(): NativeCaptureRecoveryDispatcherV2 = synchronized(lock) {
         if (closed) throw NativeCaptureBindingClosedV2()
         recovery
+    }
+
+    /**
+     * A pause settles only attempts of an adapter that admission or a
+     * lifecycle event already created. Before that there is nothing to
+     * settle, and creating the adapter would acquire the durable root: a view
+     * replaced before first use (a quick replay/camera switch) then failed its
+     * disposal pause while the replacing view held the root, and kept its
+     * ARCore session, so the replacing view never started.
+     */
+    private fun adapterForPauseOrNull(): NativeCaptureAdapterV2? = synchronized(lock) {
+        if (!closed && !adapterDelegate.isInitialized()) null else adapterForLifecycleOrNull()
     }
 
     private fun adapterForLifecycleOrNull(): NativeCaptureAdapterV2? = synchronized(lock) {

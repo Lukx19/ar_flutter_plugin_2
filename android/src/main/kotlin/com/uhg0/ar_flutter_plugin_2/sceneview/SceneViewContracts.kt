@@ -195,6 +195,9 @@ internal interface SceneViewCaptureHost {
     val cameraTextureIds: IntArray
     val cameraTexture: Texture?
 
+    /** This view does not own the scene session yet (normally the previous view's session is still closing). */
+    val waitingForSceneSession: Boolean get() = false
+
     /** Releases a capture-owned Filament stream while the renderer is still alive. */
     fun destroyCaptureStream(stream: Stream): Boolean {
         engine.destroyStream(stream)
@@ -266,8 +269,10 @@ internal class SceneViewRenderLifecycle(
 ) : LifecycleOwner {
     private val registry = LifecycleRegistry(this)
     private var terminal = false
+    private var resumesBlocked = false
     private val parentObserver = LifecycleEventObserver { _, event ->
         if (terminal) return@LifecycleEventObserver
+        if (resumesBlocked && event in UPWARD_EVENTS) return@LifecycleEventObserver
         if (event == Lifecycle.Event.ON_DESTROY) {
             // The host owns the Compose disposal callback. Stop frame
             // production here, then let the host cancel the ARSceneView
@@ -298,9 +303,22 @@ internal class SceneViewRenderLifecycle(
         }
     }
 
+    /**
+     * Disposal pause: like [pauseForTeardown], and no parent ON_CREATE,
+     * ON_START or ON_RESUME and no [resumeAfterTransientDetach] moves the
+     * render lifecycle up again. The disposed host's ARCore session may still
+     * be waiting for or inside its off-main close until
+     * [destroyAfterComposition]; ARSceneView must not resume it meanwhile.
+     */
+    fun pauseForDisposal() {
+        if (terminal) return
+        pauseForTeardown()
+        resumesBlocked = true
+    }
+
     /** Resumes after a transient platform-view detach without recreating state. */
     fun resumeAfterTransientDetach() {
-        if (terminal) return
+        if (terminal || resumesBlocked) return
         val parentState = parentLifecycle.currentState
         if (parentState.isAtLeast(Lifecycle.State.STARTED) &&
             !registry.currentState.isAtLeast(Lifecycle.State.STARTED)
@@ -327,6 +345,14 @@ internal class SceneViewRenderLifecycle(
 
     private fun handleParentEvent(event: Lifecycle.Event) {
         handleRenderEvent(event, "parent")
+    }
+
+    private companion object {
+        val UPWARD_EVENTS = setOf(
+            Lifecycle.Event.ON_CREATE,
+            Lifecycle.Event.ON_START,
+            Lifecycle.Event.ON_RESUME,
+        )
     }
 
     private fun handleRenderEvent(event: Lifecycle.Event, source: String) {

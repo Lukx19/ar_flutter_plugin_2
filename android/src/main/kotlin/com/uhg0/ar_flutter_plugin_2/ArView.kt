@@ -482,8 +482,9 @@ internal class ArView(
             reapplyDepthMode = { root.post { if (!disposed) sceneHost.reapplyVisibilityGridDepthMode() } },
         ) { runCatching { captureSession.getCameraIntrinsics() }.getOrNull() }
         // Last, so a view whose construction failed is never registered.
-        // Until disposal released the ARCore session, Settings must not open
-        // a second one (camera and tier enumeration).
+        // The view leaves the open views once its ARCore session is closed
+        // (off the main thread, after disposal); until then Settings must not
+        // open a second session (camera and tier enumeration).
         OpenArViews.opened(this)
     }
 
@@ -568,8 +569,10 @@ internal class ArView(
     private fun disposeAfterCaptureClosed() {
         pendingCloudOperations.toList().forEach { it() }
         pendingCloudOperations.clear()
-        sceneHost.dispose()
-        OpenArViews.closed(this)
+        sceneHost.dispose(onSessionClosed = {
+            Log.i("ArView", "AR view left the open views after its ARCore session closed")
+            OpenArViews.closed(this)
+        })
         disposeCompleted = true
         settleDispose(Result.success(Unit))
         scope.cancel()

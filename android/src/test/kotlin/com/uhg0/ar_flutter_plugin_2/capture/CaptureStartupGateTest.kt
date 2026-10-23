@@ -62,6 +62,44 @@ class CaptureStartupGateTest {
         assertEquals(0, starts)
     }
 
+    @Test fun predecessorSessionCloseDoesNotConsumeTheStartupDeadline() = runBlocking {
+        // The previous view's ARCore close holds the scene session for 10 s.
+        var elapsedMs = 0L
+        var starts = 0
+        val gate = CaptureStartupGate(
+            timeoutMs = 10_000,
+            pollIntervalMs = 16,
+            nanoTime = { elapsedMs * 1_000_000L },
+            suspendDelay = { elapsedMs += it },
+        )
+        gate.initialize(
+            isReady = { elapsedMs >= 10_500L },
+            ensureCurrent = {},
+            start = { starts++ },
+            waitingForPredecessor = { elapsedMs < 10_000L },
+        )
+        assertEquals(1, starts)
+        assertTrue(elapsedMs in 10_500L..10_520L)
+    }
+
+    @Test fun predecessorWaitIsBoundedOnItsOwn() = runBlocking {
+        var elapsedMs = 0L
+        var starts = 0
+        val gate = CaptureStartupGate(
+            timeoutMs = 50,
+            predecessorTimeoutMs = 1_000,
+            pollIntervalMs = 16,
+            nanoTime = { elapsedMs * 1_000_000L },
+            suspendDelay = { elapsedMs += it },
+        )
+        val error = runCatching {
+            gate.initialize({ true }, {}, { starts++ }, waitingForPredecessor = { true })
+        }.exceptionOrNull()
+        assertTrue(error is CaptureStartupTimeoutException)
+        assertTrue(elapsedMs in 1_000L..1_016L)
+        assertEquals(0, starts)
+    }
+
     @Test fun readinessAfterDeadlineCannotStartResources() = runBlocking {
         var elapsedMs = 0L
         var starts = 0

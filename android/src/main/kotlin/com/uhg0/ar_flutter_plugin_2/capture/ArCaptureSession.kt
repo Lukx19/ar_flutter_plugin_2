@@ -229,6 +229,7 @@ internal class ArCaptureSession(
                     },
                     ensureCurrent = ::ensureStartupOwnerCurrent,
                     start = { initializeReady(configMap, parsedConfig) },
+                    waitingForPredecessor = { sceneHost.waitingForSceneSession },
                 )
             } catch (error: CaptureStartupTimeoutException) {
                 throw CaptureSessionException("CAPTURE_NOT_INITIALIZED", error.message.orEmpty())

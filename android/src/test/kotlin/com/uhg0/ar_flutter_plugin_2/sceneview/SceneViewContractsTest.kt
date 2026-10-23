@@ -261,6 +261,43 @@ class SceneViewContractsTest {
     }
 
     @Test
+    fun `disposal pause keeps the render lifecycle down until composition destroy`() {
+        val executor = ArchTaskExecutor.getInstance()
+        executor.setDelegate(object : TaskExecutor() {
+            override fun executeOnDiskIO(runnable: Runnable) = runnable.run()
+            override fun postToMainThread(runnable: Runnable) = runnable.run()
+            override fun isMainThread() = true
+        })
+        try {
+            val parent = TestLifecycleOwner()
+            parent.lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_CREATE)
+            val render = SceneViewRenderLifecycle(parent.lifecycle)
+            parent.lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_START)
+            parent.lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
+            assertEquals(Lifecycle.State.RESUMED, render.lifecycle.currentState)
+
+            render.pauseForDisposal()
+            // Home and return while the disposed host's session still closes.
+            parent.lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
+            parent.lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_STOP)
+            parent.lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_START)
+            parent.lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
+            assertFalse(render.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED))
+            // A platform-view reattach.
+            render.resumeAfterTransientDetach()
+            assertFalse(render.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED))
+
+            render.destroyAfterComposition()
+            assertEquals(Lifecycle.State.DESTROYED, render.lifecycle.currentState)
+            parent.lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
+            parent.lifecycle.handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
+            assertEquals(Lifecycle.State.DESTROYED, render.lifecycle.currentState)
+        } finally {
+            executor.setDelegate(null)
+        }
+    }
+
+    @Test
     fun `composition disposal waits for one frame and coalesces duplicate requests`() {
         var scheduled: (() -> Unit)? = null
         var disposalCount = 0
