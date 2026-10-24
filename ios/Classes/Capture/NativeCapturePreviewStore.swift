@@ -65,7 +65,7 @@ final class NativeCapturePreviewReader {
 
   func materialize(manifestId: String, captureId: String, target: URL, edge: Int, cancelled: () -> Bool) -> Bool {
     lock.lock(); defer { lock.unlock() }
-    guard edge == 512 || edge == 1024, DurableStoreEncoding.isHash(manifestId), DurableStoreEncoding.isHash(captureId) else { return false }
+    guard edge == 0 || edge == 512 || edge == 1024, DurableStoreEncoding.isHash(manifestId), DurableStoreEncoding.isHash(captureId) else { return false }
     let sessions = storeRoot.appendingPathComponent("sessions", isDirectory: true)
     guard let entries = try? FileManager.default.contentsOfDirectory(atPath: sessions.path) else { return false }
     for name in entries.sorted() {
@@ -76,12 +76,21 @@ final class NativeCapturePreviewReader {
       let source = image.source
       guard Self.isPlainFile(source), Self.fileSize(source) == image.length else { continue }
       try? FileManager.default.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
-      if CapturePreviewThumbnail.valid(target, edge: edge) { return true }
+      if edge == 0 {
+        if Self.isPlainFile(target), Self.fileSize(target) == image.length,
+           let bytes = try? Data(contentsOf: target),
+           DurableStoreEncoding.hex(DurableStoreEncoding.sha256([UInt8](bytes))) == image.hash { return !cancelled() }
+      } else if CapturePreviewThumbnail.valid(target, edge: edge) { return true }
       let partial = target.deletingLastPathComponent().appendingPathComponent(target.lastPathComponent + ".part")
       defer { try? FileManager.default.removeItem(at: partial) }
       guard !cancelled(), let bytes = try? Data(contentsOf: source),
             DurableStoreEncoding.hex(DurableStoreEncoding.sha256([UInt8](bytes))) == image.hash,
-            CapturePreviewThumbnail.write(source: source, target: partial, edge: edge, cancelled: cancelled), !cancelled() else { return false }
+            !cancelled() else { return false }
+      if edge == 0 {
+        // Verified bytes are copied without decoding, recompression or metadata changes.
+        guard (try? bytes.write(to: partial)) != nil else { return false }
+      } else if !CapturePreviewThumbnail.write(source: source, target: partial, edge: edge, cancelled: cancelled) { return false }
+      guard !cancelled() else { return false }
       return rename(partial.path, target.path) == 0
     }
     return false
@@ -231,14 +240,14 @@ final class NativeCapturePreviewOwner {
 
   func materialize(manifestId: String, captureId: String, edge: Int = 512, cancelled: () -> Bool = { false }) throws -> String? {
     startup.lock.lock(); defer { startup.lock.unlock() }
-    guard edge == 512 || edge == 1024 else { throw DurableStoreStateError("Preview edge must be 512 or 1024") }
+    guard edge == 0 || edge == 512 || edge == 1024 else { throw DurableStoreStateError("Preview edge must be original, 512 or 1024") }
     let key = try Self.key(manifestId, captureId)
     try checkRoot()
     if cancelled() || !startup.reconciled { return nil }
     if FileManager.default.fileExists(atPath: root.appendingPathComponent("\(key).deleted").path) { return nil }
-    let target = try ownedFile(edge == 512 ? "\(key).jpg" : "\(key).detail.jpg")
+    let target = try ownedFile(edge == 0 ? "\(key).original.jpg" : (edge == 512 ? "\(key).jpg" : "\(key).detail.jpg"))
     guard reader.materialize(manifestId: manifestId, captureId: captureId, target: target, edge: edge, cancelled: cancelled) else { return nil }
-    if edge == 1024 { trimDetailedCopies(viewed: target) }
+    if edge != 512 { trimDetailedCopies(viewed: target) }
     return target.path
   }
 
@@ -358,10 +367,10 @@ final class NativeCapturePreviewOwner {
     return file
   }
 
-  /// Keeps the viewed detail copy plus at most two others.
+  /// Keeps the viewed detail/original copy plus at most two others.
   private func trimDetailedCopies(viewed: URL) {
     try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: viewed.path)
-    let names = ((try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? []).filter { $0.hasSuffix(".detail.jpg") }
+    let names = ((try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? []).filter { $0.hasSuffix(".detail.jpg") || $0.hasSuffix(".original.jpg") }
     let others = names.map { root.appendingPathComponent($0) }.filter { $0.lastPathComponent != viewed.lastPathComponent }
     guard others.count > 2 else { return }
     let dated = others.map { url -> (URL, Date) in
@@ -382,7 +391,7 @@ final class NativeCapturePreviewOwner {
     try PosixDurableFileBackend.fullSync(fd)
   }
 
-  private static func previewNames(_ key: String) -> [String] { ["\(key).jpg", "\(key).detail.jpg"] }
+  private static func previewNames(_ key: String) -> [String] { ["\(key).jpg", "\(key).detail.jpg", "\(key).original.jpg"] }
 
   static func key(_ manifestId: String, _ captureId: String) throws -> String {
     guard DurableStoreEncoding.isHash(manifestId), DurableStoreEncoding.isHash(captureId) else {

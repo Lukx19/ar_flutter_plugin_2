@@ -7,6 +7,22 @@ import XCTest
 /// (`render_*.bin`, written by Dart and read by Kotlin) and the Dart
 /// exporter's room stream; display mode and colour table goldens.
 final class RendererDeltaGoldenTests: XCTestCase {
+  func testDenseScreenPointDiametersAreRetainedWithBoundedPhysicalSize() throws {
+    let handler = DisplayModeHandler()
+    var mode = [UInt8](try GridRendererFixtures.golden("display_mode.bin"))
+    var state = GridDisplayState()
+    let cases: [(Float, Float)] = [(96, 96), (128, 128), (400, 128), (-2, 1), (.nan, 6)]
+    for (requested, expected) in cases {
+      let bits = requested.bitPattern
+      for byte in 0..<4 {
+        mode[DisplayModeLayout.pointSize + byte] = UInt8(truncatingIfNeeded: bits >> (byte * 8))
+      }
+      XCTAssertEqual(handler.onMessage(Data(mode)), .mode)
+      XCTAssertTrue(handler.snapshotMode(into: &state, knownVersion: -1))
+      XCTAssertEqual(state.pointSizePx, expected)
+    }
+  }
+
   private let renderGoldens = [
     "render_surface_slice.bin", "render_brick_summaries.bin", "render_occupancy_masks.bin",
     "render_region_summaries.bin", "render_compact_voxels.bin", "render_free_slots.bin",

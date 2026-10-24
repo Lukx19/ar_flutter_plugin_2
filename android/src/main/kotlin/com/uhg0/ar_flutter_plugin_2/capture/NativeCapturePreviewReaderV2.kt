@@ -30,7 +30,8 @@ internal class NativeCapturePreviewReaderV2(
         cancelled: () -> Boolean = { false },
         edge: Int = 512,
     ): Boolean {
-        require(edge == 512 || edge == 1024)
+        // Zero selects an immutable byte-for-byte original display copy.
+        require(edge == 0 || edge == 512 || edge == 1024)
         if (!HASH.matches(manifestId) || !HASH.matches(captureId)) return false
         val sessions = File(storeRoot.canonicalFile, "sessions")
         if (!sessions.isDirectory) return false
@@ -49,12 +50,26 @@ internal class NativeCapturePreviewReaderV2(
             if (!source.isFile || source.canonicalFile != source.absoluteFile || source.length() != descriptor.length) continue
             val parent = target.parentFile ?: continue
             parent.mkdirs()
-            if (validPreview(target, edge)) return true
+            if (edge == 0) {
+                if (target.isFile && target.canonicalFile == target.absoluteFile && target.length() == descriptor.length &&
+                    sha256(target, cancelled).hex() == descriptor.hash) return !cancelled()
+            } else if (validPreview(target, edge)) return true
             val partial = File(parent, "${target.name}.part")
             try {
                 check(target.canonicalFile == target.absoluteFile && partial.canonicalFile == partial.absoluteFile)
                 if (cancelled() || sha256(source, cancelled).hex() != descriptor.hash) return false
-                if (!writePreview(source, partial, cancelled, edge) || cancelled()) return false
+                if (edge == 0) {
+                    FileInputStream(source).use { input ->
+                        java.io.FileOutputStream(partial).use { output ->
+                            val receipt = copyWorkspace.copy(
+                                { bytes, offset, count -> if (cancelled()) throw java.io.IOException("Preview cancelled") else input.read(bytes, offset, count) },
+                                output::write,
+                            )
+                            if (receipt.length != descriptor.length || receipt.digest.hex() != descriptor.hash) return false
+                        }
+                    }
+                } else if (!writePreview(source, partial, cancelled, edge)) return false
+                if (cancelled()) return false
                 Files.move(
                     partial.toPath(),
                     target.toPath(),

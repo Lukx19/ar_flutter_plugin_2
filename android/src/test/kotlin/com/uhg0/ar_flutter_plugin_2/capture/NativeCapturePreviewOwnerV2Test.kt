@@ -23,6 +23,24 @@ class NativeCapturePreviewOwnerV2Test {
     @Before fun initialize() { owner().reconcile(emptyList()) }
     @After fun cleanup() { root.deleteRecursively() }
 
+    @Test fun `original inspection copies share detail bound and deletion rollback fences all variants`() {
+        val owner = owner()
+        val thumbnail = requireNotNull(owner.materialize(manifest, capture))
+        val original = requireNotNull(owner.materialize(manifest, capture, edge = 0))
+        val detail = requireNotNull(owner.materialize(manifest, capture, edge = 1024))
+        val token = owner.beginDeletion(listOf(reference))
+        assertFalse(File(thumbnail).exists()); assertFalse(File(original).exists()); assertFalse(File(detail).exists())
+        assertNull(owner.materialize(manifest, capture, edge = 0))
+        owner().rollbackDeletion(token)
+        assertArrayEquals(bytes, File(original).readBytes())
+        for (id in listOf("c", "d", "e", "f")) owner.materialize(manifest, id.repeat(64), edge = 0)
+        val copies = File(root, "capture-v2-previews").listFiles().orEmpty()
+        assertTrue(File(thumbnail).exists())
+        assertEquals(3, copies.count { it.name.endsWith(".original.jpg") || it.name.endsWith(".detail.jpg") })
+        owner.commitDeletion(owner.beginDeletion(listOf(reference)))
+        assertNull(owner().materialize(manifest, capture, edge = 0))
+    }
+
     @Test fun `session deletion reaches the durable store with the session id and refuses an empty id`() {
         val deleted = mutableListOf<String>()
         val owner = NativeCapturePreviewOwnerV2(root, { deleted += it; 7L }) { _, _, _, _, _ -> false }

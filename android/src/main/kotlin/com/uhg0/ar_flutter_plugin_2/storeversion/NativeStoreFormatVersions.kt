@@ -31,8 +31,9 @@ object NativeStoreFormatVersions {
     val PHOTO_ROOT_SCHEMAS_READABLE: Set<String> =
         setOf(PHOTO_ROOT_SCHEMA_PLAIN.toString(), PHOTO_ROOT_SCHEMA_ASSESSED.toString())
 
-    /** Layout of `capture-v2-previews` (512 px and 1024 px JPEG previews, delete markers). */
-    const val PREVIEW_CACHE_LAYOUT = 1
+    /** Layout of `capture-v2-previews`: 512/1024 px previews, optional full-resolution
+     * `<key>.original.jpg` copies and deletion markers. Existing previews remain readable. */
+    const val PREVIEW_CACHE_LAYOUT = 2
 
     /** Reply of [METHOD]: component name to version, plus the readable root schemas. */
     fun report(): Map<String, Any> = mapOf(

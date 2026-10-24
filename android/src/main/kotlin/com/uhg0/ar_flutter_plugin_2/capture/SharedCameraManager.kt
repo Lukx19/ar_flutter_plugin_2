@@ -1,8 +1,6 @@
 package com.uhg0.ar_flutter_plugin_2.capture
 
 import android.content.Context
-import android.content.ContextWrapper
-import android.app.Activity
 import android.graphics.ImageFormat
 import android.graphics.Rect
 import android.graphics.YuvImage
@@ -29,7 +27,6 @@ import android.os.SystemClock
 import android.util.Log
 import android.util.Size
 import android.view.Surface
-import android.view.HapticFeedbackConstants
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
 import com.google.ar.core.Session
@@ -854,59 +851,10 @@ internal class SharedCameraManager(
         val shutterConfirmation: CaptureShutterConfirmation = CaptureShutterConfirmation(),
     )
 
-    /** Confirm completed integration before analysis/save; never shake an exposing sensor. */
-    private fun confirmShutterExposure() {
-        Handler(Looper.getMainLooper()).post {
-            // Profile uses the release plugin build, so BuildConfig.DEBUG alone
-            // would hide the physical-device diagnostic. Never force a haptic.
-            val diagnostic = context.applicationInfo.flags and
-                android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0
-            val contextChain = if (diagnostic) mutableListOf<String>() else null
-            fun trace(value: Context) {
-                if (contextChain != null && contextChain.size < 8) {
-                    contextChain.add(value.javaClass.simpleName.take(80))
-                }
-            }
-            fun report(reason: String, resolvedActivity: Boolean, attached: Boolean = false,
-                       focus: Boolean = false, enabled: Boolean = false, accepted: Boolean = false) {
-                if (diagnostic) {
-                    Log.i("CaptureShutter", "haptic reason=$reason contextChain=${contextChain?.joinToString(">")}" +
-                        " resolvedActivity=$resolvedActivity attached=$attached focus=$focus" +
-                        " hapticEnabled=$enabled accepted=$accepted")
-                }
-            }
-            var owner = context
-            trace(owner)
-            while (owner !is Activity && owner is ContextWrapper) {
-                val base = owner.baseContext
-                if (base === owner) {
-                    report("context-cycle", false)
-                    return@post
-                }
-                owner = base
-                trace(owner)
-            }
-            val activity = owner as? Activity
-            if (activity == null) {
-                report("missing-activity", false)
-                return@post
-            }
-            if (activity.isFinishing || activity.isDestroyed) {
-                report("activity-closing", true)
-                return@post
-            }
-            val view = activity.window.decorView
-            val attached = view.isAttachedToWindow
-            val focus = view.hasWindowFocus()
-            if (attached && focus) {
-                // No IGNORE_* flags: respect the view and system haptic settings.
-                val accepted = view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
-                report("requested", true, attached, focus, view.isHapticFeedbackEnabled, accepted)
-            } else {
-                report("window-inactive", true, attached, focus, view.isHapticFeedbackEnabled)
-            }
-        }
-    }
+    // Exposure confirmation remains one-shot and cancellation qualified, but
+    // vibration is now owned by the shared coordinator after quality-qualified
+    // retention. Physical completion alone must not buzz for a rejected image.
+    private fun confirmShutterExposure() = Unit
 
     private data class ExposureBracketSpec(
         val exposureEv: Int,

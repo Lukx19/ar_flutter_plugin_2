@@ -75,7 +75,7 @@ class ArFlutterPlugin: FlutterPlugin, ActivityAware {
                                 requireNotNull(call.argument<String>("manifestId")),
                                 requireNotNull(call.argument<String>("captureId")),
                                 cancelled,
-                                if (call.argument<Boolean>("detailed") == true) 1024 else 512,
+                                if (call.argument<Boolean>("original") == true) 0 else if (call.argument<Boolean>("detailed") == true) 1024 else 512,
                             )
                             // Replies the bytes reclaimed from the native storage budget.
                             "deleteNativeCaptureSession" -> previewOwner.deleteSession(

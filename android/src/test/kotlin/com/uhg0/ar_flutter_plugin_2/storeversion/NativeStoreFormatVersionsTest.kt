@@ -10,7 +10,7 @@ class NativeStoreFormatVersionsTest {
         assertEquals(3, report["nativePhotoStore"])
         assertEquals(6, report["nativePhotoRootSchema"])
         assertEquals(listOf(5, 6), report["nativePhotoRootSchemasReadable"])
-        assertEquals(1, report["nativePreviewCache"])
+        assertEquals(2, report["nativePreviewCache"])
         assertEquals(setOf("5", "6"), NativeStoreFormatVersions.PHOTO_ROOT_SCHEMAS_READABLE)
     }
 }

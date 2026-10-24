@@ -1,5 +1,6 @@
 import Flutter
 import Foundation
+import ImageIO
 import XCTest
 @testable import ar_flutter_plugin_2
 
@@ -59,6 +60,27 @@ final class NativeCapturePreviewChannelTests: XCTestCase {
     var arguments: [String: Any] = ["manifestId": photo.manifest, "captureId": photo.capture, "requestId": UUID().uuidString]
     if detailed { arguments["detailed"] = true }
     return invoke("materializeNativeCapturePreview", arguments) as? String
+  }
+
+  func testOriginalInspectionKeepsFullResolutionAndDeletionRollback() throws {
+    let photo = try commitPhoto()
+    _ = invoke("reconcileNativeCapturePreviews", ["references": [photo.reference]])
+    let arguments: [String: Any] = ["manifestId": photo.manifest, "captureId": photo.capture,
+                                     "requestId": UUID().uuidString, "original": true]
+    let path = try XCTUnwrap(invoke("materializeNativeCapturePreview", arguments) as? String)
+    let bytes = try Data(contentsOf: URL(fileURLWithPath: path))
+    let source = try XCTUnwrap(CGImageSourceCreateWithData(bytes as CFData, nil))
+    let properties = try XCTUnwrap(CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any])
+    XCTAssertEqual(properties[kCGImagePropertyPixelWidth] as? Int, 1200)
+    XCTAssertEqual(properties[kCGImagePropertyPixelHeight] as? Int, 900)
+    let token = try XCTUnwrap(invoke("beginNativeCapturePreviewDeletion", ["references": [photo.reference]]) as? String)
+    XCTAssertFalse(FileManager.default.fileExists(atPath: path))
+    XCTAssertNil(invoke("materializeNativeCapturePreview", arguments) as? String)
+    _ = invoke("rollbackNativeCapturePreviewDeletion", ["token": token])
+    XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: path)), bytes)
+    try Data([1, 2, 3]).write(to: URL(fileURLWithPath: path))
+    XCTAssertEqual(invoke("materializeNativeCapturePreview", arguments) as? String, path)
+    XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: path)), bytes)
   }
 
   func testCommittedPhotoPreviewResolvesOnlyAfterTheChannelReconciles() throws {

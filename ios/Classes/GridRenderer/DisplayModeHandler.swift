@@ -100,7 +100,7 @@ final class DisplayModeHandler {
       pending.colourAttribute = colour
       pending.sizeRule = size
       pending.spikeNearestK = b.le16(DisplayModeLayout.spikeNearestK)
-      pending.pointSizePx = px.isFinite ? min(max(px, 1), 64) : 6
+      pending.pointSizePx = px.isFinite ? min(max(px, 1), 128) : 6
       pending.colourTableGeneration = b.leU32(DisplayModeLayout.colourTableGeneration)
       pending.minQuality = b.le8(DisplayModeLayout.minQuality)
       pending.modeVersion += 1

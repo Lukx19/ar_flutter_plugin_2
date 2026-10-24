@@ -30,8 +30,9 @@ enum NativeStoreFormatVersions {
   static let photoRootSchemaShot = 7
   /// Root record schemas this platform reads.
   static let photoRootSchemasReadable = [photoRootSchemaPlain, photoRootSchemaShot]
-  /// Layout of `capture-v2-previews` (512 px and 1024 px previews, delete markers).
-  static let previewCacheLayout = 1
+  /// Layout of `capture-v2-previews`: 512/1024 px previews, optional full-resolution
+  /// `<key>.original.jpg` copies and deletion markers. Existing previews remain readable.
+  static let previewCacheLayout = 2
   /// Layout of `capture-v2-native/budget` (ledger, reservations, verified
   /// reclaims). 2: a settlement writes `reservations-v2/<token>.settled`
   /// before the ledger moves and deletes it after the reservation files, so

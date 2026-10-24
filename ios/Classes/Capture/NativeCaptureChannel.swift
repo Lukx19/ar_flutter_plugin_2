@@ -681,7 +681,7 @@ enum NativeCapturePreviewChannel {
               throw DurableStoreStateError("manifestId and captureId are required")
             }
             value = try owner.materialize(manifestId: manifestId, captureId: captureId,
-                                          edge: arguments["detailed"] as? Bool == true ? 1024 : 512, cancelled: cancelled) ?? NSNull()
+                                          edge: arguments["original"] as? Bool == true ? 0 : (arguments["detailed"] as? Bool == true ? 1024 : 512), cancelled: cancelled) ?? NSNull()
           case "reconcileNativeCaptureSessions":
             guard let sessionIds = arguments["sessionIds"] as? [String] else {
               throw NativeCaptureWireError.invalid("sessionIds are required")

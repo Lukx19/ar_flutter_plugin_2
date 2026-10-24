@@ -18,15 +18,15 @@ internal class NativeCapturePreviewOwnerV2(
     private val lock = startup.lock
 
     fun materialize(manifestId: String, captureId: String, cancelled: () -> Boolean = { false }, edge: Int = 512): String? = synchronized(lock) {
-        require(edge == 512 || edge == 1024)
+        require(edge == 0 || edge == 512 || edge == 1024)
         val key = key(manifestId, captureId)
         checkRoot()
         if (cancelled()) return@synchronized null
         if (!startup.reconciled) return@synchronized null
         if (File(root, "$key.deleted").exists()) return@synchronized null
-        val target = ownedFile(if (edge == 512) "$key.jpg" else "$key.detail.jpg")
+        val target = ownedFile(when (edge) { 0 -> "$key.original.jpg"; 512 -> "$key.jpg"; else -> "$key.detail.jpg" })
         if (!copyPreview(manifestId, captureId, target, cancelled, edge)) return@synchronized null
-        if (edge == 1024) trimDetailedCopies(target)
+        if (edge != 512) trimDetailedCopies(target)
         target.absolutePath
     }
 
@@ -151,15 +151,17 @@ internal class NativeCapturePreviewOwnerV2(
         FileOutputStream(file).use { it.write(bytes); it.fd.sync() }
     }
 
-    private fun previewNames(key: String) = arrayOf("$key.jpg", "$key.detail.jpg")
+    private fun previewNames(key: String) = arrayOf("$key.jpg", "$key.detail.jpg", "$key.original.jpg")
 
     /** Keep the viewed display plus at most two others; disk thumbnails remain persistent. */
     private fun trimDetailedCopies(viewed: File) {
         viewed.setLastModified(System.currentTimeMillis())
         val retained = ArrayList<File>(3)
-        java.nio.file.Files.newDirectoryStream(root.toPath(), "*.detail.jpg").use { entries ->
+        java.nio.file.Files.newDirectoryStream(root.toPath()).use { entries ->
             for (entry in entries) {
-                val file = ownedFile(entry.fileName.toString())
+                val name = entry.fileName.toString()
+                if (!name.endsWith(".detail.jpg") && !name.endsWith(".original.jpg")) continue
+                val file = ownedFile(name)
                 if (file == viewed) continue
                 retained.add(file)
                 if (retained.size > 2) {

@@ -134,7 +134,7 @@ internal class DisplayModeHandler {
                     pending.sizeRule = size
                     pending.spikeNearestK = b.getShort(offset + DisplayModeLayout.SPIKE_NEAREST_K).toInt() and 0xffff
                     val px = b.getFloat(offset + DisplayModeLayout.POINT_SIZE)
-                    pending.pointSizePx = if (px.isFinite()) px.coerceIn(1f, 64f) else 6f
+                    pending.pointSizePx = if (px.isFinite()) px.coerceIn(1f, 128f) else 6f
                     pending.colourTableGeneration =
                         b.getInt(offset + DisplayModeLayout.COLOUR_TABLE_GENERATION).toLong() and 0xffffffffL
                     pending.minQuality = b.get(offset + DisplayModeLayout.MIN_QUALITY).toInt() and 0xff

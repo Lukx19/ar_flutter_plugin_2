@@ -1,6 +1,7 @@
 package com.uhg0.ar_flutter_plugin_2.gridrenderer
 
 import com.uhg0.ar_flutter_plugin_2.visibilitycontract.ColourTableLayout
+import com.uhg0.ar_flutter_plugin_2.visibilitycontract.DisplayModeLayout
 import com.uhg0.ar_flutter_plugin_2.visibilitycontract.RendererDeltaLayout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -12,6 +13,20 @@ import java.nio.ByteOrder
 /** Upload scheduling on the render thread and display mode switches. */
 class DeltaUploadSchedulerTest {
     private val w = RendererDeltaWriter()
+
+    @Test
+    fun `dense screen point diameters are retained with bounded physical size`() {
+        val handler = DisplayModeHandler()
+        val mode = File("../test_assets/visibility_grid/display_mode.bin").readBytes()
+        val bytes = ByteBuffer.wrap(mode).order(ByteOrder.LITTLE_ENDIAN)
+        val state = GridDisplayState()
+        for ((requested, expected) in listOf(96f to 96f, 128f to 128f, 400f to 128f, -2f to 1f, Float.NaN to 6f)) {
+            bytes.putFloat(DisplayModeLayout.POINT_SIZE, requested)
+            assertEquals(DisplayIntake.MODE, handler.onMessage(mode))
+            assertTrue(handler.snapshotMode(state, -1))
+            assertEquals(expected, state.pointSizePx)
+        }
+    }
 
     private fun offerReset(core: GridRendererCore) {
         w.begin(RendererDeltaLayout.KIND_RESET, 0, 0, 4096, 0)

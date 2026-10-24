@@ -139,12 +139,9 @@ final class HighResolutionStillExposure: StillExposurePort {
 
   init(frameSource: @escaping () -> ARFrameSource?, jpegQuality: Int,
        deviceModel: String = ARCameraCapabilities.hardwareModelIdentifier(),
-       shutterFeedback: @escaping () -> Void = {
-         DispatchQueue.main.async {
-           guard UIApplication.shared.applicationState == .active else { return }
-           UIImpactFeedbackGenerator(style: .light).impactOccurred()
-         }
-       }) {
+       // The shared coordinator confirms quality-qualified retained images.
+       // Tests may still observe physical exposure callbacks independently.
+       shutterFeedback: @escaping () -> Void = {}) {
     self.frameSource = frameSource
     self.shutterFeedback = shutterFeedback
     self.configuredJpegQuality = jpegQuality

@@ -352,7 +352,7 @@ final class NativeCaptureBindingTests: XCTestCase {
     XCTAssertEqual(report["nativePhotoRootSchema"] as? Int, 5)
     XCTAssertEqual(report["nativePhotoShotRootSchema"] as? Int, 7)
     XCTAssertEqual(report["nativePhotoRootSchemasReadable"] as? [Int], [5, 7])
-    XCTAssertEqual(report["nativePreviewCache"] as? Int, 1)
+    XCTAssertEqual(report["nativePreviewCache"] as? Int, 2)
     XCTAssertEqual(report["nativeStorageBudget"] as? Int, 2, "settlement markers")
   }
 

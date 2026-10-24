@@ -52,6 +52,17 @@ class NativeCapturePreviewReaderV2Test {
             assertArrayEquals(thumbnail, target.readBytes())
             assertArrayEquals(image, File(session, "assets/$captureId/jpeg.$componentHash.blob").readBytes())
 
+            // Original inspection must bypass thumbnail recompression and repair
+            // corrupt cache only from this identity-qualified durable JPEG.
+            val original = File(root, "original.jpg")
+            assertTrue(reader.materializeJpegPreview(manifestId, captureId, original, edge = 0))
+            assertArrayEquals(image, original.readBytes())
+            original.writeBytes(ByteArray(image.size) { 7 })
+            assertTrue(reader.materializeJpegPreview(manifestId, captureId, original, edge = 0))
+            assertArrayEquals(image, original.readBytes())
+            assertFalse(reader.materializeJpegPreview(manifestId, "c".repeat(64), original, edge = 0))
+            assertFalse(reader.materializeJpegPreview(manifestId, captureId, original, { true }, edge = 0))
+
             val retainedRoot = File(session, "objects/$manifestId.root")
             retainedRoot.writeText(rootText.replace("revision=1", "revision=2"))
             assertFalse(reader.materializeJpegPreview(manifestId, captureId, target))
