@@ -3,6 +3,7 @@ import CoreImage
 import Foundation
 import ImageIO
 import simd
+import UIKit
 
 /// Camera intrinsics of a still: ARKit reports them for the camera's image
 /// resolution; a still of another size scales each axis. Pixel centres are
@@ -125,6 +126,7 @@ final class HighResolutionStillExposure: StillExposurePort {
   static let maximumFallbackFrameAge: TimeInterval = 0.5
 
   private let frameSource: () -> ARFrameSource?
+  private let shutterFeedback: () -> Void
   private var configuredJpegQuality: Int
   private var configuredMode: StillCaptureMode = .single
   private var configuredBurst = BurstSettings()
@@ -136,8 +138,15 @@ final class HighResolutionStillExposure: StillExposurePort {
   private var counters = Counters()
 
   init(frameSource: @escaping () -> ARFrameSource?, jpegQuality: Int,
-       deviceModel: String = ARCameraCapabilities.hardwareModelIdentifier()) {
+       deviceModel: String = ARCameraCapabilities.hardwareModelIdentifier(),
+       shutterFeedback: @escaping () -> Void = {
+         DispatchQueue.main.async {
+           guard UIApplication.shared.applicationState == .active else { return }
+           UIImpactFeedbackGenerator(style: .light).impactOccurred()
+         }
+       }) {
     self.frameSource = frameSource
+    self.shutterFeedback = shutterFeedback
     self.configuredJpegQuality = jpegQuality
     self.deviceModel = deviceModel
   }
@@ -183,7 +192,7 @@ final class HighResolutionStillExposure: StillExposurePort {
       captureShot(mode: mode == .burst ? .burst : .quality, settings: settings, isCancelled: isCancelled) { result in
         switch result {
         case .success(let shot):
-          callback(.components(StillComponentSet(
+          callback(StillImageQualityGate.outcome(for: StillComponentSet(
             qualifier: qualifier, components: [(.jpeg, shot.first.jpeg)], metadata: shot.first.metadata, shot: shot)))
         case .failure(let failure):
           callback(.failure(qualifier, failure.reason))
@@ -194,7 +203,8 @@ final class HighResolutionStillExposure: StillExposurePort {
     return captureStill(quality: .fast, isCancelled: isCancelled) { result in
       switch result {
       case .success(let still):
-        callback(.components(StillComponentSet(qualifier: qualifier, components: [(.jpeg, [UInt8](still.jpeg))], metadata: still.metadata)))
+        callback(StillImageQualityGate.outcome(for: StillComponentSet(
+          qualifier: qualifier, components: [(.jpeg, [UInt8](still.jpeg))], metadata: still.metadata)))
       case .failure(let failure):
         callback(.failure(qualifier, failure.reason))
       }
@@ -211,16 +221,23 @@ final class HighResolutionStillExposure: StillExposurePort {
   /// One encoded still. Returns false when no frame source is available;
   /// otherwise [completion] runs exactly once on the encode queue.
   func captureStill(quality: StillFrameQuality = .fast, isCancelled: @escaping () -> Bool = { false },
+                    frameCaptured: (() -> Void)? = nil,
                     completion: @escaping (Result<EncodedStill, StillCaptureFailure>) -> Void) -> Bool {
     guard let source = frameSource() else { return false }
     let requestedAt = DispatchTime.now().uptimeNanoseconds
     source.captureHighResolutionFrame(quality: quality) { [weak self, weak source] frame, error in
       guard let self = self else { return completion(.failure(StillCaptureFailure(reason: "closed"))) }
       if let frame = frame {
+        if !isCancelled(), source?.replaysRecordedStills == false {
+          (frameCaptured ?? self.shutterFeedback)()
+        }
         self.process(frame, highResolution: true, requestedAt: requestedAt, isCancelled: isCancelled, completion: completion)
       } else if let current = source?.currentFrame,
                 ProcessInfo.processInfo.systemUptime - current.timestamp < Self.maximumFallbackFrameAge {
         NSLog("capture3d still: high-resolution frame unavailable (%@); using the video frame", String(describing: error))
+        if !isCancelled(), source?.replaysRecordedStills == false {
+          (frameCaptured ?? self.shutterFeedback)()
+        }
         self.process(current, highResolution: false, requestedAt: requestedAt, isCancelled: isCancelled, completion: completion)
       } else {
         self.record { $0.failures += 1 }
@@ -279,30 +296,42 @@ final class HighResolutionStillExposure: StillExposurePort {
                    completion: @escaping (Result<CapturedShot, StillCaptureFailure>) -> Void) {
     let quality: StillFrameQuality = mode == .quality ? .balanced : .fast
     var images: [ShotImage] = []
+    // A burst may stop early on a failed/repeated frame. Confirm only once its
+    // terminal shot is known, so the motor cannot shake a subsequent exposure.
+    // This follows encoding/analysis, but never waits for durable storage.
+    // Ordinary single/quality captures still confirm at the frame callback.
+    let liveBurst = mode == .burst && frameSource()?.replaysRecordedStills == false
+    func finish(_ result: Result<CapturedShot, StillCaptureFailure>) {
+      if liveBurst, !isCancelled(), case .success(let shot) = result, !shot.images.isEmpty {
+        shutterFeedback()
+      }
+      completion(result)
+    }
     func next() {
-      if isCancelled() { return completion(.failure(StillCaptureFailure(reason: "cancelled"))) }
-      let started = captureStill(quality: quality, isCancelled: isCancelled) { [weak self] result in
+      if isCancelled() { return finish(.failure(StillCaptureFailure(reason: "cancelled"))) }
+      let started = captureStill(quality: quality, isCancelled: isCancelled,
+                                 frameCaptured: mode == .burst ? {} : nil) { [weak self] result in
         switch result {
         case .success(let still):
           // A replay answers close requests with the same recorded still:
           // a repeated exposure ends the burst instead of doubling a view.
           if images.contains(where: { $0.metadata.exposureTimestampNs == still.metadata.exposureTimestampNs }) {
-            return completion(.success(CapturedShot(shotId: UUID(), mode: mode, images: images)))
+            return finish(.success(CapturedShot(shotId: UUID(), mode: mode, images: images)))
           }
           images.append(ShotImage(
             index: images.count, jpeg: [UInt8](still.jpeg), metadata: still.metadata, trackingNormal: still.isTracking))
           if images.count < settings.imageCount, let self = self {
             self.burstQueue.asyncAfter(deadline: .now() + .milliseconds(settings.intervalMs)) { next() }
           } else {
-            completion(.success(CapturedShot(shotId: UUID(), mode: mode, images: images)))
+            finish(.success(CapturedShot(shotId: UUID(), mode: mode, images: images)))
           }
         case .failure(let failure):
-          if images.isEmpty || failure.reason == "cancelled" { return completion(.failure(failure)) }
-          completion(.success(CapturedShot(shotId: UUID(), mode: mode, images: images)))
+          if images.isEmpty || failure.reason == "cancelled" { return finish(.failure(failure)) }
+          finish(.success(CapturedShot(shotId: UUID(), mode: mode, images: images)))
         }
       }
       if !started {
-        completion(images.isEmpty ? .failure(StillCaptureFailure(reason: "closed"))
+        finish(images.isEmpty ? .failure(StillCaptureFailure(reason: "closed"))
                                   : .success(CapturedShot(shotId: UUID(), mode: mode, images: images)))
       }
     }

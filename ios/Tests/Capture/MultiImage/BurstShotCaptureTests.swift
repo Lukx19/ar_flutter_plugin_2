@@ -41,7 +41,11 @@ final class BurstShotCaptureTests: XCTestCase {
       ShotFixture.frame(timestamp: 100 + 0.2 * Double(i), pose: ShotFixture.pose(x: 1 + 0.02 * Float(i), y: 2, z: 3))
     }
     let source = source(frames)
-    let exposure = HighResolutionStillExposure(frameSource: { source }, jpegQuality: 90, deviceModel: "test")
+    var feedback = 0
+    let exposure = HighResolutionStillExposure(frameSource: { source }, jpegQuality: 90, deviceModel: "test", shutterFeedback: {
+      XCTAssertEqual(source.qualities.count, 3, "no motor pulse while later burst frames remain")
+      feedback += 1
+    })
     exposure.mode = .burst
     exposure.burst = BurstSettings(imageCount: 3, intervalMs: 50)
     let set = try expose(exposure)
@@ -55,6 +59,7 @@ final class BurstShotCaptureTests: XCTestCase {
     XCTAssertTrue(shot.images.allSatisfy { $0.trackingNormal && $0.flags.isEmpty && $0.creditable })
     XCTAssertTrue(shot.images.allSatisfy { $0.metadata.intrinsics != nil })
     XCTAssertEqual(set.components.map { $0.0 }, [.jpeg])
+    XCTAssertEqual(feedback, 1, "one confirmation for the terminal logical burst before storage")
     XCTAssertEqual(set.components.first?.1, shot.first.jpeg, "the first image is the attempt's JPEG")
     XCTAssertEqual(set.metadata.exposureTimestampNs, shot.first.metadata.exposureTimestampNs)
     XCTAssertEqual(source.qualities, [.fast, .fast, .fast])
@@ -106,12 +111,47 @@ final class BurstShotCaptureTests: XCTestCase {
     // A replay answers close requests with the same nearest recorded still.
     let source = source([ShotFixture.frame(timestamp: 40, pose: ShotFixture.pose(x: 4))])
     source.replaysRecordedStills = true
-    let exposure = HighResolutionStillExposure(frameSource: { source }, jpegQuality: 90, deviceModel: "test")
+    var feedback = 0
+    let exposure = HighResolutionStillExposure(frameSource: { source }, jpegQuality: 90, deviceModel: "test", shutterFeedback: { feedback += 1 })
     exposure.mode = .burst
     exposure.burst = BurstSettings(imageCount: 4, intervalMs: 0)
     let shot = try XCTUnwrap(try expose(exposure).shot)
     XCTAssertEqual(shot.images.count, 1)
     XCTAssertEqual(source.qualities.count, 2, "the second request returned the same still")
+    XCTAssertEqual(feedback, 0, "playback is not a physical exposure")
+  }
+
+  func testShutterFeedbackPrecedesEncodingAndDoesNotConfirmMissingOrCancelledFrames() {
+    var feedback = 0
+    let source = source([ShotFixture.frame(timestamp: 60, pose: ShotFixture.pose(x: 1))])
+    let exposure = HighResolutionStillExposure(frameSource: { source }, jpegQuality: 90, deviceModel: "test", shutterFeedback: { feedback += 1 })
+    let done = expectation(description: "encoded")
+    XCTAssertTrue(exposure.captureStill { result in
+      XCTAssertEqual(feedback, 1)
+      done.fulfill()
+    })
+    wait(for: [done], timeout: 10)
+    let cancelled = expectation(description: "cancelled")
+    XCTAssertTrue(exposure.captureStill(isCancelled: { true }) { _ in cancelled.fulfill() })
+    wait(for: [cancelled], timeout: 10)
+    XCTAssertEqual(feedback, 1)
+    let missing = HighResolutionStillExposure(frameSource: { nil }, jpegQuality: 90, shutterFeedback: { feedback += 1 })
+    XCTAssertFalse(missing.captureStill { _ in XCTFail("unavailable source must reject before exposure") })
+    XCTAssertEqual(feedback, 1)
+  }
+
+  func testLiveBurstThatEndsEarlyConfirmsOnlyItsTerminalShot() throws {
+    let source = source([ShotFixture.frame(timestamp: 70, pose: ShotFixture.pose(x: 1))])
+    var feedback = 0
+    let exposure = HighResolutionStillExposure(frameSource: { source }, jpegQuality: 90, deviceModel: "test", shutterFeedback: {
+      XCTAssertEqual(source.qualities.count, 2, "the repeated second frame ends acquisition before feedback")
+      feedback += 1
+    })
+    exposure.mode = .burst
+    exposure.burst = BurstSettings(imageCount: 4, intervalMs: 0)
+    let shot = try XCTUnwrap(try expose(exposure).shot)
+    XCTAssertEqual(shot.images.count, 1)
+    XCTAssertEqual(feedback, 1)
   }
 
   func testRecordedPlaybackUsesTheNearestRecordedStillAndKeepsShotsSingleWithoutStills() throws {

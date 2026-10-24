@@ -37,17 +37,35 @@ enum ShotFixture {
     })
   }
 
-  static func pixelBuffer(width: Int = 64, height: Int = 48) -> CVPixelBuffer {
+  static func pixelBuffer(width: Int = 64, height: Int = 48, flat: Bool = false) -> CVPixelBuffer {
     var buffer: CVPixelBuffer?
     CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
                         [kCVPixelBufferIOSurfacePropertiesKey as String: [:]] as CFDictionary, &buffer)
-    return buffer!
+    let result = buffer!
+    CVPixelBufferLockBaseAddress(result, [])
+    defer { CVPixelBufferUnlockBaseAddress(result, []) }
+    for plane in 0..<CVPixelBufferGetPlaneCount(result) {
+      let stride = CVPixelBufferGetBytesPerRowOfPlane(result, plane)
+      let planeHeight = CVPixelBufferGetHeightOfPlane(result, plane)
+      let planeWidth = CVPixelBufferGetWidthOfPlane(result, plane)
+      let bytes = CVPixelBufferGetBaseAddressOfPlane(result, plane)!.assumingMemoryBound(to: UInt8.self)
+      bytes.initialize(repeating: 128, count: stride * planeHeight)
+      if plane == 0 && !flat {
+        for y in 0..<planeHeight {
+          for x in 0..<planeWidth {
+            bytes[y * stride + x] = (x / 4 + y / 4) % 2 == 0 ? 235 : 16
+          }
+        }
+      }
+    }
+    return result
   }
 
-  static func frame(timestamp: TimeInterval, pose: simd_float4x4, tracking: ARCamera.TrackingState = .normal) -> CaptureFrame {
+  static func frame(timestamp: TimeInterval, pose: simd_float4x4, tracking: ARCamera.TrackingState = .normal,
+                    flat: Bool = false) -> CaptureFrame {
     RecordedCaptureFrame(
       timestamp: timestamp, recordedTimestamp: timestamp, cameraTransform: pose, intrinsics: arkitIntrinsics,
-      imageResolution: arkitResolution, trackingState: tracking, capturedImage: pixelBuffer(),
+      imageResolution: arkitResolution, trackingState: tracking, capturedImage: pixelBuffer(flat: flat),
       depth: nil, featurePoints: nil, lightEstimate: nil, anchors: [])
   }
 }

@@ -1,6 +1,8 @@
 package com.uhg0.ar_flutter_plugin_2.capture
 
 import android.content.Context
+import android.content.ContextWrapper
+import android.app.Activity
 import android.graphics.ImageFormat
 import android.graphics.Rect
 import android.graphics.YuvImage
@@ -20,12 +22,14 @@ import com.uhg0.ar_flutter_plugin_2.diagnostics.NativeFrameSpan
 import com.uhg0.ar_flutter_plugin_2.diagnostics.measureNativeFrame
 import com.uhg0.ar_flutter_plugin_2.diagnostics.StillCaptureMetadata
 import android.os.Handler
+import android.os.Looper
 import android.os.HandlerThread
 import android.os.Build
 import android.os.SystemClock
 import android.util.Log
 import android.util.Size
 import android.view.Surface
+import android.view.HapticFeedbackConstants
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
 import com.google.ar.core.Session
@@ -483,6 +487,7 @@ internal class SharedCameraManager(
                 timestamp: Long,
                 frameNumber: Long,
             ) {
+                if (session !== captureSession) return
                 if (BuildConfig.NATIVE_FRAME_ATTRIBUTION) recordStillStarted(session, request, timestamp, frameNumber)
                 val directTag = request.tag as? DirectCaptureTagV2
                 if (directTag != null && pendingDirectCapture?.qualifier == directTag.qualifier) {
@@ -519,6 +524,7 @@ internal class SharedCameraManager(
                 request: CaptureRequest,
                 result: TotalCaptureResult,
             ) {
+                if (session !== captureSession) return
                 if (BuildConfig.NATIVE_FRAME_ATTRIBUTION) recordStillCompleted(session, request, result)
                 val attribution = nativeFrameAttribution
                 if (attribution != null && attribution.active && session === captureSession) {
@@ -535,8 +541,35 @@ internal class SharedCameraManager(
                         }
                     } catch (_: Throwable) { attribution.recordCameraProbeFailure() }
                 }
-                latestPreviewExposureState =
-                    buildObservedExposureState(result, runtimeCameraController)
+                if (session === captureSession && request.tag == null &&
+                    request.get(CaptureRequest.CONTROL_CAPTURE_INTENT) == CaptureRequest.CONTROL_CAPTURE_INTENT_VIDEO_RECORD) {
+                    val metering = if (result.get(CaptureResult.CONTROL_AE_MODE) == CaptureRequest.CONTROL_AE_MODE_ON &&
+                        result.get(CaptureResult.CONTROL_AE_STATE) == CaptureResult.CONTROL_AE_STATE_CONVERGED) {
+                        val exposure = result.get(CaptureResult.SENSOR_EXPOSURE_TIME)
+                        val iso = result.get(CaptureResult.SENSOR_SENSITIVITY)
+                        val duration = result.get(CaptureResult.SENSOR_FRAME_DURATION)
+                        if (exposure != null && iso != null && duration != null) StillExposureMetering(
+                            receivedAtNs = SystemClock.elapsedRealtimeNanos(),
+                            sensorTimestampNs = result.get(CaptureResult.SENSOR_TIMESTAMP) ?: 0L,
+                            generation = sessionCallbackGeneration,
+                            exposureNs = exposure, iso = iso, frameDurationNs = duration,
+                            flickerHz = when (result.get(CaptureResult.STATISTICS_SCENE_FLICKER)) {
+                                CaptureResult.STATISTICS_SCENE_FLICKER_NONE -> 0
+                                CaptureResult.STATISTICS_SCENE_FLICKER_50HZ -> 50
+                                CaptureResult.STATISTICS_SCENE_FLICKER_60HZ -> 60
+                                else -> null
+                            },
+                        ) else null
+                    } else null
+                    stillExposureMeteringOwner.publish(request, metering) {
+                        latestPreviewExposureState = buildObservedExposureState(result, runtimeCameraController)
+                    }
+                }
+                if (session === captureSession && (request.tag is ManualCaptureTag || request.tag is DirectCaptureTagV2)) {
+                    Log.i("StillExposure", "actual tag=${request.tag} exposureNs=${result.get(CaptureResult.SENSOR_EXPOSURE_TIME)} " +
+                        "iso=${result.get(CaptureResult.SENSOR_SENSITIVITY)} aeMode=${result.get(CaptureResult.CONTROL_AE_MODE)} " +
+                        "afState=${result.get(CaptureResult.CONTROL_AF_STATE)}")
+                }
                 if (pendingManualCapture != null) {
                     Log.i(
                         "SharedCameraManager",
@@ -544,6 +577,9 @@ internal class SharedCameraManager(
                     )
                 }
                 val directTag = request.tag as? DirectCaptureTagV2
+                // ImageReader may already have released its owner. The request
+                // retains its confirmation until this camera result arrives.
+                directTag?.shutterConfirmation?.onExposureCompleted(feedback = ::confirmShutterExposure)
                 if (directTag != null && pendingDirectCapture?.qualifier == directTag.qualifier) {
                     captureLatencyLog(
                         "camera_capture_completed",
@@ -569,6 +605,10 @@ internal class SharedCameraManager(
                     )
                     return
                 }
+                pending.shutterConfirmation.onExposureCompleted(
+                    requestTag.bracketIndex, pending.exposureBracket.lastIndex.coerceAtLeast(0),
+                    ::confirmShutterExposure,
+                )
                 observedCaptureState = buildObservedCaptureState(result).also(
                     onObservedCaptureStateChanged,
                 )
@@ -737,6 +777,7 @@ internal class SharedCameraManager(
     private var observedCaptureState: RuntimeObservedCaptureState? = null
     @Volatile
     private var latestPreviewExposureState: RuntimeObservedExposureState? = null
+    private val stillExposureMeteringOwner = StillExposureMeteringOwner<CaptureRequest>()
     @Volatile
     private var cleanupRequested = false
     @Volatile
@@ -797,6 +838,7 @@ internal class SharedCameraManager(
         @Volatile var preAlignedPose: PoseDataExtractor.AlignedPose? = null,
         @Volatile var accepted: SharedCaptureAccepted? = null,
         val bracketedCaptures: MutableMap<Int, ExposureBracketMember> = mutableMapOf(),
+        val shutterConfirmation: CaptureShutterConfirmation = CaptureShutterConfirmation(),
     )
 
     /**
@@ -809,7 +851,62 @@ internal class SharedCameraManager(
         val qualifier: CaptureAttemptQualifierV2,
         val required: Set<CaptureComponentKind>,
         val callback: SharedCameraExposureCallbackV2,
+        val shutterConfirmation: CaptureShutterConfirmation = CaptureShutterConfirmation(),
     )
+
+    /** Confirm completed integration before analysis/save; never shake an exposing sensor. */
+    private fun confirmShutterExposure() {
+        Handler(Looper.getMainLooper()).post {
+            // Profile uses the release plugin build, so BuildConfig.DEBUG alone
+            // would hide the physical-device diagnostic. Never force a haptic.
+            val diagnostic = context.applicationInfo.flags and
+                android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0
+            val contextChain = if (diagnostic) mutableListOf<String>() else null
+            fun trace(value: Context) {
+                if (contextChain != null && contextChain.size < 8) {
+                    contextChain.add(value.javaClass.simpleName.take(80))
+                }
+            }
+            fun report(reason: String, resolvedActivity: Boolean, attached: Boolean = false,
+                       focus: Boolean = false, enabled: Boolean = false, accepted: Boolean = false) {
+                if (diagnostic) {
+                    Log.i("CaptureShutter", "haptic reason=$reason contextChain=${contextChain?.joinToString(">")}" +
+                        " resolvedActivity=$resolvedActivity attached=$attached focus=$focus" +
+                        " hapticEnabled=$enabled accepted=$accepted")
+                }
+            }
+            var owner = context
+            trace(owner)
+            while (owner !is Activity && owner is ContextWrapper) {
+                val base = owner.baseContext
+                if (base === owner) {
+                    report("context-cycle", false)
+                    return@post
+                }
+                owner = base
+                trace(owner)
+            }
+            val activity = owner as? Activity
+            if (activity == null) {
+                report("missing-activity", false)
+                return@post
+            }
+            if (activity.isFinishing || activity.isDestroyed) {
+                report("activity-closing", true)
+                return@post
+            }
+            val view = activity.window.decorView
+            val attached = view.isAttachedToWindow
+            val focus = view.hasWindowFocus()
+            if (attached && focus) {
+                // No IGNORE_* flags: respect the view and system haptic settings.
+                val accepted = view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                report("requested", true, attached, focus, view.isHapticFeedbackEnabled, accepted)
+            } else {
+                report("window-inactive", true, attached, focus, view.isHapticFeedbackEnabled)
+            }
+        }
+    }
 
     private data class ExposureBracketSpec(
         val exposureEv: Int,
@@ -997,7 +1094,10 @@ internal class SharedCameraManager(
         }
     }
 
-    private data class DirectCaptureTagV2(val qualifier: CaptureAttemptQualifierV2)
+    private data class DirectCaptureTagV2(
+        val qualifier: CaptureAttemptQualifierV2,
+        val shutterConfirmation: CaptureShutterConfirmation,
+    )
 
     private fun requestDirectExposureV2(
         qualifier: CaptureAttemptQualifierV2,
@@ -1018,9 +1118,9 @@ internal class SharedCameraManager(
             return false
         }
         return try {
-            builder.setTag(DirectCaptureTagV2(qualifier))
+            builder.setTag(DirectCaptureTagV2(qualifier, pending.shutterConfirmation))
             captureLatencyLog("camera_request_submit", qualifier.identity.attemptId)
-            val request = builder.build()
+            val request = buildOrdinaryStillRequest(builder)
             val refusal = exposureRefusalV2(qualifier)
             if (refusal != null) {
                 pendingDirectCaptureOwner.release(pending)
@@ -1039,7 +1139,8 @@ internal class SharedCameraManager(
     }
 
     private fun cancelDirectExposureV2(qualifier: CaptureAttemptQualifierV2) {
-        pendingDirectCaptureOwner.cancel(qualifier) ?: return
+        val cancelled = pendingDirectCaptureOwner.cancel(qualifier) ?: return
+        cancelled.shutterConfirmation.cancel()
         directRawJpegCaptureCorrelator.clear()
     }
 
@@ -1723,11 +1824,12 @@ internal class SharedCameraManager(
         val requestBuilder = previewCaptureRequestBuilder ?: return
 
         try {
-            captureSession.setRepeatingRequest(
-                requestBuilder.build(),
-                sharedCameraCaptureCallback,
-                captureCallbackHandler,
-            )
+            stillExposureMeteringOwner.replaceRepeating {
+                if (cleanupRequested) return@replaceRepeating null
+                val request = requestBuilder.build()
+                captureSession.setRepeatingRequest(request, sharedCameraCaptureCallback, captureCallbackHandler)
+                request
+            }
             repeatingRequestLifecycle.markRepeatingStarted()
             runtimeCameraController?.initializeOrdinaryAutofocus()
             Log.i("SharedCameraManager", "Shared-camera repeating request started")
@@ -1756,15 +1858,15 @@ internal class SharedCameraManager(
         val requestBuilder = previewCaptureRequestBuilder ?: return
 
         try {
-            state.applyCurrentSettings(requestBuilder)
-            if (!repeatingRequestLifecycle.shouldSubmitRuntimeUpdate()) {
-                return
+            stillExposureMeteringOwner.replaceRepeating {
+                if (cleanupRequested) return@replaceRepeating null
+                state.applyCurrentSettings(requestBuilder)
+                if (!repeatingRequestLifecycle.shouldSubmitRuntimeUpdate()) return@replaceRepeating null
+                val activeSession = captureSession ?: return@replaceRepeating null
+                val request = requestBuilder.build()
+                activeSession.setRepeatingRequest(request, sharedCameraCaptureCallback, captureCallbackHandler)
+                request
             }
-            captureSession?.setRepeatingRequest(
-                requestBuilder.build(),
-                sharedCameraCaptureCallback,
-                captureCallbackHandler,
-            )
             Log.i("SharedCameraManager", "Shared-camera repeating request updated from runtime controls")
         } catch (e: Exception) {
             Log.e("SharedCameraManager", "Failed to update shared-camera repeating request", e)
@@ -1772,16 +1874,15 @@ internal class SharedCameraManager(
     }
 
     fun onArSessionPaused() {
-        arCoreResumedForSharedSession = false
-        if (!repeatingRequestLifecycle.onSessionPaused()) {
-            return
-        }
-
-        try {
-            captureSession?.stopRepeating()
-            Log.i("SharedCameraManager", "Shared-camera repeating request paused")
-        } catch (e: Exception) {
-            Log.e("SharedCameraManager", "Failed to pause shared-camera repeating request", e)
+        changeCameraControls {
+            arCoreResumedForSharedSession = false
+            if (!repeatingRequestLifecycle.onSessionPaused()) return@changeCameraControls
+            try {
+                captureSession?.stopRepeating()
+                Log.i("SharedCameraManager", "Shared-camera repeating request paused")
+            } catch (e: Exception) {
+                Log.e("SharedCameraManager", "Failed to pause shared-camera repeating request", e)
+            }
         }
     }
 
@@ -1794,11 +1895,12 @@ internal class SharedCameraManager(
         val requestBuilder = previewCaptureRequestBuilder ?: return
 
         try {
-            captureSession.setRepeatingRequest(
-                requestBuilder.build(),
-                sharedCameraCaptureCallback,
-                captureCallbackHandler,
-            )
+            stillExposureMeteringOwner.replaceRepeating {
+                if (cleanupRequested) return@replaceRepeating null
+                val request = requestBuilder.build()
+                captureSession.setRepeatingRequest(request, sharedCameraCaptureCallback, captureCallbackHandler)
+                request
+            }
             Log.i("SharedCameraManager", "Shared-camera repeating request resumed")
         } catch (e: Exception) {
             Log.e("SharedCameraManager", "Failed to resume shared-camera repeating request", e)
@@ -2608,6 +2710,67 @@ internal class SharedCameraManager(
         )
     }
 
+    /** Temporary still-only controls; the shared repeating request and retained builder stay automatic. */
+    private fun buildOrdinaryStillRequest(builder: CaptureRequest.Builder): CaptureRequest =
+        stillExposureMeteringOwner.withMetering { sample -> buildOrdinaryStillRequest(builder, sample) }
+
+    private fun buildOrdinaryStillRequest(builder: CaptureRequest.Builder, sample: StillExposureMetering?): CaptureRequest {
+        val baseline = builder.build()
+        val characteristics = activeCameraCharacteristics ?: return baseline
+        val availableKeys = characteristics.availableCaptureRequestKeys ?: return baseline
+        val manualKeys = listOf(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_LOCK,
+            CaptureRequest.SENSOR_EXPOSURE_TIME, CaptureRequest.SENSOR_SENSITIVITY, CaptureRequest.SENSOR_FRAME_DURATION)
+        val capability = characteristics.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
+        val exposureRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
+        val isoRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
+        val plan = StillExposurePolicy.plan(
+            capabilities = StillExposureCapabilities(
+                manualSensorSupported = capability?.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR) == true &&
+                    characteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_MODES)?.contains(CaptureRequest.CONTROL_AE_MODE_OFF) == true &&
+                    manualKeys.all { it in availableKeys } &&
+                    characteristics.get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE) == CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME,
+                exposureRangeNs = exposureRange?.let { it.lower..it.upper },
+                isoRange = isoRange?.let { it.lower..it.upper },
+                maxAnalogIso = characteristics.get(CameraCharacteristics.SENSOR_MAX_ANALOG_SENSITIVITY),
+                fixedAperture = characteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_APERTURES)?.size == 1,
+            ),
+            metering = sample,
+            nowNs = SystemClock.elapsedRealtimeNanos(),
+            generation = sessionCallbackGeneration,
+            ordinaryUnlockedAuto = config.autoExposure && !config.rawJpeg && !config.processed &&
+                baseline.get(CaptureRequest.CONTROL_AE_MODE) == CaptureRequest.CONTROL_AE_MODE_ON &&
+                baseline.get(CaptureRequest.CONTROL_AE_LOCK) != true &&
+                baseline.get(CaptureRequest.FLASH_MODE) == CaptureRequest.FLASH_MODE_OFF &&
+                runtimeCameraController?.isAutoExposureEnabled() == true &&
+                runtimeCameraController?.getCurrentFlashMode() == RuntimeFlashMode.off,
+        ) ?: return baseline
+        return StillExposurePolicy.buildRequest(
+            baseline = baseline,
+            plan = plan,
+            apply = {
+                builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
+                builder.set(CaptureRequest.CONTROL_AE_LOCK, false)
+                builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, it.exposureNs)
+                builder.set(CaptureRequest.SENSOR_SENSITIVITY, it.iso)
+                builder.set(CaptureRequest.SENSOR_FRAME_DURATION, it.frameDurationNs)
+            },
+            build = {
+                builder.build().also {
+                    Log.i("StillExposure", "requested tag=${it.tag} sourceExposureNs=${sample?.exposureNs} " +
+                        "sourceIso=${sample?.iso} exposureNs=${plan.exposureNs} iso=${plan.iso}")
+                }
+            },
+            restore = {
+                builder.set(CaptureRequest.CONTROL_AE_MODE, baseline.get(CaptureRequest.CONTROL_AE_MODE))
+                builder.set(CaptureRequest.CONTROL_AE_LOCK, baseline.get(CaptureRequest.CONTROL_AE_LOCK))
+                builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, baseline.get(CaptureRequest.SENSOR_EXPOSURE_TIME))
+                builder.set(CaptureRequest.SENSOR_SENSITIVITY, baseline.get(CaptureRequest.SENSOR_SENSITIVITY))
+                builder.set(CaptureRequest.SENSOR_FRAME_DURATION, baseline.get(CaptureRequest.SENSOR_FRAME_DURATION))
+            },
+            onFailure = { Log.w("StillExposure", "Short-exposure controls unavailable; retaining automatic still", it) },
+        )
+    }
+
     private fun captureImage(exposureBracket: List<ExposureBracketSpec> = emptyList()): Boolean {
         val activeSession = captureSession ?: return false
         val builder = manualCaptureRequestBuilder ?: return false
@@ -2620,7 +2783,7 @@ internal class SharedCameraManager(
             if (exposureBracket.isEmpty()) {
                 builder.setTag(ManualCaptureTag(generation))
                 activeSession.capture(
-                    builder.build().also { if (BuildConfig.NATIVE_FRAME_ATTRIBUTION) recordStillSubmission(it) },
+                    buildOrdinaryStillRequest(builder).also { if (BuildConfig.NATIVE_FRAME_ATTRIBUTION) recordStillSubmission(it) },
                     sharedCameraCaptureCallback,
                     captureCallbackHandler,
                 )
@@ -2990,11 +3153,11 @@ internal class SharedCameraManager(
     }
 
     fun cleanup() {
+        changeCameraControls { cleanupRequested = true }
         v2ExposureHook.clear()
         if (processShutdownGeneration == null) {
             processShutdownGeneration = processRestartGate.markShutdownStarted()
         }
-        cleanupRequested = true
         val callbackShutdownStarted = sessionCallbackFence.beginShutdown(sessionCallbackGeneration)
         if (BuildConfig.NATIVE_FRAME_ATTRIBUTION) closeDiagnostic("cleanup-begin:gateStarted=$callbackShutdownStarted")
         pendingManualCapture?.let { pending ->
@@ -3008,6 +3171,7 @@ internal class SharedCameraManager(
             pending.latch.countDown()
         }
         pendingDirectCapture?.let { pending ->
+            pending.shutterConfirmation.cancel()
             pendingDirectCaptureOwner.release(pending)
             directRawJpegCaptureCorrelator.clear()
         }
@@ -3131,6 +3295,12 @@ internal class SharedCameraManager(
                 message = "Runtime camera controls are not initialized",
             )
 
+    /** Every bridge target enters before its controller state and request builders mutate. */
+    private fun <T> changeCameraControls(change: () -> T): T = stillExposureMeteringOwner.changeControls {
+        latestPreviewExposureState = null
+        change()
+    }
+
     private fun runtimeExposureControls(): RuntimeExposureControlBridge {
         val characteristics = getActiveSharedCameraCharacteristics()
         val isoRange =
@@ -3169,13 +3339,13 @@ internal class SharedCameraManager(
                         isoValue: Int,
                         preservedExposureTimeMicros: Long?,
                     ): Boolean =
-                        controller.setISO(isoValue, preservedExposureTimeMicros)
+                        changeCameraControls { controller.setISO(isoValue, preservedExposureTimeMicros) }
 
                     override fun setExposureTime(exposureTimeMicros: Long): Boolean =
-                        controller.setExposureTime(exposureTimeMicros)
+                        changeCameraControls { controller.setExposureTime(exposureTimeMicros) }
 
                     override fun setAutoExposureEnabled(enabled: Boolean): Boolean =
-                        controller.setAutoExposure(enabled)
+                        changeCameraControls { controller.setAutoExposure(enabled) }
 
                     override fun getCurrentISO(): Int? = controller.getCurrentISO()
 
@@ -3186,13 +3356,13 @@ internal class SharedCameraManager(
                         controller.isAutoExposureEnabled()
 
                     override fun setExposureCompensationSteps(steps: Int): Boolean =
-                        controller.setExposureCompensation(steps)
+                        changeCameraControls { controller.setExposureCompensation(steps) }
 
                     override fun getCurrentExposureCompensationSteps(): Int =
                         controller.getCurrentExposureCompensationSteps()
 
                     override fun setExposureLocked(locked: Boolean): Boolean =
-                        controller.setExposureLocked(locked)
+                        changeCameraControls { controller.setExposureLocked(locked) }
 
                     override fun isExposureLocked(): Boolean =
                         controller.isExposureLocked()
@@ -3236,13 +3406,13 @@ internal class SharedCameraManager(
             target =
                 object : RuntimeFocusControlTarget {
                     override fun setFocusDistanceDiopters(focusDistanceDiopters: Float): Boolean =
-                        controller.setFocusDistance(focusDistanceDiopters)
+                        changeCameraControls { controller.setFocusDistance(focusDistanceDiopters) }
 
                     override fun setAutofocusEnabled(enabled: Boolean): Boolean =
-                        controller.setAutofocusEnabled(enabled)
+                        changeCameraControls { controller.setAutofocusEnabled(enabled) }
 
                     override fun setFocusMode(mode: String): Boolean =
-                        controller.setFocusMode(RuntimeFocusMode.valueOf(mode))
+                        changeCameraControls { controller.setFocusMode(RuntimeFocusMode.valueOf(mode)) }
 
                     override fun getCurrentFocusDistanceDiopters(): Float? =
                         controller.getCurrentFocusDistanceDiopters()
@@ -3254,7 +3424,7 @@ internal class SharedCameraManager(
                         controller.isAutofocusEnabled()
 
                     override fun setFocusRegion(region: MeteringRegion): Boolean =
-                        controller.setFocusRegion(region)
+                        changeCameraControls { controller.setFocusRegion(region) }
 
                     override fun getCurrentFocusRegion(): MeteringRegion? =
                         controller.getCurrentFocusRegion()
@@ -3312,13 +3482,13 @@ internal class SharedCameraManager(
             target =
                 object : RuntimeWhiteBalanceControlTarget {
                     override fun setWhiteBalanceMode(mode: String): Boolean =
-                        controller.setWhiteBalanceMode(RuntimeWhiteBalanceMode.valueOf(mode))
+                        changeCameraControls { controller.setWhiteBalanceMode(RuntimeWhiteBalanceMode.valueOf(mode)) }
 
                     override fun setColorTemperature(colorTemperatureK: Int): Boolean =
-                        controller.setColorTemperature(colorTemperatureK)
+                        changeCameraControls { controller.setColorTemperature(colorTemperatureK) }
 
                     override fun setWhiteBalanceLocked(locked: Boolean): Boolean =
-                        controller.setWhiteBalanceLocked(locked)
+                        changeCameraControls { controller.setWhiteBalanceLocked(locked) }
 
                     override fun getCurrentWhiteBalanceMode(): String =
                         controller.getCurrentWhiteBalanceMode().name
@@ -3327,7 +3497,7 @@ internal class SharedCameraManager(
                         controller.getCurrentColorTemperatureKelvin()
 
                     override fun setWhiteBalanceRegion(region: MeteringRegion): Boolean =
-                        controller.setWhiteBalanceRegion(region)
+                        changeCameraControls { controller.setWhiteBalanceRegion(region) }
 
                     override fun isWhiteBalanceLocked(): Boolean =
                         controller.isWhiteBalanceLocked()
@@ -3382,7 +3552,7 @@ internal class SharedCameraManager(
             target =
                 object : RuntimeFlashControlTarget {
                     override fun setFlashMode(mode: String): Boolean =
-                        controller.setFlashMode(RuntimeFlashMode.valueOf(mode))
+                        changeCameraControls { controller.setFlashMode(RuntimeFlashMode.valueOf(mode)) }
 
                     override fun getCurrentFlashMode(): String =
                         controller.getCurrentFlashMode().name
