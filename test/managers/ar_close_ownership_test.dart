@@ -24,6 +24,64 @@ void main() {
     ARCaptureManager.debugIsSupportedOverride = null;
   });
 
+  test('encoding experiment settles before close releases its camera owner',
+      () async {
+    native.encodingReply = Completer<Object?>();
+    final check = native.capture.testTemporaryImageEncoding(format: 'heif');
+    await native.encodingRequested.future;
+    final close = native.capture.dispose();
+    await Future<void>.delayed(Duration.zero);
+    expect(native.captureMethods, isNot(contains('dispose')));
+    native.encodingReply!.complete(_verifiedEncoding());
+    final result = await check;
+    expect(result.isVerified, isTrue);
+    expect(result.meetsOneSecondTarget, isTrue);
+    await native.captureRequested.future;
+    native.captureReply.complete();
+    await close;
+    expect(native.capture.isDisposed, isTrue);
+  });
+
+  test(
+      'failed encoding settles before close and new encoding is refused while closing',
+      () async {
+    native.encodingReply = Completer<Object?>();
+    final check = native.capture.testTemporaryImageEncoding(format: 'heif');
+    final failed = expectLater(check, throwsA(isA<PlatformException>()));
+    await native.encodingRequested.future;
+    final close = native.capture.dispose();
+    expect(
+        () => native.capture.testTemporaryImageEncoding(format: 'heif'),
+        throwsA(isA<ARCaptureException>()
+            .having((e) => e.code, 'code', 'CAPTURE_CLOSING')));
+    await Future<void>.delayed(Duration.zero);
+    expect(native.captureMethods, isNot(contains('dispose')));
+    native.encodingReply!
+        .completeError(PlatformException(code: 'ENCODING_UNAVAILABLE'));
+    await failed;
+    await native.captureRequested.future;
+    native.captureReply.complete();
+    await close;
+  });
+
+  test('encoding refuses concurrent experiments and unverified native output',
+      () async {
+    native.encodingReply = Completer<Object?>();
+    final check = native.capture.testTemporaryImageEncoding(format: 'heif');
+    final failed = expectLater(
+        check,
+        throwsA(isA<ARCaptureException>()
+            .having((e) => e.code, 'code', 'ENCODING_VERIFY_FAILED')));
+    await native.encodingRequested.future;
+    await expectLater(
+        native.capture.testTemporaryImageEncoding(format: 'heif'),
+        throwsA(isA<ARCaptureException>()
+            .having((e) => e.code, 'code', 'CAPTURE_IN_PROGRESS')));
+    native.encodingReply!
+        .complete({..._verifiedEncoding(), 'actualFormat': 'jpeg'});
+    await failed;
+  });
+
   test('capture shares close and refuses admission before acknowledged release',
       () async {
     final capture = native.capture;
@@ -171,6 +229,22 @@ void main() {
   });
 }
 
+Map<String, Object> _verifiedEncoding() => {
+      'requestedFormat': 'heif',
+      'actualFormat': 'heif',
+      'width': 4032,
+      'height': 3024,
+      'byteLength': 1456789,
+      'encodeUs': 200000,
+      'captureAndEncodeUs': 800000,
+      'quality': 95,
+      'highResolution': true,
+      'temporaryFileRemoved': true,
+      'stillCaptureMode': 'single',
+      'imageCount': 1,
+      'requestedImageCount': 1,
+    };
+
 class _NativeOwner {
   static const captureChannel = MethodChannel('arcapture_991');
   static const sessionChannel = MethodChannel('arsession_991');
@@ -180,10 +254,12 @@ class _NativeOwner {
   final sessionRequested = Completer<void>();
   final initializationRequested = Completer<void>();
   final resumeRequested = Completer<void>();
+  final encodingRequested = Completer<void>();
   Completer<void> captureReply = Completer<void>();
   Completer<void> sessionReply = Completer<void>();
   Completer<Object?>? initializationReply;
   Completer<void>? resumeReply;
+  Completer<Object?>? encodingReply;
   late final ARSessionManager session;
   ARCaptureManager get capture => session.captureManager!;
 
@@ -199,6 +275,10 @@ class _NativeOwner {
       if (call.method == 'initializeCapture') {
         initializationRequested.complete();
         return await initializationReply?.future ?? {'mode': 'sharedCamera'};
+      }
+      if (call.method == 'testTemporaryImageEncoding') {
+        encodingRequested.complete();
+        return await encodingReply?.future;
       }
       return null;
     });

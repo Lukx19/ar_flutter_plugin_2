@@ -163,18 +163,28 @@ final class ARSessionHost: NSObject, CaptureSessionSource, ARSessionDelegate {
   /// exposure brackets, so a refusal falls back to the plain frame once.
   func captureHighResolutionFrame(quality: StillFrameQuality, completion: @escaping (CaptureFrame?, Error?) -> Void) {
     guard quality == .balanced else { return captureHighResolutionFrame(completion: completion) }
+    captureHighResolutionFrameForProfile(quality: quality) { [weak self] frame, error in
+      if let frame = frame { return completion(frame, nil) }
+      NSLog("capture3d still: balanced frame refused (%@); plain high-resolution frame", String(describing: error))
+      guard let self = self else { return completion(nil, error) }
+      self.captureHighResolutionFrame(completion: completion)
+    }
+  }
+
+  /// Unlike ordinary capture, a profile test cannot substitute a plain frame
+  /// when the requested balanced processing is unsupported or refused.
+  func captureHighResolutionFrameForProfile(quality: StillFrameQuality, completion: @escaping (CaptureFrame?, Error?) -> Void) {
+    guard quality == .balanced else { return captureHighResolutionFrame(completion: completion) }
     if #available(iOS 26.0, *), let format = session.configuration?.videoFormat {
       let settings = AVCapturePhotoSettings(from: format.defaultPhotoSettings)
       settings.photoQualityPrioritization = .balanced
-      session.captureHighResolutionFrame(using: settings) { [weak self] frame, error in
-        if let frame = frame { return completion(ARKitCaptureFrame(frame), nil) }
-        NSLog("capture3d still: balanced frame refused (%@); plain high-resolution frame", String(describing: error))
-        guard let self = self else { return completion(nil, error) }
-        self.captureHighResolutionFrame(completion: completion)
+      session.captureHighResolutionFrame(using: settings) { frame, error in
+        completion(frame.map(ARKitCaptureFrame.init), error)
       }
       return
     }
-    captureHighResolutionFrame(completion: completion)
+    completion(nil, NSError(domain: "capture3d.encoding-profile", code: 1,
+      userInfo: [NSLocalizedDescriptionKey: "Balanced photo processing is unavailable"]))
   }
 
   // MARK: Control (main thread)

@@ -27,6 +27,7 @@ export 'package:ar_flutter_plugin_2/models/principal_point.dart';
 export 'package:ar_flutter_plugin_2/models/compatibility_result.dart';
 export 'package:ar_flutter_plugin_2/models/capture_intent_contract.dart';
 export 'package:ar_flutter_plugin_2/models/native_capture_v2.dart';
+export 'package:ar_flutter_plugin_2/models/temporary_image_encoding_result.dart';
 
 // Data Types
 export 'package:ar_flutter_plugin_2/datatypes/image_format.dart';

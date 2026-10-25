@@ -20,6 +20,7 @@ import '../models/capture_intent_contract.dart';
 import '../models/capture_quality_policy.dart';
 import '../models/image_size.dart';
 import '../models/native_capture_v2.dart';
+import '../models/temporary_image_encoding_result.dart';
 import 'ar_session_manager.dart';
 
 /// Available exposure modes
@@ -378,6 +379,7 @@ class ARCaptureManager {
   ARCaptureCloseState _closeState = ARCaptureCloseState.active;
   Future<void>? _disposeAttempt;
   CaptureInitializationResult? _initializationResult;
+  Future<TemporaryImageEncodingResult>? _temporaryEncodingAttempt;
 
   /// Native still capture exists on Android (ARCore Shared Camera) and iOS
   /// (ARKit high-resolution frames into the same durable store).
@@ -943,6 +945,69 @@ class ARCaptureManager {
         operation: 'get camera intrinsics',
       );
     }
+  }
+
+  /// Measure a real manual JPEG shot, or one fast HEIF frame, in isolation.
+  ///
+  /// The native route flushes, decodes and removes its temporary file before
+  /// replying. This never enables a durable format or retains a scan photo.
+  /// Close waits for this owned attempt to settle, even when the check fails.
+  /// Unsupported native routes report `ENCODING_TEST_UNSUPPORTED`.
+  Future<TemporaryImageEncodingResult> testTemporaryImageEncoding({
+    required String format,
+    int quality = 95,
+    ARStillCaptureMode stillCaptureMode = ARStillCaptureMode.single,
+  }) {
+    _requireOpenCapture();
+    if (!const ['jpeg', 'heif'].contains(format) ||
+        quality < 10 ||
+        quality > 100) {
+      return Future.error(const ARCaptureException(
+        'Choose JPEG or HEIF and quality 10-100',
+        code: 'CONFIG_INVALID',
+      ));
+    }
+    if (_temporaryEncodingAttempt != null) {
+      return Future.error(const ARCaptureException(
+        'An encoding test is already in progress',
+        code: 'CAPTURE_IN_PROGRESS',
+      ));
+    }
+    final completion = Completer<TemporaryImageEncodingResult>();
+    _temporaryEncodingAttempt = completion.future;
+    unawaited(() async {
+      try {
+        await _ensureInitialized();
+        final result = await _invokeOpenCapture<Map<Object?, Object?>>(
+          'testTemporaryImageEncoding',
+          {
+            'format': format,
+            'quality': quality,
+            'stillCaptureMode': stillCaptureMode.wireValue,
+          },
+        );
+        final parsed = TemporaryImageEncodingResult.fromMap(result ?? const {});
+        if (!parsed.isVerified ||
+            parsed.requestedFormat != format ||
+            parsed.quality != quality ||
+            parsed.stillCaptureMode != stillCaptureMode ||
+            parsed.requestedImageCount !=
+                (stillCaptureMode == ARStillCaptureMode.burst
+                    ? _config.burstImageCount
+                    : 1)) {
+          throw const ARCaptureException(
+            'The temporary encoding result was not verified',
+            code: 'ENCODING_VERIFY_FAILED',
+          );
+        }
+        completion.complete(parsed);
+      } on Object catch (error, stack) {
+        completion.completeError(error, stack);
+      } finally {
+        _temporaryEncodingAttempt = null;
+      }
+    }());
+    return completion.future;
   }
 
   /// Save captured image to disk by ID
@@ -2594,6 +2659,11 @@ class ARCaptureManager {
     _startupRecoveryRetry = null;
     unawaited(() async {
       try {
+        // A format experiment owns a native camera callback and temporary file.
+        // Its outcome may fail, but cleanup must settle before closing the view.
+        try {
+          await _temporaryEncodingAttempt;
+        } on Object {/* Reported to the test caller. */}
         await _channel.invokeMethod<void>('dispose');
         _releaseDartSide();
         completion.complete();

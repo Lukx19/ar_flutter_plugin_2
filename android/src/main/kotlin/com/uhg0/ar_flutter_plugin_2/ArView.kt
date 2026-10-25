@@ -1233,6 +1233,11 @@ internal class ArView(
                     resetDiagnosticTiming = isDebuggable && call.argument<Boolean>("resetDiagnosticTiming") == true,
                     includeDiagnosticTiming = isDebuggable && call.argument<Boolean>("includeDiagnosticTiming") == true,
                 ))
+                "testTemporaryImageEncoding" -> result.error(
+                    "ENCODING_TEST_UNSUPPORTED",
+                    "Use the supported capture-profile test on this camera; alternate temporary encoders are unavailable",
+                    null,
+                )
                 "getCameraIntrinsics" -> result.success(captureSession.getCameraIntrinsics())
                 "getImageData" -> result.success(captureSession.getImageData(
                     call.argument<String>("imageId") ?: throw IllegalArgumentException("imageId is required"),

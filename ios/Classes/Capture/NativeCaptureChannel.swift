@@ -99,6 +99,10 @@ final class NativeCaptureChannel: CaptureChannelExtension {
   private var binding: NativeCaptureBinding?
   private var pauseObserver: SessionPauseObserver?
   private var captureInProgress = false
+  private var encodingProbeInProgress = false
+  private var hasDurableAdmission = false
+  private lazy var encodingProbe = TemporaryImageEncodingProbe()
+  private var profileExposure: HighResolutionStillExposure?
   private var disposed = false
   private let previewOwner = NativeCapturePreviewOwner()
   private let openResources: () throws -> NativeCaptureRootResources
@@ -146,10 +150,19 @@ final class NativeCaptureChannel: CaptureChannelExtension {
     switch method {
     case "initializeCapture": initialize(call.arguments, result)
     case "dispose":
+      guard !encodingProbeInProgress else {
+        result(FlutterError(code: "CAPTURE_IN_PROGRESS", message: "The owned encoding test must settle before close", details: nil))
+        return true
+      }
       captureViewWillDispose()
       result(nil)
     case "admitNativeCaptureV2":
+      guard !encodingProbeInProgress else {
+        result(FlutterError(code: "CAPTURE_IN_PROGRESS", message: "An encoding test is running", details: nil))
+        return true
+      }
       guard let binding = requireBinding(result, code: "NATIVE_CAPTURE_V2_CLOSED") else { return true }
+      hasDurableAdmission = true
       binding.admit(call.arguments) { outcome in
         if case .failure(let error) = outcome {
           NSLog("capture3d native capture admission refused: code=%@", NativeCaptureChannel.flutterError(error).code)
@@ -173,6 +186,7 @@ final class NativeCaptureChannel: CaptureChannelExtension {
       guard let cache = requireInitialized(result) else { return true }
       result(cache.capacity())
     case "captureHighResImage": captureStaged(arguments, result)
+    case "testTemporaryImageEncoding": testTemporaryEncoding(arguments, result)
     case "getImageData", "getImageSize", "saveImageToFile", "persistCapture", "discardCapture":
       stagedOperation(method, arguments, result)
     case "getCameraIntrinsics":
@@ -190,6 +204,9 @@ final class NativeCaptureChannel: CaptureChannelExtension {
   private func initialize(_ arguments: Any?, _ result: @escaping FlutterResult) {
     guard !disposed else {
       return result(FlutterError(code: "CAPTURE_NOT_INITIALIZED", message: "The AR view was disposed.", details: nil))
+    }
+    guard !encodingProbeInProgress else {
+      return result(FlutterError(code: "CAPTURE_IN_PROGRESS", message: "An encoding test is running", details: nil))
     }
     let parsed: StillCaptureConfig
     do {
@@ -364,6 +381,60 @@ final class NativeCaptureChannel: CaptureChannelExtension {
   }
 
   // MARK: Staged stills
+
+  /// Available only on an isolated profile view before durable capture begins.
+  /// The experiment's file is already removed when its native callback settles.
+  private func testTemporaryEncoding(_ arguments: [String: Any], _ result: @escaping FlutterResult) {
+    guard requireInitialized(result) != nil else { return }
+    guard !captureInProgress, !encodingProbeInProgress, !hasDurableAdmission,
+          !context.frameSource.replaysRecordedStills else {
+      return result(FlutterError(code: "ENCODING_TEST_REQUIRES_IDLE_PROFILE", message: "Use a new live camera profile test", details: nil))
+    }
+    guard let format = arguments["format"] as? String, TemporaryImageEncodingProbe.accepts(format),
+          let quality = NativeCaptureWire.integer(arguments["quality"]), (10...100).contains(quality),
+          let mode = StillCaptureMode.parse(arguments["stillCaptureMode"]) else {
+      return result(FlutterError(code: "CONFIG_INVALID", message: "Choose JPEG or HEIF and quality 10-100", details: nil))
+    }
+    guard format == "jpeg" || mode == .single else {
+      return result(FlutterError(code: "ENCODING_MODE_UNSUPPORTED", message: "HEIF experiments use one fast frame", details: nil))
+    }
+    captureInProgress = true
+    encodingProbeInProgress = true
+    let finish: (Result<[String: Any], TemporaryImageEncodingProbe.Failure>) -> Void = { [self] outcome in
+      DispatchQueue.main.async { [self] in
+        captureInProgress = false
+        encodingProbeInProgress = false
+        profileExposure = nil
+        guard !disposed else {
+          return result(FlutterError(code: "CAPTURE_NOT_INITIALIZED", message: "The AR view was disposed during the encoding test", details: nil))
+        }
+        switch outcome {
+        case .success(let value): result(value)
+        case .failure(let error): result(FlutterError(code: error.code, message: error.message, details: nil))
+        }
+      }
+    }
+    if format == "heif" {
+      return encodingProbe.capture(source: context.frameSource, format: format, quality: Int(quality), completion: finish)
+    }
+    let source = context.frameSource
+    let exposure = HighResolutionStillExposure(frameSource: { [weak source] in source }, jpegQuality: Int(quality),
+      requireRequestedQuality: true)
+    profileExposure = exposure
+    let burst = mode == .burst ? (stills?.burst ?? BurstSettings()) : BurstSettings(imageCount: 1, intervalMs: 0)
+    let shotMode: StillShotMode = mode == .burst ? .burst : (mode == .inArQuality ? .quality : .single)
+    let started = DispatchTime.now().uptimeNanoseconds
+    var encodeUs = 0
+    exposure.captureShot(mode: shotMode, settings: burst, didEncode: { encodeUs += $0 }) { [self] outcome in
+      switch outcome {
+      case .success(let shot):
+        encodingProbe.verifyShot(shot, mode: mode, requestedImageCount: burst.imageCount,
+          quality: Int(quality), encodeUs: encodeUs, startedAt: started, completion: finish)
+      case .failure(let error):
+        finish(.failure(TemporaryImageEncodingProbe.Failure(code: "ENCODING_CAPTURE_FAILED", message: error.reason)))
+      }
+    }
+  }
 
   private func captureStaged(_ arguments: [String: Any], _ result: @escaping FlutterResult) {
     guard let cache = requireInitialized(result), let stills = stills else { return }

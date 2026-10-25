@@ -93,6 +93,7 @@ void main() {
         'hardwareFormats': {'jpeg': true, 'raw': null, 'heif': null},
         'pipelineFormats': ['jpeg'],
         'encoderFormats': ['jpeg', 'heif'],
+        'temporaryEncodingFormats': ['jpeg', 'heif'],
         'resolutionsByFormat': {
           'jpeg': [
             {'width': 4032, 'height': 3024},
@@ -118,6 +119,7 @@ void main() {
     expect(report.hardwareFormats['raw'], isNull);
     expect(report.pipelineFormats, ['jpeg']);
     expect(report.encoderFormats, contains('heif'));
+    expect(report.temporaryEncodingFormats, ['jpeg', 'heif']);
     expect(report.resolutionsByFormat['jpeg'], [
       const CameraResolution(width: 4032, height: 3024),
     ]);

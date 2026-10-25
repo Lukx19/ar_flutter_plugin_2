@@ -68,6 +68,9 @@ protocol ARFrameSource: AnyObject {
   /// high-resolution frame where that is refused. A recorded session
   /// answers with its recorded still for every quality. [completion] runs once.
   func captureHighResolutionFrame(quality: StillFrameQuality, completion: @escaping (CaptureFrame?, Error?) -> Void)
+  /// Profile measurement must refuse unsupported processing rather than silently
+  /// measuring the fast fallback as an enhanced capture.
+  func captureHighResolutionFrameForProfile(quality: StillFrameQuality, completion: @escaping (CaptureFrame?, Error?) -> Void)
   /// True when stills are recorded ones (playback): every request answers
   /// with the recorded still nearest to it.
   var replaysRecordedStills: Bool { get }
@@ -82,6 +85,14 @@ enum StillFrameQuality: Equatable {
 }
 
 extension ARFrameSource {
+  func captureHighResolutionFrameForProfile(quality: StillFrameQuality, completion: @escaping (CaptureFrame?, Error?) -> Void) {
+    guard quality == .fast else {
+      return completion(nil, NSError(domain: "capture3d.encoding-profile", code: 1,
+        userInfo: [NSLocalizedDescriptionKey: "Requested frame processing is unavailable"]))
+    }
+    captureHighResolutionFrame(quality: quality, completion: completion)
+  }
+
   func captureHighResolutionFrame(quality: StillFrameQuality, completion: @escaping (CaptureFrame?, Error?) -> Void) {
     captureHighResolutionFrame(completion: completion)
   }

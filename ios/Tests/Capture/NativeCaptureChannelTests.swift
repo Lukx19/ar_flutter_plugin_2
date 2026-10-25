@@ -116,6 +116,124 @@ final class NativeCaptureChannelTests: XCTestCase {
     ]
   }
 
+  func testTemporaryEncodingVerifiesRealBytesAndRemovesOnlyOwnedTemporaryFile() throws {
+    let directory = appFiles!.appendingPathComponent("encoding-only", isDirectory: true)
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let existing = directory.appendingPathComponent("existing.jpg")
+    let retained = Data([1, 2, 3, 4])
+    try retained.write(to: existing)
+    let result = try TemporaryImageEncodingProbe().encodeAndVerify(
+      ShotFixture.pixelBuffer(), format: "jpeg", quality: 95, directory: directory)
+    XCTAssertEqual(result["actualFormat"] as? String, "jpeg")
+    XCTAssertEqual(result["width"] as? Int, 64)
+    XCTAssertEqual(result["height"] as? Int, 48)
+    XCTAssertGreaterThan(result["byteLength"] as? Int ?? 0, 0)
+    XCTAssertEqual(result["temporaryFileRemoved"] as? Bool, true)
+    XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), ["existing.jpg"])
+    XCTAssertEqual(try Data(contentsOf: existing), retained)
+    XCTAssertThrowsError(try TemporaryImageEncodingProbe().encodeAndVerify(
+      ShotFixture.pixelBuffer(), format: "raw", quality: 95, directory: directory))
+  }
+
+  func testTemporaryEncodingRequiresARealHighResolutionFrameAndNeverStagesFallback() throws {
+    let source = StillFrameSource()
+    source.currentFrame = ShotFixture.frame(timestamp: ProcessInfo.processInfo.systemUptime, pose: ShotFixture.pose())
+    // No queued high-resolution frame: existing video must not pass the experiment.
+    let files = appFiles!
+    let channel = NativeCaptureChannel(
+      context: CaptureChannelContext(
+        viewId: 12, channel: FlutterMethodChannel(name: "arcapture_12", binaryMessenger: SilentMessenger()),
+        frameSource: source),
+      openResources: { try NativeCaptureBinding.productionResources(appFiles: files) })
+    defer { channel.captureViewWillDispose() }
+    XCTAssertFalse(call(channel, "initializeCapture", configuration(mode: "single", maxCacheSize: 2)) is FlutterError)
+    let failure = call(channel, "testTemporaryImageEncoding", ["format": "heif", "quality": 95]) as? FlutterError
+    XCTAssertEqual(failure?.code, "ENCODING_CAPTURE_FAILED")
+    let capacity = try XCTUnwrap(call(channel, "getCaptureCapacity", nil) as? [String: Any])
+    XCTAssertEqual(capacity["usedEntries"] as? Int, 0)
+  }
+
+  func testTemporaryEncodingRequestsFastFrameAndDoesNotPopulateStagedCache() throws {
+    let source = StillFrameSource()
+    source.frames = [ShotFixture.frame(timestamp: ProcessInfo.processInfo.systemUptime, pose: ShotFixture.pose())]
+    let files = appFiles!
+    let channel = NativeCaptureChannel(
+      context: CaptureChannelContext(
+        viewId: 13, channel: FlutterMethodChannel(name: "arcapture_13", binaryMessenger: SilentMessenger()),
+        frameSource: source),
+      openResources: { try NativeCaptureBinding.productionResources(appFiles: files) })
+    defer { channel.captureViewWillDispose() }
+    XCTAssertFalse(call(channel, "initializeCapture", configuration(mode: "burst", maxCacheSize: 2)) is FlutterError)
+    let result = try XCTUnwrap(call(channel, "testTemporaryImageEncoding", ["format": "jpeg", "quality": 95]) as? [String: Any])
+    XCTAssertEqual(result["actualFormat"] as? String, "jpeg")
+    XCTAssertEqual(result["temporaryFileRemoved"] as? Bool, true)
+    XCTAssertEqual(result["highResolution"] as? Bool, true)
+    XCTAssertGreaterThan(result["captureAndEncodeUs"] as? Int ?? 0, 0)
+    XCTAssertEqual(source.qualities, [.fast])
+    let capacity = try XCTUnwrap(call(channel, "getCaptureCapacity", nil) as? [String: Any])
+    XCTAssertEqual(capacity["usedEntries"] as? Int, 0)
+  }
+
+  func testTemporaryManualModesMeasureTheActualBurstAndBalancedRequests() throws {
+    for mode in ["burst", "inArQuality"] {
+      let source = StillFrameSource()
+      let count = mode == "burst" ? 3 : 1
+      let now = ProcessInfo.processInfo.systemUptime
+      source.frames = (0..<count).map {
+        ShotFixture.frame(timestamp: now + Double($0) * 0.15, pose: ShotFixture.pose(x: Float($0)))
+      }
+      let files = appFiles!.appendingPathComponent(mode)
+      let channel = NativeCaptureChannel(
+        context: CaptureChannelContext(
+          viewId: 14, channel: FlutterMethodChannel(name: "arcapture_14", binaryMessenger: SilentMessenger()),
+          frameSource: source),
+        openResources: { try NativeCaptureBinding.productionResources(appFiles: files) })
+      defer { channel.captureViewWillDispose() }
+      XCTAssertFalse(call(channel, "initializeCapture", configuration(mode: mode, maxCacheSize: 2)) is FlutterError)
+      let result = try XCTUnwrap(call(channel, "testTemporaryImageEncoding", [
+        "format": "jpeg", "quality": 95, "stillCaptureMode": mode,
+      ]) as? [String: Any])
+      XCTAssertEqual(result["stillCaptureMode"] as? String, mode)
+      XCTAssertEqual(result["imageCount"] as? Int, count)
+      XCTAssertEqual(result["requestedImageCount"] as? Int, count)
+      XCTAssertEqual(result["temporaryFileRemoved"] as? Bool, true)
+      XCTAssertEqual((result["images"] as? [[String: Any]])?.count, count)
+      XCTAssertEqual(source.qualities, Array(repeating: mode == "burst" ? .fast : .balanced, count: count))
+    }
+  }
+
+  func testTemporaryBurstRejectsRepeatedFrameInsteadOfCertifyingPartialMode() throws {
+    let source = StillFrameSource()
+    source.frames = [ShotFixture.frame(timestamp: ProcessInfo.processInfo.systemUptime, pose: ShotFixture.pose())]
+    let files = appFiles!
+    let channel = NativeCaptureChannel(
+      context: CaptureChannelContext(
+        viewId: 15, channel: FlutterMethodChannel(name: "arcapture_15", binaryMessenger: SilentMessenger()),
+        frameSource: source),
+      openResources: { try NativeCaptureBinding.productionResources(appFiles: files) })
+    defer { channel.captureViewWillDispose() }
+    XCTAssertFalse(call(channel, "initializeCapture", configuration(mode: "burst", maxCacheSize: 2)) is FlutterError)
+    let failure = call(channel, "testTemporaryImageEncoding", [
+      "format": "jpeg", "quality": 95, "stillCaptureMode": "burst",
+    ]) as? FlutterError
+    XCTAssertEqual(failure?.code, "ENCODING_INCOMPLETE_BURST")
+  }
+
+  func testTemporaryBurstRejectsDifferentImageGeometryBeforeCertification() {
+    var shot = ShotFixture.burst()
+    shot.images[1].metadata.width += 1
+    let replied = expectation(description: "mixed geometry refused")
+    TemporaryImageEncodingProbe().verifyShot(shot, mode: .burst, requestedImageCount: 3,
+      quality: 95, encodeUs: 0, startedAt: DispatchTime.now().uptimeNanoseconds) { outcome in
+      switch outcome {
+      case .success: XCTFail("A burst with mixed image dimensions must not qualify")
+      case .failure(let error): XCTAssertEqual(error.code, "ENCODING_GEOMETRY_MISMATCH")
+      }
+      replied.fulfill()
+    }
+    wait(for: [replied], timeout: 5)
+  }
+
   /// Stages one still and returns its image id.
   private func stage(_ channel: NativeCaptureChannel) throws -> String {
     let reply = try XCTUnwrap(call(channel, "captureHighResImage", ["requiresPose": true]) as? [String: Any])

@@ -96,6 +96,10 @@ final class StillFrameSource: ARFrameSource {
     captureHighResolutionFrame(quality: .fast, completion: completion)
   }
 
+  func captureHighResolutionFrameForProfile(quality: StillFrameQuality, completion: @escaping (CaptureFrame?, Error?) -> Void) {
+    captureHighResolutionFrame(quality: quality, completion: completion)
+  }
+
   func captureHighResolutionFrame(quality: StillFrameQuality, completion: @escaping (CaptureFrame?, Error?) -> Void) {
     lock.lock()
     qualities.append(quality)

@@ -19,6 +19,7 @@ class CameraCapabilityReport {
     required this.depthSupport,
     required this.controls,
     required this.hdrSupport,
+    this.temporaryEncodingFormats = const [],
   });
 
   const CameraCapabilityReport.unknown()
@@ -30,6 +31,7 @@ class CameraCapabilityReport {
         hardwareFormats = const {},
         pipelineFormats = const [],
         encoderFormats = const [],
+        temporaryEncodingFormats = const [],
         resolutionsByFormat = const {},
         pipelineResolutionsByFormat = const {},
         depthSupport = const {},
@@ -78,6 +80,7 @@ class CameraCapabilityReport {
       hardwareFormats: flags(map['hardwareFormats']),
       pipelineFormats: strings(map['pipelineFormats']),
       encoderFormats: strings(map['encoderFormats']),
+      temporaryEncodingFormats: strings(map['temporaryEncodingFormats']),
       resolutionsByFormat: sizes(map['resolutionsByFormat']),
       pipelineResolutionsByFormat: sizes(map['pipelineResolutionsByFormat']),
       depthSupport: flags(map['depthSupport']),
@@ -106,6 +109,7 @@ class CameraCapabilityReport {
       'hardwareFormats': Map<String, bool?>.of(hardwareFormats),
       'pipelineFormats': List<String>.of(pipelineFormats),
       'encoderFormats': List<String>.of(encoderFormats),
+      'temporaryEncodingFormats': List<String>.of(temporaryEncodingFormats),
       'resolutionsByFormat': sizes(resolutionsByFormat),
       'pipelineResolutionsByFormat': sizes(pipelineResolutionsByFormat),
       'depthSupport': Map<String, bool?>.of(depthSupport),
@@ -122,6 +126,10 @@ class CameraCapabilityReport {
   final Map<String, bool?> hardwareFormats;
   final List<String> pipelineFormats;
   final List<String> encoderFormats;
+
+  /// Formats the native route can capture, encode and decode as an isolated
+  /// temporary experiment. This does not enable durable scan storage.
+  final List<String> temporaryEncodingFormats;
   final Map<String, List<CameraResolution>> resolutionsByFormat;
 
   /// Active-route geometry metadata, not proof each size can capture.

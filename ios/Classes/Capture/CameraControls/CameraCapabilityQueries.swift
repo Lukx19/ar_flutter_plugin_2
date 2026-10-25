@@ -130,6 +130,7 @@ enum CameraCapabilityQueries {
       "hardwareFormats": ["jpeg": true, "heif": NSNull(), "raw": NSNull(),
                           "raw+jpeg": NSNull(), "raw+heif": NSNull()] as [String: Any],
       "pipelineFormats": ["jpeg"], "encoderFormats": encoderFormats,
+      "temporaryEncodingFormats": encoderFormats,
       // These are sensor photo-size metadata, not ARKit selectable outputs.
       "resolutionsByFormat": ["jpeg": hardwareDimensions],
       "pipelineResolutionsByFormat": ["jpeg": stillDimensions],
