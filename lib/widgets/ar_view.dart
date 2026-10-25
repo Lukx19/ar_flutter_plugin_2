@@ -105,7 +105,8 @@ class AndroidARView implements PlatformARView {
       // creation-time value in sync with the Android view key below so a mode
       // change disposes the entire platform view and starts a new AR session.
       'enableHighResCapture': captureConfig?.enableHighResCapture ?? false,
-      'retainAssessedOriginals': captureConfig?.retainAssessedOriginals ?? false,
+      'retainAssessedOriginals':
+          captureConfig?.retainAssessedOriginals ?? false,
       'rearCameraId': rearCameraId,
       // Depth mode and camera config are fixed when the session starts.
       ...sessionInputs.toCreationParams(),
@@ -178,8 +179,8 @@ class IosARView implements PlatformARView {
     // Assessed-original production is unsupported on iOS. Reader capability is
     // independent; do not advertise a producer mode this platform cannot honor.
     _captureConfig = captureConfig?.copyWith(retainAssessedOriginals: false);
-    // The capture route runs the ARKit capture view on a Metal host; every
-    // other route keeps the legacy view.
+    // Capture and camera discovery select the ARKit Metal capture host
+    // through captureView; callers without it retain the legacy view.
     final String viewType = iosViewType(captureView);
     // Debug/profile playback: the capture view replays a recorded ARKit
     // session (a folder under Application Support/recordings/); the legacy
@@ -242,7 +243,7 @@ class ARView extends StatefulWidget {
   /// rebuild the native platform view.
   final ARPlaybackConfig? playback;
 
-  /// iOS capture view configuration; set only by the capture route. Null
+  /// iOS capture host configuration for capture or discovery. Null
   /// keeps the legacy iOS view. Android ignores it.
   final ARCaptureViewConfig? captureView;
 
@@ -325,11 +326,8 @@ class _ARViewState extends State<ARView> {
     super.dispose();
   }
 
-  void _onARViewCreated(
-      ARSessionManager session,
-      ARObjectManager objects,
-      ARAnchorManager anchors,
-      ARLocationManager locations) {
+  void _onARViewCreated(ARSessionManager session, ARObjectManager objects,
+      ARAnchorManager anchors, ARLocationManager locations) {
     // A new platform view replaced the previous one, which is gone.
     final previous = _createdSession;
     if (previous != null && !identical(previous, session)) {

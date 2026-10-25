@@ -58,7 +58,8 @@ class ARCameraCapabilities {
   }
 
   Future<DeviceCameraCapabilityProfile> getDeviceCapabilityProfile() async {
-    if (!isSupported) return const DeviceCameraCapabilityProfile.unsupported();
+    if (!supportsCameraQueries)
+      return const DeviceCameraCapabilityProfile.unsupported();
     final result = await _channel.invokeMapMethod<dynamic, dynamic>(
       'getDeviceCapabilityProfile',
     );
@@ -113,7 +114,7 @@ class ARCameraCapabilities {
   }
 
   Future<void> saveSharedCameraUnsupported(String reason) async {
-    if (!isSupported) return;
+    if (!supportsCameraQueries) return;
     await _channel.invokeMethod<void>(
       'saveSharedCameraUnsupported',
       <String, dynamic>{'reason': reason},
@@ -122,9 +123,12 @@ class ARCameraCapabilities {
 
   /// Persists base shared-camera support after a live capture has completed
   /// with a pose correlated to its Camera2 sensor timestamp.
-  Future<void> saveSharedCameraSupported() async {
-    if (!isSupported) return;
-    await _channel.invokeMethod<void>('saveSharedCameraSupported');
+  Future<void> saveSharedCameraSupported({CameraResolution? resolution}) async {
+    if (!supportsCameraQueries) return;
+    await _channel.invokeMethod<void>(
+      'saveSharedCameraSupported',
+      resolution?.toMap(),
+    );
   }
 
   Future<void> saveRawJpegProbeResult({
@@ -144,7 +148,7 @@ class ARCameraCapabilities {
   /// app settings, and persisted images are not modified.
   @visibleForTesting
   Future<void> resetCapabilityProfileForTesting() async {
-    if (!isSupported) return;
+    if (!supportsCameraQueries) return;
     await _channel.invokeMethod<void>('resetCapabilityProfileForTesting');
   }
 
@@ -170,7 +174,7 @@ class ARCameraCapabilities {
   /// session surface combination on this device. The list is empty until a
   /// shared-camera session has run capability validation at least once.
   Future<List<CameraResolution>> getSupportedSharedCameraResolutions() async {
-    if (!isSupported) return [];
+    if (!supportsCameraQueries) return [];
 
     try {
       final List<dynamic> result = await _channel.invokeMethod(
@@ -527,6 +531,9 @@ class DeviceCameraCapabilityProfile {
     required this.rearConcurrentCameraIds,
     required this.selectableRearCameras,
     required this.cached,
+    this.advertisedJpegRegularResolutions = const [],
+    this.advertisedJpegHighResolutionResolutions = const [],
+    this.supportsExactStillResolutionSelection = true,
   });
 
   const DeviceCameraCapabilityProfile.unsupported()
@@ -548,7 +555,10 @@ class DeviceCameraCapabilityProfile {
         concurrentCameraIdSets = const [],
         rearConcurrentCameraIds = const [],
         selectableRearCameras = const [],
-        cached = false;
+        cached = false,
+        advertisedJpegRegularResolutions = const [],
+        advertisedJpegHighResolutionResolutions = const [],
+        supportsExactStillResolutionSelection = false;
 
   factory DeviceCameraCapabilityProfile.fromMap(Map<String, dynamic> map) {
     return DeviceCameraCapabilityProfile(
@@ -595,7 +605,42 @@ class DeviceCameraCapabilityProfile {
               )
               .toList(growable: false),
       cached: map['cached'] as bool? ?? false,
+      advertisedJpegRegularResolutions:
+          _resolutionList(map['advertisedJpegRegularResolutions']),
+      advertisedJpegHighResolutionResolutions:
+          _resolutionList(map['advertisedJpegHighResolutionResolutions']),
+      supportsExactStillResolutionSelection:
+          map['supportsExactStillResolutionSelection'] as bool? ?? true,
     );
+  }
+
+  static List<CameraResolution> _resolutionList(dynamic value) =>
+      (value as List? ?? const [])
+          .whereType<Map>()
+          .map((entry) =>
+              CameraResolution.fromMap(Map<String, dynamic>.from(entry)))
+          .where((size) => size.width > 0 && size.height > 0)
+          .toList(growable: false);
+
+  /// Advertised candidates are not operational capture evidence. Native
+  /// session validation is also insufficient until a temporary JPEG completes.
+  final List<CameraResolution> advertisedJpegRegularResolutions;
+  final List<CameraResolution> advertisedJpegHighResolutionResolutions;
+  final bool supportsExactStillResolutionSelection;
+
+  List<CameraResolution> get jpegDiscoveryCandidates {
+    final candidates = <CameraResolution>{
+      ...advertisedJpegRegularResolutions,
+      ...advertisedJpegHighResolutionResolutions,
+      ...validatedSharedResolutions,
+      // Camera2 can overwrite its validated cache after probing a large size.
+      // Retain the app's established baseline as a candidate, never as proof.
+      if (supportsExactStillResolutionSelection)
+        const CameraResolution(width: 1920, height: 1080),
+    }.where((size) => size.width > 0 && size.height > 0).toList();
+    candidates
+        .sort((a, b) => (b.width * b.height).compareTo(a.width * a.height));
+    return List.unmodifiable(candidates);
   }
 
   final int presetVersion;

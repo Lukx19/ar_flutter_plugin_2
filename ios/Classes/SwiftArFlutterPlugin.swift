@@ -1,4 +1,6 @@
 import Flutter
+import ARKit
+import Darwin
 import UIKit
 
 /// Services the plugin registers with one engine's messenger and releases
@@ -96,34 +98,32 @@ public class SwiftArFlutterPlugin: NSObject, FlutterPlugin {
 private final class CameraCapabilitiesHandler: NSObject, FlutterPlugin {
   static func register(with registrar: FlutterPluginRegistrar) {}
 
+  private func profileStore() -> CameraCapabilityProfileStore {
+    let snapshot = CameraCapabilityQueries.current()
+    let still = snapshot.stillSize.map { ["width": Int($0.width), "height": Int($0.height)] }
+    var system = utsname()
+    uname(&system)
+    let machineCapacity = MemoryLayout.size(ofValue: system.machine)
+    let model = withUnsafePointer(to: &system.machine) {
+      $0.withMemoryRebound(to: CChar.self, capacity: machineCapacity) {
+        String(cString: $0)
+      }
+    }
+    let fingerprint = "\(model)|\(UIDevice.current.systemVersion)|arkit-primary|\(still?["width"] ?? 0)x\(still?["height"] ?? 0)"
+    return CameraCapabilityProfileStore(
+      defaults: .standard, fingerprint: fingerprint,
+      supported: ARWorldTrackingConfiguration.isSupported,
+      advertisedStillResolutions: still.map { [$0] } ?? [],
+      manualSensorControls: snapshot.isoRange != nil && snapshot.exposureRange != nil)
+  }
+
   func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
     switch call.method {
     case ARKitCapabilityChannel.method:
       // During recorded playback Dart sends the playback creation parameters.
       result(ARCameraCapabilities.forQuery(call.arguments).channelMap)
     case "getDeviceCapabilityProfile":
-      result([
-        "presetVersion": 11,
-        "platformSupport": false,
-        "unsupportedCode": "UNSUPPORTED_PLATFORM",
-        "fingerprint": "",
-        "primaryCameraId": "",
-        "sharedResolutionValidationComplete": false,
-        "sharedCameraProbeStatus": "unsupported",
-        "sharedCameraProbeError": "iOS capture is not implemented.",
-        "validatedSharedResolutions": [],
-        "validatedRawJpegResolutions": [],
-        "rawJpegProbeStatus": "unsupported",
-        "rawJpegProbeError": "iOS capture is not implemented.",
-        "rawCapture": false,
-        "manualSensorControls": false,
-        "flash": false,
-        "primaryPhysicalCameraIds": [],
-        "logicalMultiCamera": false,
-        "concurrentCameraIdSets": [],
-        "rearConcurrentCameraIds": [],
-        "cached": false,
-      ])
+      result(profileStore().profile)
     case let method where CameraCapabilityQueries.handles(method):
       // Android-shaped queries answered from ARKit and its configurable camera.
       switch CameraCapabilityQueries.answer(method, arguments: call.arguments, snapshot: CameraCapabilityQueries.current()) {
@@ -131,8 +131,7 @@ private final class CameraCapabilitiesHandler: NSObject, FlutterPlugin {
       case .failure(let error): result(FlutterError(code: error.code, message: error.message, details: nil))
       }
     case "getSupportedSharedCameraResolutions":
-      // ARCore shared-camera validation has no iOS counterpart.
-      result([])
+      result(profileStore().validatedResolutions)
     case "getARCoreAvailability":
       result([
         "name": "UNSUPPORTED_PLATFORM",
@@ -140,7 +139,19 @@ private final class CameraCapabilitiesHandler: NSObject, FlutterPlugin {
         "transient": false,
         "unknown": false,
       ])
-    case "saveSharedCameraUnsupported", "saveSharedCameraSupported", "saveRawJpegProbeResult", "resetCapabilityProfileForTesting":
+    case "saveSharedCameraSupported":
+      profileStore().saveSupported(arguments: call.arguments)
+      result(nil)
+    case "saveSharedCameraUnsupported":
+      let arguments = call.arguments as? [String: Any]
+      profileStore().saveUnsupported(reason: arguments?["reason"] as? String)
+      result(nil)
+    case "resetCapabilityProfileForTesting":
+      profileStore().reset()
+      result(nil)
+    case "saveRawJpegProbeResult":
+      // This ARKit route delivers processed JPEGs only. This says nothing
+      // about ProRAW support in a separate AVCaptureSession.
       result(nil)
     default:
       result(FlutterMethodNotImplemented)

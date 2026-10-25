@@ -92,9 +92,8 @@ enum CameraCapabilityQueries {
       let dimensions = format.defaultPhotoSettings.maxPhotoDimensions
       if dimensions.width > 0 { still = CGSize(width: Int(dimensions.width), height: Int(dimensions.height)) }
     }
-    if still == nil, let format = ARWorldTrackingConfiguration.recommendedVideoFormatForHighResolutionFrameCapturing {
-      still = format.imageResolution
-    }
+    // Before iOS 26 ARKit exposes video geometry here, not the delivered
+    // high-resolution still geometry. Leave it unknown until a real probe.
     let device = ARWorldTrackingConfiguration.configurableCaptureDeviceForPrimaryCamera
     let iso = device.map { $0.activeFormat.minISO...$0.activeFormat.maxISO }
     let exposure = device.map { $0.activeFormat.minExposureDuration.seconds...$0.activeFormat.maxExposureDuration.seconds }

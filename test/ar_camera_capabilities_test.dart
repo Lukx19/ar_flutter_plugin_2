@@ -128,6 +128,95 @@ void main() {
         const CameraResolution(width: 1920, height: 1080));
   });
 
+  test('advertised JPEG candidates retain the baseline beyond native cache',
+      () {
+    final profile = DeviceCameraCapabilityProfile.fromMap(<String, dynamic>{
+      'validatedSharedResolutions': [
+        {'width': 4608, 'height': 3456},
+      ],
+      'advertisedJpegRegularResolutions': [
+        {'width': 4032, 'height': 3024},
+        {'width': 1920, 'height': 1080},
+        {'width': 0, 'height': 1080},
+      ],
+      'advertisedJpegHighResolutionResolutions': [
+        {'width': 4608, 'height': 3456},
+        {'width': 4032, 'height': 3024},
+      ],
+    });
+
+    expect(profile.advertisedJpegRegularResolutions, [
+      const CameraResolution(width: 4032, height: 3024),
+      const CameraResolution(width: 1920, height: 1080),
+    ]);
+    expect(profile.advertisedJpegHighResolutionResolutions, hasLength(2));
+    expect(profile.validatedSharedResolutions, [
+      const CameraResolution(width: 4608, height: 3456),
+    ]);
+    expect(profile.jpegDiscoveryCandidates, [
+      const CameraResolution(width: 4608, height: 3456),
+      const CameraResolution(width: 4032, height: 3024),
+      const CameraResolution(width: 1920, height: 1080),
+    ]);
+    expect(profile.sharedCameraCapture, isFalse);
+  });
+
+  test('cached maximum alone does not discard the baseline candidate', () {
+    final profile = DeviceCameraCapabilityProfile.fromMap(<String, dynamic>{
+      'validatedSharedResolutions': [
+        {'width': 4608, 'height': 3456},
+      ],
+    });
+
+    expect(profile.jpegDiscoveryCandidates, [
+      const CameraResolution(width: 4608, height: 3456),
+      const CameraResolution(width: 1920, height: 1080),
+    ]);
+  });
+
+  test('automatic still selection does not invent configurable video sizes',
+      () {
+    final profile = DeviceCameraCapabilityProfile.fromMap(<String, dynamic>{
+      'supportsExactStillResolutionSelection': false,
+      'advertisedJpegHighResolutionResolutions': [
+        {'width': 4032, 'height': 3024},
+      ],
+    });
+
+    expect(profile.supportsExactStillResolutionSelection, isFalse);
+    expect(profile.jpegDiscoveryCandidates, [
+      const CameraResolution(width: 4032, height: 3024),
+    ]);
+    expect(profile.validatedSharedResolutions, isEmpty);
+  });
+
+  test('camera-query platforms discover profiles without ARCore support',
+      () async {
+    final capabilities = ARCameraCapabilities(
+      supportedOverride: false,
+      cameraQueriesOverride: true,
+    );
+
+    expect((await capabilities.getDeviceCapabilityProfile()).isCurrentPreset,
+        isTrue);
+    expect(
+        await capabilities.getSupportedSharedCameraResolutions(), hasLength(1));
+    await capabilities.saveSharedCameraSupported(
+      resolution: const CameraResolution(width: 4032, height: 3024),
+    );
+    await capabilities.resetCapabilityProfileForTesting();
+    expect((await capabilities.getARCoreAvailability()).supported, isFalse);
+    expect(await capabilities.getSelectableRearCameras(), isEmpty);
+
+    expect(calls.map((call) => call.method), [
+      'getDeviceCapabilityProfile',
+      'getSupportedSharedCameraResolutions',
+      'saveSharedCameraSupported',
+      'resetCapabilityProfileForTesting',
+    ]);
+    expect(calls[2].arguments, {'width': 4032, 'height': 3024});
+  });
+
   test('persists operational probe outcomes with stable payloads', () async {
     final capabilities = ARCameraCapabilities(supportedOverride: true);
 

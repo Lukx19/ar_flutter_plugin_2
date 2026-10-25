@@ -12,8 +12,8 @@ import 'package:flutter_test/flutter_test.dart';
 /// (`Runtime*ControlBridge`) and iOS (`CameraControlBridge`): the contract
 /// `test_assets/camera_controls/runtime_control_replies.json` names every
 /// reply key and mode name; its examples decode with the Dart models. The
-/// camera queries also reach the native channel on iOS, while the ARCore
-/// profile stays Android only.
+/// camera queries and native device profile also reach the channel on iOS,
+/// while ARCore availability remains an Android-only query.
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
@@ -82,6 +82,28 @@ void main() {
           .setMockMethodCallHandler(channel, (call) async {
         calls.add(call.method);
         return switch (call.method) {
+          'getDeviceCapabilityProfile' => {
+              'presetVersion': ARCameraCapabilities.capabilityPresetVersion,
+              'fingerprint': 'iPhone13,3|iOS27|arkit-primary',
+              'primaryCameraId': 'arkit-primary',
+              'supportsExactStillResolutionSelection': false,
+              'advertisedJpegRegularResolutions': <Map<String, int>>[],
+              'advertisedJpegHighResolutionResolutions': [
+                {'width': 4032, 'height': 3024},
+              ],
+              'sharedResolutionValidationComplete': false,
+              'sharedCameraProbeStatus': 'pending',
+              'sharedCameraProbeError': '',
+              'validatedSharedResolutions': <Map<String, int>>[],
+              'validatedRawJpegResolutions': <Map<String, int>>[],
+              'rawJpegProbeStatus': 'unsupported',
+              'rawJpegProbeError':
+                  'The ARKit capture route delivers JPEG only.',
+              'rawCapture': false,
+              'manualSensorControls': true,
+              'flash': false,
+              'cached': false,
+            },
           'getSupportedResolutions' => [
               {'width': 4032, 'height': 3024},
               {'width': 1920, 'height': 1440},
@@ -100,7 +122,9 @@ void main() {
           .setMockMethodCallHandler(channel, null);
     });
 
-    test('reach the channel while the ARCore profile stays local', () async {
+    test(
+        'reach the native iOS profile channel while ARCore availability stays local',
+        () async {
       final capabilities = ARCameraCapabilities(
         supportedOverride: false,
         cameraQueriesOverride: true,
@@ -118,8 +142,38 @@ void main() {
         const Duration(microseconds: 333333),
       );
       final profile = await capabilities.getDeviceCapabilityProfile();
-      expect(profile.manualSensorControls, isFalse);
-      expect(calls, isNot(contains('getDeviceCapabilityProfile')));
+      expect(
+          profile.presetVersion, ARCameraCapabilities.capabilityPresetVersion);
+      expect(profile.isCurrentPreset, isTrue);
+      expect(profile.fingerprint, 'iPhone13,3|iOS27|arkit-primary');
+      expect(profile.primaryCameraId, 'arkit-primary');
+      expect(profile.supportsExactStillResolutionSelection, isFalse);
+      expect(profile.advertisedJpegRegularResolutions, isEmpty);
+      expect(profile.advertisedJpegHighResolutionResolutions, const [
+        CameraResolution(width: 4032, height: 3024),
+      ]);
+      expect(profile.jpegDiscoveryCandidates, const [
+        CameraResolution(width: 4032, height: 3024),
+      ]);
+      expect(profile.sharedResolutionValidationComplete, isFalse);
+      expect(profile.sharedCameraProbeStatus, 'pending');
+      expect(profile.sharedCameraCapture, isFalse);
+      expect(profile.validatedSharedResolutions, isEmpty);
+      expect(profile.validatedRawJpegResolutions, isEmpty);
+      expect(profile.rawJpegProbeStatus, 'unsupported');
+      expect(profile.rawJpegProbeError,
+          'The ARKit capture route delivers JPEG only.');
+      expect(profile.rawCapture, isFalse);
+      expect(profile.rawJpegCapture, isFalse);
+      expect(profile.manualSensorControls, isTrue);
+      expect(profile.flash, isFalse);
+      expect(profile.cached, isFalse);
+      expect(calls.where((method) => method == 'getDeviceCapabilityProfile'),
+          hasLength(1));
+      final availability = await capabilities.getARCoreAvailability();
+      expect(availability.supported, isFalse);
+      expect(availability.name, 'platform');
+      expect(calls, isNot(contains('getARCoreAvailability')));
     });
   });
 }
