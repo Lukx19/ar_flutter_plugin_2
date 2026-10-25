@@ -541,6 +541,13 @@ internal class SceneViewHost(
                     // benchmark replay) instead of selecting a camera.
                     val selectedConfig = if (playback != null) null else selectRearCameraConfig(session)
                     val activeCameraConfig = selectedConfig ?: session.cameraConfig
+                    if (playback == null) {
+                        com.uhg0.ar_flutter_plugin_2.shared_camera.camera.CameraDepthCapabilityRegistry.record(
+                            activeCameraConfig.cameraId,
+                            session.isDepthModeSupported(Config.DepthMode.AUTOMATIC),
+                            session.isDepthModeSupported(Config.DepthMode.RAW_DEPTH_ONLY),
+                        )
+                    }
                     configuredCameraFpsLower = activeCameraConfig.fpsRange.lower
                     configuredCameraFpsUpper = activeCameraConfig.fpsRange.upper
                     arConfig.depthMode =

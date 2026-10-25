@@ -69,4 +69,33 @@ class CameraCapabilityProfileResolverTest {
 
         assertEquals(listOf("3"), rearIds)
     }
+    @Test
+    fun `paired RAW pipeline requires current successful pair qualification and dimensions`() {
+        for (status in listOf("pending", "failed", "unsupported", null)) {
+            assertEquals(listOf("jpeg"), CameraCapabilityProfileResolver.pipelineCaptureFormats(
+                true, status, true,
+            ))
+        }
+        assertEquals(listOf("jpeg"), CameraCapabilityProfileResolver.pipelineCaptureFormats(
+            true, "supported", false,
+        ))
+        assertEquals(listOf("jpeg"), CameraCapabilityProfileResolver.pipelineCaptureFormats(
+            false, "supported", true,
+        ))
+        assertEquals(listOf("jpeg", "raw+jpeg"), CameraCapabilityProfileResolver.pipelineCaptureFormats(
+            true, "supported", true,
+        ))
+    }
+
+    @Test
+    fun `JPEG exposure bracket metadata requires three distinct clamped sensor steps`() {
+        assertEquals(true, CameraCapabilityProfileResolver.exposureBracketingAvailable(-6, 6, 1.0 / 3))
+        assertEquals(true, CameraCapabilityProfileResolver.exposureBracketingAvailable(-1, 1, 1.0))
+        assertEquals(false, CameraCapabilityProfileResolver.exposureBracketingAvailable(0, 0, 1.0 / 3))
+        assertEquals(false, CameraCapabilityProfileResolver.exposureBracketingAvailable(-6, 6, 5.0))
+        assertEquals(false, CameraCapabilityProfileResolver.exposureBracketingAvailable(-6, 6, 0.0))
+        assertEquals(null, CameraCapabilityProfileResolver.exposureBracketingAvailable(null, 6, 1.0 / 3))
+        assertEquals(null, CameraCapabilityProfileResolver.exposureBracketingAvailable(-6, 6, null))
+    }
+
 }

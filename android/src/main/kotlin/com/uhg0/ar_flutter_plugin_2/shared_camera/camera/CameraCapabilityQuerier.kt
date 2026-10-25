@@ -8,6 +8,7 @@ import android.os.Build
 import android.util.Log
 import android.util.Size
 import com.google.ar.core.CameraConfig
+import com.google.ar.core.Config
 import com.google.ar.core.CameraConfigFilter
 import com.google.ar.core.Session
 import kotlin.math.atan
@@ -120,6 +121,8 @@ class CameraCapabilityQuerier(private val context: Context) {
         )
 
         return mapOf(
+            "capabilityReport" to captureCapabilityReport(primaryId, characteristics,
+                cacheHit, if (cacheHit) preferences.getString("profile_raw_jpeg_status", "pending") else "pending"),
             "fingerprint" to fingerprint,
             "presetVersion" to CAPABILITY_PRESET_VERSION,
             "primaryCameraId" to primaryId,
@@ -181,6 +184,103 @@ class CameraCapabilityQuerier(private val context: Context) {
             }
             editor.apply()
         }
+    }
+
+    /** Camera2/ARCore metadata only; no shutter, control mutation or new camera. */
+    private fun captureCapabilityReport(
+        cameraId: String,
+        camera: CameraCharacteristics,
+        cacheIdentityMatches: Boolean,
+        rawPairProbeStatus: String?,
+    ): Map<String, Any?> {
+        val streams = camera.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        fun sizes(format: Int): List<Map<String, Int>>? = runCatching {
+            if (streams == null) return@runCatching null
+            val regular = streams?.getOutputSizes(format).orEmpty().toList()
+            val large = streams?.getHighResolutionOutputSizes(format).orEmpty().toList()
+            (regular + large).distinct().sortedByDescending { it.width.toLong() * it.height }
+                .map { mapOf("width" to it.width, "height" to it.height) }
+        }.getOrNull()
+        val jpegSizes = sizes(android.graphics.ImageFormat.JPEG)
+        val rawSizes = sizes(android.graphics.ImageFormat.RAW_SENSOR)
+        val jpeg = jpegSizes.orEmpty()
+        val raw = rawSizes.orEmpty()
+        val heif = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            sizes(android.graphics.ImageFormat.HEIC)
+        } else emptyList()
+        val modes = camera.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: intArrayOf()
+        val manual = modes.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR)
+        val af = camera.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES) ?: intArrayOf()
+        val awb = camera.get(CameraCharacteristics.CONTROL_AWB_AVAILABLE_MODES) ?: intArrayOf()
+        val compensation = camera.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)
+        val sceneModes = camera.get(CameraCharacteristics.CONTROL_AVAILABLE_SCENE_MODES)
+        val compensationStepEv = camera.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP)?.toDouble()
+        val pairedSizes = getSupportedRawJpegResolutions()
+        val pipelineFormats = CameraCapabilityProfileResolver.pipelineCaptureFormats(
+            cacheIdentityMatches, rawPairProbeStatus, pairedSizes.isNotEmpty(),
+        )
+        val resolutions = linkedMapOf("jpeg" to jpeg, "raw" to raw, "heif" to heif.orEmpty())
+        // Session creation queries ARCore support without opening a CameraDevice.
+        // Over an active view use that owner's last metadata; never create a
+        // competing AR session or infer depth from Camera2 DEPTH_OUTPUT.
+        val depth = CameraDepthCapabilityRegistry.forCamera(cameraId) ?: if (!OpenArViews.any) {
+            runCatching {
+                val session = Session(context, setOf(Session.Feature.SHARED_CAMERA))
+                try {
+                    if (session.cameraConfig.cameraId != cameraId) null else {
+                        CameraDepthCapabilityRegistry.record(
+                            cameraId,
+                            session.isDepthModeSupported(Config.DepthMode.AUTOMATIC),
+                            session.isDepthModeSupported(Config.DepthMode.RAW_DEPTH_ONLY),
+                        )
+                    }
+                } finally { session.close() }
+            }.getOrNull()
+        } else null
+        return mapOf(
+            "schemaVersion" to 1,
+            "evidence" to "advertised",
+            "deviceModel" to Build.MODEL,
+            "platform" to "android",
+            "osVersion" to Build.VERSION.RELEASE,
+            "cameraId" to cameraId,
+            "hardwareFormats" to mapOf(
+                "jpeg" to jpegSizes?.isNotEmpty(), "raw" to rawSizes?.isNotEmpty(),
+                "heif" to heif?.isNotEmpty(),
+                // Independent stream support never proves simultaneous output.
+                "raw+jpeg" to if ("raw+jpeg" in pipelineFormats) true else null,
+                "raw+heif" to null,
+            ),
+            "pipelineFormats" to pipelineFormats,
+            "encoderFormats" to emptyList<String>(),
+            "resolutionsByFormat" to resolutions,
+            "pipelineResolutionsByFormat" to mapOf("jpeg" to jpeg,
+                "raw+jpeg" to if ("raw+jpeg" in pipelineFormats) pairedSizes.map {
+                    mapOf("width" to it.width, "height" to it.height)
+                } else emptyList()),
+            "depthSupport" to mapOf("depthApi" to depth?.first, "rawDepth" to depth?.second,
+                // ARCore predicted depth is not evidence for a LiDAR sensor.
+                "lidar" to null),
+            "controls" to mapOf(
+                "iso" to manual,
+                "exposureTime" to manual,
+                "focus" to (af.contains(CameraCharacteristics.CONTROL_AF_MODE_OFF) &&
+                    (camera.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f) > 0f),
+                "whiteBalance" to awb.contains(CameraCharacteristics.CONTROL_AWB_MODE_OFF),
+                "exposureCompensation" to (compensation != null && compensation.lower != compensation.upper),
+            ),
+            "hdrSupport" to mapOf(
+                "photo" to sceneModes?.contains(CameraCharacteristics.CONTROL_SCENE_MODE_HDR),
+                "video" to null,
+                // No merged/Smart-HDR effect oracle exists for the JPEG route.
+                "pipelinePhoto" to null, "mergedPhoto" to null,
+                "exposureBracketing" to CameraCapabilityProfileResolver.exposureBracketingAvailable(
+                    compensation?.lower, compensation?.upper, compensationStepEv,
+                ),
+                "balancedPhotoProcessing" to false,
+                "balancedPhotoMayFallback" to false,
+            ),
+        )
     }
 
     /**
@@ -759,4 +859,12 @@ class CameraCapabilityQuerier(private val context: Context) {
             false
         }
     }
+}
+
+/** Current-process, camera-qualified ARCore metadata; never operational evidence. */
+internal object CameraDepthCapabilityRegistry {
+    private val values = java.util.concurrent.ConcurrentHashMap<String, Pair<Boolean, Boolean>>()
+    fun record(cameraId: String, automatic: Boolean, raw: Boolean): Pair<Boolean, Boolean> =
+        (automatic to raw).also { values[cameraId] = it }
+    fun forCamera(cameraId: String): Pair<Boolean, Boolean>? = values[cameraId]
 }

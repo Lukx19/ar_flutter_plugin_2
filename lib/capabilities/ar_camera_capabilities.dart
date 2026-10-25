@@ -6,6 +6,9 @@ import '../models/ar_capture_config.dart';
 import '../models/ar_session_inputs.dart';
 import '../models/ar_camera_intrinsics.dart';
 import '../datatypes/image_format.dart';
+import 'camera_capability_report.dart';
+
+export 'camera_capability_report.dart';
 
 /// Provides information about available camera capabilities for AR capture
 /// Can be used independently throughout the application for capability discovery
@@ -534,6 +537,7 @@ class DeviceCameraCapabilityProfile {
     this.advertisedJpegRegularResolutions = const [],
     this.advertisedJpegHighResolutionResolutions = const [],
     this.supportsExactStillResolutionSelection = true,
+    this.capabilityReport = const CameraCapabilityReport.unknown(),
   });
 
   const DeviceCameraCapabilityProfile.unsupported()
@@ -558,7 +562,8 @@ class DeviceCameraCapabilityProfile {
         cached = false,
         advertisedJpegRegularResolutions = const [],
         advertisedJpegHighResolutionResolutions = const [],
-        supportsExactStillResolutionSelection = false;
+        supportsExactStillResolutionSelection = false,
+        capabilityReport = const CameraCapabilityReport.unknown();
 
   factory DeviceCameraCapabilityProfile.fromMap(Map<String, dynamic> map) {
     return DeviceCameraCapabilityProfile(
@@ -611,6 +616,11 @@ class DeviceCameraCapabilityProfile {
           _resolutionList(map['advertisedJpegHighResolutionResolutions']),
       supportsExactStillResolutionSelection:
           map['supportsExactStillResolutionSelection'] as bool? ?? true,
+      capabilityReport: CameraCapabilityReport.fromMap(
+        map['capabilityReport'] is Map
+            ? Map<String, dynamic>.from(map['capabilityReport'] as Map)
+            : const {},
+      ),
     );
   }
 
@@ -627,6 +637,9 @@ class DeviceCameraCapabilityProfile {
   final List<CameraResolution> advertisedJpegRegularResolutions;
   final List<CameraResolution> advertisedJpegHighResolutionResolutions;
   final bool supportsExactStillResolutionSelection;
+
+  /// Fresh metadata; never operational or sensor-readback evidence.
+  final CameraCapabilityReport capabilityReport;
 
   List<CameraResolution> get jpegDiscoveryCandidates {
     final candidates = <CameraResolution>{

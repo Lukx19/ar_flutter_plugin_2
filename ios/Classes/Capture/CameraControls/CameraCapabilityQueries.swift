@@ -1,6 +1,8 @@
 import ARKit
 import AVFoundation
 import Foundation
+import ImageIO
+import UIKit
 
 /// What the Android-shaped camera capability queries of
 /// `ar_flutter_plugin_2/camera_capabilities` read on iOS.
@@ -78,6 +80,73 @@ enum CameraCapabilityQueries {
       if value.0 > 0, value.1 > 0, !out.contains(where: { $0 == value }) { out.append(value) }
     }
     return out
+  }
+
+  /// Metadata of existing still mechanisms, never proof of merged HDR or
+  /// Smart HDR. The iOS 26 balanced request may silently fall back to a plain
+  /// high-resolution frame; no returned mode/effect oracle currently exists.
+  static func hdrSupport(supportsBalancedAPI: Bool, highResolutionFrameCapture: Bool,
+                         videoHDR: Bool) -> [String: Any] {
+    let balanced = supportsBalancedAPI && highResolutionFrameCapture
+    return [
+      "video": videoHDR, "photo": NSNull(),
+      "pipelinePhoto": NSNull(), "mergedPhoto": NSNull(),
+      "exposureBracketing": false,
+      "balancedPhotoProcessing": balanced,
+      "balancedPhotoMayFallback": balanced,
+    ]
+  }
+
+  /// Read-only metadata. An unconfigured AVCapturePhotoOutput cannot prove
+  /// RAW/ProRAW codec support, and opening a second session would compete with
+  /// ARKit. Those flags remain unknown rather than reporting a false refusal.
+  static func capabilityReport() -> [String: Any] {
+    let snapshot = current()
+    let capabilities = ARCameraCapabilities.current()
+    let device = ARWorldTrackingConfiguration.configurableCaptureDeviceForPrimaryCamera
+    var hardwareSizes = Set<String>()
+    var hardwareDimensions = [[String: Int]]()
+    if #available(iOS 16.0, *) {
+      for format in device?.formats ?? [] {
+        for dimensions in format.supportedMaxPhotoDimensions where dimensions.width > 0 && dimensions.height > 0 {
+          let key = "\(dimensions.width)x\(dimensions.height)"
+          if hardwareSizes.insert(key).inserted {
+            hardwareDimensions.append(["width": Int(dimensions.width), "height": Int(dimensions.height)])
+          }
+        }
+      }
+    }
+    hardwareDimensions.sort { $0["width"]! * $0["height"]! > $1["width"]! * $1["height"]! }
+    let stillDimensions = snapshot.stillSize.map { [["width": Int($0.width), "height": Int($0.height)]] } ?? []
+    let encoders = CGImageDestinationCopyTypeIdentifiers() as? [String] ?? []
+    let encoderFormats = ["jpeg"] + (encoders.contains("public.heic") ? ["heif"] : [])
+    func value(_ flag: Bool?) -> Any { flag.map { $0 as Any } ?? NSNull() }
+    let supportsBalancedAPI: Bool
+    if #available(iOS 26.0, *) { supportsBalancedAPI = true } else { supportsBalancedAPI = false }
+    return [
+      "schemaVersion": 1, "evidence": "advertised",
+      "deviceModel": capabilities.modelIdentifier, "platform": "ios",
+      "osVersion": UIDevice.current.systemVersion, "cameraId": "arkit-primary",
+      "hardwareFormats": ["jpeg": true, "heif": NSNull(), "raw": NSNull(),
+                          "raw+jpeg": NSNull(), "raw+heif": NSNull()] as [String: Any],
+      "pipelineFormats": ["jpeg"], "encoderFormats": encoderFormats,
+      // These are sensor photo-size metadata, not ARKit selectable outputs.
+      "resolutionsByFormat": ["jpeg": hardwareDimensions],
+      "pipelineResolutionsByFormat": ["jpeg": stillDimensions],
+      "depthSupport": ["depthApi": capabilities.sceneDepthSupported,
+                       "rawDepth": false, "lidar": capabilities.hasLiDARDepth],
+      "controls": [
+        "iso": value(device?.isExposureModeSupported(.custom)),
+        "exposureTime": value(device?.isExposureModeSupported(.custom)),
+        "focus": value(device?.isLockingFocusWithCustomLensPositionSupported),
+        "whiteBalance": value(device?.isLockingWhiteBalanceWithCustomDeviceGainsSupported),
+        "exposureCompensation": value(device.map { $0.minExposureTargetBias != $0.maxExposureTargetBias }),
+      ],
+      "hdrSupport": hdrSupport(
+        supportsBalancedAPI: supportsBalancedAPI,
+        highResolutionFrameCapture: capabilities.supportsHighResolutionFrameCapture,
+        videoHDR: capabilities.videoFormats.contains { $0.isVideoHDRSupported }),
+    ]
   }
 
   /// The values on this device: ARKit's formats, the configurable camera's

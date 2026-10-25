@@ -291,6 +291,25 @@ final class CameraControlBridgeTests: XCTestCase {
     XCTAssertEqual(device.configurations, 3, "reads never lock; each change locks once")
   }
 
+  func testHDRMechanismMetadataSeparatesBalancedFallbackFromMergedHDR() {
+    let beforeBalancedAPI = CameraCapabilityQueries.hdrSupport(
+      supportsBalancedAPI: false, highResolutionFrameCapture: true, videoHDR: true)
+    XCTAssertEqual(beforeBalancedAPI["balancedPhotoProcessing"] as? Bool, false)
+    XCTAssertEqual(beforeBalancedAPI["balancedPhotoMayFallback"] as? Bool, false)
+    XCTAssertEqual(beforeBalancedAPI["video"] as? Bool, true)
+    let balanced = CameraCapabilityQueries.hdrSupport(
+      supportsBalancedAPI: true, highResolutionFrameCapture: true, videoHDR: false)
+    XCTAssertEqual(balanced["balancedPhotoProcessing"] as? Bool, true)
+    XCTAssertEqual(balanced["balancedPhotoMayFallback"] as? Bool, true)
+    XCTAssertEqual(balanced["exposureBracketing"] as? Bool, false)
+    XCTAssertTrue(balanced["pipelinePhoto"] is NSNull)
+    XCTAssertTrue(balanced["mergedPhoto"] is NSNull)
+    XCTAssertTrue(balanced["photo"] is NSNull)
+    let noHighResolution = CameraCapabilityQueries.hdrSupport(
+      supportsBalancedAPI: true, highResolutionFrameCapture: false, videoHDR: false)
+    XCTAssertEqual(noHighResolution["balancedPhotoProcessing"] as? Bool, false)
+  }
+
   // MARK: Shared contract
 
   static func contract() throws -> [String: Any] {

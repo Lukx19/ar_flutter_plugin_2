@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:ar_flutter_plugin_2/capabilities/ar_camera_capabilities.dart';
 import 'package:ar_flutter_plugin_2/datatypes/image_format.dart';
 import 'package:ar_flutter_plugin_2/models/ar_capture_config.dart';
@@ -80,6 +82,116 @@ void main() {
   tearDown(() {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, null);
+  });
+
+  test('capability report keeps hardware and pipeline evidence separate', () {
+    final profile = DeviceCameraCapabilityProfile.fromMap({
+      'capabilityReport': {
+        'schemaVersion': 1,
+        'deviceModel': 'iPhone13,3',
+        'platform': 'ios',
+        'hardwareFormats': {'jpeg': true, 'raw': null, 'heif': null},
+        'pipelineFormats': ['jpeg'],
+        'encoderFormats': ['jpeg', 'heif'],
+        'resolutionsByFormat': {
+          'jpeg': [
+            {'width': 4032, 'height': 3024},
+            {'width': 0, 'height': 1},
+          ]
+        },
+        'pipelineResolutionsByFormat': {'jpeg': []},
+        'depthSupport': {'lidar': true, 'rawDepth': false},
+        'controls': {'iso': true, 'focus': null},
+        'hdrSupport': {
+          'video': true,
+          'photo': null,
+          'pipelinePhoto': null,
+          'mergedPhoto': null,
+          'exposureBracketing': false,
+          'balancedPhotoProcessing': true,
+          'balancedPhotoMayFallback': true,
+        },
+      },
+    });
+    final report = profile.capabilityReport;
+    expect(report.deviceModel, 'iPhone13,3');
+    expect(report.hardwareFormats['raw'], isNull);
+    expect(report.pipelineFormats, ['jpeg']);
+    expect(report.encoderFormats, contains('heif'));
+    expect(report.resolutionsByFormat['jpeg'], [
+      const CameraResolution(width: 4032, height: 3024),
+    ]);
+    expect(report.pipelineResolutionsByFormat['jpeg'], isEmpty);
+    expect(report.depthSupport['lidar'], true);
+    expect(report.hdrSupport['photo'], isNull);
+    expect(report.hdrSupport['pipelinePhoto'], isNull);
+    expect(report.hdrSupport['balancedPhotoProcessing'], true);
+    expect(report.hdrSupport['balancedPhotoMayFallback'], true);
+    expect(report.evidence, 'advertised');
+    expect(profile.sharedCameraCapture, false);
+    expect(
+        DeviceCameraCapabilityProfile.fromMap({})
+            .capabilityReport
+            .schemaVersion,
+        0);
+  });
+
+  test('capability report JSON round trip retains geometry and unknown flags',
+      () {
+    final original = CameraCapabilityReport.fromMap({
+      'schemaVersion': 1,
+      'deviceModel': 'iPhone13,3',
+      'platform': 'ios',
+      'osVersion': '27.0.1',
+      'cameraId': 'arkit-primary',
+      'hardwareFormats': {'jpeg': true, 'raw': null, 'heif': null},
+      'pipelineFormats': ['jpeg'],
+      'encoderFormats': ['jpeg', 'heif'],
+      'resolutionsByFormat': {
+        'jpeg': [
+          {'width': 4032, 'height': 3024}
+        ],
+        'raw': [],
+      },
+      'pipelineResolutionsByFormat': {
+        'jpeg': [
+          {'width': 1920, 'height': 1440}
+        ],
+      },
+      'depthSupport': {'depthApi': true, 'lidar': true, 'rawDepth': false},
+      'controls': {'iso': true, 'focus': null, 'whiteBalance': false},
+      'hdrSupport': {
+        'video': true,
+        'photo': null,
+        'pipelinePhoto': null,
+        'mergedPhoto': null,
+        'exposureBracketing': false,
+        'balancedPhotoProcessing': true,
+        'balancedPhotoMayFallback': true,
+      },
+    });
+    final encoded = jsonEncode(original.toMap());
+    final restored = CameraCapabilityReport.fromMap(
+      Map<String, dynamic>.from(jsonDecode(encoded) as Map),
+    );
+    expect(restored.toMap(), original.toMap());
+    expect(restored.resolutionsByFormat['jpeg'], [
+      const CameraResolution(width: 4032, height: 3024),
+    ]);
+    expect(restored.pipelineResolutionsByFormat['jpeg'], [
+      const CameraResolution(width: 1920, height: 1440),
+    ]);
+    expect(restored.hardwareFormats.containsKey('raw'), true);
+    expect(restored.hardwareFormats['raw'], isNull);
+    expect(restored.controls.containsKey('focus'), true);
+    expect(restored.controls['focus'], isNull);
+    expect(restored.hdrSupport['pipelinePhoto'], isNull);
+    expect(restored.hdrSupport['mergedPhoto'], isNull);
+    expect(restored.hdrSupport['exposureBracketing'], false);
+    expect(restored.hdrSupport['balancedPhotoProcessing'], true);
+    expect(restored.hdrSupport['balancedPhotoMayFallback'], true);
+    expect(restored.evidence, 'advertised');
+    expect(restored.toMap()['schemaVersion'], 1);
   });
 
   test('queries and parses every native capability result', () async {

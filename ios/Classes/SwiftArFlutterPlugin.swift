@@ -123,7 +123,9 @@ private final class CameraCapabilitiesHandler: NSObject, FlutterPlugin {
       // During recorded playback Dart sends the playback creation parameters.
       result(ARCameraCapabilities.forQuery(call.arguments).channelMap)
     case "getDeviceCapabilityProfile":
-      result(profileStore().profile)
+      var profile = profileStore().profile
+      profile["capabilityReport"] = CameraCapabilityQueries.capabilityReport()
+      result(profile)
     case let method where CameraCapabilityQueries.handles(method):
       // Android-shaped queries answered from ARKit and its configurable camera.
       switch CameraCapabilityQueries.answer(method, arguments: call.arguments, snapshot: CameraCapabilityQueries.current()) {
