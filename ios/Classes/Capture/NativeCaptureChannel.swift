@@ -2,6 +2,7 @@ import ARKit
 import Flutter
 import Foundation
 import QuartzCore
+import UIKit
 import simd
 
 /// Registers native still capture with the plugin: the `arcapture_<id>`
@@ -108,6 +109,7 @@ final class NativeCaptureChannel: CaptureChannelExtension {
   private let openResources: () throws -> NativeCaptureRootResources
   private let controlDevice: () -> CameraControlDevice?
   private var controls: CameraControlBridge?
+  private let cameraAccess: StillCameraAccess
 
   /// [openResources] opens the durable root (tests pass a temporary one);
   /// [controlDevice] gives the AR session's configurable camera.
@@ -117,8 +119,27 @@ final class NativeCaptureChannel: CaptureChannelExtension {
        },
        controlDevice: @escaping () -> CameraControlDevice? = { ARKitCaptureControlDevice.primary() }) {
     self.context = context
+    self.cameraAccess = StillCameraAccess(running: context.frameSource.lifecycleState == .running)
     self.openResources = openResources
     self.controlDevice = controlDevice
+    cameraAccess.setRecoveryHandler { [weak self] in
+      guard let self = self, !self.disposed,
+            UIApplication.shared.applicationState == .active,
+            ARFrameSourceRegistry.shared.current === self.context.frameSource,
+            let source = self.context.frameSource as? CaptureSessionSource,
+            let resume = source.pauseForStillRecovery() else { return nil }
+      return { [weak self, weak source] in
+        // Capture-only close may precede AR-view close. The source's own
+        // revision/disposed checks preserve that ordering without resuming a
+        // replacement view or overriding a later explicit pause.
+        guard let self = self, let source = source,
+              UIApplication.shared.applicationState == .active,
+              ARFrameSourceRegistry.shared.current === source,
+              self.context.frameSource === source else { return }
+        resume()
+      }
+    }
+    context.frameSource.addFrameObserver(cameraAccess)
   }
 
   func captureViewWillDispose() {
@@ -126,8 +147,13 @@ final class NativeCaptureChannel: CaptureChannelExtension {
     disposed = true
     // The configurable camera is shared by the process: return it to auto
     // (torch off) so a later view or screen never inherits manual settings.
-    if let controls = controls {
-      do { try controls.reset() } catch { NSLog("capture3d camera controls: reset on dispose failed: %@", "\(error)") }
+    let closingControls = controls
+    let closingSource = context.frameSource
+    let closingAccess = cameraAccess
+    cameraAccess.close {
+      // Keep the source alive through its actual stop notification on dispose.
+      defer { closingSource.removeFrameObserver(closingAccess) }
+      do { try closingControls?.reset() } catch { NSLog("capture3d camera controls: reset on dispose failed: %@", "\(error)") }
     }
     controls = nil
     if let observer = pauseObserver { context.frameSource.removeFrameObserver(observer) }
@@ -262,7 +288,7 @@ final class NativeCaptureChannel: CaptureChannelExtension {
       exposure = existing
     } else {
       exposure = HighResolutionStillExposure(frameSource: { [weak frameSource] in frameSource },
-        jpegQuality: parsed.jpegQuality, exactStillResolution: exact)
+        jpegQuality: parsed.jpegQuality, exactStillResolution: exact, cameraAccess: cameraAccess)
       stills = exposure
     }
     exposure.format = parsed.format
@@ -356,7 +382,7 @@ final class NativeCaptureChannel: CaptureChannelExtension {
   /// `initializeCapture` (Android: `CAPTURE_NOT_INITIALIZED` before it).
   /// The AR session keeps running: controls only lock the capture device
   /// for configuration. A recorded playback has no camera to control.
-  private func cameraControl(_ method: String, _ arguments: [String: Any], _ result: FlutterResult) {
+  private func cameraControl(_ method: String, _ arguments: [String: Any], _ result: @escaping FlutterResult) {
     guard requireInitialized(result) != nil else { return }
     if context.frameSource.replaysRecordedStills {
       return result(CameraControlMethods.unavailable(method, reason: "a recorded session replays; it has no camera to control"))
@@ -365,14 +391,17 @@ final class NativeCaptureChannel: CaptureChannelExtension {
     guard let controls = controls else {
       return result(CameraControlMethods.unavailable(method, reason: "ARKit offers no configurable camera on this device"))
     }
-    do {
-      let value = try controls.handle(method, arguments)
-      result(Self.channelValue(value))
-    } catch let error as CameraControlError {
-      result(CameraControlMethods.error(error))
-    } catch {
-      result(FlutterError(code: CameraControlError.updateFailedCode, message: "\(error)", details: nil))
-    }
+    cameraAccess.configure({
+      let reply: Any
+      do { reply = Self.channelValue(try controls.handle(method, arguments)) }
+      catch let error as CameraControlError { reply = CameraControlMethods.error(error) }
+      catch { reply = FlutterError(code: CameraControlError.updateFailedCode, message: "\(error)", details: nil) }
+      DispatchQueue.main.async { result(reply) }
+    }, unavailable: {
+      DispatchQueue.main.async {
+        result(FlutterError(code: CameraControlError.updateFailedCode, message: "The camera stopped or closed before the control applied", details: nil))
+      }
+    })
   }
 
   /// Optional map values become NSNull, as the Android codec sends null.
@@ -438,11 +467,11 @@ final class NativeCaptureChannel: CaptureChannelExtension {
       }
     }
     if format == "heif" {
-      return encodingProbe.capture(source: context.frameSource, format: format, quality: Int(quality), completion: finish)
+      return encodingProbe.capture(source: context.frameSource, format: format, quality: Int(quality), cameraAccess: cameraAccess, completion: finish)
     }
     let source = context.frameSource
     let exposure = HighResolutionStillExposure(frameSource: { [weak source] in source }, jpegQuality: Int(quality),
-      requireRequestedQuality: true)
+      requireRequestedQuality: true, cameraAccess: cameraAccess)
     profileExposure = exposure
     let burst = mode == .burst ? (stills?.burst ?? BurstSettings()) : BurstSettings(imageCount: 1, intervalMs: 0)
     let shotMode: StillShotMode = mode == .burst ? .burst : (mode == .inArQuality ? .quality : .single)

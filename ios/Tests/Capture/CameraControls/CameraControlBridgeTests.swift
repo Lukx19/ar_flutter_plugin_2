@@ -33,6 +33,8 @@ final class FakeCameraControlDevice: CameraControlDevice {
   var isTorchAvailable = true
   var isTorchOn = false
 
+  /// Interleave another owner before the physical configuration lock is acquired.
+  var beforeConfiguration: (() -> Void)?
   var configurationFails = false
   private(set) var configurations = 0
   private(set) var locked = false
@@ -42,6 +44,7 @@ final class FakeCameraControlDevice: CameraControlDevice {
   private(set) var violations: [String] = []
 
   func configure(_ change: () throws -> Void) throws {
+    beforeConfiguration?()
     if configurationFails { throw NSError(domain: "AVFoundationErrorDomain", code: -11800) }
     locked = true
     defer { locked = false }
@@ -176,6 +179,26 @@ final class CameraControlBridgeTests: XCTestCase {
     XCTAssertEqual(device.configurations, 0, "nothing on the device changes")
     try bridge.reset()
     XCTAssertFalse(device.isTorchOn)
+  }
+
+  func testRetiredControlCannotMutateReplacementSettingsAfterWaitingForConfiguration() throws {
+    var replacement: CameraControlBridge?
+    device.beforeConfiguration = {
+      // The old setter reached configuration first but had not acquired the
+      // device lock. A replacement can claim and configure before it resumes.
+      self.device.beforeConfiguration = nil
+      let next = CameraControlBridge(device: self.device)
+      replacement = next
+      do {
+        _ = try next.handle("setISO", ["isoValue": 600])
+        _ = try next.handle("setTorchEnabled", ["enabled": true])
+      } catch { XCTFail("replacement could not configure: \(error)") }
+    }
+    assertCode(CameraControlError.updateFailedCode, "setISO", ["isoValue": 200])
+    XCTAssertNotNil(replacement)
+    XCTAssertEqual(device.iso, 600, "retired setter must fail instead of overwriting the replacement ISO")
+    XCTAssertTrue(device.isTorchOn)
+    XCTAssertEqual(device.exposureMode, .custom)
   }
 
   func testResetReturnsTheSharedCameraToAutoWithTheTorchOff() throws {

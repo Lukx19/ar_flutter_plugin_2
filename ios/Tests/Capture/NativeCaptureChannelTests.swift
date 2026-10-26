@@ -91,8 +91,10 @@ final class NativeCaptureChannelTests: XCTestCase {
     let unsupported = call(channel, "setFlashMode", ["mode": "on"]) as? FlutterError
     XCTAssertEqual(unsupported?.code, "CONTROL_UNSUPPORTED")
     XCTAssertEqual(source.lifecycleState, .running, "controls never pause the AR session")
-    // Closing the view returns the shared camera to auto with the torch off.
+    // Closing resets on the camera worker after outstanding camera work.
     channel.captureViewWillDispose()
+    let reset = expectation(for: NSPredicate { _, _ in !device.isTorchOn && device.exposureMode == .auto }, evaluatedWith: nil)
+    wait(for: [reset], timeout: 5)
     XCTAssertFalse(device.isTorchOn)
     XCTAssertEqual(device.exposureMode, .auto)
     XCTAssertTrue(device.isWhiteBalanceAuto)
@@ -109,6 +111,278 @@ final class NativeCaptureChannelTests: XCTestCase {
     defer { replay.captureViewWillDispose() }
     XCTAssertFalse(call(replay, "initializeCapture", configuration(mode: "single", maxCacheSize: 2)) is FlutterError)
     XCTAssertEqual((call(replay, "getSupportedISORange", nil) as? FlutterError)?.code, "CONTROL_UNSUPPORTED")
+  }
+
+  /// A funded shutter owns the camera until its asynchronous frame returns.
+  /// ISO/brightness edits arriving meanwhile must preserve that still and the
+  /// next admission instead of configuring the same device concurrently.
+  func testCameraControlsWaitForOutstandingDurableStillThenNextCaptureCommits() throws {
+    let source = StillFrameSource()
+    let device = FakeCameraControlDevice()
+    let files = appFiles!
+    let messenger = SilentMessenger()
+    let exposed = expectation(description: "physical still requested")
+    var deliverFrame: ((CaptureFrame?, Error?) -> Void)?
+    source.interceptStill = { callback in
+      deliverFrame = callback
+      exposed.fulfill()
+    }
+    let channel = NativeCaptureChannel(
+      context: CaptureChannelContext(
+        viewId: 20, channel: FlutterMethodChannel(name: "arcapture_20", binaryMessenger: messenger),
+        frameSource: source),
+      openResources: { try NativeCaptureBinding.productionResources(appFiles: files) },
+      controlDevice: { device })
+    defer { channel.captureViewWillDispose() }
+    XCTAssertFalse(call(channel, "initializeCapture", configuration(mode: "single", maxCacheSize: 2)) is FlutterError)
+    let first = CaptureFixture.request()
+    XCTAssertFalse(call(channel, "admitNativeCaptureV2", CaptureFixture.admissionMap(first)) is FlutterError)
+    wait(for: [exposed], timeout: 5)
+
+    let isoReply = expectation(description: "ISO edit replied")
+    var controlReplyCount = 0
+    XCTAssertTrue(channel.handleCaptureCall(FlutterMethodCall(methodName: "setISO", arguments: ["isoValue": 200])) { value in
+      XCTAssertFalse(value is FlutterError)
+      controlReplyCount += 1
+      isoReply.fulfill()
+    })
+    let mainTurn = expectation(description: "control delivery turn")
+    DispatchQueue.main.async { mainTurn.fulfill() }
+    wait(for: [mainTurn], timeout: 5)
+    XCTAssertEqual(device.iso, 100, "ISO cannot mutate while ARKit owns an outstanding still")
+    XCTAssertEqual(controlReplyCount, 0, "control result follows the actual camera change")
+
+    let firstCommitted = expectation(description: "first durable photo committed")
+    let committed = expectation(description: "both durable photos committed")
+    committed.expectedFulfillmentCount = 2
+    var committedCount = 0
+    messenger.onEvent = { event in
+      if event["kind"] as? String == "committed" {
+        committedCount += 1
+        if committedCount == 1 { firstCommitted.fulfill() }
+        committed.fulfill()
+      }
+    }
+    source.interceptStill = nil
+    let frame = ShotFixture.frame(timestamp: ProcessInfo.processInfo.systemUptime, pose: ShotFixture.pose())
+    source.frames = [frame]
+    try XCTUnwrap(deliverFrame)(frame, nil)
+    wait(for: [isoReply, firstCommitted], timeout: 5)
+    XCTAssertEqual(device.iso, 200)
+    let second = CaptureFixture.request(attemptId: "6f1c2d3e-0000-4000-8000-000000000002", commitId: "commit-2", ordinal: 2)
+    XCTAssertFalse(call(channel, "admitNativeCaptureV2", CaptureFixture.admissionMap(second)) is FlutterError)
+    wait(for: [committed], timeout: 10)
+    XCTAssertEqual(controlReplyCount, 1)
+  }
+
+  func testStoppedCameraSettlesPendingStillOnceAndIgnoresLateFrame() throws {
+    let source = StillFrameSource()
+    let files = appFiles!
+    let device = FakeCameraControlDevice()
+    let channel = NativeCaptureChannel(
+      context: CaptureChannelContext(
+        viewId: 21, channel: FlutterMethodChannel(name: "arcapture_21", binaryMessenger: SilentMessenger()),
+        frameSource: source),
+      openResources: { try NativeCaptureBinding.productionResources(appFiles: files) }, controlDevice: { device })
+    defer { channel.captureViewWillDispose() }
+    XCTAssertFalse(call(channel, "initializeCapture", configuration(mode: "single", maxCacheSize: 2)) is FlutterError)
+    let exposed = expectation(description: "frame outstanding")
+    var lateFrame: ((CaptureFrame?, Error?) -> Void)?
+    source.interceptStill = { callback in lateFrame = callback; exposed.fulfill() }
+    source.currentFrame = ShotFixture.frame(timestamp: ProcessInfo.processInfo.systemUptime, pose: ShotFixture.pose())
+    let replied = expectation(description: "stopped camera resolves shutter")
+    var replies = 0
+    XCTAssertTrue(channel.handleCaptureCall(FlutterMethodCall(methodName: "captureHighResImage", arguments: nil)) { value in
+      replies += 1
+      XCTAssertTrue(value is FlutterError)
+      replied.fulfill()
+    })
+    wait(for: [exposed], timeout: 5)
+    let controlRefused = expectation(description: "queued control fails when camera stops")
+    XCTAssertTrue(channel.handleCaptureCall(FlutterMethodCall(methodName: "setISO", arguments: ["isoValue": 200])) { value in
+      XCTAssertEqual((value as? FlutterError)?.code, CameraControlError.updateFailedCode)
+      controlRefused.fulfill()
+    })
+    source.stopCamera()
+    wait(for: [replied, controlRefused], timeout: 1)
+    XCTAssertEqual(device.iso, 100, "an unapplied control must not report success")
+    let frame = ShotFixture.frame(timestamp: ProcessInfo.processInfo.systemUptime, pose: ShotFixture.pose())
+    try XCTUnwrap(lateFrame)(frame, nil)
+    let drained = expectation(description: "late callback drained")
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { drained.fulfill() }
+    wait(for: [drained], timeout: 5)
+    XCTAssertEqual(replies, 1, "late frame cannot finish the old shutter again")
+    let capacity = try XCTUnwrap(call(channel, "getCaptureCapacity", nil) as? [String: Any])
+    XCTAssertEqual(capacity["usedEntries"] as? Int, 0, "late frame cannot stage an image after stop")
+    source.interceptStill = nil
+    source.frames = [frame]
+    source.resumeCamera()
+    _ = try stage(channel)
+    let resumed = try XCTUnwrap(call(channel, "getCaptureCapacity", nil) as? [String: Any])
+    XCTAssertEqual(resumed["usedEntries"] as? Int, 1, "actual source resume allows the next capture")
+    XCTAssertEqual(replies, 1)
+  }
+
+  func testDisposeResolvesPendingStillAndQueuedControlWithoutLatePublication() throws {
+    let source = StillFrameSource()
+    let device = FakeCameraControlDevice()
+    let files = appFiles!
+    let channel = NativeCaptureChannel(
+      context: CaptureChannelContext(
+        viewId: 22, channel: FlutterMethodChannel(name: "arcapture_22", binaryMessenger: SilentMessenger()), frameSource: source),
+      openResources: { try NativeCaptureBinding.productionResources(appFiles: files) }, controlDevice: { device })
+    XCTAssertFalse(call(channel, "initializeCapture", configuration(mode: "single", maxCacheSize: 2)) is FlutterError)
+    let frame = ShotFixture.frame(timestamp: ProcessInfo.processInfo.systemUptime, pose: ShotFixture.pose())
+    source.currentFrame = frame
+    let requested = expectation(description: "physical request outstanding")
+    var lateFrame: ((CaptureFrame?, Error?) -> Void)?
+    source.interceptStill = { callback in lateFrame = callback; requested.fulfill() }
+    let stopped = expectation(description: "disposed capture resolves")
+    var replies = 0
+    XCTAssertTrue(channel.handleCaptureCall(FlutterMethodCall(methodName: "captureHighResImage", arguments: nil)) { value in
+      replies += 1
+      XCTAssertTrue(value is FlutterError)
+      stopped.fulfill()
+    })
+    wait(for: [requested], timeout: 2)
+    let refused = expectation(description: "disposed queued control resolves")
+    XCTAssertTrue(channel.handleCaptureCall(FlutterMethodCall(methodName: "setISO", arguments: ["isoValue": 200])) { value in
+      XCTAssertEqual((value as? FlutterError)?.code, CameraControlError.updateFailedCode)
+      refused.fulfill()
+    })
+    channel.captureViewWillDispose()
+    wait(for: [stopped, refused], timeout: 2)
+    source.stopCamera()
+    try XCTUnwrap(lateFrame)(frame, nil)
+    let lateDrained = expectation(description: "late disposed frame ignored")
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { lateDrained.fulfill() }
+    wait(for: [lateDrained], timeout: 2)
+    XCTAssertEqual(replies, 1)
+    XCTAssertEqual(device.iso, 100)
+  }
+
+  func testInitiallyPausedCameraRejectsCaptureAndControlUntilActualResume() throws {
+    let source = StillFrameSource()
+    source.lifecycleState = .paused
+    source.currentFrame = ShotFixture.frame(timestamp: ProcessInfo.processInfo.systemUptime, pose: ShotFixture.pose())
+    let device = FakeCameraControlDevice()
+    let files = appFiles!
+    let channel = NativeCaptureChannel(
+      context: CaptureChannelContext(
+        viewId: 23, channel: FlutterMethodChannel(name: "arcapture_23", binaryMessenger: SilentMessenger()), frameSource: source),
+      openResources: { try NativeCaptureBinding.productionResources(appFiles: files) }, controlDevice: { device })
+    defer { channel.captureViewWillDispose() }
+    XCTAssertFalse(call(channel, "initializeCapture", configuration(mode: "single", maxCacheSize: 2)) is FlutterError)
+    XCTAssertTrue(call(channel, "captureHighResImage", ["requiresPose": true]) is FlutterError)
+    XCTAssertEqual((call(channel, "setISO", ["isoValue": 200]) as? FlutterError)?.code, CameraControlError.updateFailedCode)
+    XCTAssertEqual(device.iso, 100)
+    XCTAssertEqual(source.qualities.count, 0, "a source paused before observer registration cannot own a physical still")
+    source.frames = [ShotFixture.frame(timestamp: ProcessInfo.processInfo.systemUptime, pose: ShotFixture.pose())]
+    source.resumeCamera()
+    _ = try stage(channel)
+    XCTAssertEqual(source.qualities.count, 1, "only actual source resume authorizes capture")
+  }
+
+  func testLateDisposedOwnerResetCannotOverwriteReplacementCameraControls() throws {
+    let device = FakeCameraControlDevice()
+    let oldSource = StillFrameSource()
+    let files = appFiles!
+    let old = NativeCaptureChannel(
+      context: CaptureChannelContext(
+        viewId: 24, channel: FlutterMethodChannel(name: "arcapture_24", binaryMessenger: SilentMessenger()), frameSource: oldSource),
+      openResources: { try NativeCaptureBinding.productionResources(appFiles: files) }, controlDevice: { device })
+    defer { old.captureViewWillDispose() }
+    XCTAssertFalse(call(old, "initializeCapture", configuration(mode: "single", maxCacheSize: 2)) is FlutterError)
+    XCTAssertFalse(call(old, "setISO", ["isoValue": 400]) is FlutterError)
+    let requested = expectation(description: "old physical frame pending")
+    var lateFrame: ((CaptureFrame?, Error?) -> Void)?
+    oldSource.interceptStill = { callback in lateFrame = callback; requested.fulfill() }
+    XCTAssertFalse(call(old, "admitNativeCaptureV2", CaptureFixture.admissionMap(CaptureFixture.request())) is FlutterError)
+    wait(for: [requested], timeout: 2)
+
+    // Dart awaits capture dispose before disposing the AR view. Capture-only
+    // disposal must acknowledge without pausing AR or waiting for its frame.
+    XCTAssertNil(call(old, "dispose", nil))
+    XCTAssertEqual(oldSource.lifecycleState, .running)
+    // The view has paused the driver, but its delegate-queue stop notification
+    // can reach the old camera gate after the replacement applies controls.
+    oldSource.lifecycleState = .paused
+    let replacementSource = StillFrameSource()
+    let replacement = NativeCaptureChannel(
+      context: CaptureChannelContext(
+        viewId: 25, channel: FlutterMethodChannel(name: "arcapture_25", binaryMessenger: SilentMessenger()), frameSource: replacementSource),
+      openResources: { try NativeCaptureBinding.productionResources(appFiles: files.appendingPathComponent("replacement")) },
+      controlDevice: { device })
+    defer { replacement.captureViewWillDispose() }
+    XCTAssertFalse(call(replacement, "initializeCapture", configuration(mode: "single", maxCacheSize: 2)) is FlutterError)
+    XCTAssertFalse(call(replacement, "setISO", ["isoValue": 600]) is FlutterError)
+    XCTAssertEqual(call(replacement, "setTorchEnabled", ["enabled": true]) as? Bool, true)
+    XCTAssertEqual(device.exposureMode, .custom)
+
+    let oldCleanup = expectation(for: NSPredicate { _, _ in oldSource.observerCount == 0 }, evaluatedWith: nil)
+    oldSource.stopCamera()
+    wait(for: [oldCleanup], timeout: 2)
+    XCTAssertEqual(device.iso, 600)
+    XCTAssertEqual(device.exposureMode, .custom, "late old reset must not return replacement exposure to Auto")
+    XCTAssertTrue(device.isTorchOn, "late old reset must not switch off replacement torch")
+    let frame = ShotFixture.frame(timestamp: ProcessInfo.processInfo.systemUptime, pose: ShotFixture.pose())
+    try XCTUnwrap(lateFrame)(frame, nil)
+  }
+
+  func testMissingFrameWatchdogPausesActualSourceAndWaitsForStopBeforeRecovery() throws {
+    let source = StillFrameSource()
+    source.deliverStopOnPause = false
+    let previous = ARFrameSourceRegistry.shared.current
+    ARFrameSourceRegistry.shared.publish(source)
+    defer { ARFrameSourceRegistry.shared.publish(previous) }
+    let device = FakeCameraControlDevice()
+    let files = appFiles!
+    let channel = NativeCaptureChannel(
+      context: CaptureChannelContext(
+        viewId: 26, channel: FlutterMethodChannel(name: "arcapture_26", binaryMessenger: SilentMessenger()), frameSource: source),
+      openResources: { try NativeCaptureBinding.productionResources(appFiles: files) }, controlDevice: { device })
+    defer { channel.captureViewWillDispose() }
+    XCTAssertFalse(call(channel, "initializeCapture", configuration(mode: "single", maxCacheSize: 2)) is FlutterError)
+    source.currentFrame = ShotFixture.frame(timestamp: ProcessInfo.processInfo.systemUptime, pose: ShotFixture.pose())
+    let requested = expectation(description: "physical frame callback missing")
+    var lateFrame: ((CaptureFrame?, Error?) -> Void)?
+    source.interceptStill = { callback in lateFrame = callback; requested.fulfill() }
+    let captureEnded = expectation(description: "capture fails after actual stop")
+    var captureReplies = 0
+    XCTAssertTrue(channel.handleCaptureCall(FlutterMethodCall(methodName: "captureHighResImage", arguments: nil)) { result in
+      captureReplies += 1
+      XCTAssertTrue(result is FlutterError)
+      captureEnded.fulfill()
+    })
+    wait(for: [requested], timeout: 2)
+    let controlEnded = expectation(description: "queued control truthfully fails")
+    var controlReplies = 0
+    XCTAssertTrue(channel.handleCaptureCall(FlutterMethodCall(methodName: "setISO", arguments: ["isoValue": 200])) { result in
+      controlReplies += 1
+      XCTAssertEqual((result as? FlutterError)?.code, CameraControlError.updateFailedCode)
+      controlEnded.fulfill()
+    })
+    let paused = expectation(description: "watchdog requests actual source pause")
+    source.onPause = { XCTAssertTrue(Thread.isMainThread); paused.fulfill() }
+    wait(for: [paused], timeout: 12)
+    XCTAssertEqual(source.pauseCalls, 1)
+    XCTAssertEqual(captureReplies, 0, "time expiry alone cannot release physical camera ownership")
+    XCTAssertEqual(controlReplies, 0, "controls remain blocked until actual stop acknowledgement")
+    let resumed = expectation(description: "same source resumes after observed stop")
+    source.onResume = { XCTAssertTrue(Thread.isMainThread); resumed.fulfill() }
+    source.stopCamera()
+    wait(for: [captureEnded, controlEnded, resumed], timeout: 2)
+    XCTAssertEqual(source.resumeCalls, 1)
+    if source.resumeCalls == 0 { source.resumeCamera() } // bounded baseline cleanup
+    source.interceptStill = nil
+    let frame = ShotFixture.frame(timestamp: ProcessInfo.processInfo.systemUptime, pose: ShotFixture.pose())
+    source.currentFrame = frame
+    source.frames = [frame]
+    _ = try stage(channel)
+    try XCTUnwrap(lateFrame)(frame, nil)
+    let state = call(channel, "getCaptureCapacity", nil) as? [String: Any]
+    XCTAssertEqual(state?["usedEntries"] as? Int, 1, "late pre-recovery frame cannot publish another image")
+    XCTAssertEqual(captureReplies, 1)
   }
 
   private func configuration(mode: String, maxCacheSize: Int) -> [String: Any] {

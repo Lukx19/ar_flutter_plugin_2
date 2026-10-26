@@ -157,6 +157,59 @@ final class ARSessionHostTests: XCTestCase {
     host.dispose()
   }
 
+  func testSessionFailureStopsCameraBeforeNotifyingClient() {
+    let driver = FakeSessionDriver()
+    let host = makeHost(driver)
+    let observer = RecordingObserver()
+    host.addFrameObserver(observer)
+    host.start()
+    let failed = expectation(description: "session failure delivered")
+    host.onSessionFailure = { _ in
+      XCTAssertEqual(host.lifecycleState, .paused, "failed camera must stop owning requests before UI recovery")
+      XCTAssertEqual(driver.calls, [.run(resetTracking: true), .pause])
+      failed.fulfill()
+    }
+    host.session(host.session, didFailWithError: ARError(.sensorFailed))
+    wait(for: [failed], timeout: 2)
+    host.delegateQueue.sync {}
+    XCTAssertEqual(observer.events, ["start 1", "stop"], "pending still owner receives actual camera stop")
+    host.dispose()
+  }
+
+  func testStillRecoveryResumeRejectsInterveningPauseAndReplacement() throws {
+    let registry = ARFrameSourceRegistry()
+    let driver = FakeSessionDriver()
+    let host = makeHost(driver, registry: registry)
+    host.start()
+    let resumeAfterPause = try XCTUnwrap(host.pauseForStillRecovery())
+    host.delegateQueue.sync {}
+    host.pause() // An explicit pause, even when already paused, owns intent.
+    resumeAfterPause()
+    XCTAssertEqual(host.lifecycleState, .paused)
+    XCTAssertEqual(driver.calls, [.run(resetTracking: true), .pause])
+    host.resume()
+    let resumeAfterReplacement = try XCTUnwrap(host.pauseForStillRecovery())
+    host.delegateQueue.sync {}
+    let replacementDriver = FakeSessionDriver()
+    let replacement = makeHost(replacementDriver, registry: registry)
+    resumeAfterReplacement()
+    XCTAssertEqual(host.lifecycleState, .paused)
+    XCTAssertEqual(driver.calls, [.run(resetTracking: true), .pause, .run(resetTracking: false), .pause])
+    XCTAssertTrue(replacementDriver.calls.isEmpty)
+    host.dispose()
+    replacement.dispose()
+  }
+
+  func testStillRecoveryDeclinesIdleInterruptedAndDisposedSources() {
+    let host = makeHost(FakeSessionDriver())
+    XCTAssertNil(host.pauseForStillRecovery())
+    host.start()
+    host.sessionWasInterrupted(host.session)
+    XCTAssertNil(host.pauseForStillRecovery())
+    host.dispose()
+    XCTAssertNil(host.pauseForStillRecovery())
+  }
+
   func testControlCallsDriveTheSessionOnce() {
     let driver = FakeSessionDriver()
     let host = makeHost(driver)

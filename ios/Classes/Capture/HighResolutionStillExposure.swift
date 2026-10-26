@@ -134,6 +134,7 @@ final class HighResolutionStillExposure: StillExposurePort {
   static let maximumFallbackFrameAge: TimeInterval = 0.5
 
   private let frameSource: () -> ARFrameSource?
+  private let cameraAccess: StillCameraAccess?
   private let requireRequestedQuality: Bool
   /// Immutable geometry selected by the owning AR session, not a cache hint.
   let exactStillResolution: CGSize?
@@ -146,16 +147,25 @@ final class HighResolutionStillExposure: StillExposurePort {
   private let deviceModel: String
   private let encodeQueue = DispatchQueue(label: "capture3d.still-encode", qos: .userInitiated)
   private let lock = NSLock()
-  private var cancelled: [CaptureAttemptQualifier] = []
+  /// Each camera request retains its own monotonic cancellation until its
+  /// callback. A bounded history can forget a queued request before ARKit runs it.
+  private final class Cancellation {
+    private let lock = NSLock()
+    private var cancelled = false
+    func cancel() { lock.lock(); cancelled = true; lock.unlock() }
+    var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return cancelled }
+  }
+  private var cancellations: [CaptureAttemptQualifier: Cancellation] = [:]
   private var counters = Counters()
 
   init(frameSource: @escaping () -> ARFrameSource?, jpegQuality: Int, requireRequestedQuality: Bool = false,
-       exactStillResolution: CGSize? = nil,
+       exactStillResolution: CGSize? = nil, cameraAccess: StillCameraAccess? = nil,
        deviceModel: String = ARCameraCapabilities.hardwareModelIdentifier(),
        // The shared coordinator confirms quality-qualified retained images.
        // Tests may still observe physical exposure callbacks independently.
        shutterFeedback: @escaping () -> Void = {}) {
     self.frameSource = frameSource
+    self.cameraAccess = cameraAccess
     self.requireRequestedQuality = requireRequestedQuality
     self.exactStillResolution = exactStillResolution
     self.shutterFeedback = shutterFeedback
@@ -203,38 +213,55 @@ final class HighResolutionStillExposure: StillExposurePort {
                        callback: @escaping (StillExposureOutcome) -> Void) -> Bool {
     guard required == (format == "heic" ? [.heic] : [.jpeg]) else { return false }
     let mode = lane == .manual ? self.mode : .single
-    let isCancelled: () -> Bool = { [weak self] in self?.isCancelled(qualifier) ?? true }
     if mode == .burst || mode == .inArQuality {
-      guard format == "jpeg" else { return false }
-      guard frameSource() != nil else { return false }
+      guard format == "jpeg", frameSource() != nil else { return false }
+    }
+    let cancellation = Cancellation()
+    lock.lock()
+    guard cancellations[qualifier] == nil else { lock.unlock(); return false }
+    cancellations[qualifier] = cancellation
+    lock.unlock()
+    let isCancelled: () -> Bool = { cancellation.isCancelled }
+    let finish: (StillExposureOutcome) -> Void = { [weak self] outcome in
+      self?.forgetCancellation(qualifier, owner: cancellation)
+      callback(outcome)
+    }
+    if mode == .burst || mode == .inArQuality {
       let settings = mode == .burst ? burst : BurstSettings(imageCount: 1, intervalMs: 0)
       captureShot(mode: mode == .burst ? .burst : .quality, settings: settings, isCancelled: isCancelled) { result in
         switch result {
         case .success(let shot):
-          callback(StillImageQualityGate.outcome(for: StillComponentSet(
+          finish(StillImageQualityGate.outcome(for: StillComponentSet(
             qualifier: qualifier, components: [(.jpeg, shot.first.jpeg)], metadata: shot.first.metadata, shot: shot)))
         case .failure(let failure):
-          callback(.failure(qualifier, failure.reason))
+          finish(.failure(qualifier, failure.reason))
         }
       }
       return true
     }
-    return captureStill(quality: .fast, isCancelled: isCancelled) { result in
+    let requested = captureStill(quality: .fast, isCancelled: isCancelled) { result in
       switch result {
       case .success(let still):
-        callback(StillImageQualityGate.outcome(for: StillComponentSet(
+        finish(StillImageQualityGate.outcome(for: StillComponentSet(
           qualifier: qualifier, components: [(still.format == "heic" ? .heic : .jpeg, [UInt8](still.bytes))], metadata: still.metadata)))
       case .failure(let failure):
-        callback(.failure(qualifier, failure.reason))
+        finish(.failure(qualifier, failure.reason))
       }
     }
+    if !requested { forgetCancellation(qualifier, owner: cancellation) }
+    return requested
   }
 
   func cancelExposure(_ qualifier: CaptureAttemptQualifier) {
     lock.lock()
-    if !cancelled.contains(qualifier) { cancelled.append(qualifier) }
-    if cancelled.count > 16 { cancelled.removeFirst(cancelled.count - 16) }
+    let cancellation = cancellations.removeValue(forKey: qualifier)
     lock.unlock()
+    cancellation?.cancel()
+  }
+
+  private func forgetCancellation(_ qualifier: CaptureAttemptQualifier, owner: Cancellation) {
+    lock.lock(); defer { lock.unlock() }
+    if cancellations[qualifier] === owner { cancellations.removeValue(forKey: qualifier) }
   }
 
   /// One encoded still. Returns false when no frame source is available;
@@ -247,6 +274,9 @@ final class HighResolutionStillExposure: StillExposurePort {
     let receive: (CaptureFrame?, Error?) -> Void = { [weak self, weak source] frame, error in
       guard let self = self else { return completion(.failure(StillCaptureFailure(reason: "closed"))) }
       if isCancelled() { return completion(.failure(StillCaptureFailure(reason: "cancelled"))) }
+      // A stopped/closed owner is a lifecycle result, never permission to
+      // substitute a still from a fresh-looking pre-stop video frame.
+      if let failure = error as? StillCaptureFailure { return completion(.failure(failure)) }
       if let frame = frame {
         if let exact = self.exactStillResolution,
            (CVPixelBufferGetWidth(frame.capturedImage) != Int(exact.width)
@@ -271,11 +301,16 @@ final class HighResolutionStillExposure: StillExposurePort {
         completion(.failure(StillCaptureFailure(reason: "high-resolution-frame-unavailable")))
       }
     }
-    if requireRequestedQuality {
-      source.captureHighResolutionFrameForProfile(quality: quality, completion: receive)
-    } else {
-      source.captureHighResolutionFrame(quality: quality, completion: receive)
+    let request: (@escaping StillCameraAccess.FrameCompletion) -> Void = { completion in
+      guard !isCancelled() else { return completion(nil, StillCaptureFailure(reason: "cancelled")) }
+      if self.requireRequestedQuality {
+        source.captureHighResolutionFrameForProfile(quality: quality, completion: completion)
+      } else {
+        source.captureHighResolutionFrame(quality: quality, completion: completion)
+      }
     }
+    if let cameraAccess = cameraAccess { cameraAccess.capture(request, completion: receive) }
+    else { request(receive) }
     return true
   }
 
@@ -374,11 +409,6 @@ final class HighResolutionStillExposure: StillExposurePort {
       }
     }
     burstQueue.async { next() }
-  }
-
-  private func isCancelled(_ qualifier: CaptureAttemptQualifier) -> Bool {
-    lock.lock(); defer { lock.unlock() }
-    return cancelled.contains(qualifier)
   }
 
   private func record(_ update: (inout Counters) -> Void) {

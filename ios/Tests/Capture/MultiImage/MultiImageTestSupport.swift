@@ -73,7 +73,7 @@ enum ShotFixture {
 /// Frame source fake: answers each still request with the next queued frame
 /// (or the last one again) and records the requested quality. It has no
 /// pause: shots never stop the session.
-final class StillFrameSource: ARFrameSource {
+final class StillFrameSource: CaptureSessionSource {
   var anchorHost: CaptureAnchorHost { anchors }
   private var storedCurrentFrame: CaptureFrame?
   /// A live session keeps advancing its video frame while durable admission runs.
@@ -84,20 +84,61 @@ final class StillFrameSource: ARFrameSource {
     set { storedCurrentFrame = newValue }
   }
   var runConfiguration: CaptureRunConfiguration? { CaptureRunConfiguration(depth: .none) }
-  var lifecycleState: ARSessionLifecycleState { .running }
+  var lifecycleState: ARSessionLifecycleState = .running
+  var onSessionFailure: ((Error) -> Void)?
+  var deliverStopOnPause = true
+  var onPause: (() -> Void)?
+  var onResume: (() -> Void)?
+  private var controlRevision: UInt64 = 0
+  private(set) var pauseCalls = 0
+  private(set) var resumeCalls = 0
+  func start() { controlRevision &+= 1; resumeCamera() }
+  func initialize() { controlRevision &+= 1 }
+  func pause() {
+    controlRevision &+= 1
+    pauseCalls += 1
+    lifecycleState = .paused
+    onPause?()
+    if deliverStopOnPause { stopCamera() }
+  }
+  func resume() { controlRevision &+= 1; resumeCalls += 1; resumeCamera(); onResume?() }
+  func pauseForStillRecovery() -> (() -> Void)? {
+    guard lifecycleState == .running else { return nil }
+    pause()
+    let revision = controlRevision
+    return { [weak self] in
+      guard let self = self, self.lifecycleState == .paused, self.controlRevision == revision else { return }
+      self.resume()
+    }
+  }
+  func restart() { controlRevision &+= 1; resumeCamera() }
+  func dispose() { controlRevision &+= 1; stopCamera(); lifecycleState = .disposed }
+
   var deliversSceneDepth: Bool { false }
   var depthOutputSize: ARDepthOutputSize { .standard }
   var epoch: Int { 1 }
   var replaysRecordedStills = false
   var exactStillResolution: CGSize?
   var frames: [CaptureFrame] = []
+  /// Holds a real frame request at the asynchronous camera boundary.
+  var interceptStill: ((@escaping (CaptureFrame?, Error?) -> Void) -> Void)?
   private(set) var qualities: [StillFrameQuality] = []
   private(set) var requestTimes: [TimeInterval] = []
   private let anchors = RecordedAnchorStore()
   private let lock = NSLock()
 
-  func addFrameObserver(_ observer: ARFrameObserver) {}
-  func removeFrameObserver(_ observer: ARFrameObserver) {}
+  private var observers: [ARFrameObserver] = []
+  var observerCount: Int { lock.lock(); defer { lock.unlock() }; return observers.count }
+  func addFrameObserver(_ observer: ARFrameObserver) { lock.lock(); observers.append(observer); lock.unlock() }
+  func removeFrameObserver(_ observer: ARFrameObserver) {
+    lock.lock(); observers.removeAll { $0 === observer }; lock.unlock()
+  }
+  private func observerSnapshot() -> [ARFrameObserver] { lock.lock(); defer { lock.unlock() }; return observers }
+  func stopCamera() { lifecycleState = .paused; observerSnapshot().forEach { $0.frameSourceDidStop(self) } }
+  func resumeCamera() {
+    lifecycleState = .running
+    observerSnapshot().forEach { $0.frameSource(self, didStart: CaptureRunConfiguration(depth: .none), epoch: 1) }
+  }
   func getCurrentWorldMap(completion: @escaping (ARWorldMap?, Error?) -> Void) { completion(nil, nil) }
 
   func captureHighResolutionFrame(completion: @escaping (CaptureFrame?, Error?) -> Void) {
@@ -114,6 +155,7 @@ final class StillFrameSource: ARFrameSource {
     requestTimes.append(ProcessInfo.processInfo.systemUptime)
     let frame = frames.count > 1 ? frames.removeFirst() : frames.first
     lock.unlock()
+    if let interceptStill = interceptStill { return interceptStill(completion) }
     DispatchQueue.global().async { completion(frame, frame == nil ? RecordedSessionError.noStill : nil) }
   }
 }

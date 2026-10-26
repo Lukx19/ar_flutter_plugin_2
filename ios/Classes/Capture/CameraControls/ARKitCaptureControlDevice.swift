@@ -21,6 +21,8 @@ final class ARKitCaptureControlDevice: CameraControlDevice {
     return ARKitCaptureControlDevice(device: device)
   }
 
+  var configurationIdentity: AnyHashable { AnyHashable(device.uniqueID) }
+
   var minISO: Float { device.activeFormat.minISO }
   var maxISO: Float { device.activeFormat.maxISO }
   var iso: Float { device.iso }

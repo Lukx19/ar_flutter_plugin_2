@@ -114,10 +114,18 @@ protocol CaptureSessionSource: ARFrameSource {
   func initialize()
   func pause()
   func resume()
+  /// Main-thread recovery of a missing still callback. Returns a qualified
+  /// resume action, invoked only after this source confirms didStop.
+  /// Unsupported sources decline without changing their lifecycle.
+  func pauseForStillRecovery() -> (() -> Void)?
   /// New world frame: epoch increments.
   func restart()
   /// Idempotent; no callback follows.
   func dispose()
+}
+
+extension CaptureSessionSource {
+  func pauseForStillRecovery() -> (() -> Void)? { nil }
 }
 
 /// Observers of one frame source, held weakly, with whether each received

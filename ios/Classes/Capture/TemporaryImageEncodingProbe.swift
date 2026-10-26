@@ -15,10 +15,10 @@ final class TemporaryImageEncodingProbe {
 
   /// The supplied source remains owned by the caller until completion. One
   /// high-resolution frame is requested; failure never passes via video fallback.
-  func capture(source: ARFrameSource, format: String, quality: Int,
+  func capture(source: ARFrameSource, format: String, quality: Int, cameraAccess: StillCameraAccess? = nil,
                completion: @escaping (Result<[String: Any], Failure>) -> Void) {
     let started = DispatchTime.now().uptimeNanoseconds
-    source.captureHighResolutionFrame(quality: .fast) { [self] frame, error in
+    let receive: StillCameraAccess.FrameCompletion = { [self] frame, error in
       guard let frame = frame else {
         return completion(.failure(Failure(code: "ENCODING_CAPTURE_FAILED", message: "A high-resolution camera frame was unavailable")))
       }
@@ -37,6 +37,11 @@ final class TemporaryImageEncodingProbe {
         catch { completion(.failure(Failure(code: "ENCODING_TEST_FAILED", message: "Temporary encoding verification failed"))) }
       }
     }
+    let request: (@escaping StillCameraAccess.FrameCompletion) -> Void = { completion in
+      source.captureHighResolutionFrame(quality: .fast, completion: completion)
+    }
+    if let cameraAccess = cameraAccess { cameraAccess.capture(request, completion: receive) }
+    else { request(receive) }
   }
 
   /// Encodes the actual camera buffer, flushes a uniquely owned temporary file,

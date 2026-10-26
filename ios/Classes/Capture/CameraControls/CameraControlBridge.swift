@@ -24,6 +24,8 @@ enum CameraFocusModeValue: Equatable, Hashable {
 /// Every change goes through [configure] (`lockForConfiguration`) on the
 /// running device: the AR session is never paused or reconfigured for it.
 protocol CameraControlDevice: AnyObject {
+  /// Stable identity of the physical device across per-view wrappers.
+  var configurationIdentity: AnyHashable { get }
   var minISO: Float { get }
   var maxISO: Float { get }
   var iso: Float { get }
@@ -73,6 +75,37 @@ protocol CameraControlDevice: AnyObject {
   func setTorch(_ on: Bool) throws
 }
 
+extension CameraControlDevice {
+  var configurationIdentity: AnyHashable { AnyHashable(ObjectIdentifier(self)) }
+}
+
+/// A replacement view supersedes the previous device configuration owner.
+/// The registry retains only identity values and tokens, never devices or
+/// bridges. A lease removes only its own current token on destruction.
+private final class CameraControlOwnership {
+  private static let lock = NSLock()
+  private static var current: [AnyHashable: UUID] = [:]
+  private let identity: AnyHashable
+  private let token = UUID()
+
+  init(identity: AnyHashable) {
+    self.identity = identity
+    Self.lock.lock()
+    Self.current[identity] = token
+    Self.lock.unlock()
+  }
+
+  var isCurrent: Bool {
+    Self.lock.lock(); defer { Self.lock.unlock() }
+    return Self.current[identity] == token
+  }
+
+  deinit {
+    Self.lock.lock(); defer { Self.lock.unlock() }
+    if Self.current[identity] == token { Self.current.removeValue(forKey: identity) }
+  }
+}
+
 /// A refused or failed camera control: the Android `CaptureSessionException`
 /// codes (`CONTROL_UNSUPPORTED`, `CONTROL_UPDATE_FAILED`).
 struct CameraControlError: Error, Equatable, CustomStringConvertible {
@@ -97,7 +130,8 @@ struct CameraControlError: Error, Equatable, CustomStringConvertible {
 /// exposure compensation moves in steps of 1/3 EV (AVFoundation takes any
 /// bias); white balance presets are fixed colour temperatures and there is
 /// no white balance point; flash for stills is not available while ARKit
-/// runs, so the flash modes are `off` and `torch`. Main thread only.
+/// runs, so the flash modes are `off` and `torch`. Caller-confined; live calls
+/// run on the camera access queue.
 final class CameraControlBridge {
   static let methods: Set<String> = [
     "setISO", "setExposureTime", "setAutoExposureEnabled", "getCurrentISO", "getCurrentExposureTime",
@@ -121,12 +155,14 @@ final class CameraControlBridge {
   static let colorTemperatureRange: ClosedRange<Int> = 2500...10000
 
   private let device: CameraControlDevice
+  private let ownership: CameraControlOwnership
   private var whiteBalanceMode = "auto"
   private var manualTemperature: Int?
   private var focusRegion: (x: Double, y: Double)?
 
   init(device: CameraControlDevice) {
     self.device = device
+    self.ownership = CameraControlOwnership(identity: device.configurationIdentity)
   }
 
   /// Handles one control method with the Android argument map; throws
@@ -480,6 +516,10 @@ final class CameraControlBridge {
   /// view would otherwise inherit manual settings or a lit torch.
   func reset() throws {
     try device.configure {
+      // Check while holding the physical configuration lock: a replacement
+      // either already owns the device, or applies its settings after this
+      // lock is released. The retired view cannot overwrite either outcome.
+      guard ownership.isCurrent else { return }
       if device.hasTorch { try device.setTorch(false) }
       device.setExposureMode(.auto)
       device.setExposureBias(0)
@@ -495,9 +535,210 @@ final class CameraControlBridge {
 
   private func apply(_ what: String, _ change: () throws -> Void) throws {
     do {
-      try device.configure(change)
+      try device.configure {
+        guard ownership.isCurrent else {
+          throw CameraControlError.failed("The camera control owner was replaced")
+        }
+        try change()
+      }
     } catch {
       throw CameraControlError.failed("Failed to apply \(what): \(error)")
+    }
+  }
+}
+
+/// Serial authority over physical still requests and runtime device configuration.
+/// A durable attempt's terminal/cancellation does not cancel ARKit's physical
+/// frame request. Keep ownership until its callback or a confirmed source stop.
+/// Configuration waits off the main thread; encoding and durable publication do
+/// not hold the camera, so a valid still is retained while controls take effect.
+final class StillCameraAccess: ARFrameObserver {
+  typealias FrameCompletion = (CaptureFrame?, Error?) -> Void
+  /// A frame callback gets ten seconds. Expiry requests a real source pause;
+  /// it never proves cancellation or releases the physical camera by itself.
+  static let frameCallbackDeadline: TimeInterval = 10
+  private final class DeadlineTicket {
+    private let lock = NSLock()
+    private var cancelled = false
+    private var claimed = false
+    func claimPause() -> Bool {
+      lock.lock(); defer { lock.unlock() }
+      guard !cancelled, !claimed else { return false }
+      claimed = true
+      return true
+    }
+    @discardableResult func cancel() -> Bool {
+      lock.lock(); defer { lock.unlock() }
+      cancelled = true
+      return claimed
+    }
+  }
+  private struct Recovery {
+    var ticket: DeadlineTicket
+    var observedStop = false
+    var resume: (() -> Void)?
+  }
+  private enum Operation {
+    case frame((@escaping FrameCompletion) -> Void, FrameCompletion)
+    case control(() -> Void, () -> Void)
+  }
+  private let queue = DispatchQueue(label: "capture3d.still-camera-access", qos: .userInitiated)
+  private var pending: [Operation] = []
+  private var active: (generation: UInt64, completion: FrameCompletion, ticket: DeadlineTicket)?
+  private var recovery: Recovery?
+  private var requestRecoveryPause: (() -> (() -> Void)?)?
+  private var generation: UInt64 = 0
+  private var closed = false
+  private var stopped: Bool
+  private var reset: (() -> Void)?
+
+  init(running: Bool = true) { stopped = !running }
+
+  /// Configured before the first request. The handler runs on main and may
+  /// return a source-qualified resume action after performing an actual pause.
+  func setRecoveryHandler(_ handler: @escaping () -> (() -> Void)?) {
+    queue.async { self.requestRecoveryPause = handler }
+  }
+
+  func capture(_ request: @escaping (@escaping FrameCompletion) -> Void,
+               completion: @escaping FrameCompletion) {
+    queue.async {
+      self.pending.append(.frame(request, completion))
+      self.drain()
+    }
+  }
+
+  func configure(_ change: @escaping () -> Void, unavailable: @escaping () -> Void) {
+    queue.async {
+      self.pending.append(.control(change, unavailable))
+      self.drain()
+    }
+  }
+
+  /// Closing rejects queued work, but cannot establish physical cancellation.
+  /// A final device reset waits for the frame callback or confirmed source stop.
+  func close(reset: @escaping () -> Void) {
+    queue.async {
+      guard !self.closed else { return }
+      self.closed = true
+      self.reset = reset
+      self.rejectPending(reason: "closed")
+      if let current = self.active {
+        // Logical callers finish now, while physical ownership is retained
+        // until ARKit returns or the source confirms it stopped.
+        let pauseClaimed = current.ticket.cancel()
+        if !pauseClaimed { self.recovery = nil }
+        self.active = (current.generation, { _, _ in }, current.ticket)
+        current.completion(nil, StillCaptureFailure(reason: "closed"))
+      } else { self.finishReset() }
+    }
+  }
+
+  private func drain() {
+    guard !closed else { rejectPending(reason: "closed"); return }
+    guard !stopped else { rejectPending(reason: "camera-stopped"); return }
+    guard active == nil, recovery == nil else { return }
+    while !pending.isEmpty {
+      switch pending.removeFirst() {
+      case .control(let change, _): change()
+      case .frame(let request, let completion):
+        generation &+= 1
+        let token = generation
+        let ticket = DeadlineTicket()
+        active = (token, completion, ticket)
+        if requestRecoveryPause != nil {
+          queue.asyncAfter(deadline: .now() + Self.frameCallbackDeadline) { [weak self, weak ticket] in
+            guard let self = self, let ticket = ticket else { return }
+            self.frameDeadlineExpired(token, ticket: ticket)
+          }
+        }
+        request { frame, error in
+          self.queue.async {
+            guard let current = self.active, current.generation == token else { return }
+            self.active = nil
+            let pauseClaimed = current.ticket.cancel()
+            if !pauseClaimed, self.recovery?.ticket === current.ticket { self.recovery = nil }
+            current.completion(frame, error)
+            if self.closed { self.finishReset() } else { self.drain() }
+          }
+        }
+        return
+      }
+    }
+  }
+
+  private func rejectPending(reason: String) {
+    let refused = pending
+    pending.removeAll()
+    for operation in refused {
+      switch operation {
+      case .frame(_, let completion): completion(nil, StillCaptureFailure(reason: reason))
+      case .control(_, let unavailable): unavailable()
+      }
+    }
+  }
+
+  private func finishReset() {
+    let action = reset
+    reset = nil
+    action?()
+  }
+
+  func frameSource(_ source: ARFrameSource, didUpdate frame: CaptureFrame) {}
+  func frameSourceDidStop(_ source: ARFrameSource) { cameraStopped(confirmedPause: true) }
+  func frameSourceWasInterrupted(_ source: ARFrameSource) { cameraStopped(confirmedPause: false) }
+  func frameSourceInterruptionEnded(_ source: ARFrameSource) {
+    if source.lifecycleState == .running { cameraStarted() }
+  }
+  func frameSource(_ source: ARFrameSource, didStart configuration: CaptureRunConfiguration, epoch: Int) {
+    cameraStarted()
+  }
+
+  private func cameraStopped(confirmedPause: Bool) {
+    queue.async {
+      self.stopped = true
+      let current = self.active
+      self.active = nil
+      let pauseClaimed = current?.ticket.cancel() ?? self.recovery?.ticket.cancel() ?? false
+      if !pauseClaimed { self.recovery = nil }
+      if confirmedPause, self.recovery != nil { self.recovery?.observedStop = true }
+      self.rejectPending(reason: "camera-stopped")
+      current?.completion(nil, StillCaptureFailure(reason: "camera-stopped"))
+      if self.closed { self.finishReset() }
+      self.finishRecoveryIfStopped()
+    }
+  }
+
+  private func frameDeadlineExpired(_ generation: UInt64, ticket: DeadlineTicket) {
+    guard !closed, !stopped, active?.generation == generation, active?.ticket === ticket,
+          let requestPause = requestRecoveryPause else { return }
+    recovery = Recovery(ticket: ticket)
+    DispatchQueue.main.async { [weak self] in
+      let resume = ticket.claimPause() ? requestPause() : nil
+      self?.queue.async { [weak self] in
+        guard let self = self, self.recovery?.ticket === ticket else { return }
+        guard let resume = resume else {
+          self.recovery = nil
+          self.drain()
+          return
+        }
+        self.recovery?.resume = resume
+        self.finishRecoveryIfStopped()
+      }
+    }
+  }
+
+  private func finishRecoveryIfStopped() {
+    guard let current = recovery, current.observedStop, let resume = current.resume else { return }
+    recovery = nil
+    DispatchQueue.main.async(execute: resume)
+  }
+
+  private func cameraStarted() {
+    queue.async {
+      guard !self.closed else { return }
+      self.stopped = false
+      self.drain()
     }
   }
 }

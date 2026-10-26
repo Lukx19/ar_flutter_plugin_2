@@ -36,6 +36,41 @@ final class BurstShotCaptureTests: XCTestCase {
     return set
   }
 
+  func testCancelledQueuedAttemptsNeverRequestAnotherPhysicalFrame() throws {
+    let source = StillFrameSource()
+    let access = StillCameraAccess()
+    defer { access.close {} }
+    let exposure = HighResolutionStillExposure(frameSource: { source }, jpegQuality: 90, cameraAccess: access)
+    let firstRequested = expectation(description: "first physical frame pending")
+    var firstFrame: ((CaptureFrame?, Error?) -> Void)?
+    source.interceptStill = { callback in firstFrame = callback; firstRequested.fulfill() }
+    let completed = expectation(description: "all attempts complete")
+    completed.expectedFulfillmentCount = 21
+    let first = CaptureAttemptQualifier(identity: CaptureFixture.request().accepted.identity, exposureGeneration: 1)
+    XCTAssertTrue(exposure.requestExposure(first, required: [.jpeg]) { _ in completed.fulfill() })
+    wait(for: [firstRequested], timeout: 2)
+    // More than the historical cancellation ring's sixteen entries: each
+    // queued request must retain its own cancellation until it leaves camera
+    // ownership, even if the native admission fence already released it.
+    for index in 2...21 {
+      let qualifier = CaptureAttemptQualifier(
+        identity: CaptureFixture.request(attemptId: "queued-\(index)", commitId: "commit-\(index)", ordinal: Int64(index)).accepted.identity,
+        exposureGeneration: Int64(index))
+      XCTAssertTrue(exposure.requestExposure(qualifier, required: [.jpeg]) { outcome in
+        if case .failure(_, let reason) = outcome { XCTAssertEqual(reason, "cancelled") }
+        else { XCTFail("cancelled request acquired another physical frame") }
+        completed.fulfill()
+      })
+      exposure.cancelExposure(qualifier)
+    }
+    source.interceptStill = nil
+    let frame = ShotFixture.frame(timestamp: ProcessInfo.processInfo.systemUptime, pose: ShotFixture.pose())
+    source.frames = [frame]
+    try XCTUnwrap(firstFrame)(frame, nil)
+    wait(for: [completed], timeout: 5)
+    XCTAssertEqual(source.qualities.count, 1, "logical cancellation cannot schedule another physical still")
+  }
+
   func testExactGeometryRejectsFallbackAndMismatchesForEveryExposureModeAndLane() {
     for mode in StillCaptureMode.allCases {
       for lane in [CaptureLane.manual, .automatic] {

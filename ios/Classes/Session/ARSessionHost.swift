@@ -59,6 +59,8 @@ final class ARSessionHost: NSObject, CaptureSessionSource, ARSessionDelegate {
   private let clock: () -> TimeInterval
   private let lock = NSLock()
   private var lifecycle = ARSessionLifecycle()
+  private var controlRevision: UInt64 = 0
+  private var interrupted = false
   private var currentConfiguration: CaptureRunConfiguration?
   private var observers = FrameObserverSet()
 
@@ -198,6 +200,28 @@ final class ARSessionHost: NSObject, CaptureSessionSource, ARSessionDelegate {
     perform { $0.pause(now: now) }
   }
   func resume() { perform { $0.resume() } }
+  /// Pause is an actual driver operation. A later explicit control, failure,
+  /// interruption or replacement must prevent this recovery from resuming it.
+  func pauseForStillRecovery() -> (() -> Void)? {
+    precondition(Thread.isMainThread)
+    lock.lock()
+    let canPause = lifecycle.state == .running && !interrupted
+    lock.unlock()
+    guard canPause, registry == nil || registry?.current === self else { return nil }
+    pause()
+    lock.lock()
+    let revision = controlRevision
+    lock.unlock()
+    return { [weak self] in
+      precondition(Thread.isMainThread)
+      guard let self = self, self.registry == nil || self.registry?.current === self else { return }
+      self.lock.lock()
+      let canResume = self.lifecycle.state == .paused && !self.interrupted && self.controlRevision == revision
+      self.lock.unlock()
+      if canResume { self.resume() }
+    }
+  }
+
   /// New world frame: runs with `.resetTracking`, epoch increments.
   func restart() {
     let now = clock()
@@ -209,6 +233,7 @@ final class ARSessionHost: NSObject, CaptureSessionSource, ARSessionDelegate {
   func dispose() {
     lock.lock()
     let alreadyDisposed = lifecycle.state == .disposed
+    controlRevision &+= 1
     let command = lifecycle.dispose()
     lock.unlock()
     if alreadyDisposed { return }
@@ -227,6 +252,7 @@ final class ARSessionHost: NSObject, CaptureSessionSource, ARSessionDelegate {
   private func perform(_ transition: (inout ARSessionLifecycle) -> ARSessionCommand) {
     lock.lock()
     let previous = lifecycle
+    controlRevision &+= 1
     let command = transition(&lifecycle)
     if case .run = command, plan.unsupportedStillResolution {
       lifecycle = previous
@@ -334,11 +360,13 @@ final class ARSessionHost: NSObject, CaptureSessionSource, ARSessionDelegate {
   }
 
   func sessionWasInterrupted(_ session: ARSession) {
+    lock.lock(); interrupted = true; lock.unlock()
     guard admitsSessionCallbacks else { return }
     startedObservers().forEach { $0.frameSourceWasInterrupted(self) }
   }
 
   func sessionInterruptionEnded(_ session: ARSession) {
+    lock.lock(); interrupted = false; lock.unlock()
     guard admitsSessionCallbacks else { return }
     startedObservers().forEach { $0.frameSourceInterruptionEnded(self) }
   }
@@ -350,6 +378,9 @@ final class ARSessionHost: NSObject, CaptureSessionSource, ARSessionDelegate {
     guard lifecycleState != .disposed else { return }
     DispatchQueue.main.async { [weak self] in
       guard let self = self, self.lifecycleState != .disposed else { return }
+      // A failed camera cannot retain pending still ownership while the UI
+      // recovers. Pause emits the real source stop without resetting tracking.
+      self.pause()
       self.onSessionFailure?(error)
     }
   }
