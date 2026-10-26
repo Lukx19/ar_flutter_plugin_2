@@ -109,11 +109,11 @@ private final class CameraCapabilitiesHandler: NSObject, FlutterPlugin {
         String(cString: $0)
       }
     }
-    let fingerprint = "\(model)|\(UIDevice.current.systemVersion)|arkit-primary|\(still?["width"] ?? 0)x\(still?["height"] ?? 0)"
+    let fingerprint = "resolution-pairs-v1|\(model)|\(UIDevice.current.systemVersion)|arkit-primary|\(still?["width"] ?? 0)x\(still?["height"] ?? 0)"
     return CameraCapabilityProfileStore(
       defaults: .standard, fingerprint: fingerprint,
       supported: ARWorldTrackingConfiguration.isSupported,
-      advertisedStillResolutions: still.map { [$0] } ?? [],
+      advertisedStillResolutions: CameraCapabilityQueries.selectableStillResolutions(),
       manualSensorControls: snapshot.isoRange != nil && snapshot.exposureRange != nil)
   }
 

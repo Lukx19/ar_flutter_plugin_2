@@ -584,7 +584,7 @@ final class NativeCaptureRecoveryReplay {
     NativeCaptureEvent(
       kind: projection.kind == .committedPicture ? .committed : projection.kind == .abandonedAttempt ? .abandoned : .recovering,
       attemptId: projection.attemptId, captureId: projection.captureId, captureRevision: projection.captureRevision,
-      manifestId: projection.manifestId, jpegSizeBytes: projection.jpegSizeBytes, dngSizeBytes: projection.dngSizeBytes,
+      manifestId: projection.manifestId, jpegSizeBytes: projection.jpegSizeBytes, dngSizeBytes: projection.dngSizeBytes, heicSizeBytes: projection.heicSizeBytes,
       reason: projection.reason, recoveryContext: projection.recoveryContext, shot: projection.shot)
   }
 }

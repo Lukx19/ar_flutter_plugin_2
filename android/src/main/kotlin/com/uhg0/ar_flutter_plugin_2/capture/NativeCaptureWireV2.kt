@@ -31,6 +31,7 @@ internal object NativeCaptureWireV2 {
         value.captureRevision?.let { put("captureRevision", it) }
         value.manifestId?.let { put("manifestId", it) }
         value.jpegSizeBytes?.let { put("jpegSizeBytes", it) }
+        value.heicSizeBytes?.let { put("heicSizeBytes", it) }
         value.dngSizeBytes?.let { put("dngSizeBytes", it) }
         value.reason?.let { put("reason", it) }
         value.recoveryContext?.let { put("recoveryContext", encodeRecoveryContext(it)) }
@@ -55,8 +56,8 @@ internal object NativeCaptureWireV2 {
         require(value.kind == NativeCaptureEventKindV2.COMMITTED && terminal.kind == CaptureTerminalKind.COMMITTED_PICTURE)
         require(value.attemptId == terminal.identity.attemptId && value.captureId == terminal.captureId &&
             value.captureRevision == terminal.captureRevision && value.manifestId == terminal.manifestId &&
-            value.jpegSizeBytes == terminal.jpegSizeBytes && value.dngSizeBytes == terminal.dngSizeBytes)
-        require(value.recoveryContext != null && terminal.jpegSizeBytes != null &&
+            value.jpegSizeBytes == terminal.jpegSizeBytes && value.dngSizeBytes == terminal.dngSizeBytes && value.heicSizeBytes == terminal.heicSizeBytes)
+        require(value.recoveryContext != null && (terminal.jpegSizeBytes != null || terminal.heicSizeBytes != null) &&
             terminal.qualityAssessment != null && terminal.qualityAssessmentHash != null)
         val assessment = terminal.qualityAssessment
         return event(value).toMutableMap().apply {
@@ -140,7 +141,7 @@ internal object NativeCaptureWireV2 {
         val components = (map["requiredComponents"] as? List<*>)
             ?.map { CaptureComponentKind.valueOf((it as? String ?: error("component must be a string")).uppercase()) }
             ?.toSet() ?: error("requiredComponents must be a list")
-        require(components == setOf(CaptureComponentKind.JPEG) || components == setOf(CaptureComponentKind.JPEG, CaptureComponentKind.DNG))
+        require(components == setOf(CaptureComponentKind.JPEG) || components == setOf(CaptureComponentKind.HEIC) || components == setOf(CaptureComponentKind.JPEG, CaptureComponentKind.DNG))
         return CaptureComponentProfile(map.string("profileId"), components, map.long("maximumComponentBytes"), map.long("maximumWorkingBytes"))
     }
 

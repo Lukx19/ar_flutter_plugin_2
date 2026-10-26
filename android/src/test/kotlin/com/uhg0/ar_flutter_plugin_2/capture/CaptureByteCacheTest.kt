@@ -50,8 +50,23 @@ class CaptureByteCacheTest {
     }
 
     @Test
+    fun `config parser accepts heic and heif formats`() {
+        listOf("heic", "heif").forEach { format ->
+            val config = CaptureConfig.fromMap(
+                mapOf(
+                    "format" to format,
+                    "resolution" to mapOf("width" to 640, "height" to 480),
+                    "maxCacheSize" to 2,
+                    "jpegQuality" to 95,
+                ),
+            )
+            assertEquals(format, config.format)
+        }
+    }
+
+    @Test
     fun `config parser rejects removed and unknown logical formats`() {
-        listOf("raw", "raw_only", "png", "heif", null).forEach { format ->
+        listOf("raw", "raw_only", "png", null).forEach { format ->
             val error = captureException {
                 CaptureConfig.fromMap(
                 mapOf(

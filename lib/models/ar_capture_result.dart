@@ -29,7 +29,7 @@ class ARCaptureResult {
     required this.pose,
     required this.resolution,
     required this.format,
-    this.formats = const [CaptureAssetFormat.jpeg],
+    List<CaptureAssetFormat>? formats,
     this.imageSizeBytesByFormat = const {},
     required this.captureTimestamp,
     required this.imageSizeBytes,
@@ -40,7 +40,10 @@ class ARCaptureResult {
     this.intrinsics,
     this.filePath,
     this.exposureBracket = const <Map<String, dynamic>>[],
-  });
+  }) : formats = formats ??
+            (format == CaptureFormat.heic
+                ? const [CaptureAssetFormat.heic]
+                : const [CaptureAssetFormat.jpeg]);
 
   factory ARCaptureResult.fromMap(Map<String, dynamic> map) {
     return ARCaptureResult(
@@ -49,7 +52,10 @@ class ARCaptureResult {
       resolution:
           CameraResolution.fromMap(map['resolution'] as Map<String, dynamic>),
       format: CaptureFormat.fromWire(map['format']),
-      formats: ((map['formats'] as List<dynamic>?) ?? const ['jpeg'])
+      formats: ((map['formats'] as List<dynamic>?) ??
+              (CaptureFormat.fromWire(map['format']) == CaptureFormat.heic
+                  ? const ['heic']
+                  : const ['jpeg']))
           .map(CaptureAssetFormat.fromWire)
           .toList(growable: false),
       imageSizeBytesByFormat:

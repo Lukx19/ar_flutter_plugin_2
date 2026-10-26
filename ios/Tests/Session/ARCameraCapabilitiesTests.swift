@@ -20,6 +20,47 @@ final class ARCameraCapabilitiesTests: XCTestCase {
       highResolutionFrameCaptureFormat: highResolution ? highResolutionFormat : nil)
   }
 
+  func testExactStillSizeSelectsItsRealVideoPairAndKeepsAutomaticDistinct() {
+    func format(_ photoWidth: Int, _ photoHeight: Int, videoWidth: Int, videoHeight: Int, fps: Int) -> ARVideoFormatDescription {
+      ARVideoFormatDescription(width: videoWidth, height: videoHeight, framesPerSecond: fps,
+        captureDeviceType: ARSessionConfigurationPlan.wideAngleDeviceType,
+        isRecommendedForHighResolutionFrameCapturing: true, isVideoHDRSupported: false,
+        stillWidth: photoWidth, stillHeight: photoHeight)
+    }
+    let large = format(4032, 3024, videoWidth: 1920, videoHeight: 1440, fps: 60)
+    let smallSlow = format(2016, 1512, videoWidth: 1920, videoHeight: 1440, fps: 30)
+    let smallFast = format(2016, 1512, videoWidth: 1440, videoHeight: 1080, fps: 60)
+    let smallWide = format(2016, 1512, videoWidth: 1920, videoHeight: 1080, fps: 120)
+    var capabilities = Self.capabilities(lidar: true, highResolution: true)
+    capabilities.videoFormats = [large, smallSlow, smallFast, smallWide]
+    capabilities.highResolutionFrameCaptureFormat = large
+    var automatic = ARSessionOptions()
+    automatic.highResolutionFrameCapture = true
+    XCTAssertEqual(ARSessionConfigurationPlan(options: automatic, capabilities: capabilities).videoFormat, large)
+    let exact = ARSessionOptions(creationParams: ["highResolutionFrameCapture": true,
+      "stillWidth": 2016, "stillHeight": 1512, "maxCameraImageHeight": 480])
+    let plan = ARSessionConfigurationPlan(options: exact, capabilities: capabilities)
+    XCTAssertEqual(plan.videoFormat, smallFast, "exact photo and video are coupled, not independently downscaled")
+    XCTAssertFalse(plan.unsupportedStillResolution)
+    XCTAssertEqual(plan.exactStillResolution, CGSize(width: 2016, height: 1512))
+    var pointsOnly = exact
+    pointsOnly.sceneDepth = false
+    XCTAssertEqual(ARSessionConfigurationPlan(options: pointsOnly, capabilities: capabilities).videoFormat, smallWide)
+    XCTAssertFalse(plan.highResolutionFrameCapture, "makeConfiguration must use this pair, not replace it with Automatic")
+    XCTAssertEqual(smallFast.channelMap["stillWidth"] as? Int, 2016)
+    XCTAssertEqual(smallFast.channelMap["stillHeight"] as? Int, 1512)
+  }
+
+  func testUnsupportedExactStillSizeCannotBecomeNativeDefault() {
+    let options = ARSessionOptions(creationParams: ["stillWidth": 8000, "stillHeight": 6000])
+    let plan = ARSessionConfigurationPlan(options: options, capabilities: Self.capabilities(lidar: true, highResolution: true))
+    XCTAssertTrue(plan.unsupportedStillResolution)
+    XCTAssertNil(plan.videoFormat)
+    let malformed = ARSessionOptions(creationParams: ["stillWidth": -1, "stillHeight": 3024])
+    XCTAssertNil(malformed.stillWidth)
+    XCTAssertNil(malformed.stillHeight)
+  }
+
   func testChannelMapReportsLiDARFormatsAndHighResolutionCapture() {
     let map = ARCameraCapabilitiesTests.capabilities(lidar: true, highResolution: true).channelMap
     XCTAssertEqual(map["platform"] as? String, "ios")

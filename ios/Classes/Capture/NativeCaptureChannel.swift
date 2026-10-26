@@ -150,7 +150,7 @@ final class NativeCaptureChannel: CaptureChannelExtension {
     switch method {
     case "initializeCapture": initialize(call.arguments, result)
     case "dispose":
-      guard !encodingProbeInProgress else {
+      guard !encodingProbeInProgress, !captureInProgress else {
         result(FlutterError(code: "CAPTURE_IN_PROGRESS", message: "The owned encoding test must settle before close", details: nil))
         return true
       }
@@ -223,6 +223,28 @@ final class NativeCaptureChannel: CaptureChannelExtension {
     guard let burst = BurstSettings.parse(map) else {
       return result(FlutterError(code: "CONFIG_INVALID", message: "burstImageCount must be 2-5 and burstIntervalMs 0-1000", details: nil))
     }
+    guard parsed.format == "jpeg" || requestedMode == .single else {
+      return result(FlutterError(code: "ENCODING_MODE_UNSUPPORTED", message: "HEIC captures use single-photo mode", details: nil))
+    }
+    guard config?.format == nil || config?.format == parsed.format || !hasDurableAdmission else {
+      return result(FlutterError(code: "CAPTURE_CONFIG_REQUIRES_NEW_OWNER", message: "Close capture before changing its format", details: nil))
+    }
+    let frameSource = context.frameSource
+    let exact = frameSource.exactStillResolution
+    guard exact == nil || (parsed.resolutionWidth == Int(exact!.width)
+        && parsed.resolutionHeight == Int(exact!.height)) else {
+      return result(FlutterError(code: "CAPTURE_CONFIG_REQUIRES_NEW_OWNER",
+        message: "Capture resolution must match the owning ARKit session", details: nil))
+    }
+    guard stills == nil || stills?.exactStillResolution == exact else {
+      return result(FlutterError(code: "CAPTURE_CONFIG_REQUIRES_NEW_OWNER",
+        message: "Close capture before changing its exact still resolution", details: nil))
+    }
+    guard !hasDurableAdmission || config == nil
+        || (config?.resolutionWidth == parsed.resolutionWidth && config?.resolutionHeight == parsed.resolutionHeight) else {
+      return result(FlutterError(code: "CAPTURE_CONFIG_REQUIRES_NEW_OWNER",
+        message: "Close capture before changing its resolution", details: nil))
+    }
     config = parsed
     // A repeated initialize keeps the staged stills: the new configuration
     // applies to stills captured afterwards, and each staged one stays
@@ -232,7 +254,6 @@ final class NativeCaptureChannel: CaptureChannelExtension {
     } else {
       cache = StagedStillCache(config: parsed)
     }
-    let frameSource = context.frameSource
     // One exposure per view: the binding keeps the first one, so a repeated
     // initialize only updates its quality.
     let exposure: HighResolutionStillExposure
@@ -240,9 +261,11 @@ final class NativeCaptureChannel: CaptureChannelExtension {
       existing.jpegQuality = parsed.jpegQuality
       exposure = existing
     } else {
-      exposure = HighResolutionStillExposure(frameSource: { [weak frameSource] in frameSource }, jpegQuality: parsed.jpegQuality)
+      exposure = HighResolutionStillExposure(frameSource: { [weak frameSource] in frameSource },
+        jpegQuality: parsed.jpegQuality, exactStillResolution: exact)
       stills = exposure
     }
+    exposure.format = parsed.format
     // A recording without stills has nothing to burst or process: its
     // stills are video frames, so the shot stays single.
     let highResolution = ARCameraCapabilities.of(frameSource).supportsHighResolutionFrameCapture
@@ -487,16 +510,16 @@ final class NativeCaptureChannel: CaptureChannelExtension {
     }
     let metadata = still.metadata
     var capture: [String: Any] = [
-      "imageId": imageId, "resolution": ["width": metadata.width, "height": metadata.height], "format": "jpeg",
-      "formats": ["jpeg"], "captureTimestampMs": Int(timestampMs), "imageSizeBytes": still.jpeg.count,
-      "imageSizeBytesByFormat": ["jpeg": still.jpeg.count], "isHighResolution": metadata.highResolution,
+      "imageId": imageId, "resolution": ["width": metadata.width, "height": metadata.height], "format": still.format,
+      "formats": [still.format], "captureTimestampMs": Int(timestampMs), "imageSizeBytes": still.bytes.count,
+      "imageSizeBytesByFormat": [still.format: still.bytes.count], "isHighResolution": metadata.highResolution,
       "exposureStartTimestampNs": Int(metadata.exposureTimestampNs), "exposureTimeNs": 0, "rollingShutterSkewNs": 0,
       "filePath": NSNull(),
     ]
     capture["pose"] = pose ?? NSNull()
     capture["intrinsics"] = metadata.intrinsics.map { Self.intrinsicsMap($0, width: metadata.width, height: metadata.height) } ?? NSNull()
     let attemptId = "attempt_\(timestampMs)"
-    let entry = StagedStillCache.Entry(imageId: imageId, bytes: still.jpeg, width: metadata.width, height: metadata.height, timestampMs: timestampMs)
+    let entry = StagedStillCache.Entry(imageId: imageId, bytes: still.bytes, width: metadata.width, height: metadata.height, timestampMs: timestampMs, format: still.format)
     if let quality = quality, quality["blurPassed"] as? Bool == false {
       if keepRejected {
         do { try cache.cache(entry) } catch { return result(Self.flutterError(error)) }

@@ -13,7 +13,7 @@ export 'camera_capability_report.dart';
 /// Provides information about available camera capabilities for AR capture
 /// Can be used independently throughout the application for capability discovery
 class ARCameraCapabilities {
-  static const int capabilityPresetVersion = 12;
+  static const int capabilityPresetVersion = 13;
 
   /// Name of the plugin's capability channel (Android camera queries; the
   /// iOS ARKit query `ARKitCapabilityQuery` uses it too).
@@ -648,7 +648,8 @@ class DeviceCameraCapabilityProfile {
       ...validatedSharedResolutions,
       // Camera2 can overwrite its validated cache after probing a large size.
       // Retain the app's established baseline as a candidate, never as proof.
-      if (supportsExactStillResolutionSelection)
+      if (supportsExactStillResolutionSelection &&
+          capabilityReport.platform != 'ios')
         const CameraResolution(width: 1920, height: 1080),
     }.where((size) => size.width > 0 && size.height > 0).toList();
     candidates

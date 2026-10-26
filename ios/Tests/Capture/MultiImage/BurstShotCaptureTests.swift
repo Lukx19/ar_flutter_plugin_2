@@ -36,6 +36,56 @@ final class BurstShotCaptureTests: XCTestCase {
     return set
   }
 
+  func testExactGeometryRejectsFallbackAndMismatchesForEveryExposureModeAndLane() {
+    for mode in StillCaptureMode.allCases {
+      for lane in [CaptureLane.manual, .automatic] {
+        for missing in [false, true] {
+          let source = StillFrameSource()
+          source.refreshCurrentVideoFrame = true
+          if !missing { source.frames = [ShotFixture.frame(timestamp: 100, pose: ShotFixture.pose())] }
+          let exposure = HighResolutionStillExposure(frameSource: { source }, jpegQuality: 95,
+            exactStillResolution: CGSize(width: 128, height: 96), deviceModel: "fixture")
+          exposure.mode = mode
+          exposure.burst = BurstSettings(imageCount: 2, intervalMs: 0)
+          let completed = expectation(description: "strict \(mode) \(lane) \(missing)")
+          XCTAssertTrue(exposure.requestExposure(qualifier(), required: [.jpeg], lane: lane) { result in
+            guard case .failure(_, let reason) = result else {
+              XCTFail("Exact selection must not return successful components")
+              return completed.fulfill()
+            }
+            XCTAssertEqual(reason, missing ? "high-resolution-frame-unavailable" : "still-resolution-mismatch")
+            completed.fulfill()
+          })
+          wait(for: [completed], timeout: 10)
+          XCTAssertEqual(exposure.snapshot.highResolution, 0)
+          XCTAssertEqual(exposure.snapshot.videoFallback, 0)
+          XCTAssertEqual(exposure.snapshot.failures, 1)
+        }
+      }
+    }
+  }
+
+  func testWrongLaterBurstGeometryFailsTheWholeExplicitShot() {
+    let source = StillFrameSource()
+    source.frames = [
+      ShotFixture.frame(timestamp: 100, pose: ShotFixture.pose()),
+      ShotFixture.frame(timestamp: 100.15, pose: ShotFixture.pose(), width: 128, height: 96),
+    ]
+    let exposure = HighResolutionStillExposure(frameSource: { source }, jpegQuality: 95,
+      exactStillResolution: CGSize(width: 64, height: 48), deviceModel: "fixture")
+    exposure.mode = .burst
+    exposure.burst = BurstSettings(imageCount: 2, intervalMs: 0)
+    let completed = expectation(description: "mixed burst is not a successful partial component set")
+    XCTAssertTrue(exposure.requestExposure(qualifier(), required: [.jpeg], lane: .manual) { outcome in
+      if case .failure(_, let reason) = outcome { XCTAssertEqual(reason, "still-resolution-mismatch") }
+      else { XCTFail("A partial matching image must not hide later geometry failure") }
+      completed.fulfill()
+    })
+    wait(for: [completed], timeout: 10)
+    XCTAssertEqual(exposure.snapshot.highResolution, 1)
+    XCTAssertEqual(exposure.snapshot.failures, 1)
+  }
+
   func testABurstTakesEveryImageFromItsOwnFrame() throws {
     let frames = (0..<3).map { i in
       ShotFixture.frame(timestamp: 100 + 0.2 * Double(i), pose: ShotFixture.pose(x: 1 + 0.02 * Float(i), y: 2, z: 3))

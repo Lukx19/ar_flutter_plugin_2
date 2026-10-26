@@ -17,17 +17,19 @@ struct CameraCapabilitySnapshot: Equatable {
   var exposureRange: ClosedRange<Double>?
   /// Intrinsics map of the newest frame of a running capture view.
   var intrinsics: [String: Any]?
+  /// Output geometry attached to actual ARKit video/still pairs.
+  var selectableStillSizes: [CGSize] = []
 
   static func == (lhs: CameraCapabilitySnapshot, rhs: CameraCapabilitySnapshot) -> Bool {
-    lhs.stillSize == rhs.stillSize && lhs.videoSizes == rhs.videoSizes && lhs.isoRange == rhs.isoRange
+    lhs.stillSize == rhs.stillSize && lhs.videoSizes == rhs.videoSizes && lhs.selectableStillSizes == rhs.selectableStillSizes && lhs.isoRange == rhs.isoRange
       && lhs.exposureRange == rhs.exposureRange && (lhs.intrinsics == nil) == (rhs.intrinsics == nil)
   }
 }
 
 /// The Android camera capability queries (`CameraCapabilityQuerier`) with
 /// the Android reply shapes, answered from ARKit and the configurable camera
-/// ARKit runs. Stills are JPEG only: ARKit's high-resolution frames are
-/// processed images and RAW photo output needs its own `AVCaptureSession`,
+/// ARKit runs. Its processed frames can be encoded to JPEG or HEIC; RAW
+/// photo output needs its own `AVCaptureSession`,
 /// which would pause AR, so `raw+jpeg` is never supported.
 enum CameraCapabilityQueries {
   /// Android `generateISORange`: the common ISO values inside the range.
@@ -42,7 +44,7 @@ enum CameraCapabilityQueries {
   static func answer(_ method: String, arguments: Any?, snapshot: CameraCapabilitySnapshot) -> Result<Any, CameraControlError> {
     switch method {
     case "getSupportedResolutions": return .success(resolutions(snapshot).map { ["width": $0.0, "height": $0.1] })
-    case "getSupportedFormats": return .success(["jpeg"])
+    case "getSupportedFormats": return .success(pipelineFormats)
     case "getSupportedISORange":
       guard let range = snapshot.isoRange else { return .success([Int]()) }
       return .success(commonISOValues.filter { Float($0) >= range.lowerBound && Float($0) <= range.upperBound })
@@ -61,7 +63,7 @@ enum CameraCapabilityQueries {
       guard let format = arguments as? String else {
         return .failure(CameraControlError(code: "INVALID_ARGUMENTS", message: "Format string is required"))
       }
-      return .success(format == "jpeg")
+      return .success(pipelineFormats.contains(format))
     case "getCameraIntrinsics":
       guard let intrinsics = snapshot.intrinsics else {
         return .failure(CameraControlError(code: "INTRINSICS_ERROR", message: "Unable to extract camera intrinsics: no capture view is running"))
@@ -72,10 +74,10 @@ enum CameraCapabilityQueries {
     }
   }
 
-  /// Still size first, then the video formats, largest first, unique.
+  /// Actual ARKit still outputs only; video geometry never invents a photo size.
   static func resolutions(_ snapshot: CameraCapabilitySnapshot) -> [(Int, Int)] {
     var out: [(Int, Int)] = []
-    for size in ([snapshot.stillSize].compactMap { $0 } + snapshot.videoSizes.sorted { $0.width * $0.height > $1.width * $1.height }) {
+    for size in (snapshot.selectableStillSizes + [snapshot.stillSize].compactMap { $0 }).sorted(by: { $0.width * $0.height > $1.width * $1.height }) {
       let value = (Int(size.width), Int(size.height))
       if value.0 > 0, value.1 > 0, !out.contains(where: { $0 == value }) { out.append(value) }
     }
@@ -117,7 +119,7 @@ enum CameraCapabilityQueries {
       }
     }
     hardwareDimensions.sort { $0["width"]! * $0["height"]! > $1["width"]! * $1["height"]! }
-    let stillDimensions = snapshot.stillSize.map { [["width": Int($0.width), "height": Int($0.height)]] } ?? []
+    let stillDimensions = selectableStillResolutions()
     let encoders = CGImageDestinationCopyTypeIdentifiers() as? [String] ?? []
     let encoderFormats = ["jpeg"] + (encoders.contains("public.heic") ? ["heif"] : [])
     func value(_ flag: Bool?) -> Any { flag.map { $0 as Any } ?? NSNull() }
@@ -129,11 +131,11 @@ enum CameraCapabilityQueries {
       "osVersion": UIDevice.current.systemVersion, "cameraId": "arkit-primary",
       "hardwareFormats": ["jpeg": true, "heif": NSNull(), "raw": NSNull(),
                           "raw+jpeg": NSNull(), "raw+heif": NSNull()] as [String: Any],
-      "pipelineFormats": ["jpeg"], "encoderFormats": encoderFormats,
+      "pipelineFormats": pipelineFormats, "encoderFormats": encoderFormats,
       "temporaryEncodingFormats": encoderFormats,
       // These are sensor photo-size metadata, not ARKit selectable outputs.
       "resolutionsByFormat": ["jpeg": hardwareDimensions],
-      "pipelineResolutionsByFormat": ["jpeg": stillDimensions],
+      "pipelineResolutionsByFormat": Dictionary(uniqueKeysWithValues: pipelineFormats.map { ($0, stillDimensions) }),
       "depthSupport": ["depthApi": capabilities.sceneDepthSupported,
                        "rawDepth": false, "lidar": capabilities.hasLiDARDepth],
       "controls": [
@@ -148,6 +150,26 @@ enum CameraCapabilityQueries {
         highResolutionFrameCapture: capabilities.supportsHighResolutionFrameCapture,
         videoHDR: capabilities.videoFormats.contains { $0.isVideoHDRSupported }),
     ]
+  }
+
+  /// Encodable durable formats; advertisements remain candidates until measured.
+  static var pipelineFormats: [String] {
+    let encoders = CGImageDestinationCopyTypeIdentifiers() as? [String] ?? []
+    return ["jpeg"] + (encoders.contains("public.heic") ? ["heic"] : [])
+  }
+
+  /// Still geometry attached to an actual wide-angle ARKit configuration.
+  /// Raw AVCaptureDevice dimensions alone cannot authorize an ARKit profile.
+  static func selectableStillResolutions() -> [[String: Int]] {
+    var sizes: [[String: Int]] = []
+    for format in ARWorldTrackingConfiguration.supportedVideoFormats {
+      let value = ARVideoFormatDescription(format)
+      guard value.captureDeviceType == ARSessionConfigurationPlan.wideAngleDeviceType,
+            let width = value.stillWidth, let height = value.stillHeight else { continue }
+      let size = ["width": width, "height": height]
+      if !sizes.contains(size) { sizes.append(size) }
+    }
+    return sizes.sorted { $0["width"]! * $0["height"]! > $1["width"]! * $1["height"]! }
   }
 
   /// The values on this device: ARKit's formats, the configurable camera's
@@ -176,6 +198,8 @@ enum CameraCapabilityQueries {
     }
     return CameraCapabilitySnapshot(
       stillSize: still, videoSizes: formats.map { $0.imageResolution }, isoRange: iso, exposureRange: exposure,
-      intrinsics: intrinsics)
+      intrinsics: intrinsics, selectableStillSizes: selectableStillResolutions().map {
+        CGSize(width: $0["width"]!, height: $0["height"]!)
+      })
   }
 }

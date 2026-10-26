@@ -45,7 +45,7 @@ enum CaptureAttemptPhase {
   abandonedAttempt,
 }
 
-enum CaptureComponentKind { jpeg, dng, raw, hdr, sidecar }
+enum CaptureComponentKind { jpeg, dng, raw, hdr, sidecar, heic }
 
 enum CaptureTerminalKind { committedPicture, abandonedAttempt }
 

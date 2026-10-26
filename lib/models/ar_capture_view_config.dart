@@ -1,6 +1,7 @@
 import 'package:flutter/foundation.dart';
 
 import 'ar_session_inputs.dart';
+import 'camera_resolution.dart';
 
 /// Creation parameter keys of the iOS capture view; the Swift twin is
 /// `ARCaptureViewParameter`.
@@ -8,10 +9,11 @@ abstract final class ARCaptureViewParameter {
   static const String sceneDepth = 'sceneDepth';
   static const String depthWidth = 'depthWidth';
   static const String depthHeight = 'depthHeight';
-  static const String highResolutionFrameCapture =
-      'highResolutionFrameCapture';
+  static const String highResolutionFrameCapture = 'highResolutionFrameCapture';
   static const String videoHdr = 'videoHdr';
   static const String maxCameraImageHeight = 'maxCameraImageHeight';
+  static const String stillWidth = 'stillWidth';
+  static const String stillHeight = 'stillHeight';
 }
 
 /// Creation configuration of the iOS capture view (`capture3d/capture_ar_view`):
@@ -28,6 +30,7 @@ class ARCaptureViewConfig {
     this.highResolutionFrameCapture = false,
     this.videoHdr = false,
     this.maxVideoHeight = 0,
+    this.stillResolution,
   });
 
   /// Platform view type the iOS session host registers.
@@ -57,6 +60,22 @@ class ARCaptureViewConfig {
   /// set.
   final int maxVideoHeight;
 
+  /// Exact native still output, selected through an ARKit video/still pair.
+  /// Null keeps Automatic. It is a sensor request, never a resize operation.
+  final CameraResolution? stillResolution;
+
+  /// Select an exact native still/video pair; null restores Automatic.
+  ARCaptureViewConfig withStillResolution(CameraResolution? resolution) =>
+      ARCaptureViewConfig(
+        sceneDepth: sceneDepth,
+        depthWidth: depthWidth,
+        depthHeight: depthHeight,
+        highResolutionFrameCapture: highResolutionFrameCapture,
+        videoHdr: videoHdr,
+        maxVideoHeight: maxVideoHeight,
+        stillResolution: resolution,
+      );
+
   /// This configuration with [videoHdr] replaced.
   ARCaptureViewConfig withVideoHdr(bool videoHdr) => ARCaptureViewConfig(
         sceneDepth: sceneDepth,
@@ -65,6 +84,7 @@ class ARCaptureViewConfig {
         highResolutionFrameCapture: highResolutionFrameCapture,
         videoHdr: videoHdr,
         maxVideoHeight: maxVideoHeight,
+        stillResolution: stillResolution,
       );
 
   /// This configuration under the user's session [inputs]: no scene depth
@@ -77,6 +97,7 @@ class ARCaptureViewConfig {
         highResolutionFrameCapture: highResolutionFrameCapture,
         videoHdr: videoHdr,
         maxVideoHeight: inputs.cameraResolution.maxImageHeight,
+        stillResolution: stillResolution,
       );
 
   /// Creation parameters for the platform view ([ARCaptureViewParameter]
@@ -88,6 +109,10 @@ class ARCaptureViewConfig {
         ARCaptureViewParameter.highResolutionFrameCapture:
             highResolutionFrameCapture,
         if (videoHdr) ARCaptureViewParameter.videoHdr: true,
+        if (stillResolution case final size?) ...{
+          ARCaptureViewParameter.stillWidth: size.width,
+          ARCaptureViewParameter.stillHeight: size.height,
+        },
         if (maxVideoHeight > 0)
           ARCaptureViewParameter.maxCameraImageHeight: maxVideoHeight,
       };
@@ -100,11 +125,12 @@ class ARCaptureViewConfig {
       other.depthHeight == depthHeight &&
       other.highResolutionFrameCapture == highResolutionFrameCapture &&
       other.videoHdr == videoHdr &&
-      other.maxVideoHeight == maxVideoHeight;
+      other.maxVideoHeight == maxVideoHeight &&
+      other.stillResolution == stillResolution;
 
   @override
   int get hashCode => Object.hash(sceneDepth, depthWidth, depthHeight,
-      highResolutionFrameCapture, videoHdr, maxVideoHeight);
+      highResolutionFrameCapture, videoHdr, maxVideoHeight, stillResolution);
 
   @override
   String toString() => 'ARCaptureViewConfig(sceneDepth: $sceneDepth, '

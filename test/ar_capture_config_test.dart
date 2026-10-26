@@ -5,15 +5,34 @@ import 'package:ar_flutter_plugin_2/models/camera_resolution.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
-  test('assessed producer config defaults off and preserves explicit copy map identity', () {
-    const legacy = ARCaptureConfig(resolution: CameraResolution(width: 4128, height: 3096), format: CaptureFormat.jpeg);
+  test('HEIC config and asset formats retain a distinct canonical wire value',
+      () {
+    expect(CaptureFormat.fromWire('heic'), CaptureFormat.heic);
+    expect(CaptureFormat.fromWire('heif').wireValue, 'heic');
+    expect(CaptureAssetFormat.fromWire('heic'), CaptureAssetFormat.heic);
+    final config = ARCaptureConfig(
+        format: CaptureFormat.heic,
+        resolution: const CameraResolution(width: 4032, height: 3024));
+    expect(ARCaptureConfig.fromMap(config.toMap()).format, CaptureFormat.heic);
+  });
+
+  test(
+      'assessed producer config defaults off and preserves explicit copy map identity',
+      () {
+    const legacy = ARCaptureConfig(
+        resolution: CameraResolution(width: 4128, height: 3096),
+        format: CaptureFormat.jpeg);
     expect(legacy.retainAssessedOriginals, isFalse);
     final assessed = legacy.copyWith(retainAssessedOriginals: true);
     expect(ARCaptureConfig.fromMap(assessed.toMap()), assessed);
     expect(assessed.copyWith(jpegQuality: 95).retainAssessedOriginals, isTrue);
     expect(assessed.copyWith(retainAssessedOriginals: false), legacy);
     expect(assessed, isNot(legacy));
-    expect(ARCaptureConfig.fromMap({...legacy.toMap()}..remove('retainAssessedOriginals')).retainAssessedOriginals, isFalse);
+    expect(
+        ARCaptureConfig.fromMap(
+                {...legacy.toMap()}..remove('retainAssessedOriginals'))
+            .retainAssessedOriginals,
+        isFalse);
     expect(assessed.resolution, legacy.resolution);
     expect(assessed.jpegQuality, 95);
   });
@@ -76,7 +95,7 @@ void main() {
   });
 
   test('rejects removed, missing, and unknown logical capture formats', () {
-    for (final format in <Object?>['raw', 'raw_only', 'png', 'heif', null]) {
+    for (final format in <Object?>['raw', 'raw_only', 'png', null]) {
       expect(
         () => ARCaptureConfig.fromMap(<String, dynamic>{
           ...baseConfig.toMap(),
@@ -84,7 +103,8 @@ void main() {
         }),
         throwsA(
           isA<CaptureFormatException>()
-              .having((error) => error.code, 'code', 'UNSUPPORTED_CAPTURE_FORMAT')
+              .having(
+                  (error) => error.code, 'code', 'UNSUPPORTED_CAPTURE_FORMAT')
               .having((error) => error.wireValue, 'wire value', format),
         ),
       );

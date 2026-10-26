@@ -1,5 +1,7 @@
 import 'package:flutter/foundation.dart';
 
+import 'camera_resolution.dart';
+
 /// Upper bound of the AR camera image the session runs with: the ARCore
 /// CameraConfig (CPU image and GPU texture) on Android, the ARKit video
 /// format on iOS. [auto] keeps the platform's default choice. High
@@ -79,6 +81,8 @@ class ARCameraFormat {
     this.textureWidth,
     this.textureHeight,
     this.captureDeviceType,
+    this.stillWidth,
+    this.stillHeight,
   });
 
   final int imageWidth;
@@ -89,6 +93,17 @@ class ARCameraFormat {
 
   /// ARKit capture device type (`AVCaptureDevice.DeviceType` raw value).
   final String? captureDeviceType;
+
+  /// ARKit's native still geometry for this exact video format (iOS 26+).
+  /// Absent means unknown, not equal to the video image dimensions.
+  final int? stillWidth;
+  final int? stillHeight;
+  CameraResolution? get stillResolution => stillWidth != null &&
+          stillHeight != null &&
+          stillWidth! > 0 &&
+          stillHeight! > 0
+      ? CameraResolution(width: stillWidth!, height: stillHeight!)
+      : null;
 
   /// ARKit's wide-angle camera, the only one the capture view runs.
   static const String wideAngleDeviceType =
@@ -125,6 +140,10 @@ class ARCameraFormat {
           imageHeight: h,
           maxFps: fps,
           captureDeviceType: device is String ? device : null,
+          stillWidth:
+              item['stillWidth'] is int ? item['stillWidth'] as int : null,
+          stillHeight:
+              item['stillHeight'] is int ? item['stillHeight'] as int : null,
         ),
       );
     }
@@ -149,7 +168,9 @@ class ARCameraFormat {
       other.maxFps == maxFps &&
       other.textureWidth == textureWidth &&
       other.textureHeight == textureHeight &&
-      other.captureDeviceType == captureDeviceType;
+      other.captureDeviceType == captureDeviceType &&
+      other.stillWidth == stillWidth &&
+      other.stillHeight == stillHeight;
 
   @override
   int get hashCode => Object.hash(
@@ -159,6 +180,8 @@ class ARCameraFormat {
         textureWidth,
         textureHeight,
         captureDeviceType,
+        stillWidth,
+        stillHeight,
       );
 
   @override

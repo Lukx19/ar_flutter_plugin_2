@@ -348,11 +348,11 @@ final class NativeCaptureBindingTests: XCTestCase {
 
   func testStoreVersionsReportThePlainAndShotRootSchemas() {
     let report = NativeStoreFormatVersions.report()
-    XCTAssertEqual(report["nativePhotoStore"] as? Int, 6, "shot records name their intrinsics convention")
+    XCTAssertEqual(report["nativePhotoStore"] as? Int, 7, "HEIC components retain their encoding identity")
     XCTAssertEqual(report["nativePhotoRootSchema"] as? Int, 5)
     XCTAssertEqual(report["nativePhotoShotRootSchema"] as? Int, 7)
-    XCTAssertEqual(report["nativePhotoRootSchemasReadable"] as? [Int], [5, 7])
-    XCTAssertEqual(report["nativePreviewCache"] as? Int, 2)
+    XCTAssertEqual(report["nativePhotoRootSchemasReadable"] as? [Int], [5, 7, 8])
+    XCTAssertEqual(report["nativePreviewCache"] as? Int, 3)
     XCTAssertEqual(report["nativeStorageBudget"] as? Int, 2, "settlement markers")
   }
 

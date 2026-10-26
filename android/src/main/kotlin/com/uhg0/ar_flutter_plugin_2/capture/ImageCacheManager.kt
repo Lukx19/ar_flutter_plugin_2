@@ -657,7 +657,7 @@ class ImageCacheManager(
     }
 
     private fun requireAsset(cachedImage: CachedImage, format: String): CachedImageAsset {
-        if (format !in setOf("jpeg", "dng")) {
+        if (format !in setOf("jpeg", "dng", "heic")) {
             throw CaptureSessionException(
                 code = "FORMAT_NOT_CAPTURED",
                 message = "Unknown capture asset format=$format",
@@ -674,6 +674,7 @@ class ImageCacheManager(
         val matches =
             when (format) {
                 "jpeg" -> lowerPath.endsWith(".jpg") || lowerPath.endsWith(".jpeg")
+                "heic" -> lowerPath.endsWith(".heic") || lowerPath.endsWith(".heif")
                 "dng" -> lowerPath.endsWith(".dng")
                 else -> false
             }
@@ -688,6 +689,7 @@ class ImageCacheManager(
     private fun formatName(format: Int): String =
         when (format) {
             ImageFormat.JPEG -> "jpeg"
+            ImageFormat.HEIC -> "heic"
             ImageFormat.RAW_SENSOR -> "dng"
             else -> throw CaptureSessionException(
                 code = "FORMAT_NOT_CAPTURED",

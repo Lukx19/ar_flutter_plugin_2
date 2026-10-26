@@ -2,6 +2,7 @@ package com.uhg0.ar_flutter_plugin_2.capture
 
 import java.io.File
 import java.nio.file.Files
+import java.security.MessageDigest
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.Executors
@@ -22,6 +23,37 @@ class NativeCapturePreviewOwnerV2Test {
     }
     @Before fun initialize() { owner().reconcile(emptyList()) }
     @After fun cleanup() { root.deleteRecursively() }
+
+    @Test fun `HEIC immutable originals keep their extension and survive deletion rollback`() {
+        fun hash(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes).toCaptureHashHex()
+        val request = "d".repeat(64)
+        val source = "immutable-heic-original".toByteArray()
+        val sourceHash = hash(source)
+        val record = "schema=8\nrevision=1\nrequest=$request\nprevious=-\nsecondPrevious=-\ncomponent=HEIC:${source.size}:$sourceHash\n"
+        val manifestId = hash(record.toByteArray())
+        val session = File(root.canonicalFile, "capture-v2-native/store/sessions/session").apply { mkdirs() }
+        File(session, "root-A.ptr").writeText("1\n$manifestId\n${"e".repeat(64)}\n")
+        File(session, "objects/$manifestId.root").apply { parentFile!!.mkdirs(); writeText(record) }
+        val original = File(session, "assets/$capture/heic.$sourceHash.blob").apply { parentFile!!.mkdirs(); writeBytes(source) }
+        File(session, "attempts/accepted/receipt.properties").apply {
+            parentFile!!.mkdirs()
+            writeText("kind=COMMITTED_PICTURE\nrootHash=$manifestId\ncaptureId=$capture\nrequestHash=$request\nrevision=1\nheicSizeBytes=${source.size}\nreceiptHash=${hash("$request|$manifestId".toByteArray())}\n")
+        }
+        val nativeReference = "native-v2://$manifestId/$capture"
+        val owner = NativeCapturePreviewOwnerV2(root)
+        owner.reconcile(listOf(nativeReference))
+        val path = requireNotNull(owner.materialize(manifestId, capture, edge = 0))
+        assertTrue(path.endsWith(".original.heic"))
+        assertArrayEquals(source, File(path).readBytes())
+        val token = owner.beginDeletion(listOf(nativeReference))
+        assertFalse(File(path).exists())
+        owner.rollbackDeletion(token)
+        assertArrayEquals(source, File(path).readBytes())
+        assertArrayEquals(source, original.readBytes())
+        owner.commitDeletion(owner.beginDeletion(listOf(nativeReference)))
+        assertNull(owner.materialize(manifestId, capture, edge = 0))
+        assertArrayEquals(source, original.readBytes())
+    }
 
     @Test fun `original inspection copies share detail bound and deletion rollback fences all variants`() {
         val owner = owner()

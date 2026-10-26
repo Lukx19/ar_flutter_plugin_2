@@ -19,7 +19,7 @@ object NativeStoreFormatVersions {
     /** Layout of `capture-v2-native/store` (sessions, attempts, assets, A/B root pointers). */
     // 3: deletion preserves damaged metadata outside the fenced session:
     // quarantine/<sessionHash>/<sha256(bytes)>.record (raw immutable bytes).
-    const val PHOTO_STORE_LAYOUT = 3
+    const val PHOTO_STORE_LAYOUT = 7
 
     /** Root record schema written without a quality assessment. */
     const val PHOTO_ROOT_SCHEMA_PLAIN = 5
@@ -27,19 +27,22 @@ object NativeStoreFormatVersions {
     /** Root record schema written with a quality assessment (assessed originals). */
     const val PHOTO_ROOT_SCHEMA_ASSESSED = 6
 
+    const val PHOTO_ROOT_SCHEMA_HEIC_PLAIN = 8
+    const val PHOTO_ROOT_SCHEMA_HEIC_ASSESSED = 9
+
     /** Root record schemas the reader accepts. */
     val PHOTO_ROOT_SCHEMAS_READABLE: Set<String> =
-        setOf(PHOTO_ROOT_SCHEMA_PLAIN.toString(), PHOTO_ROOT_SCHEMA_ASSESSED.toString())
+        setOf(PHOTO_ROOT_SCHEMA_PLAIN.toString(), PHOTO_ROOT_SCHEMA_ASSESSED.toString(), "8", "9")
 
     /** Layout of `capture-v2-previews`: 512/1024 px previews, optional full-resolution
      * `<key>.original.jpg` copies and deletion markers. Existing previews remain readable. */
-    const val PREVIEW_CACHE_LAYOUT = 2
+    const val PREVIEW_CACHE_LAYOUT = 3
 
     /** Reply of [METHOD]: component name to version, plus the readable root schemas. */
     fun report(): Map<String, Any> = mapOf(
         "nativePhotoStore" to PHOTO_STORE_LAYOUT,
-        "nativePhotoRootSchema" to PHOTO_ROOT_SCHEMA_ASSESSED,
-        "nativePhotoRootSchemasReadable" to listOf(PHOTO_ROOT_SCHEMA_PLAIN, PHOTO_ROOT_SCHEMA_ASSESSED),
+        "nativePhotoRootSchema" to PHOTO_ROOT_SCHEMA_HEIC_ASSESSED,
+        "nativePhotoRootSchemasReadable" to listOf(PHOTO_ROOT_SCHEMA_PLAIN, PHOTO_ROOT_SCHEMA_ASSESSED, PHOTO_ROOT_SCHEMA_HEIC_PLAIN, PHOTO_ROOT_SCHEMA_HEIC_ASSESSED),
         "nativePreviewCache" to PREVIEW_CACHE_LAYOUT,
     )
 

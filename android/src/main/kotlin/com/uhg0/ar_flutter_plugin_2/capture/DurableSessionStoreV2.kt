@@ -49,6 +49,7 @@ class DurableSessionStoreV2(
         val qualityAssessment: CaptureQualityAssessmentV1? = null,
         val qualityAssessmentHash: String? = null,
         val verifiedTerminal: CaptureTerminal? = null,
+        val heicSizeBytes: Long? = null,
     )
     private val mutex = Any()
     private val files = SafeFilesystemV2(root, faults, filesystemBackend)
@@ -85,11 +86,11 @@ class DurableSessionStoreV2(
         var source: File? = null
         for (location in locations) {
             if (manifestId !in retainedRootHashes(location)) continue
-            val jpegHash = readRootMetadata(location, manifestId)?.components
-                ?.firstOrNull { it.kind == "JPEG" }?.hash
+            val primary = readRootMetadata(location, manifestId)?.components
+                ?.singleOrNull { it.kind == "JPEG" || it.kind == "HEIC" }
                 ?: continue
             val asset = path(location, "assets", captureId)
-            source = path(asset, "jpeg.$jpegHash.blob").takeIf(files::isFile)
+            source = path(asset, "${primary.kind.lowercase()}.${primary.hash}.blob").takeIf(files::isFile)
             if (source != null) break
         }
         val selectedSource = source ?: return@synchronized false
@@ -273,10 +274,11 @@ class DurableSessionStoreV2(
             faults.at(DurableStoreFaultPointV2.ROOT_WRITE)
             writeImmutable(path(location, "objects", "$rootHash.root"), rootBytes)
             faults.at(DurableStoreFaultPointV2.ROOT_FILE_SYNC)
-            val jpegSizeBytes = request.components.single { it.kind == CaptureComponentKind.JPEG }.byteLength
+            val jpegSizeBytes = request.components.singleOrNull { it.kind == CaptureComponentKind.JPEG }?.byteLength
             val dngSizeBytes = request.components.singleOrNull { it.kind == CaptureComponentKind.DNG }?.byteLength
             val terminal = CaptureTerminal(CaptureTerminalKind.COMMITTED_PICTURE, request.accepted.identity, requestHash, "committed", captureId, revision, rootHash, jpegSizeBytes, dngSizeBytes, request.qualityAssessment,
-                request.qualityAssessment?.let { CaptureQualityAssessmentV1.boundHash(requestHash, it) })
+                request.qualityAssessment?.let { CaptureQualityAssessmentV1.boundHash(requestHash, it) },
+                heicSizeBytes = request.components.singleOrNull { it.kind == CaptureComponentKind.HEIC }?.byteLength)
             val committed = CaptureReceipt(request.accepted.identity, CaptureAttemptPhase.COMMITTED_PICTURE, requestHash, receiptHash(requestHash, rootHash), true, terminal)
             // Receipt is durable before, and independently validates, the pointer switch.
             faults.at(DurableStoreFaultPointV2.RECEIPT_WRITE)
@@ -380,10 +382,11 @@ class DurableSessionStoreV2(
             faults.at(DurableStoreFaultPointV2.ROOT_WRITE)
             writeImmutable(path(location, "objects", "$rootHash.root"), rootBytes)
             faults.at(DurableStoreFaultPointV2.ROOT_FILE_SYNC)
-            val jpegSizeBytes = request.components.single { it.kind == CaptureComponentKind.JPEG }.byteLength
+            val jpegSizeBytes = request.components.singleOrNull { it.kind == CaptureComponentKind.JPEG }?.byteLength
             val dngSizeBytes = request.components.singleOrNull { it.kind == CaptureComponentKind.DNG }?.byteLength
             val terminal = CaptureTerminal(CaptureTerminalKind.COMMITTED_PICTURE, identity, requestHash, "committed", captureId, revision, rootHash, jpegSizeBytes, dngSizeBytes, request.qualityAssessment,
-                request.qualityAssessment?.let { CaptureQualityAssessmentV1.boundHash(requestHash, it) })
+                request.qualityAssessment?.let { CaptureQualityAssessmentV1.boundHash(requestHash, it) },
+                heicSizeBytes = request.components.singleOrNull { it.kind == CaptureComponentKind.HEIC }?.byteLength)
             val committed = CaptureReceipt(identity, CaptureAttemptPhase.COMMITTED_PICTURE, requestHash, receiptHash(requestHash, rootHash), true, terminal)
             faults.at(DurableStoreFaultPointV2.RECEIPT_WRITE)
             writeReceipt(
@@ -771,6 +774,7 @@ class DurableSessionStoreV2(
                             verified.jpegSizeBytes,
                             verified.dngSizeBytes,
                             verified.qualityAssessment, verified.qualityAssessmentHash, verifiedTerminal,
+                            heicSizeBytes = verified.heicSizeBytes,
                         )
                     } else if (value.getProperty("kind") == CaptureTerminalKind.ABANDONED_ATTEMPT.name) {
                         RecoveryProjectionV2(
@@ -1059,6 +1063,7 @@ class DurableSessionStoreV2(
         val dngSizeBytes: Long?,
         val qualityAssessment: CaptureQualityAssessmentV1?,
         val qualityAssessmentHash: String?,
+        val heicSizeBytes: Long? = null,
     )
 
     private fun receipt(location: File, identity: CaptureAttemptIdentity): CaptureReceipt? {
@@ -1088,6 +1093,7 @@ class DurableSessionStoreV2(
         verified.dngSizeBytes,
         verified.qualityAssessment,
         verified.qualityAssessmentHash,
+        heicSizeBytes = verified.heicSizeBytes,
     )
 
     /** Schema-6 receipt, accepted identity and root must agree before authority is constructed. */
@@ -1098,7 +1104,20 @@ class DurableSessionStoreV2(
     ): VerifiedCommittedReceiptV2 {
         val rootHash = receipt.getProperty("rootHash") ?: throw DurableStoreConflictV2("Committed receipt has no root")
         val metadata = readRootMetadata(location, rootHash) ?: throw DurableStoreConflictV2("Committed root is invalid")
-        if (metadata.schema == "5") {
+        if (metadata.schema == "8") {
+            val exact = identity ?: throw DurableStoreConflictV2("HEIC recovery requires exact accepted identity")
+            requireExactAcceptedIdentity(location, exact)
+            if (receipt.getProperty("captureId") != safe(exact.attemptId) ||
+                receipt.getProperty("revision")?.toLongOrNull() != metadata.revision ||
+                receipt.getProperty("requestHash") != metadata.request ||
+                receipt.getProperty("receiptHash") != receiptHash(requireNotNull(metadata.request), rootHash)) {
+                throw DurableStoreConflictV2("HEIC receipt is not bound to its accepted identity and root")
+            }
+        }
+        if (metadata.schema == "5" || metadata.schema == "8") {
+            if (metadata.schema == "8" && (receipt.getProperty("jpegSizeBytes") != null || receipt.getProperty("dngSizeBytes") != null || receipt.getProperty("heicSizeBytes")?.toLongOrNull() != metadata.components.singleOrNull { it.kind == "HEIC" }?.length)) {
+                throw DurableStoreConflictV2("HEIC receipt conflicts with its primary component")
+            }
             if (receipt.stringPropertyNames().any { it.startsWith("quality") }) {
                 throw DurableStoreConflictV2("Legacy receipt cannot carry assessed quality")
             }
@@ -1109,9 +1128,10 @@ class DurableSessionStoreV2(
                 terminalComponentSize(location, receipt, CaptureComponentKind.DNG),
                 null,
                 null,
+                heicSizeBytes = terminalComponentSize(location, receipt, CaptureComponentKind.HEIC),
             )
         }
-        if (metadata.schema != "6") throw DurableStoreConflictV2("Unknown quality root schema")
+        if (metadata.schema != "6" && metadata.schema != "9") throw DurableStoreConflictV2("Unknown quality root schema")
         val fields = receipt.stringPropertyNames().associateWith { receipt.getProperty(it) }
         val assessment = CaptureQualityAssessmentV1.fromRootFields(fields)
             ?: throw DurableStoreConflictV2("Committed receipt has missing or malformed quality")
@@ -1143,7 +1163,10 @@ class DurableSessionStoreV2(
             }
             return size
         }
-        val jpegSize = exactComponentSize(CaptureComponentKind.JPEG, "jpegSizeBytes")
+        val heic = metadata.schema == "9"
+        val jpegSize = if (heic) null else exactComponentSize(CaptureComponentKind.JPEG, "jpegSizeBytes")
+        val heicSize = if (heic) exactComponentSize(CaptureComponentKind.HEIC, "heicSizeBytes") else null
+        if (heic && (receipt.getProperty("jpegSizeBytes") != null || receipt.getProperty("dngSizeBytes") != null)) throw DurableStoreConflictV2("HEIC receipt contains JPEG/DNG sizes")
         val dngDescriptor = metadata.components.singleOrNull { it.kind == CaptureComponentKind.DNG.name }
         val dngProperty = receipt.getProperty("dngSizeBytes")
         val dngSize = if (dngDescriptor == null) {
@@ -1159,6 +1182,7 @@ class DurableSessionStoreV2(
             dngSize,
             assessment,
             requireNotNull(assessmentHash),
+            heicSizeBytes = heicSize,
         )
     }
 
@@ -1185,7 +1209,7 @@ class DurableSessionStoreV2(
     private fun acceptedReceipt(attempt: CaptureAcceptedAttempt) = CaptureReceipt(attempt.identity, CaptureAttemptPhase.RESERVED_ACCEPTED, acceptedHash(attempt), attempt.acceptedReceiptHash.hex(), true)
     /** Legacy receipts omitted DNG sizes; the retained hash-validated root still records the exact set. */
     private fun terminalComponentSize(location: File, receipt: Properties, kind: CaptureComponentKind): Long? {
-        val property = if (kind == CaptureComponentKind.JPEG) "jpegSizeBytes" else "dngSizeBytes"
+        val property = when (kind) { CaptureComponentKind.JPEG -> "jpegSizeBytes"; CaptureComponentKind.HEIC -> "heicSizeBytes"; else -> "dngSizeBytes" }
         receipt.getProperty(property)?.let { return it.toLong().also { size -> require(size > 0) } }
         val rootHash = receipt.getProperty("rootHash") ?: return null
         return readRootMetadata(location, rootHash)?.components
@@ -1252,7 +1276,7 @@ class DurableSessionStoreV2(
     private fun reservationOwner(identity: CaptureAttemptIdentity) = "capture:${safe(identity.lifecycleCut.sessionId)}:${safe(identity.commitId)}"
     private fun receiptHash(requestHash: String, rootHash: String) = sha256("$requestHash|$rootHash".toByteArray()).hex()
     private fun rootRecord(request: CaptureCommitRequest, requestHash: String, revision: Long, staged: List<Staged>, prior: RootPointer?) = buildString {
-        append("schema=${if (request.qualityAssessment == null) NativeStoreFormatVersions.PHOTO_ROOT_SCHEMA_PLAIN else NativeStoreFormatVersions.PHOTO_ROOT_SCHEMA_ASSESSED}\nrevision=$revision\nrequest=$requestHash\nprevious=${prior?.rootHash ?: "-"}\nsecondPrevious=${prior?.previousHash ?: "-"}\n")
+        append("schema=${if (request.components.any { it.kind == CaptureComponentKind.HEIC }) { if (request.qualityAssessment == null) 8 else 9 } else if (request.qualityAssessment == null) NativeStoreFormatVersions.PHOTO_ROOT_SCHEMA_PLAIN else NativeStoreFormatVersions.PHOTO_ROOT_SCHEMA_ASSESSED}\nrevision=$revision\nrequest=$requestHash\nprevious=${prior?.rootHash ?: "-"}\nsecondPrevious=${prior?.previousHash ?: "-"}\n")
         staged.sortedBy { it.kind.ordinal }.forEach { append("component=${it.kind}:${it.descriptor.byteLength}:${it.descriptor.sha256.hex()}\n") }
         request.qualityAssessment?.let { assessment ->
             append("exposureTimestampNanoseconds=${request.exposureTimestampNanoseconds}\n")
@@ -1260,7 +1284,7 @@ class DurableSessionStoreV2(
             append("qualityAssessmentHash=${CaptureQualityAssessmentV1.boundHash(requestHash, assessment)}\n")
         }
     }.toByteArray(StandardCharsets.UTF_8)
-    private fun receiptProperties(receipt: CaptureReceipt, rootHash: String) = Properties().apply { setProperty("kind", receipt.terminal!!.kind.name); setProperty("requestHash", receipt.requestHash); setProperty("receiptHash", receipt.receiptHash); setProperty("rootHash", rootHash); setProperty("reason", receipt.terminal.reason); receipt.terminal.captureId?.let { setProperty("captureId", it) }; receipt.terminal.captureRevision?.let { setProperty("revision", it.toString()) }; receipt.terminal.jpegSizeBytes?.let { setProperty("jpegSizeBytes", it.toString()) }; receipt.terminal.dngSizeBytes?.let { setProperty("dngSizeBytes", it.toString()) }; receipt.terminal.qualityAssessment?.let { assessment -> assessment.rootFields().forEach { (key, value) -> setProperty(key, value) }; setProperty("qualityAssessmentHash", requireNotNull(receipt.terminal.qualityAssessmentHash)) } }
+    private fun receiptProperties(receipt: CaptureReceipt, rootHash: String) = Properties().apply { setProperty("kind", receipt.terminal!!.kind.name); setProperty("requestHash", receipt.requestHash); setProperty("receiptHash", receipt.receiptHash); setProperty("rootHash", rootHash); setProperty("reason", receipt.terminal.reason); receipt.terminal.captureId?.let { setProperty("captureId", it) }; receipt.terminal.captureRevision?.let { setProperty("revision", it.toString()) }; receipt.terminal.jpegSizeBytes?.let { setProperty("jpegSizeBytes", it.toString()) }; receipt.terminal.dngSizeBytes?.let { setProperty("dngSizeBytes", it.toString()) }; receipt.terminal.heicSizeBytes?.let { setProperty("heicSizeBytes", it.toString()) }; receipt.terminal.qualityAssessment?.let { assessment -> assessment.rootFields().forEach { (key, value) -> setProperty(key, value) }; setProperty("qualityAssessmentHash", requireNotNull(receipt.terminal.qualityAssessmentHash)) } }
 
     private fun replayReceiptBeforeExposure(location: File, request: CaptureCommitRequest): CaptureReceipt? {
         val prior = receipt(location, request.accepted.identity) ?: return null

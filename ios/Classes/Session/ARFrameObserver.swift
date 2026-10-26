@@ -74,6 +74,9 @@ protocol ARFrameSource: AnyObject {
   /// True when stills are recorded ones (playback): every request answers
   /// with the recorded still nearest to it.
   var replaysRecordedStills: Bool { get }
+  /// Exact still geometry selected when this camera owner was created.
+  /// Nil preserves legacy Automatic behavior; never inferred from a video frame.
+  var exactStillResolution: CGSize? { get }
 }
 
 /// Quality of an in-AR still.
@@ -98,6 +101,7 @@ extension ARFrameSource {
   }
 
   var replaysRecordedStills: Bool { false }
+  var exactStillResolution: CGSize? { nil }
 }
 
 /// A frame source the capture view drives: the live session host or a

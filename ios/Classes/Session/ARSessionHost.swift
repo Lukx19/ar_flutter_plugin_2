@@ -45,6 +45,7 @@ final class ARSessionHost: NSObject, CaptureSessionSource, ARSessionDelegate {
   let session: ARSession
   let delegateQueue: DispatchQueue
   let plan: ARSessionConfigurationPlan
+  var exactStillResolution: CGSize? { plan.exactStillResolution }
 
   /// Called on the main thread when ARKit reports a session error.
   var onSessionFailure: ((Error) -> Void)?
@@ -225,7 +226,15 @@ final class ARSessionHost: NSObject, CaptureSessionSource, ARSessionDelegate {
 
   private func perform(_ transition: (inout ARSessionLifecycle) -> ARSessionCommand) {
     lock.lock()
+    let previous = lifecycle
     let command = transition(&lifecycle)
+    if case .run = command, plan.unsupportedStillResolution {
+      lifecycle = previous
+      lock.unlock()
+      onSessionFailure?(NSError(domain: "capture3d.camera-profile", code: 1,
+        userInfo: [NSLocalizedDescriptionKey: "Requested ARKit still resolution is unavailable"]))
+      return
+    }
     let epoch = lifecycle.epoch
     lock.unlock()
     apply(command, epoch: epoch)

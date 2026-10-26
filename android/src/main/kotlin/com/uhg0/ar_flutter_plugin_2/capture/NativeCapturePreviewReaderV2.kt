@@ -41,11 +41,11 @@ internal class NativeCapturePreviewReaderV2(
             val session = entry.toFile()
             if (!session.isDirectory || session.canonicalFile != session.absoluteFile || File(session, "tombstone").exists()) continue
             val descriptor = committedRoot(session, manifestId, captureId, cancelled)?.components
-                ?.firstOrNull { it.kind == "JPEG" }?.let { Descriptor(it.length, it.hash) }
+                ?.firstOrNull { it.kind == "JPEG" || it.kind == "HEIC" }?.let { Descriptor(it.length, it.hash, it.kind.lowercase()) }
                 ?: continue
             val source = File(
                 session,
-                "assets/$captureId/jpeg.${descriptor.hash}.blob",
+                "assets/$captureId/${descriptor.format}.${descriptor.hash}.blob",
             )
             if (!source.isFile || source.canonicalFile != source.absoluteFile || source.length() != descriptor.length) continue
             val parent = target.parentFile ?: continue
@@ -82,6 +82,23 @@ internal class NativeCapturePreviewReaderV2(
         }
         }
         return false
+    }
+
+    /** Root-qualified format of an immutable original; never inferred from its filename. */
+    @Synchronized
+    fun sourceFormat(manifestId: String, captureId: String): String? {
+        if (!HASH.matches(manifestId) || !HASH.matches(captureId)) return null
+        val sessions = File(storeRoot.canonicalFile, "sessions")
+        if (!sessions.isDirectory) return null
+        Files.newDirectoryStream(sessions.toPath()).use { entries ->
+            for (entry in entries) {
+                val session = entry.toFile()
+                if (!session.isDirectory || session.canonicalFile != session.absoluteFile || File(session, "tombstone").exists()) continue
+                val root = committedRoot(session, manifestId, captureId) { false } ?: continue
+                return root.components.singleOrNull { it.kind == "JPEG" || it.kind == "HEIC" }?.kind?.lowercase()
+            }
+        }
+        return null
     }
 
     /** Walk immutable ancestors with one open descriptor and scalar state, not a root-sized set. */
@@ -131,8 +148,8 @@ internal class NativeCapturePreviewReaderV2(
     }
 
     private fun knownQualitySchema(root: CaptureRootMetadataV2): Boolean = when (root.schema) {
-        "5" -> root.qualityAssessment == null && root.qualityAssessmentHash == null && root.exposureTimestampNanoseconds == null
-        "6" -> root.qualityAssessment != null && root.request != null && root.exposureTimestampNanoseconds != null &&
+        "5", "8" -> root.qualityAssessment == null && root.qualityAssessmentHash == null && root.exposureTimestampNanoseconds == null
+        "6", "9" -> root.qualityAssessment != null && root.request != null && root.exposureTimestampNanoseconds != null &&
             root.qualityAssessmentHash == CaptureQualityAssessmentV1.boundHash(root.request, root.qualityAssessment)
         else -> false
     }
@@ -155,19 +172,22 @@ internal class NativeCapturePreviewReaderV2(
                 if (values.getProperty("requestHash") != root.request || values.getProperty("revision")?.toLongOrNull() != root.revision ||
                     values.getProperty("receiptHash") != MessageDigest.getInstance("SHA-256")
                         .digest("${root.request}|$manifestId".toByteArray()).toCaptureHashHex()) return false
-                val jpeg = root.components.singleOrNull { it.kind == "JPEG" } ?: return false
+                val jpeg = root.components.singleOrNull { it.kind == "JPEG" || it.kind == "HEIC" } ?: return false
+                val primarySize = if (jpeg.kind == "HEIC") "heicSizeBytes" else "jpegSizeBytes"
+                if (jpeg.kind == "HEIC" && (values.getProperty("jpegSizeBytes") != null || values.getProperty("dngSizeBytes") != null)) return false
                 val dng = root.components.singleOrNull { it.kind == "DNG" }
                 when (root.schema) {
-                    "5" -> {
+                    "5", "8" -> {
+                        if (root.schema == "8" && values.getProperty(primarySize)?.toLongOrNull() != jpeg.length) return false
                         if (values.stringPropertyNames().any { it.startsWith("quality") }) return false
-                        if (values.getProperty("jpegSizeBytes")?.let { it.toLongOrNull() != jpeg.length } == true ||
+                        if (values.getProperty(primarySize)?.let { it.toLongOrNull() != jpeg.length } == true ||
                             values.getProperty("dngSizeBytes")?.let { it.toLongOrNull() != dng?.length } == true) return false
                     }
-                    "6" -> {
+                    "6", "9" -> {
                         val fields = values.stringPropertyNames().associateWith { values.getProperty(it) }
                         if (CaptureQualityAssessmentV1.fromRootFields(fields) != root.qualityAssessment ||
                             values.getProperty("qualityAssessmentHash") != root.qualityAssessmentHash ||
-                            values.getProperty("jpegSizeBytes")?.toLongOrNull() != jpeg.length ||
+                            values.getProperty(primarySize)?.toLongOrNull() != jpeg.length ||
                             values.getProperty("dngSizeBytes")?.toLongOrNull() != dng?.length ||
                             (dng == null && values.getProperty("dngSizeBytes") != null)) return false
                     }
@@ -200,7 +220,7 @@ internal class NativeCapturePreviewReaderV2(
 
     private fun ByteArray.hex() = toCaptureHashHex()
 
-    private data class Descriptor(val length: Long, val hash: String)
+    private data class Descriptor(val length: Long, val hash: String, val format: String)
     private data class RootPointer(val revision: Long, val hash: String)
 
     private companion object {

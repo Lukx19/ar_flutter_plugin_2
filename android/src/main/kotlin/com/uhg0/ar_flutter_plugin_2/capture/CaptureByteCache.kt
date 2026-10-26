@@ -26,7 +26,7 @@ internal data class CaptureConfig(
             val maxCacheSize = (configMap["maxCacheSize"] as? Number)?.toInt() ?: 10
             val jpegQuality = (configMap["jpegQuality"] as? Number)?.toInt() ?: 95
 
-            if (format !in setOf("jpeg", "raw+jpeg")) {
+            if (format !in setOf("jpeg", "raw+jpeg", "heic", "heif")) {
                 throw CaptureSessionException(
                     code = "UNSUPPORTED_CAPTURE_FORMAT",
                     message = "Unsupported capture mode=$format",

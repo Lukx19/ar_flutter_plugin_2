@@ -130,6 +130,33 @@ final class ARSessionHostTests: XCTestCase {
       clock: { [unowned self] in self.now })
   }
 
+  func testExactStillSelectionReachesProductionFrameSourceWithoutReadingVideoGeometry() {
+    var plan = Self.plan
+    plan.exactStillResolution = CGSize(width: 4032, height: 3024)
+    let driver = FakeSessionDriver()
+    let host: ARFrameSource = ARSessionHost(plan: plan, driver: driver, registry: nil,
+      makeConfiguration: { ARWorldTrackingConfiguration() })
+    XCTAssertEqual(host.exactStillResolution, CGSize(width: 4032, height: 3024))
+    XCTAssertNil(makeHost(driver).exactStillResolution)
+  }
+
+  func testUnsupportedStillProfileDoesNotRunAnotherCameraConfiguration() {
+    let driver = FakeSessionDriver()
+    var invalid = Self.plan
+    invalid.unsupportedStillResolution = true
+    let host = ARSessionHost(plan: invalid, driver: driver, registry: nil,
+      makeConfiguration: { ARWorldTrackingConfiguration() })
+    var failures: [Error] = []
+    host.onSessionFailure = { failures.append($0) }
+    host.start()
+    XCTAssertTrue(driver.calls.isEmpty)
+    XCTAssertEqual(failures.count, 1)
+    XCTAssertNil(host.runConfiguration)
+    XCTAssertEqual(host.exactStillResolution, invalid.exactStillResolution)
+    XCTAssertEqual(host.lifecycleState, .idle)
+    host.dispose()
+  }
+
   func testControlCallsDriveTheSessionOnce() {
     let driver = FakeSessionDriver()
     let host = makeHost(driver)

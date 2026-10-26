@@ -25,6 +25,7 @@ struct NativeCaptureEvent: Hashable {
   var manifestId: String?
   var jpegSizeBytes: Int64?
   var dngSizeBytes: Int64?
+  var heicSizeBytes: Int64? = nil
   var reason: String?
   var resources: CaptureResourceSnapshot?
   var recoveryContext: NativeCaptureRecoveryContext?
@@ -33,7 +34,7 @@ struct NativeCaptureEvent: Hashable {
 
   /// Fields that must not change between a live terminal and its replay.
   var terminalIdentity: [AnyHashable?] {
-    [kind, captureId, captureRevision, manifestId, jpegSizeBytes, dngSizeBytes, recoveryContext,
+    [kind, captureId, captureRevision, manifestId, jpegSizeBytes, dngSizeBytes, heicSizeBytes, recoveryContext,
      kind == .abandoned ? reason : nil, shot]
   }
 
@@ -149,7 +150,7 @@ enum NativeCaptureWire {
       guard let kind = CaptureComponentKind(storedName: text.uppercased()) else { throw NativeCaptureWireError.invalid("Unknown component \(text)") }
       components.insert(kind)
     }
-    guard components == [.jpeg] || components == [.jpeg, .dng] else {
+    guard components == [.heic] || components == [.jpeg] || components == [.jpeg, .dng] else {
       throw NativeCaptureWireError.invalid("Profile must be JPEG or JPEG+DNG")
     }
     let profile = CaptureComponentProfile(
@@ -188,6 +189,7 @@ enum NativeCaptureWire {
     if let v = value.captureId { map["captureId"] = v }
     if let v = value.captureRevision { map["captureRevision"] = Int(v) }
     if let v = value.manifestId { map["manifestId"] = v }
+    if let v = value.heicSizeBytes { map["heicSizeBytes"] = Int(v) }
     if let v = value.jpegSizeBytes { map["jpegSizeBytes"] = Int(v) }
     if let v = value.dngSizeBytes { map["dngSizeBytes"] = Int(v) }
     if let v = value.reason { map["reason"] = v }
@@ -250,7 +252,7 @@ enum NativeCaptureWire {
     NativeCaptureEvent(
       kind: terminal.kind == .committedPicture ? .committed : .abandoned, attemptId: terminal.identity.attemptId,
       captureId: terminal.captureId, captureRevision: terminal.captureRevision, manifestId: terminal.manifestId,
-      jpegSizeBytes: terminal.jpegSizeBytes, dngSizeBytes: terminal.dngSizeBytes, reason: terminal.reason,
+      jpegSizeBytes: terminal.jpegSizeBytes, dngSizeBytes: terminal.dngSizeBytes, heicSizeBytes: terminal.heicSizeBytes, reason: terminal.reason,
       recoveryContext: recoveryContext, shot: terminal.shot)
   }
 

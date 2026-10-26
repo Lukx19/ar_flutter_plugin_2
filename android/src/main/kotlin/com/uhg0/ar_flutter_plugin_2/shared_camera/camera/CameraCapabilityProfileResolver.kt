@@ -20,9 +20,10 @@ internal object CameraCapabilityProfileResolver {
         cacheIdentityMatches: Boolean,
         rawPairProbeStatus: String?,
         hasValidatedPairedSizes: Boolean,
-    ): List<String> = listOf("jpeg") + if (
+        hardwareHeicAvailable: Boolean = false,
+    ): List<String> = listOf("jpeg") + (if (
         cacheIdentityMatches && rawPairProbeStatus == "supported" && hasValidatedPairedSizes
-    ) listOf("raw+jpeg") else emptyList()
+    ) listOf("raw+jpeg") else emptyList()) + if (hardwareHeicAvailable) listOf("heic") else emptyList()
 
     /**
      * The JPEG bracket route requests -2/0/+2 EV, rounded to sensor steps and

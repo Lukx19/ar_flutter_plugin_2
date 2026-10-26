@@ -5,19 +5,23 @@
 enum CaptureFormat {
   jpeg,
 
+  /// HEVC encoded still in a HEIF container, saved with a .heic extension.
+  heic,
+
   /// Simultaneous RAW sensor master and hardware JPEG from one shutter event.
   rawJpeg,
-
   ;
 
   String get wireValue => switch (this) {
         CaptureFormat.jpeg => 'jpeg',
+        CaptureFormat.heic => 'heic',
         CaptureFormat.rawJpeg => 'raw+jpeg',
       };
 
   static CaptureFormat fromWire(Object? value) {
     return switch (value) {
       'jpeg' => CaptureFormat.jpeg,
+      'heic' || 'heif' => CaptureFormat.heic,
       'raw+jpeg' => CaptureFormat.rawJpeg,
       _ => throw CaptureFormatException(
           code: 'UNSUPPORTED_CAPTURE_FORMAT',
@@ -38,6 +42,7 @@ enum CaptureFormat {
 /// A file belonging to a logical [CaptureFormat] capture.
 enum CaptureAssetFormat {
   jpeg,
+  heic,
   dng;
 
   String get wireValue => name;
@@ -45,6 +50,7 @@ enum CaptureAssetFormat {
   static CaptureAssetFormat fromWire(Object? value) {
     return switch (value) {
       'jpeg' => CaptureAssetFormat.jpeg,
+      'heic' || 'heif' => CaptureAssetFormat.heic,
       'dng' => CaptureAssetFormat.dng,
       _ => throw CaptureFormatException(
           code: 'UNSUPPORTED_CAPTURE_FORMAT',

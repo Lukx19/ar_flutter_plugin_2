@@ -209,6 +209,9 @@ internal class ArCaptureSession(
 
     suspend fun initialize(configMap: Map<String, Any?>) {
         val parsedConfig = CaptureConfig.fromMap(configMap)
+        if (parsedConfig.format in setOf("heic", "heif") && configMap["enableHighResCapture"] != true) {
+            throw CaptureSessionException("UNSUPPORTED_CAPTURE_FORMAT", "HEIC requires the hardware shared-camera output path")
+        }
         ensureStartupOwnerCurrent()
         if (configMap["enableHighResCapture"] == true) {
             try {
@@ -959,6 +962,7 @@ internal class ArCaptureSession(
                                 terminal.captureRevision,
                                 terminal.manifestId,
                                 jpegSizeBytes = terminal.jpegSizeBytes,
+                                heicSizeBytes = terminal.heicSizeBytes,
                                 dngSizeBytes = terminal.dngSizeBytes,
                                 reason = terminal.reason,
                                 recoveryContext = request.recoveryContext,

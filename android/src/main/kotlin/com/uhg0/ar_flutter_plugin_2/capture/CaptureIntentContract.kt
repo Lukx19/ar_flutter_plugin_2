@@ -37,7 +37,7 @@ enum class CaptureAttemptPhase {
     COMMITTED_PICTURE,
     ABANDONED_ATTEMPT,
 }
-enum class CaptureComponentKind { JPEG, DNG, RAW, HDR, SIDECAR }
+enum class CaptureComponentKind { JPEG, DNG, RAW, HDR, SIDECAR, HEIC }
 enum class CaptureTerminalKind { COMMITTED_PICTURE, ABANDONED_ATTEMPT }
 enum class CaptureTransitionDisposition { APPLIED, EXACT_REPLAY, REJECTED, CONFLICT }
 enum class CaptureFault {
@@ -366,6 +366,7 @@ data class CaptureTerminal(
     val dngSizeBytes: Long? = null,
     val qualityAssessment: CaptureQualityAssessmentV1? = null,
     val qualityAssessmentHash: String? = null,
+    val heicSizeBytes: Long? = null,
 ) {
     init {
         require((qualityAssessment == null) == (qualityAssessmentHash == null))
@@ -374,6 +375,7 @@ data class CaptureTerminal(
         require(canonicalTerminalHash.isNotEmpty() && reason.isNotEmpty())
         require(captureRevision == null || captureRevision >= 0)
         require(jpegSizeBytes == null || jpegSizeBytes > 0)
+        require(heicSizeBytes == null || (heicSizeBytes > 0 && jpegSizeBytes == null && dngSizeBytes == null))
         require(dngSizeBytes == null || (dngSizeBytes > 0 && jpegSizeBytes != null))
         require((kind == CaptureTerminalKind.COMMITTED_PICTURE) == (captureId != null && captureRevision != null && manifestId != null))
     }

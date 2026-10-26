@@ -9,15 +9,21 @@ struct ARVideoFormatDescription: Equatable {
   var captureDeviceType: String
   var isRecommendedForHighResolutionFrameCapturing: Bool
   var isVideoHDRSupported: Bool
+  /// Full still output for this exact ARKit video format; unknown before iOS 26.
+  var stillWidth: Int?
+  var stillHeight: Int?
 
   init(width: Int, height: Int, framesPerSecond: Int, captureDeviceType: String,
-       isRecommendedForHighResolutionFrameCapturing: Bool, isVideoHDRSupported: Bool) {
+       isRecommendedForHighResolutionFrameCapturing: Bool, isVideoHDRSupported: Bool,
+       stillWidth: Int? = nil, stillHeight: Int? = nil) {
     self.width = width
     self.height = height
     self.framesPerSecond = framesPerSecond
     self.captureDeviceType = captureDeviceType
     self.isRecommendedForHighResolutionFrameCapturing = isRecommendedForHighResolutionFrameCapturing
     self.isVideoHDRSupported = isVideoHDRSupported
+    self.stillWidth = stillWidth
+    self.stillHeight = stillHeight
   }
 
   init(_ format: ARConfiguration.VideoFormat) {
@@ -28,10 +34,17 @@ struct ARVideoFormatDescription: Equatable {
       captureDeviceType: format.captureDeviceType.rawValue,
       isRecommendedForHighResolutionFrameCapturing: format.isRecommendedForHighResolutionFrameCapturing,
       isVideoHDRSupported: format.isVideoHDRSupported)
+    if #available(iOS 26.0, *) {
+      let size = format.defaultPhotoSettings.maxPhotoDimensions
+      if size.width > 0, size.height > 0 {
+        stillWidth = Int(size.width)
+        stillHeight = Int(size.height)
+      }
+    }
   }
 
   var channelMap: [String: Any] {
-    [
+    var value: [String: Any] = [
       "width": width,
       "height": height,
       "framesPerSecond": framesPerSecond,
@@ -39,6 +52,11 @@ struct ARVideoFormatDescription: Equatable {
       "recommendedForHighResolutionFrameCapturing": isRecommendedForHighResolutionFrameCapturing,
       "videoHDRSupported": isVideoHDRSupported,
     ]
+    if let stillWidth = stillWidth, let stillHeight = stillHeight {
+      value["stillWidth"] = stillWidth
+      value["stillHeight"] = stillHeight
+    }
+    return value
   }
 }
 
@@ -80,6 +98,8 @@ enum ARCaptureViewParameter {
   /// Highest video format image height (`ARCameraResolution`); absent or 0
   /// keeps ARKit's default format.
   static let maxCameraImageHeight = "maxCameraImageHeight"
+  static let stillWidth = "stillWidth"
+  static let stillHeight = "stillHeight"
 }
 
 /// Size of the depth map sent to the visibility grid ingest.
@@ -181,6 +201,8 @@ struct ARSessionOptions: Equatable {
   var videoHdr = false
   /// Highest video format image height; 0 keeps ARKit's default format.
   var maxVideoHeight = 0
+  var stillWidth: Int?
+  var stillHeight: Int?
 
   init() {}
 
@@ -193,6 +215,11 @@ struct ARSessionOptions: Equatable {
       highResolutionFrameCapture = value
     }
     if let value = map[ARCaptureViewParameter.videoHdr] as? Bool { videoHdr = value }
+    if let width = map[ARCaptureViewParameter.stillWidth] as? Int,
+       let height = map[ARCaptureViewParameter.stillHeight] as? Int, width > 0, height > 0 {
+      stillWidth = width
+      stillHeight = height
+    }
     if let value = map[ARCaptureViewParameter.maxCameraImageHeight] as? Int, value > 0 { maxVideoHeight = value }
     if let width = map[ARCaptureViewParameter.depthWidth] as? Int,
        let height = map[ARCaptureViewParameter.depthHeight] as? Int,
@@ -211,6 +238,10 @@ struct ARSessionConfigurationPlan: Equatable {
   var videoHdr = false
   /// The video format is the one recommended for high-resolution stills.
   var highResolutionFrameCapture = false
+  /// An exact request must never silently become the native default.
+  var unsupportedStillResolution = false
+  /// Exact sensor-space still request bound to this session; nil is Automatic.
+  var exactStillResolution: CGSize?
 
   var deliversSceneDepth: Bool { sceneDepth }
 
@@ -244,7 +275,24 @@ struct ARSessionConfigurationPlan: Equatable {
     smoothedSceneDepth = options.smoothedSceneDepth && capabilities.smoothedSceneDepthSupported
     // High-resolution stills need the format ARKit recommends for them; a
     // lower AR camera tier would lower the stills, so it is not applied then.
-    if options.highResolutionFrameCapture {
+    if let width = options.stillWidth, let height = options.stillHeight {
+      exactStillResolution = CGSize(width: width, height: height)
+      // Photo resolution and AR input are coupled by ARKit. Prefer the fastest
+      // matching wide-angle format, then the smallest video feed at that rate.
+      let depthReference = capabilities.highResolutionFrameCaptureFormat ?? capabilities.videoFormats.first
+      let keepDepthAspect = sceneDepth
+      videoFormat = capabilities.videoFormats.filter { format in
+        let aspectCompatible = !keepDepthAspect || (depthReference.map { reference in
+          format.width * reference.height == reference.width * format.height
+        } ?? true)
+        return format.stillWidth == width && format.stillHeight == height
+          && format.captureDeviceType == Self.wideAngleDeviceType && aspectCompatible
+      }.max { a, b in
+        if a.framesPerSecond != b.framesPerSecond { return a.framesPerSecond < b.framesPerSecond }
+        return a.width * a.height > b.width * b.height
+      }
+      unsupportedStillResolution = videoFormat == nil
+    } else if options.highResolutionFrameCapture {
       videoFormat = capabilities.highResolutionFrameCaptureFormat
       highResolutionFrameCapture = capabilities.highResolutionFrameCaptureFormat != nil
     } else if options.maxVideoHeight > 0 {

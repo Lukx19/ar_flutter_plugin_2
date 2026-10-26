@@ -2556,6 +2556,7 @@ class ARCaptureManager {
       'manifestId': event.manifestId,
       'jpegSizeBytes': event.jpegSizeBytes,
       'dngSizeBytes': event.dngSizeBytes,
+      'heicSizeBytes': event.heicSizeBytes,
       'qualityDisposition': event.qualityDisposition?.name,
       'qualityAssessmentHash': event.qualityAssessmentHash,
       'qualityAssessment': event.qualityAssessment?.toMap(),

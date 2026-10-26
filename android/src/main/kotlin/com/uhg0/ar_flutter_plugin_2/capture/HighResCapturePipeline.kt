@@ -270,9 +270,7 @@ internal class HighResCapturePipeline(
             "formats" to if (sharedResult.rawDngEncoder == null) listOf(sharedResult.primaryAssetName) else listOf("dng", sharedResult.primaryAssetName),
             "captureTimestampMs" to sharedResult.captureTimestampMs,
             "imageSizeBytes" to assets.values.sumOf { it.bytes.size },
-            "imageSizeBytesByFormat" to mapOf(
-                "jpeg" to assets.values.sumOf { it.bytes.size },
-            ),
+            "imageSizeBytesByFormat" to assets.mapValues { it.value.bytes.size },
             "isHighResolution" to true,
             "exposureStartTimestampNs" to sharedResult.sensorTimestampNs,
             "exposureTimeNs" to sharedResult.exposureTimeNs,

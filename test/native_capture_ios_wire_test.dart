@@ -29,6 +29,29 @@ void main() {
     'worldFromGroup': _identity,
   };
 
+  test('HEIC terminal keeps distinct size and rejects mixed primary formats',
+      () {
+    final event = <String, dynamic>{
+      'wireVersion': 'native_capture_v2',
+      'kind': 'committed',
+      'attemptId': 'heic-attempt',
+      'captureId': 'heic-capture',
+      'captureRevision': 1,
+      'manifestId': 'manifest',
+      'heicSizeBytes': 1234,
+      'reason': 'committed',
+      'recoveryContext': context,
+    };
+    final parsed = ARNativeCaptureEventV2.fromMap(event);
+    expect(parsed.heicSizeBytes, 1234);
+    expect(parsed.jpegSizeBytes, isNull);
+    expect(
+        () => ARNativeCaptureEventV2.fromMap({...event, 'jpegSizeBytes': 1234}),
+        throwsFormatException);
+    expect(() => ARNativeCaptureEventV2.fromMap({...event, 'heicSizeBytes': 0}),
+        throwsFormatException);
+  });
+
   test('iOS committed, abandoned and recovering events decode', () {
     final committed = ARNativeCaptureEventV2.fromMap({
       'wireVersion': 'native_capture_v2',
@@ -184,12 +207,20 @@ void main() {
         shot([image(1)..['captureId'] = first]),
         shot([image(1)..['flags'] = 8]),
         shot([image(1)..['extra'] = 1]),
-        shot([image(1)..['cameraToWorld'] = [1.0]]),
+        shot([
+          image(1)..['cameraToWorld'] = [1.0]
+        ]),
         shot([image(1)..['trackingNormal'] = 1]),
         shot([image(1)..['captureId'] = 'not-a-hash']),
         shot([image(5)], imageCount: 2),
-        {...shot([image(1)]), 'mode': 'quality'},
-        {...shot([image(1)]), 'shotId': 'shot'},
+        {
+          ...shot([image(1)]),
+          'mode': 'quality'
+        },
+        {
+          ...shot([image(1)]),
+          'shotId': 'shot'
+        },
         <String, Object?>{},
       ];
       for (final value in malformed) {
@@ -202,7 +233,10 @@ void main() {
     test('an assessed committed terminal never carries a shot', () {
       expect(
         () => ARNativeCaptureEventV2.fromMap(
-          {...committed(shot([image(1)])), 'wireVersion': 'native_capture_quality_v1'},
+          {
+            ...committed(shot([image(1)])),
+            'wireVersion': 'native_capture_quality_v1'
+          },
           allowAssessedQuality: true,
         ),
         throwsFormatException,

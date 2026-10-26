@@ -21,6 +21,7 @@ enum CaptureComponentKind: Int, CaseIterable, Comparable {
   case raw = 2
   case hdr = 3
   case sidecar = 4
+  case heic = 5
 
   /// Kotlin enum name, used in root records and blob names (lowercased).
   var storedName: String {
@@ -30,6 +31,7 @@ enum CaptureComponentKind: Int, CaseIterable, Comparable {
     case .raw: return "RAW"
     case .hdr: return "HDR"
     case .sidecar: return "SIDECAR"
+    case .heic: return "HEIC"
     }
   }
 
@@ -229,6 +231,7 @@ struct CaptureTerminal: Hashable {
   var manifestId: String?
   var jpegSizeBytes: Int64?
   var dngSizeBytes: Int64?
+  var heicSizeBytes: Int64? = nil
   /// The images after the first one of a committed burst shot (shot root,
   /// schema 7); nil for a single-image commit.
   var shot: CommittedShot? = nil

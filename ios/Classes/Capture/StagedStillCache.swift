@@ -1,7 +1,7 @@
 import Foundation
 
 /// Parsed `initializeCapture` configuration (Android `CaptureConfig.fromMap`,
-/// same codes and bounds). iOS captures JPEG only.
+/// same codes and bounds). iOS captures JPEG and HEIC.
 struct StillCaptureConfig {
   var format: String
   var captureIntervalMs: Int
@@ -28,9 +28,9 @@ struct StillCaptureConfig {
       resolutionHeight: (resolution?["height"] as? NSNumber)?.intValue ?? 0,
       maxCacheSize: int("maxCacheSize", 10), jpegQuality: int("jpegQuality", 95))
     if format == "raw+jpeg" {
-      throw Invalid(code: "UNSUPPORTED_CAPTURE_FORMAT", message: "RAW+JPEG capture is not available on iOS; ARKit stills are JPEG only")
+      throw Invalid(code: "UNSUPPORTED_CAPTURE_FORMAT", message: "RAW+JPEG capture is not available on iOS; ARKit exposes processed stills, not RAW")
     }
-    guard format == "jpeg" else { throw Invalid(code: "UNSUPPORTED_CAPTURE_FORMAT", message: "Unsupported capture mode=\(format)") }
+    guard format == "jpeg" || format == "heic" else { throw Invalid(code: "UNSUPPORTED_CAPTURE_FORMAT", message: "Unsupported capture mode=\(format)") }
     guard config.captureIntervalMs >= 0 else { throw Invalid(code: "CONFIG_INVALID", message: "captureIntervalMs must be zero or a positive value") }
     guard !(1...99).contains(config.captureIntervalMs) else { throw Invalid(code: "CONFIG_INVALID", message: "captureIntervalMs must be 0 or at least 100ms") }
     guard config.captureIntervalMs <= 3_600_000 else { throw Invalid(code: "CONFIG_INVALID", message: "captureIntervalMs must not exceed 3600000ms") }
@@ -53,6 +53,7 @@ final class StagedStillCache {
     var width: Int
     var height: Int
     var timestampMs: Int64
+    var format: String = "jpeg"
   }
 
   struct Failure: Error {
@@ -94,7 +95,7 @@ final class StagedStillCache {
   }
 
   func data(_ imageId: String, format: String) throws -> Data {
-    try requireJpeg(format)
+    try requireFormat(format, imageId: imageId)
     return try entry(imageId).bytes
   }
 
@@ -104,10 +105,10 @@ final class StagedStillCache {
   }
 
   func save(_ imageId: String, to path: String, format: String) throws -> Bool {
-    try requireJpeg(format)
+    try requireFormat(format, imageId: imageId)
     let lower = path.lowercased()
-    guard lower.hasSuffix(".jpg") || lower.hasSuffix(".jpeg") else {
-      throw Failure(code: "FORMAT_MISMATCH", message: "JPEG captures must be saved to a .jpg or .jpeg path")
+    guard format == "heic" ? lower.hasSuffix(".heic") : (lower.hasSuffix(".jpg") || lower.hasSuffix(".jpeg")) else {
+      throw Failure(code: "FORMAT_MISMATCH", message: "The destination extension must match the captured format")
     }
     let url = URL(fileURLWithPath: path)
     try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -117,19 +118,20 @@ final class StagedStillCache {
 
   /// Writes `<root>/<sessionFolder>/<baseName>.jpg.part` and releases the slot.
   func persist(_ imageId: String, root: String, sessionFolder: String, baseName: String, format: String) throws -> [String: Any] {
-    try requireJpeg(format)
+    try requireFormat(format, imageId: imageId)
     guard !baseName.trimmingCharacters(in: .whitespaces).isEmpty else { throw Failure(code: "CONFIG_INVALID", message: "baseName is required") }
     let value = try entry(imageId)
     var directory = URL(fileURLWithPath: root, isDirectory: true)
     if !sessionFolder.trimmingCharacters(in: .whitespaces).isEmpty { directory.appendPathComponent(sessionFolder, isDirectory: true) }
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-    let part = directory.appendingPathComponent("\(baseName).jpg.part")
+    let ext = format == "heic" ? "heic" : "jpg"
+    let part = directory.appendingPathComponent("\(baseName).\(ext).part")
     try value.bytes.write(to: part)
     remove(imageId)
     return [
-      "files": ["jpeg": part.path],
-      "sizes": ["jpeg": value.bytes.count],
-      "hashes": ["jpeg": DurableStoreEncoding.hex(DurableStoreEncoding.sha256([UInt8](value.bytes)))],
+      "files": [format: part.path],
+      "sizes": [format: value.bytes.count],
+      "hashes": [format: DurableStoreEncoding.hex(DurableStoreEncoding.sha256([UInt8](value.bytes)))],
     ]
   }
 
@@ -151,7 +153,7 @@ final class StagedStillCache {
     return value
   }
 
-  private func requireJpeg(_ format: String) throws {
-    guard format == "jpeg" else { throw Failure(code: "FORMAT_NOT_CAPTURED", message: "Only JPEG capture is currently supported") }
+  private func requireFormat(_ format: String, imageId: String) throws {
+    guard format == (try entry(imageId)).format else { throw Failure(code: "FORMAT_NOT_CAPTURED", message: "Requested format differs from the staged image") }
   }
 }

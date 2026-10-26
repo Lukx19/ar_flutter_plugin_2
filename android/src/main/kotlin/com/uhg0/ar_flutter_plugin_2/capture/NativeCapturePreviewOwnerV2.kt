@@ -13,6 +13,7 @@ internal class NativeCapturePreviewOwnerV2(
     private val copyPreview: (String, String, File, () -> Boolean, Int) -> Boolean =
         NativeCapturePreviewReaderV2(File(appFiles, "capture-v2-native/store"))::materializeJpegPreview,
 ) {
+    private val sourceFormat = NativeCapturePreviewReaderV2(File(appFiles, "capture-v2-native/store"))::sourceFormat
     private val root = File(appFiles.canonicalFile, "capture-v2-previews")
     private val startup = synchronized(startups) { startups.getOrPut(root.absolutePath) { Startup() } }
     private val lock = startup.lock
@@ -24,7 +25,7 @@ internal class NativeCapturePreviewOwnerV2(
         if (cancelled()) return@synchronized null
         if (!startup.reconciled) return@synchronized null
         if (File(root, "$key.deleted").exists()) return@synchronized null
-        val target = ownedFile(when (edge) { 0 -> "$key.original.jpg"; 512 -> "$key.jpg"; else -> "$key.detail.jpg" })
+        val target = ownedFile(when (edge) { 0 -> if (sourceFormat(manifestId, captureId) == "heic") "$key.original.heic" else "$key.original.jpg"; 512 -> "$key.jpg"; else -> "$key.detail.jpg" })
         if (!copyPreview(manifestId, captureId, target, cancelled, edge)) return@synchronized null
         if (edge != 512) trimDetailedCopies(target)
         target.absolutePath
@@ -151,7 +152,7 @@ internal class NativeCapturePreviewOwnerV2(
         FileOutputStream(file).use { it.write(bytes); it.fd.sync() }
     }
 
-    private fun previewNames(key: String) = arrayOf("$key.jpg", "$key.detail.jpg", "$key.original.jpg")
+    private fun previewNames(key: String) = arrayOf("$key.jpg", "$key.detail.jpg", "$key.original.jpg", "$key.original.heic")
 
     /** Keep the viewed display plus at most two others; disk thumbnails remain persistent. */
     private fun trimDetailedCopies(viewed: File) {
@@ -160,7 +161,7 @@ internal class NativeCapturePreviewOwnerV2(
         java.nio.file.Files.newDirectoryStream(root.toPath()).use { entries ->
             for (entry in entries) {
                 val name = entry.fileName.toString()
-                if (!name.endsWith(".detail.jpg") && !name.endsWith(".original.jpg")) continue
+                if (!name.endsWith(".detail.jpg") && !name.endsWith(".original.jpg") && !name.endsWith(".original.heic")) continue
                 val file = ownedFile(name)
                 if (file == viewed) continue
                 retained.add(file)

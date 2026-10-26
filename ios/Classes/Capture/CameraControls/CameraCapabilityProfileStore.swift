@@ -5,7 +5,7 @@ import Foundation
 /// Advertised ARKit geometry never counts as an operational JPEG measurement.
 final class CameraCapabilityProfileStore {
   static let namespace = "camera_capability_profile_v1."
-  static let presetVersion = 12
+  static let presetVersion = 13
 
   private let defaults: UserDefaults
   private let fingerprint: String
@@ -37,9 +37,9 @@ final class CameraCapabilityProfileStore {
       "platformSupport": supported,
       "fingerprint": fingerprint,
       "primaryCameraId": "arkit-primary",
-      // ARKit chooses the recommended high-resolution format. A requested
-      // arbitrary still size cannot be configured like Camera2's reader size.
-      "supportsExactStillResolutionSelection": false,
+      // Known dimensions come from ARKit's own video/still format pairs.
+      // Before iOS 26 that metadata is unavailable and geometry stays automatic.
+      "supportsExactStillResolutionSelection": !advertisedStillResolutions.isEmpty,
       "advertisedJpegRegularResolutions": [[String: Int]](),
       "advertisedJpegHighResolutionResolutions": advertisedStillResolutions,
       "sharedResolutionValidationComplete": status == "supported" && !validatedResolutions.isEmpty,

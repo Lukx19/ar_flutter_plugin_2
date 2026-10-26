@@ -17,6 +17,51 @@ class DurableSessionStoreV2Test {
     private val directories = mutableListOf<File>()
     @After fun cleanUp() { directories.forEach { it.deleteRecursively() } }
 
+    @Test fun `HEIC commits retain explicit format through restart recovery and original copy`() {
+        for (assessed in listOf(false, true)) {
+            val root = directory()
+            val bytes = "opaque-heic-original".toByteArray()
+            val assessment = if (assessed) CaptureQualityAssessmentV1(
+                policyVersion = "heic-test", disposition = CaptureQualityDispositionV1.POLICY_PASSED,
+                reason = CaptureQualityReasonV1.POLICY_PASSED, score = 200.0, threshold = 110.0,
+                sampleWidth = 32, sampleHeight = 24) else null
+            val request = request("heic-commit", "heic-attempt", bytes, primaryKind = CaptureComponentKind.HEIC, assessment = assessment, fundedRecoveryMetadata = true)
+            // Fund the production accepted-record, coexistence and rollback
+            // liabilities, plus headroom for descriptor-filesystem allocation.
+            val capacityBytes = Math.multiplyExact(request.accepted.reservation.totalStoreLiability, 4L)
+            val budget = budget(root, capacityBytes = capacityBytes); val store = store(root, budget)
+            store.acceptCaptureBeforeExposure(request)
+            val streams = listOf(CaptureComponentStreamV2(CaptureComponentKind.HEIC, ByteArrayInputStream(bytes)))
+            val terminal = (if (assessed) store.commitStreamedAssessed(request, streams)
+                else store.commitStreamed(request, streams)).terminal!!
+            assertNull(terminal.jpegSizeBytes); assertNull(terminal.dngSizeBytes)
+            assertEquals(bytes.size.toLong(), terminal.heicSizeBytes)
+            store.close(); budget.close()
+            val recovered = store(root, budget(root, capacityBytes = capacityBytes))
+            assertEquals(terminal, recovered.queryReceipt(request.accepted.identity)!!.terminal)
+            val projection = recovered.recoverAndProject().single()
+            assertEquals(bytes.size.toLong(), projection.heicSizeBytes)
+            assertNull(projection.jpegSizeBytes)
+            assertEquals(assessment, projection.qualityAssessment)
+            val reader = NativeCapturePreviewReaderV2(File(root, "store"))
+            assertEquals("heic", reader.sourceFormat(terminal.manifestId!!, terminal.captureId!!))
+            // Reader targets mirror canonical app-files paths; macOS temp roots
+            // may contain /var -> /private/var aliases which it correctly refuses.
+            val target = File(root.canonicalFile, "original.heic")
+            assertTrue(reader.materializeJpegPreview(terminal.manifestId, terminal.captureId, target, edge = 0))
+            assertArrayEquals(bytes, target.readBytes())
+            val event = NativeCaptureEventV2(NativeCaptureEventKindV2.COMMITTED,
+                attemptId = terminal.identity.attemptId, captureId = terminal.captureId,
+                captureRevision = terminal.captureRevision, manifestId = terminal.manifestId,
+                heicSizeBytes = terminal.heicSizeBytes, recoveryContext = request.recoveryContext,
+                qualityAssessment = assessment, qualityAssessmentHash = terminal.qualityAssessmentHash,
+                verifiedTerminal = terminal)
+            val wire = encodeNativeCaptureEventV2(event)
+            assertEquals(bytes.size.toLong(), wire["heicSizeBytes"])
+            assertFalse(wire.containsKey("jpegSizeBytes"))
+        }
+    }
+
     @Test fun `acceptance reserves durable liability before streamed commit and replay is exact after restart`() {
         val root = directory()
         val budget = budget(root)
@@ -750,15 +795,19 @@ class DurableSessionStoreV2Test {
             "${sha256Hex(request.accepted.identity.commitId)}/accepted.properties",
     )
 
-    private fun request(commit: String, attempt: String, jpeg: ByteArray, session: String = "session-1", dng: ByteArray? = null): CaptureCommitRequest {
+    private fun request(commit: String, attempt: String, jpeg: ByteArray, session: String = "session-1", dng: ByteArray? = null, primaryKind: CaptureComponentKind = CaptureComponentKind.JPEG, assessment: CaptureQualityAssessmentV1? = null, fundedRecoveryMetadata: Boolean = false): CaptureCommitRequest {
         val identity = CaptureAttemptIdentity(attempt, commit, 1, CaptureLifecycleCut(session, 1, "group-1", 1, "ar-1", "view-1", 1, "binding-1", 1, 1))
-        val kinds = if (dng == null) setOf(CaptureComponentKind.JPEG) else setOf(CaptureComponentKind.JPEG, CaptureComponentKind.DNG)
-        val profile = CaptureComponentProfile(if (dng == null) "jpeg" else "raw+jpeg", kinds, 64, 64)
-        val accepted = CaptureAcceptedAttempt(identity, CaptureLane.MANUAL, profile, CaptureReservationLiability(0, 64L * kinds.size, kinds.size.toLong(), 1, 0, true), digest("intent"), digest("accepted"))
+        val kinds = if (dng == null) setOf(primaryKind) else setOf(CaptureComponentKind.JPEG, CaptureComponentKind.DNG)
+        val profile = CaptureComponentProfile(if (dng == null) primaryKind.name.lowercase() else "raw+jpeg", kinds, 64, 64)
+        val reservation = if (fundedRecoveryMetadata) CaptureReservationLiability(
+            64, NativeCaptureReservationBoundsV2.physicalBytes(profile.maximumComponentBytes, kinds.size),
+            kinds.size.toLong(), 1, NativeCaptureReservationBoundsV2.rollbackBytes(profile.maximumComponentBytes), true,
+        ) else CaptureReservationLiability(0, 64L * kinds.size, kinds.size.toLong(), 1, 0, true)
+        val accepted = CaptureAcceptedAttempt(identity, CaptureLane.MANUAL, profile, reservation, digest("intent"), digest("accepted"))
         return CaptureCommitRequest(
             accepted,
             listOfNotNull(
-                CaptureComponentDescriptor(CaptureComponentKind.JPEG, jpeg.size.toLong(), sha(jpeg), "object"),
+                CaptureComponentDescriptor(primaryKind, jpeg.size.toLong(), sha(jpeg), "object"),
                 dng?.let { CaptureComponentDescriptor(CaptureComponentKind.DNG, it.size.toLong(), sha(it), "dng-object") },
             ),
             1,
@@ -768,6 +817,7 @@ class DurableSessionStoreV2Test {
                 listOf(0.0, 0.0, 0.0), listOf(0.0, 0.0, 0.0, 1.0),
                 identityMatrix(), identityMatrix(), identityMatrix(), identityMatrix(),
             ),
+            qualityAssessment = assessment,
         )
     }
     private fun identityMatrix() = List(16) { if (it % 5 == 0) 1.0 else 0.0 }
@@ -793,10 +843,10 @@ class DurableSessionStoreV2Test {
         .any { it.name == sha256Hex(request.accepted.identity.attemptId) && it.parentFile?.name == "assets" }
     private fun store(root: File, budget: StorageBudgetCoordinatorV2, faults: DurableStoreFaultInjectorV2 = DurableStoreFaultInjectorV2 { }) =
         DurableSessionStoreV2(File(root, "store"), budget, faults, JvmDescriptorFilesystemV2())
-    private fun budget(root: File, faults: DurableStoreFaultInjectorV2 = DurableStoreFaultInjectorV2 { }) = StorageBudgetCoordinatorV2(
-        File(root, "budget"), StorageBudgetPolicyV2(1024 * 1024, 0),
+    private fun budget(root: File, faults: DurableStoreFaultInjectorV2 = DurableStoreFaultInjectorV2 { }, capacityBytes: Long = 1024 * 1024L) = StorageBudgetCoordinatorV2(
+        File(root, "budget"), StorageBudgetPolicyV2(capacityBytes, 0),
         JvmDescriptorFilesystemV2(authoritativeAllocationUnit = { 4_096L }), faults,
-    ) { 1024 * 1024 }
+    ) { capacityBytes }
     private fun hasReceiptTemporary(root: File, request: CaptureCommitRequest) =
         File(acceptedFile(root, request).parentFile, ".receipt.properties.part").exists()
     private fun directory(): File = File.createTempFile("durable-store-v2", "").also { it.delete(); assertTrue(it.mkdirs()); directories += it }

@@ -165,6 +165,7 @@ class MethodChannelARCameraCapabilities(private val context: Context) : MethodCa
 
         val format = when (formatString) {
             "jpeg" -> CaptureFormat.JPEG
+            "heic", "heif" -> CaptureFormat.HEIC
             "raw+jpeg" -> CaptureFormat.RAW_JPEG
             else -> {
                 result.success(false)

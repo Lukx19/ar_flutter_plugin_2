@@ -1,6 +1,7 @@
 package com.uhg0.ar_flutter_plugin_2.capture
 
 import android.content.Context
+import android.graphics.BitmapFactory
 import android.graphics.ImageFormat
 import android.graphics.Rect
 import android.graphics.YuvImage
@@ -89,10 +90,14 @@ data class ParsedCaptureConfig(
                 val format =
                     when (formatName) {
                         "jpeg" -> android.graphics.ImageFormat.JPEG
+                        "heic", "heif" -> {
+                            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) throw CaptureSessionException("UNSUPPORTED_CAPTURE_FORMAT", "HEIC requires Android 10 or later")
+                            android.graphics.ImageFormat.HEIC
+                        }
                         "raw+jpeg" -> android.graphics.ImageFormat.JPEG
                         else -> throw CaptureSessionException(
                             "UNSUPPORTED_CAPTURE_FORMAT",
-                            "Supported formats are jpeg and raw+jpeg; received $formatName",
+                            "Supported formats are jpeg, heic and raw+jpeg; received $formatName",
                         )
                     }
 
@@ -1052,11 +1057,12 @@ internal class SharedCameraManager(
         required: Set<CaptureComponentKind>,
         callback: SharedCameraExposureCallbackV2,
     ): Boolean {
-        val supported = required == setOf(CaptureComponentKind.JPEG) ||
+        val supported = required == setOf(CaptureComponentKind.JPEG) || required == setOf(CaptureComponentKind.HEIC) ||
             required == setOf(CaptureComponentKind.JPEG, CaptureComponentKind.DNG)
         if (!supported || !isInitialized) return false
         if (pendingManualCapture != null) return false
         if ((CaptureComponentKind.DNG in required) != config.rawJpeg) return false
+        if ((CaptureComponentKind.HEIC in required) != (config.format == ImageFormat.HEIC)) return false
         val pending = PendingDirectCaptureV2(qualifier, required, callback)
         if (!pendingDirectCaptureOwner.acquire(pending)) return false
         val activeSession = captureSession
@@ -1322,7 +1328,7 @@ internal class SharedCameraManager(
         // Standard mode uses Camera2's hardware JPEG output. This avoids a
         // multi-megapixel YUV copy and software encode on every capture.
         val supportedSizes =
-            configMap.getOutputSizes(android.graphics.ImageFormat.JPEG)
+            configMap.getOutputSizes(config.format)
                 ?: emptyArray()
 
         if (config.rawJpeg) {
@@ -1346,8 +1352,8 @@ internal class SharedCameraManager(
             capabilities =
                 SharedCaptureCapabilities(
                     supportedOutputSizes = supportedSizes.map { it.width to it.height },
-                    highResolutionOutputSizes = if (config.format == ImageFormat.JPEG && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
-                        configMap.getHighResolutionOutputSizes(ImageFormat.JPEG)?.map { it.width to it.height } ?: emptyList()
+                    highResolutionOutputSizes = if ((config.format == ImageFormat.JPEG || config.format == ImageFormat.HEIC) && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
+                        configMap.getHighResolutionOutputSizes(config.format)?.map { it.width to it.height } ?: emptyList()
                     else emptyList(),
                     timestampSource =
                         characteristics.get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE),
@@ -1598,7 +1604,7 @@ internal class SharedCameraManager(
                     builder.set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_OFF)
                 }
 
-                if (config.format == android.graphics.ImageFormat.JPEG) {
+                if (config.format == android.graphics.ImageFormat.JPEG || config.format == ImageFormat.HEIC) {
                     builder.set(CaptureRequest.JPEG_ORIENTATION, 0)
                     builder.set(CaptureRequest.JPEG_QUALITY, config.jpegQuality.toByte())
                 }
@@ -1918,8 +1924,18 @@ internal class SharedCameraManager(
                     ?.let(::handleCorrelatedProcessedFrame)
                 return
             }
-            check(image.format == ImageFormat.JPEG) {
-                "Supported shared-camera capture modes must deliver hardware JPEG"
+            check(image.format == config.format && (image.format == ImageFormat.JPEG || image.format == ImageFormat.HEIC)) {
+                "The camera delivered a different encoded format than requested"
+            }
+            if (image.format == ImageFormat.HEIC) {
+                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                CameraPlaneInputStreamV2(image.planes.single().buffer.asReadOnlyBuffer()) {}.use {
+                    BitmapFactory.decodeStream(it, null, bounds)
+                }
+                check(bounds.outMimeType in setOf("image/heic", "image/heif") &&
+                    bounds.outWidth == image.width && bounds.outHeight == image.height) {
+                    "The camera HEIC bytes could not be decoded at the requested geometry"
+                }
             }
             if (direct != null) {
                 captureLatencyLog("camera_image_arrived", direct.qualifier.identity.attemptId)
@@ -1935,7 +1951,7 @@ internal class SharedCameraManager(
                         dispatchDirectStoreComponents(
                             direct = direct,
                             streams = listOf(
-                                CaptureComponentStreamV2(CaptureComponentKind.JPEG, jpeg),
+                                CaptureComponentStreamV2(if (config.format == ImageFormat.HEIC) CaptureComponentKind.HEIC else CaptureComponentKind.JPEG, jpeg),
                             ),
                             exposureTimestampNanoseconds = image.timestamp,
                             jpegForAnalysis = image.planes.single().buffer.asReadOnlyBuffer(),
@@ -2415,7 +2431,7 @@ internal class SharedCameraManager(
     }
 
     private fun exposureBracketSpecs(): List<ExposureBracketSpec> {
-        if (config.rawJpeg || config.processed) {
+        if (config.rawJpeg || config.processed || config.format != ImageFormat.JPEG) {
             throw CaptureSessionException(
                 "HDR_BRACKET_UNSUPPORTED",
                 "HDR exposure bracketing is available for JPEG capture only",
@@ -3669,7 +3685,7 @@ internal class SharedCameraManager(
                     rollingShutterSkewNs = center.rollingShutterSkewNs,
                     observedTimestampNs = center.observedTimestampNs,
                     intrinsics = center.intrinsics,
-                    primaryAssetName = "jpeg",
+                    primaryAssetName = if (config.format == ImageFormat.HEIC) "heic" else "jpeg",
                     preEncodeQuality = pending.preEncodeQuality,
                     requiresPose = pending.requiresPose,
                     pipelineTimingMs = hardwareJpegAcquisitionTimings(
@@ -3702,7 +3718,7 @@ internal class SharedCameraManager(
                     rollingShutterSkewNs = capture.result.rollingShutterSkewNs,
                     observedTimestampNs = capture.result.observedTimestampNs,
                     intrinsics = intrinsics,
-                    primaryAssetName = "jpeg",
+                    primaryAssetName = if (config.format == ImageFormat.HEIC) "heic" else "jpeg",
                     preEncodeQuality = pending.preEncodeQuality,
                     requiresPose = pending.requiresPose,
                     pipelineTimingMs = hardwareJpegAcquisitionTimings(

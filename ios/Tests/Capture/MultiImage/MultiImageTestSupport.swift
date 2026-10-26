@@ -62,10 +62,10 @@ enum ShotFixture {
   }
 
   static func frame(timestamp: TimeInterval, pose: simd_float4x4, tracking: ARCamera.TrackingState = .normal,
-                    flat: Bool = false) -> CaptureFrame {
+                    flat: Bool = false, width: Int = 64, height: Int = 48) -> CaptureFrame {
     RecordedCaptureFrame(
       timestamp: timestamp, recordedTimestamp: timestamp, cameraTransform: pose, intrinsics: arkitIntrinsics,
-      imageResolution: arkitResolution, trackingState: tracking, capturedImage: pixelBuffer(flat: flat),
+      imageResolution: arkitResolution, trackingState: tracking, capturedImage: pixelBuffer(width: width, height: height, flat: flat),
       depth: nil, featurePoints: nil, lightEstimate: nil, anchors: [])
   }
 }
@@ -75,13 +75,21 @@ enum ShotFixture {
 /// pause: shots never stop the session.
 final class StillFrameSource: ARFrameSource {
   var anchorHost: CaptureAnchorHost { anchors }
-  var currentFrame: CaptureFrame?
+  private var storedCurrentFrame: CaptureFrame?
+  /// A live session keeps advancing its video frame while durable admission runs.
+  var refreshCurrentVideoFrame = false
+  var currentFrame: CaptureFrame? {
+    get { refreshCurrentVideoFrame
+      ? ShotFixture.frame(timestamp: ProcessInfo.processInfo.systemUptime, pose: ShotFixture.pose()) : storedCurrentFrame }
+    set { storedCurrentFrame = newValue }
+  }
   var runConfiguration: CaptureRunConfiguration? { CaptureRunConfiguration(depth: .none) }
   var lifecycleState: ARSessionLifecycleState { .running }
   var deliversSceneDepth: Bool { false }
   var depthOutputSize: ARDepthOutputSize { .standard }
   var epoch: Int { 1 }
   var replaysRecordedStills = false
+  var exactStillResolution: CGSize?
   var frames: [CaptureFrame] = []
   private(set) var qualities: [StillFrameQuality] = []
   private(set) var requestTimes: [TimeInterval] = []

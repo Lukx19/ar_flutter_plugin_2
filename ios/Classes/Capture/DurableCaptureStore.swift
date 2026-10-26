@@ -38,6 +38,7 @@ final class DurableCaptureStore {
     var recoveryContext: NativeCaptureRecoveryContext?
     var jpegSizeBytes: Int64?
     var dngSizeBytes: Int64?
+    var heicSizeBytes: Int64? = nil
     var shot: CommittedShot? = nil
   }
 
@@ -266,7 +267,7 @@ final class DurableCaptureStore {
       let dngSize = request.components.first { $0.kind == .dng }?.byteLength
       let terminal = CaptureTerminal(
         kind: .committedPicture, identity: identity, canonicalTerminalHash: requestHash, reason: "committed",
-        captureId: captureId, captureRevision: revision, manifestId: rootHash, jpegSizeBytes: jpegSize, dngSizeBytes: dngSize,
+        captureId: captureId, captureRevision: revision, manifestId: rootHash, jpegSizeBytes: jpegSize, dngSizeBytes: dngSize, heicSizeBytes: request.components.first { $0.kind == .heic }?.byteLength,
         shot: committedShot(location, captureId: captureId, rootHash: rootHash))
       let committed = CaptureReceipt(
         identity: identity, phase: .committedPicture, requestHash: requestHash,
@@ -729,7 +730,7 @@ final class DurableCaptureStore {
         result.append(RecoveryProjection(
           attemptId: attemptId, kind: .committedPicture, captureId: verified.captureId, captureRevision: verified.revision,
           manifestId: rootHash, reason: "recovered-committed", recoveryContext: context,
-          jpegSizeBytes: verified.jpegSizeBytes, dngSizeBytes: verified.dngSizeBytes,
+          jpegSizeBytes: verified.jpegSizeBytes, dngSizeBytes: verified.dngSizeBytes, heicSizeBytes: verified.heicSizeBytes,
           shot: verified.captureId.flatMap { committedShot(session, captureId: $0, rootHash: rootHash) }))
       } else if value["kind"] == CaptureTerminalKind.abandonedAttempt.storedName {
         result.append(RecoveryProjection(
@@ -859,6 +860,7 @@ final class DurableCaptureStore {
     var revision: Int64?
     var jpegSizeBytes: Int64?
     var dngSizeBytes: Int64?
+    var heicSizeBytes: Int64? = nil
   }
 
   private func receipt(_ location: [String], _ identity: CaptureAttemptIdentity) throws -> CaptureReceipt? {
@@ -873,7 +875,7 @@ final class DurableCaptureStore {
       terminal = CaptureTerminal(
         kind: .committedPicture, identity: identity, canonicalTerminalHash: value["requestHash"] ?? "", reason: "committed",
         captureId: verified.captureId, captureRevision: verified.revision, manifestId: rootHash,
-        jpegSizeBytes: verified.jpegSizeBytes, dngSizeBytes: verified.dngSizeBytes,
+        jpegSizeBytes: verified.jpegSizeBytes, dngSizeBytes: verified.dngSizeBytes, heicSizeBytes: verified.heicSizeBytes,
         shot: verified.captureId.flatMap { committedShot(location, captureId: $0, rootHash: rootHash) })
     } else {
       terminal = CaptureTerminal(
@@ -895,13 +897,14 @@ final class DurableCaptureStore {
     func size(_ property: String, _ kind: CaptureComponentKind) throws -> Int64? {
       if let text = receipt[property] {
         guard let size = Int64(text), size > 0 else { throw DurableStoreConflict("Committed receipt has malformed \(property)") }
+        if kind == .heic && metadata.components.first(where: { $0.kind == kind.storedName })?.length != size { throw DurableStoreConflict("HEIC receipt differs from rooted component") }
         return size
       }
       return metadata.components.first { $0.kind == kind.storedName }?.length
     }
     return VerifiedCommittedReceipt(
       captureId: receipt["captureId"], revision: receipt["revision"].flatMap(Int64.init),
-      jpegSizeBytes: try size("jpegSizeBytes", .jpeg), dngSizeBytes: try size("dngSizeBytes", .dng))
+      jpegSizeBytes: try size("jpegSizeBytes", .jpeg), dngSizeBytes: try size("dngSizeBytes", .dng), heicSizeBytes: try size("heicSizeBytes", .heic))
   }
 
   private struct SelectedPointer {
@@ -1097,7 +1100,7 @@ final class DurableCaptureStore {
     guard terminal.kind == .committedPicture, let captureId = terminal.captureId,
           let root = (files.backend as? PosixDurableFileBackend)?.root else { return nil }
     let assets = sessionRoot + [DurableStoreEncoding.safeName(terminal.identity.lifecycleCut.sessionId), "assets", captureId]
-    guard let name = (try? files.list(assets))?.sorted().first(where: { $0.hasPrefix("jpeg.") && $0.hasSuffix(".blob") }),
+    guard let name = (try? files.list(assets))?.sorted().first(where: { ($0.hasPrefix("jpeg.") || $0.hasPrefix("heic.")) && $0.hasSuffix(".blob") }),
           files.isFile(assets + [name]) else { return nil }
     return (assets + [name]).reduce(root) { $0.appendingPathComponent($1, isDirectory: false) }
   }
@@ -1172,7 +1175,7 @@ final class DurableCaptureStore {
     requestHash: String, revision: Int64, components: [DurableComponentDescriptor], prior: CaptureRootPointer?,
     priorPrevious: String?, shot: CaptureRootShot? = nil
   ) -> [UInt8] {
-    let schema = shot == nil ? NativeStoreFormatVersions.photoRootSchemaPlain : NativeStoreFormatVersions.photoRootSchemaShot
+    let schema = shot == nil ? (components.contains { $0.kind == .heic } ? NativeStoreFormatVersions.photoRootSchemaHeic : NativeStoreFormatVersions.photoRootSchemaPlain) : NativeStoreFormatVersions.photoRootSchemaShot
     var text = "schema=\(schema)\nrevision=\(revision)\nrequest=\(requestHash)\nprevious=\(prior?.hash ?? "-")\nsecondPrevious=\(priorPrevious ?? "-")\n"
     for component in components.sorted(by: { $0.kind < $1.kind }) {
       text += "component=\(component.kind.storedName):\(component.byteLength):\(DurableStoreEncoding.hex(component.sha256))\n"
@@ -1207,6 +1210,7 @@ final class DurableCaptureStore {
     ]
     if let value = terminal.captureId { values["captureId"] = value }
     if let value = terminal.captureRevision { values["revision"] = String(value) }
+    if let value = terminal.heicSizeBytes { values["heicSizeBytes"] = String(value) }
     if let value = terminal.jpegSizeBytes { values["jpegSizeBytes"] = String(value) }
     if let value = terminal.dngSizeBytes { values["dngSizeBytes"] = String(value) }
     return values

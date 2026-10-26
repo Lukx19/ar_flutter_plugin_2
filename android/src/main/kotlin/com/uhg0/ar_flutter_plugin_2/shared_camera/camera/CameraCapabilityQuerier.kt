@@ -26,12 +26,13 @@ data class CameraResolution(val width: Int, val height: Int)
 enum class CaptureFormat(val wireValue: String) {
     JPEG("jpeg"),
     RAW_JPEG("raw+jpeg"),
+    HEIC("heic"),
 }
 
 class CameraCapabilityQuerier(private val context: Context) {
 
     companion object {
-        const val CAPABILITY_PRESET_VERSION = 12
+        const val CAPABILITY_PRESET_VERSION = 13
         private const val TAG = "CameraCapabilityQuerier"
     }
 
@@ -43,7 +44,7 @@ class CameraCapabilityQuerier(private val context: Context) {
     fun getDeviceCapabilityProfile(): Map<String, Any?> {
         val primaryId = getDefaultCameraId()
         val fingerprint =
-            listOf(Build.FINGERPRINT, primaryId, cameraManager.cameraIdList.joinToString(","))
+            listOf(Build.FINGERPRINT, primaryId, cameraManager.cameraIdList.joinToString(","), "heic-profile-v1")
                 .joinToString("|")
         val cacheHit =
             preferences.getInt("profile_version", 0) == CAPABILITY_PRESET_VERSION &&
@@ -218,8 +219,9 @@ class CameraCapabilityQuerier(private val context: Context) {
         val pairedSizes = getSupportedRawJpegResolutions()
         val pipelineFormats = CameraCapabilityProfileResolver.pipelineCaptureFormats(
             cacheIdentityMatches, rawPairProbeStatus, pairedSizes.isNotEmpty(),
+            hardwareHeicAvailable = heif.orEmpty().isNotEmpty(),
         )
-        val resolutions = linkedMapOf("jpeg" to jpeg, "raw" to raw, "heif" to heif.orEmpty())
+        val resolutions = linkedMapOf("jpeg" to jpeg, "raw" to raw, "heif" to heif.orEmpty(), "heic" to heif.orEmpty())
         // Session creation queries ARCore support without opening a CameraDevice.
         // Over an active view use that owner's last metadata; never create a
         // competing AR session or infer depth from Camera2 DEPTH_OUTPUT.
@@ -246,7 +248,7 @@ class CameraCapabilityQuerier(private val context: Context) {
             "cameraId" to cameraId,
             "hardwareFormats" to mapOf(
                 "jpeg" to jpegSizes?.isNotEmpty(), "raw" to rawSizes?.isNotEmpty(),
-                "heif" to heif?.isNotEmpty(),
+                "heif" to heif?.isNotEmpty(), "heic" to heif?.isNotEmpty(),
                 // Independent stream support never proves simultaneous output.
                 "raw+jpeg" to if ("raw+jpeg" in pipelineFormats) true else null,
                 "raw+heif" to null,
@@ -254,7 +256,7 @@ class CameraCapabilityQuerier(private val context: Context) {
             "pipelineFormats" to pipelineFormats,
             "encoderFormats" to emptyList<String>(),
             "resolutionsByFormat" to resolutions,
-            "pipelineResolutionsByFormat" to mapOf("jpeg" to jpeg,
+            "pipelineResolutionsByFormat" to mapOf("jpeg" to jpeg, "heic" to heif.orEmpty(),
                 "raw+jpeg" to if ("raw+jpeg" in pipelineFormats) pairedSizes.map {
                     mapOf("width" to it.width, "height" to it.height)
                 } else emptyList()),
@@ -460,6 +462,11 @@ class CameraCapabilityQuerier(private val context: Context) {
             val jpegSizes = configMap.getOutputSizes(android.graphics.ImageFormat.JPEG)
             if (jpegSizes != null && jpegSizes.isNotEmpty()) {
                 supportedFormats.add(CaptureFormat.JPEG)
+            }
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+                configMap.getOutputSizes(android.graphics.ImageFormat.HEIC).orEmpty().isNotEmpty()) {
+                supportedFormats.add(CaptureFormat.HEIC)
             }
 
             // Check for RAW support

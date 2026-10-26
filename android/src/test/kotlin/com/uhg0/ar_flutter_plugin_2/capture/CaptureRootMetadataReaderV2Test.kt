@@ -5,6 +5,16 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class CaptureRootMetadataReaderV2Test {
+    @Test fun `HEIC requires its new root schema and cannot masquerade as legacy JPEG`() {
+        val reader = CaptureRootMetadataReaderV2()
+        val heic = root(1).toString(Charsets.UTF_8).replace("schema=5", "schema=8").replace("component=JPEG", "component=HEIC").toByteArray()
+        assertEquals("HEIC", heic.inputStream().use { reader.root(hash(heic), it::read) }!!.components.single().kind)
+        val mislabeled = heic.toString(Charsets.UTF_8).replace("schema=8", "schema=5").toByteArray()
+        assertNull(mislabeled.inputStream().use { reader.root(hash(mislabeled), it::read) })
+        val mismatched = heic.toString(Charsets.UTF_8).replace("component=HEIC", "component=JPEG").toByteArray()
+        assertNull(mismatched.inputStream().use { reader.root(hash(mismatched), it::read) })
+    }
+
     @Test
     fun `repeated root bytes reuse parsed metadata but corruption never reuses authority`() {
         val reader = CaptureRootMetadataReaderV2()

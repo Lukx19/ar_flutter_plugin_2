@@ -1,3 +1,5 @@
+import ARKit
+import CoreVideo
 import Flutter
 import XCTest
 @testable import ar_flutter_plugin_2
@@ -234,6 +236,114 @@ final class NativeCaptureChannelTests: XCTestCase {
     wait(for: [replied], timeout: 5)
   }
 
+  func testExactProfilesRefuseVideoFallbackAndWrongHighResolutionBeforeDurableCommit() throws {
+    for format in ["jpeg", "heic"] {
+      for lane in [CaptureLane.manual, .automatic] {
+        try assertProductionOutcome(format: format, lane: lane, exact: CGSize(width: 64, height: 48),
+          scenario: "fallback", expectedReason: "high-resolution-frame-unavailable")
+        try assertProductionOutcome(format: format, lane: lane, exact: CGSize(width: 128, height: 96),
+          scenario: "mismatch", expectedReason: "still-resolution-mismatch")
+      }
+    }
+  }
+
+  func testMatchingExactJpegAndHeicProfilesCommitThroughProductionOwnerOnBothLanes() throws {
+    for format in ["jpeg", "heic"] {
+      for lane in [CaptureLane.manual, .automatic] {
+        try assertProductionOutcome(format: format, lane: lane, exact: CGSize(width: 64, height: 48),
+          scenario: "matching", expectedReason: nil)
+      }
+    }
+  }
+
+  func testAutomaticNativeGeometryPreservesVideoFallbackWithoutExplicitStillRequest() throws {
+    for format in ["jpeg", "heic"] {
+      // The configured cache resolution deliberately differs from the frame.
+      // It is not an explicit sensor request and must not make Automatic strict.
+      try assertProductionOutcome(format: format, lane: .automatic, exact: nil,
+        scenario: "fallback", expectedReason: nil)
+    }
+  }
+
+  func testExactOwnerRejectsMismatchingAndReboundInitialization() throws {
+    let source = StillFrameSource()
+    source.exactStillResolution = CGSize(width: 64, height: 48)
+    let files = appFiles!.appendingPathComponent("reinitialize")
+    let channel = NativeCaptureChannel(context: CaptureChannelContext(viewId: 40,
+      channel: FlutterMethodChannel(name: "arcapture_40", binaryMessenger: SilentMessenger()), frameSource: source),
+      openResources: { try NativeCaptureBinding.productionResources(appFiles: files) })
+    defer { channel.captureViewWillDispose() }
+    var config = configuration(mode: "single", maxCacheSize: 2)
+    XCTAssertEqual((call(channel, "initializeCapture", config) as? FlutterError)?.code, "CAPTURE_CONFIG_REQUIRES_NEW_OWNER")
+    config["resolution"] = ["width": 64, "height": 48]
+    XCTAssertFalse(call(channel, "initializeCapture", config) is FlutterError)
+    config["resolution"] = ["width": 128, "height": 96]
+    XCTAssertEqual((call(channel, "initializeCapture", config) as? FlutterError)?.code, "CAPTURE_CONFIG_REQUIRES_NEW_OWNER")
+    // A source's selection is immutable in production; even an incorrectly
+    // rebound collaborator cannot silently retarget the existing exposure.
+    source.exactStillResolution = CGSize(width: 128, height: 96)
+    XCTAssertEqual((call(channel, "initializeCapture", config) as? FlutterError)?.code, "CAPTURE_CONFIG_REQUIRES_NEW_OWNER")
+  }
+
+  private func assertProductionOutcome(format: String, lane: CaptureLane, exact: CGSize?, scenario: String,
+                                       expectedReason: String?) throws {
+    let files = appFiles!.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: files) }
+    let source = StillFrameSource()
+    source.exactStillResolution = exact
+    source.refreshCurrentVideoFrame = true
+    if scenario != "fallback" {
+      source.frames = [ShotFixture.frame(timestamp: ProcessInfo.processInfo.systemUptime, pose: ShotFixture.pose())]
+    }
+    let messenger = SilentMessenger()
+    let channel = NativeCaptureChannel(context: CaptureChannelContext(viewId: 41,
+      channel: FlutterMethodChannel(name: "arcapture_41", binaryMessenger: messenger), frameSource: source),
+      openResources: { try NativeCaptureBinding.productionResources(appFiles: files) })
+    defer { channel.captureViewWillDispose() }
+    var config = configuration(mode: "single", maxCacheSize: 2)
+    config["format"] = format
+    if let exact = exact { config["resolution"] = ["width": Int(exact.width), "height": Int(exact.height)] }
+    XCTAssertFalse(call(channel, "initializeCapture", config) is FlutterError)
+    _ = call(channel, "replayNativeCaptureRecoveryV2", nil)
+    let terminalReady = expectation(description: "one durable terminal: \(format) \(lane) \(scenario)")
+    var terminals: [[String: Any]] = []
+    messenger.onEvent = { event in
+      guard let kind = event["kind"] as? String, ["committed", "abandoned"].contains(kind) else { return }
+      terminals.append(event)
+      terminalReady.fulfill()
+    }
+    var admission = CaptureFixture.admissionMap(CaptureFixture.request(lane: lane))
+    var accepted = try XCTUnwrap(admission["accepted"] as? [String: Any])
+    var profile = try XCTUnwrap(accepted["profile"] as? [String: Any])
+    profile["requiredComponents"] = [format]
+    accepted["profile"] = profile
+    admission["accepted"] = accepted
+    XCTAssertFalse(call(channel, "admitNativeCaptureV2", admission) is FlutterError)
+    wait(for: [terminalReady], timeout: 10)
+    XCTAssertEqual(terminals.count, 1)
+    let terminal = try XCTUnwrap(terminals.first)
+    if let expectedReason = expectedReason {
+      XCTAssertEqual(terminal["kind"] as? String, "abandoned")
+      XCTAssertEqual(terminal["reason"] as? String, "camera-\(expectedReason)")
+      XCTAssertTrue(terminal["captureId"] == nil || terminal["captureId"] is NSNull)
+      XCTAssertTrue(terminal["jpegSizeBytes"] == nil || terminal["jpegSizeBytes"] is NSNull)
+      XCTAssertTrue(terminal["heicSizeBytes"] == nil || terminal["heicSizeBytes"] is NSNull)
+      let performance = try XCTUnwrap(call(channel, "getPerformanceSnapshot", nil) as? [String: Any])
+      let counters = try XCTUnwrap(performance["stillCaptureMetadata"] as? [String: Any])
+      XCTAssertEqual(counters["highResolutionStills"] as? Int, 0, "rejected before encoding")
+      XCTAssertEqual(counters["videoFallbackStills"] as? Int, 0)
+    } else {
+      XCTAssertEqual(terminal["kind"] as? String, "committed")
+      XCTAssertNotNil(terminal["captureId"] as? String)
+      XCTAssertGreaterThan(terminal[format == "heic" ? "heicSizeBytes" : "jpegSizeBytes"] as? Int ?? 0, 0)
+    }
+    _ = call(channel, "getNativeCaptureHealthV2", nil)
+    XCTAssertEqual(terminals.count, 1)
+    var changed = config
+    changed["resolution"] = ["width": 320, "height": 240]
+    XCTAssertEqual((call(channel, "initializeCapture", changed) as? FlutterError)?.code, "CAPTURE_CONFIG_REQUIRES_NEW_OWNER")
+  }
+
   /// Stages one still and returns its image id.
   private func stage(_ channel: NativeCaptureChannel) throws -> String {
     let reply = try XCTUnwrap(call(channel, "captureHighResImage", ["requiresPose": true]) as? [String: Any])
@@ -256,8 +366,17 @@ final class NativeCaptureChannelTests: XCTestCase {
 
 /// Accepts every outgoing message and installs no handler.
 private final class SilentMessenger: NSObject, FlutterBinaryMessenger {
-  func send(onChannel channel: String, message: Data?) {}
-  func send(onChannel channel: String, message: Data?, binaryReply callback: FlutterBinaryReply? = nil) {}
+  var onEvent: (([String: Any]) -> Void)?
+  func send(onChannel channel: String, message: Data?) {
+    send(onChannel: channel, message: message, binaryReply: nil)
+  }
+  func send(onChannel channel: String, message: Data?, binaryReply callback: FlutterBinaryReply? = nil) {
+    guard let message = message else { return }
+    let codec = FlutterStandardMethodCodec.sharedInstance()
+    let call = codec.decodeMethodCall(message)
+    if call.method == "onNativeCaptureV2Event", let event = call.arguments as? [String: Any] { onEvent?(event) }
+    callback?(codec.encodeSuccessEnvelope(nil))
+  }
   func setMessageHandlerOnChannel(
     _ channel: String, binaryMessageHandler handler: FlutterBinaryMessageHandler? = nil
   ) -> FlutterBinaryMessengerConnection { 0 }

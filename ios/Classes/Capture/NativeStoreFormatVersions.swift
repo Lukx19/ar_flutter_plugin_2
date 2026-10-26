@@ -23,16 +23,20 @@ enum NativeStoreFormatVersions {
   /// are read with intrinsics of unrecorded convention.
   // 6: deletion preserves damaged metadata as raw bytes at
   // store/quarantine/<sessionHash>/<sha256(bytes)>.record.
-  static let photoStoreLayout = 6
+  // 7: HEIC primary component (appended ordinal 5), explicit heicSizeBytes
+  // receipts and plain root schema 8. Legacy JPEG roots remain byte-identical.
+  static let photoStoreLayout = 7
   /// Root record schema written without a quality assessment.
   static let photoRootSchemaPlain = 5
+  static let photoRootSchemaHeic = 8
   /// Root record schema of a burst shot (schema 5 plus shot lines).
   static let photoRootSchemaShot = 7
   /// Root record schemas this platform reads.
-  static let photoRootSchemasReadable = [photoRootSchemaPlain, photoRootSchemaShot]
+  static let photoRootSchemasReadable = [photoRootSchemaPlain, photoRootSchemaShot, photoRootSchemaHeic]
   /// Layout of `capture-v2-previews`: 512/1024 px previews, optional full-resolution
   /// `<key>.original.jpg` copies and deletion markers. Existing previews remain readable.
-  static let previewCacheLayout = 2
+  // 3: optional byte-identical .original.heic copies; previews stay JPEG.
+  static let previewCacheLayout = 3
   /// Layout of `capture-v2-native/budget` (ledger, reservations, verified
   /// reclaims). 2: a settlement writes `reservations-v2/<token>.settled`
   /// before the ledger moves and deletes it after the reservation files, so

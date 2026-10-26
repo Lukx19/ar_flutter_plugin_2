@@ -6,6 +6,12 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class CameraCapabilityProfileResolverTest {
+    @Test fun `HEIC route is offered only when that camera advertises encoded output sizes`() {
+        assertEquals(listOf("jpeg"), CameraCapabilityProfileResolver.pipelineCaptureFormats(false, null, false, hardwareHeicAvailable = false))
+        assertEquals(listOf("jpeg", "heic"), CameraCapabilityProfileResolver.pipelineCaptureFormats(false, null, false, hardwareHeicAvailable = true))
+        assertEquals(listOf("jpeg", "raw+jpeg", "heic"), CameraCapabilityProfileResolver.pipelineCaptureFormats(true, "supported", true, hardwareHeicAvailable = true))
+    }
+
     @Test
     fun `cold cache uses detected capability instead of false`() {
         val supported =

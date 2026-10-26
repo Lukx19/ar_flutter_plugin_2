@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 import XCTest
 @testable import ar_flutter_plugin_2
@@ -25,14 +26,30 @@ final class CameraCapabilityProfileStoreTests: XCTestCase {
 
   func testAdvertisedStillGeometryIsPendingUntilOperationalCapture() {
     let profile = store().profile
-    XCTAssertEqual(profile["presetVersion"] as? Int, 12)
+    XCTAssertEqual(profile["presetVersion"] as? Int, 13)
     XCTAssertEqual(profile["sharedCameraProbeStatus"] as? String, "pending")
     XCTAssertEqual(profile["sharedResolutionValidationComplete"] as? Bool, false)
-    XCTAssertEqual(profile["supportsExactStillResolutionSelection"] as? Bool, false)
+    XCTAssertEqual(profile["supportsExactStillResolutionSelection"] as? Bool, true)
     XCTAssertEqual((profile["validatedSharedResolutions"] as? [[String: Int]])?.count, 0)
     XCTAssertEqual((profile["advertisedJpegHighResolutionResolutions"] as? [[String: Int]])?.first?["width"], 4032)
     XCTAssertEqual(profile["rawCapture"] as? Bool, false)
     XCTAssertEqual(profile["rawJpegProbeStatus"] as? String, "unsupported")
+  }
+
+  func testUnknownStillMetadataRetainsAutomaticWithoutInventingVideoSizes() {
+    let unknown = CameraCapabilityProfileStore(defaults: defaults, fingerprint: "old-ios",
+      supported: true, advertisedStillResolutions: [])
+    XCTAssertEqual(unknown.profile["supportsExactStillResolutionSelection"] as? Bool, false)
+    XCTAssertEqual((unknown.profile["advertisedJpegHighResolutionResolutions"] as? [[String: Int]])?.count, 0)
+  }
+
+  func testSupportedResolutionQueryDoesNotMislabelVideoGeometryAsStillOutput() {
+    var snapshot = CameraCapabilitySnapshot(stillSize: CGSize(width: 4032, height: 3024),
+      videoSizes: [CGSize(width: 1920, height: 1440), CGSize(width: 640, height: 480)],
+      isoRange: nil, exposureRange: nil, intrinsics: nil)
+    XCTAssertEqual(CameraCapabilityQueries.resolutions(snapshot).map { [$0.0, $0.1] }, [[4032, 3024]])
+    snapshot.selectableStillSizes = [CGSize(width: 2016, height: 1512), CGSize(width: 4032, height: 3024)]
+    XCTAssertEqual(CameraCapabilityQueries.resolutions(snapshot).map { [$0.0, $0.1] }, [[4032, 3024], [2016, 1512]])
   }
 
   func testSupportedRequiresActualPositiveGeometryAndPreservesKnownDimensions() {

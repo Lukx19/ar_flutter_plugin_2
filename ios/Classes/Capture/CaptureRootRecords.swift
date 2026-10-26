@@ -109,10 +109,12 @@ enum CaptureRootRecords {
     let plain = String(NativeStoreFormatVersions.photoRootSchemaPlain)
     let shotSchema = String(NativeStoreFormatVersions.photoRootSchemaShot)
     switch schema {
-    case plain:
+    case plain, String(NativeStoreFormatVersions.photoRootSchemaHeic):
       guard shotId == nil, shotImages.isEmpty, shotRecord == nil else { return nil }
+      if schema == plain && components.contains(where: { $0.kind == "HEIC" }) { return nil }
+      if schema == String(NativeStoreFormatVersions.photoRootSchemaHeic), !(components.count == 1 && components[0].kind == "HEIC") { return nil }
       return CaptureRootMetadata(
-        schema: plain, revision: revision, request: request, previous: previous,
+        schema: schema!, revision: revision, request: request, previous: previous,
         secondPrevious: secondPrevious, components: components)
     case shotSchema:
       guard let id = shotId, UUID(uuidString: id) != nil, (keys["shot"] ?? 0) == 1,

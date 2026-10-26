@@ -133,6 +133,7 @@ internal data class NativeCaptureEventV2(
     val qualityAssessment: CaptureQualityAssessmentV1? = null,
     val qualityAssessmentHash: String? = null,
     val verifiedTerminal: CaptureTerminal? = null,
+    val heicSizeBytes: Long? = null,
 )
 
 /** Both live and recovered assessed events use the contract encoder and verified receipt authority. */
@@ -299,11 +300,11 @@ internal class NativeCaptureRecoveryDispatcherV2(
                 if (existing != null && existing.kind in setOf(NativeCaptureEventKindV2.COMMITTED, NativeCaptureEventKindV2.ABANDONED) &&
                     event.kind in setOf(NativeCaptureEventKindV2.COMMITTED, NativeCaptureEventKindV2.ABANDONED) &&
                     listOf(existing.kind, existing.captureId, existing.captureRevision, existing.manifestId,
-                        existing.jpegSizeBytes, existing.dngSizeBytes, existing.recoveryContext,
+                        existing.jpegSizeBytes, existing.dngSizeBytes, existing.heicSizeBytes, existing.recoveryContext,
                         existing.qualityAssessment, existing.qualityAssessmentHash,
                         existing.reason.takeIf { existing.kind == NativeCaptureEventKindV2.ABANDONED }) !=
                     listOf(event.kind, event.captureId, event.captureRevision, event.manifestId,
-                        event.jpegSizeBytes, event.dngSizeBytes, event.recoveryContext,
+                        event.jpegSizeBytes, event.dngSizeBytes, event.heicSizeBytes, event.recoveryContext,
                         event.qualityAssessment, event.qualityAssessmentHash,
                         event.reason.takeIf { event.kind == NativeCaptureEventKindV2.ABANDONED })) {
                     throw DurableStoreConflictV2("Changed durable terminal conflicts with replay identity")
@@ -341,6 +342,7 @@ internal class NativeCaptureRecoveryDispatcherV2(
         captureRevision = captureRevision,
         manifestId = manifestId,
         jpegSizeBytes = jpegSizeBytes,
+        heicSizeBytes = heicSizeBytes,
         dngSizeBytes = dngSizeBytes,
         reason = reason,
         recoveryContext = recoveryContext,
@@ -1521,6 +1523,7 @@ internal class NativeCaptureAdapterV2(
                 captureRevision = terminal.captureRevision,
                 manifestId = terminal.manifestId,
                 jpegSizeBytes = terminal.jpegSizeBytes,
+                heicSizeBytes = terminal.heicSizeBytes,
                 dngSizeBytes = terminal.dngSizeBytes,
                 reason = terminal.reason,
                 recoveryContext = recoveryContext,

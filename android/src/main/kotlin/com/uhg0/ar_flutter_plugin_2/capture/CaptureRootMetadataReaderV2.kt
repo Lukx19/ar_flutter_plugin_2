@@ -80,11 +80,11 @@ internal class CaptureRootMetadataReaderV2 {
         var assessmentHash: String? = null
         var exposure: Long? = null
         when (schema) {
-            "5" -> {
+            "5", "8" -> {
                 // Explicit legacy branch: existing schema-5 records keep their interpretation.
                 if (fields.keys.any { it.startsWith("quality") || it == "exposureTimestampNanoseconds" }) return null
             }
-            "6" -> {
+            "6", "9" -> {
                 val expected = setOf("schema", "revision", "request", "previous", "secondPrevious",
                     "exposureTimestampNanoseconds", "qualityAssessmentHash") + CaptureQualityAssessmentV1.ROOT_KEYS
                 if (malformedLine || duplicateKeys.isNotEmpty() || fields.keys != expected) return null
@@ -92,7 +92,7 @@ internal class CaptureRootMetadataReaderV2 {
                 if (!(previous == "-" || isHash(previous)) || !(secondPrevious == "-" || isHash(secondPrevious))) return null
                 if (components.isEmpty() || components.size > CaptureComponentKind.entries.size ||
                     components.map { it.kind }.toSet().size != components.size ||
-                    components.none { it.kind == "JPEG" } || components.any { component ->
+                    components.none { it.kind == if (schema == "9") "HEIC" else "JPEG" } || components.any { component ->
                         component.length <= 0L || CaptureComponentKind.entries.none { it.name == component.kind }
                     }) return null
                 exposure = fields.getValue("exposureTimestampNanoseconds").toLongOrNull() ?: return null
@@ -103,6 +103,14 @@ internal class CaptureRootMetadataReaderV2 {
             }
             else -> return null
         }
+        if (schema == "8") {
+            if (malformedLine || duplicateKeys.isNotEmpty() || fields.keys != setOf("schema", "revision", "request", "previous", "secondPrevious") ||
+                revision == null || revision!! <= 0L || !isHash(request) ||
+                !(previous == "-" || isHash(previous)) || !(secondPrevious == "-" || isHash(secondPrevious)) ||
+                components.size != 1 || components.single().kind != "HEIC" || components.single().length <= 0L) return null
+        }
+        if ((schema == "5" || schema == "6") && components.any { it.kind == "HEIC" }) return null
+        if (schema == "9" && (components.size != 1 || components.single().kind != "HEIC")) return null
         val parsed = CaptureRootMetadataV2(schema, revision, request, previous, secondPrevious,
             java.util.Collections.unmodifiableList(components), exposure, assessment, assessmentHash)
         parsedRootCount++
