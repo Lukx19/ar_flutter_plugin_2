@@ -142,31 +142,17 @@ class QuestOverlayLayerTest {
     }
 
     @Test
-    fun `the aim reticle appears only near the standpoint`() {
+    fun `near lens target hides without teleporting to the aimed surface`() {
         val layer = QuestOverlayLayer()
         val b = reference()
         layer.onMessage(b, b.capacity())
-        layer.setView(1500f, 2f)
-        // At the standpoint: aim ring (3 x 32) and a 16-dash reticle, both
-        // around the aim point; the reticle is the 4 deg inner circle.
         val near = Recorder()
-        assertEquals(3 * 32 + 16 + others, layer.buildLines(2f, 1.2f, 1.5f, near))
-        val reticle = 1.5f * tan(Math.toRadians(4.0)).toFloat()
-        for (k in 0 until 96) {
-            assertEquals(0f, near.points[k][2], 1e-5f)
-            val expected = 1.5f * reticle * QuestOverlayGeometry.RING_LOOPS[k / 32]
-            assertEquals(expected, radiusAround(near.points[k], 2f, 1.2f, 0f), 1e-4f)
-        }
-        for (k in 96 until 112) {
-            assertEquals(reticle, radiusAround(near.points[k], 2f, 1.2f, 0f), 1e-4f)
-            assertEquals(QuestOverlayGeometry.COLOUR_AIMED, near.colours[k])
-        }
-        // Just outside twice the tolerance and far away: no line near the aim point.
-        for (z in floatArrayOf(2.11f, 12f)) {
+        assertEquals(others, layer.buildLines(2f, 1.2f, 1.5f, near))
+        for (z in floatArrayOf(1.8f, 2.11f, 12f)) {
             val r = Recorder()
             layer.buildLines(2f, 1.2f, z, r)
             val ring = if (z > 1.5f + QuestOverlayGeometry.FAR_METRES) 3 * 16 else 3 * 32
-            for (k in 0 until ring) assertTrue(radiusAround(r.points[k], 2f, 1.2f, 0f) > 1f)
+            for (k in 0 until ring) assertEquals(1.5f, r.points[k][2], 1e-5f)
         }
     }
 

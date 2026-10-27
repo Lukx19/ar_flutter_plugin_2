@@ -27,12 +27,51 @@ final class NativeCapturePreviewChannelTests: XCTestCase {
     super.tearDown()
   }
 
+  func testGuidanceDescriptorAcceptsOnlyBoundedNativeRoundTripMetadata() {
+    let descriptor = "guidance_preview_v1:1200:900:6"
+    let expected = GuidancePreviewLuma.SourceGeometry(width: 1200, height: 900, exifOrientation: 6)
+    XCTAssertEqual(GuidancePreviewLuma.sourceGeometry([kCGImagePropertyTIFFDictionary: [kCGImagePropertyTIFFImageDescription: descriptor]]), expected)
+    XCTAssertEqual(GuidancePreviewLuma.sourceGeometry([kCGImagePropertyIPTCDictionary: [kCGImagePropertyIPTCCaptionAbstract: descriptor]]), expected)
+    XCTAssertNil(GuidancePreviewLuma.sourceGeometry([:]), "legacy previews cannot invent geometry")
+    XCTAssertNil(GuidancePreviewLuma.sourceGeometry([
+      kCGImagePropertyTIFFDictionary: [kCGImagePropertyTIFFImageDescription: descriptor],
+      kCGImagePropertyIPTCDictionary: [kCGImagePropertyIPTCCaptionAbstract: "guidance_preview_v1:900:1200:1"],
+    ]))
+    for invalid in ["legacy:1200:900:6", "guidance_preview_v1:0:900:1", "guidance_preview_v1:1200:900:9", "guidance_preview_v1::1200:900:1", "guidance_preview_v1:65537:900:1", "guidance_preview_v1:+1200:900:1", String(repeating: "x", count: 81)] {
+      XCTAssertNil(GuidancePreviewLuma.sourceGeometry([kCGImagePropertyIPTCDictionary: [kCGImagePropertyIPTCCaptionAbstract: invalid]]))
+    }
+  }
+
+  func testGuidanceLumaUsesAuthorizedBoundedPreviewAndExactSourceGeometry() throws {
+    let photo = try commitPhoto()
+    XCTAssertNil(invoke("guidanceNativeCapturePreview", ["manifestId": photo.manifest, "captureId": photo.capture]), "unreconciled references must not expose a guidance preview")
+    _ = invoke("reconcileNativeCapturePreviews", ["references": [photo.reference]])
+    let previewPath = try XCTUnwrap(materialize(photo))
+    let previewSource = try XCTUnwrap(CGImageSourceCreateWithURL(URL(fileURLWithPath: previewPath) as CFURL, nil))
+    let previewProperties = try XCTUnwrap(CGImageSourceCopyPropertiesAtIndex(previewSource, 0, nil) as? [CFString: Any])
+    XCTAssertEqual(GuidancePreviewLuma.sourceGeometry(previewProperties),
+                   GuidancePreviewLuma.SourceGeometry(width: 1200, height: 900, exifOrientation: 1),
+                   "Source geometry must round-trip through the actual native JPEG writer: \(previewProperties)")
+    XCTAssertNotNil(GuidancePreviewLuma.read(previewPath, cancelled: { false }), "Authorized native preview must be directly readable before channel encoding")
+    let payload = try XCTUnwrap(invoke("guidanceNativeCapturePreview", ["manifestId": photo.manifest, "captureId": photo.capture]) as? [String: Any])
+    XCTAssertEqual(payload["wireVersion"] as? String, "guidance_luma_v1")
+    XCTAssertEqual(payload["sourceWidth"] as? Int, 1200)
+    XCTAssertEqual(payload["sourceHeight"] as? Int, 900)
+    XCTAssertEqual(payload["exifOrientation"] as? Int, 1)
+    let width = try XCTUnwrap(payload["width"] as? Int), height = try XCTUnwrap(payload["height"] as? Int)
+    XCTAssertLessThanOrEqual(width, 256); XCTAssertLessThanOrEqual(height, 256)
+    let luma = try XCTUnwrap((payload["luma"] as? FlutterStandardTypedData)?.data)
+    XCTAssertEqual(luma.count, width * height)
+    XCTAssertLessThan(luma[(height / 4) * width + width / 2], 24)
+    XCTAssertGreaterThan(luma[(height * 3 / 4) * width + width / 2], 231)
+  }
+
   /// Commits one photo to the durable store; returns its preview reference parts.
   private func commitPhoto() throws -> (manifest: String, capture: String, reference: String) {
     let (store, _) = try CaptureFixture.store(NativeCaptureStorePaths.nativeRoot(appFiles))
     let request = CaptureFixture.request()
     _ = try store.acceptCaptureBeforeExposure(request)
-    let jpeg = StillQualityTests.jpeg(width: 1200, height: 900) { x, y in UInt8((x ^ y) & 0xff) }
+    let jpeg = StillQualityTests.jpeg(width: 1200, height: 900) { _, y in y < 450 ? 0 : 255 }
     let receipt = try store.commitStreamedFinalized(request.template, exposureTimestampNanoseconds: 1, components: [(.jpeg, [UInt8](jpeg))])
     let manifest = try XCTUnwrap(receipt.terminal?.manifestId)
     let capture = try XCTUnwrap(receipt.terminal?.captureId)

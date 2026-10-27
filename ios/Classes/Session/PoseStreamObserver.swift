@@ -1,6 +1,7 @@
 import ARKit
 import Foundation
 import simd
+import UIKit
 
 extension PoseWireSample {
   /// A wire sample from an ARKit camera. `ARCamera.transform` is the
@@ -57,9 +58,37 @@ final class PoseStreamObserver: ARFrameObserver {
   private var sequence: Int64 = 0
   private var limiter = PoseRateLimiter()
   private let deliver: (Data) -> Void
+  private let deliverDisplaySample: ((Data, Double?, SemanticFloorSample?) -> Void)?
+  private var displayOrientation: UIInterfaceOrientation?
 
-  init(deliver: @escaping (Data) -> Void) {
+  func updateDisplayOrientation(_ orientation: UIInterfaceOrientation?) {
+    lock.lock(); defer { lock.unlock() }
+    displayOrientation = orientation == .unknown ? nil : orientation
+  }
+
+  private func currentDisplayOrientation() -> UIInterfaceOrientation? {
+    lock.lock(); defer { lock.unlock() }
+    return displayOrientation
+  }
+
+  /// Rotation from optical right/up to displayed right/up, determined by
+  /// ARKit's actual view matrix rather than a guessed portrait offset.
+  static func displayRotation(camera: simd_float4x4, view: simd_float4x4) -> Double? {
+    let display = simd_inverse(view)
+    let rawRight = SIMD3<Float>(camera.columns.0.x, camera.columns.0.y, camera.columns.0.z)
+    let rawUp = SIMD3<Float>(camera.columns.1.x, camera.columns.1.y, camera.columns.1.z)
+    let right = SIMD3<Float>(display.columns.0.x, display.columns.0.y, display.columns.0.z)
+    let rawForward = SIMD3<Float>(camera.columns.2.x, camera.columns.2.y, camera.columns.2.z)
+    let forward = SIMD3<Float>(display.columns.2.x, display.columns.2.y, display.columns.2.z)
+    let cosine = simd_dot(right, rawRight), sine = simd_dot(right, rawUp)
+    guard cosine.isFinite, sine.isFinite, simd_dot(forward, rawForward) >= 0.999,
+      abs(cosine * cosine + sine * sine - 1) <= 0.001 else { return nil }
+    return Double(atan2(sine, cosine))
+  }
+
+  init(deliverDisplaySample: ((Data, Double?, SemanticFloorSample?) -> Void)? = nil, deliver: @escaping (Data) -> Void) {
     self.deliver = deliver
+    self.deliverDisplaySample = deliverDisplaySample
   }
 
   var isEnabled: Bool {
@@ -100,7 +129,30 @@ final class PoseStreamObserver: ARFrameObserver {
       timestampNs: timestampNs,
       cameraTransform: frame.cameraTransform,
       trackingState: frame.trackingState)
-    deliver(PoseBatchWire.encode(sample))
+    let encoded = PoseBatchWire.encode(sample)
+    if let deliverDisplaySample = deliverDisplaySample {
+      let rotation = currentDisplayOrientation().flatMap {
+        Self.displayRotation(camera: frame.cameraTransform, view: frame.viewMatrix(for: $0))
+      }
+      // ARCore has no semantic floor classification; its producer omits these facts.
+      // A horizontal tabletop must never be reported as a verified floor.
+      var floor: SemanticFloorSample?
+      var largestArea: Double = 0
+      if sample.isTracking {
+        for case let plane as ARPlaneAnchor in frame.anchors where plane.classification == .floor && plane.alignment == .horizontal {
+          let centre = plane.transform * SIMD4<Float>(plane.center.x, plane.center.y, plane.center.z, 1)
+          let area = Double(plane.extent.x * plane.extent.z)
+          let normalY = Double(plane.transform.columns.1.y)
+          if area.isFinite && centre.y.isFinite && normalY.isFinite && area > largestArea {
+            largestArea = area
+            floor = SemanticFloorSample(anchorId: plane.identifier.uuidString, worldY: Double(centre.y), normalY: normalY, areaSquareMetres: area)
+          }
+        }
+      }
+      deliverDisplaySample(encoded, rotation, floor)
+    } else {
+      deliver(encoded)
+    }
   }
 
   func frameSourceDidStop(_ source: ARFrameSource) {

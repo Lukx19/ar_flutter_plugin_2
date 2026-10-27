@@ -6,6 +6,66 @@ import 'package:vector_math/vector_math_64.dart';
 
 void main() {
   test(
+      'semantic floor sidecar validates facts and immutable canonical key order',
+      () {
+    final value = <String, Object>{
+      'classification': 'floor',
+      'anchorId': 'plane',
+      'worldY': -1.5,
+      'normalY': 1.0,
+      'areaSquareMetres': 4.0
+    };
+    final decoded = decodeSemanticFloor(value)!;
+    value['worldY'] = 0;
+    expect(decoded['worldY'], -1.5);
+    expect(() => decoded['worldY'] = 0, throwsUnsupportedError);
+    for (final invalid in [
+      null,
+      {},
+      {...decoded, 'classification': 'table'},
+      {...decoded, 'normalY': double.nan},
+      {...decoded, 'normalY': 2},
+      {...decoded, 'areaSquareMetres': 0},
+      {...decoded, 'worldY': double.infinity},
+      {...decoded, 'anchorId': 'x' * 129}
+    ]) {
+      expect(decodeSemanticFloor(invalid), isNull);
+    }
+    final pose = ARFramePose.fromMap({
+      'semanticFloorV1': decoded,
+      'position': {'x': 0.0, 'y': 0.0, 'z': 0.0},
+      'rotation': {'x': 0.0, 'y': 0.0, 'z': 0.0, 'w': 1.0},
+      'transform': List.generate(16, (i) => i % 5 == 0 ? 1.0 : 0.0),
+      'timestampMs': 0,
+      'confidence': 1.0,
+      'isTracking': true,
+    });
+    expect(pose.semanticFloor, decoded);
+    expect(pose.toMap()['semanticFloorV1'], decoded);
+  });
+
+  test(
+      'display rotation sidecars require one finite bounded value per exact sample',
+      () {
+    expect(
+        decodePoseDisplayRotations(
+            [0, 1.5707963267948966, null, -1.5707963267948966], 4),
+        [0.0, 1.5707963267948966, null, -1.5707963267948966]);
+    for (final malformed in [
+      null,
+      [],
+      [0],
+      [0, double.nan],
+      [0, double.infinity],
+      [0, 4],
+      [0, 'portrait']
+    ]) {
+      expect(decodePoseDisplayRotations(malformed, 2), isNull);
+    }
+    expect(decodePoseDisplayRotations(List.filled(9, 0), 9), isNull);
+  });
+
+  test(
       'packed poses preserve int64 timestamps, float geometry and retained ownership',
       () {
     final bytes = ByteData(packedPoseSampleBytes + 3);

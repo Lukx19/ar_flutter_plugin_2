@@ -71,6 +71,11 @@ internal object CaptureThumbnail {
                 check(display.compress(Bitmap.CompressFormat.JPEG, if (edge == 512) 78 else 85, output))
                 // Reconstructible display cache; durable originals own their fsync.
             }
+            if (cancelled()) return false
+            ExifInterface(target.absolutePath).apply {
+                setAttribute(ExifInterface.TAG_IMAGE_DESCRIPTION, "guidance_preview_v1:${bounds.outWidth}:${bounds.outHeight}:$orientation")
+                saveAttributes()
+            }
             return !cancelled() && valid(target, edge)
         } finally {
             oriented?.takeUnless { it === scaled || it === decoded }?.recycle()

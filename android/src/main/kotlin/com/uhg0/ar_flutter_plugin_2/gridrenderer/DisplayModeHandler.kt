@@ -27,7 +27,10 @@ internal object GridDisplayCodes {
     const val COLOUR_AGE = 2
     const val COLOUR_SOURCE = 3
     const val COLOUR_COMPLETION = 4
-    const val COLOUR_ATTRIBUTES = 5
+    const val COLOUR_DIRECTIONAL_COVERAGE = 5
+    const val COLOUR_ATTRIBUTES = 6
+    const val OVERLAY_HALF_TRANSPARENCY = 64
+    const val OVERLAY_FOCUS_PRIORITY = 128
 
     const val SIZE_FIXED = 0
     const val SIZE_BY_COVERAGE = 1
@@ -95,6 +98,9 @@ internal class DisplayModeHandler {
     private val tables = ByteArray(GridDisplayCodes.COLOUR_ATTRIBUTES * ColourTableLayout.ENTRIES * 4)
     private var tablesVersion = 0L
     private val targets = FloatArray(PlannerTargetMessageLayout.MAX_TARGETS * PlannerTargetMessageLayout.FLOATS_PER_TARGET)
+    private val focus = FloatArray(64 * 4)
+    private var focusCount = 0
+    private var focusVersion = 0L
     private var targetCount = 0
     private var targetsVersion = 0L
     var rejected = 0L
@@ -155,6 +161,22 @@ internal class DisplayModeHandler {
                 }
                 DisplayIntake.COLOUR_TABLE
             }
+            contractMagic("C3FP") -> {
+                val count = b.get(offset + 6).toInt() and 0xff
+                if (version != 1 || count > 64 || length != 8 + count * 16) return reject()
+                // Validate the whole update before changing the visible frame.
+                for (i in 0 until count * 4) {
+                    val value = b.getFloat(offset + 8 + i * 4)
+                    if (!value.isFinite() || (i % 4 == 3 && value !in 0f..1f)) return reject()
+                }
+                synchronized(lock) {
+                    focus.fill(0f)
+                    for (i in 0 until count * 4) focus[i] = b.getFloat(offset + 8 + i * 4)
+                    focusCount = count
+                    focusVersion++
+                }
+                DisplayIntake.OVERLAY
+            }
             PlannerTargetMessageLayout.MAGIC -> {
                 if (version != PlannerTargetMessageLayout.VERSION || length < PlannerTargetMessageLayout.BYTES) return reject()
                 val count = (b.get(offset + PlannerTargetMessageLayout.COUNT).toInt() and 0xff)
@@ -184,7 +206,7 @@ internal class DisplayModeHandler {
         true
     }
 
-    /** Copies the colour tables (5 x 256 RGBA8) into [out] when newer than [knownVersion]; returns the version or -1. */
+    /** Copies the colour tables (6 x 256 RGBA8) into [out] when newer than [knownVersion]; returns the version or -1. */
     fun snapshotTables(out: ByteBuffer, knownVersion: Long): Long = synchronized(lock) {
         if (tablesVersion == knownVersion) return -1
         out.clear()
@@ -200,6 +222,19 @@ internal class DisplayModeHandler {
         targetCount
     }
 
+    fun clearFocus() = synchronized(lock) {
+        focus.fill(0f)
+        focusCount = 0
+        focusVersion++
+    }
+
+    fun snapshotFocus(out: FloatArray, knownVersion: Long): Int = synchronized(lock) {
+        if (focusVersion == knownVersion) return -1
+        System.arraycopy(focus, 0, out, 0, focus.size)
+        focusCount
+    }
+
+    val currentFocusVersion: Long get() = synchronized(lock) { focusVersion }
     val currentTargetsVersion: Long get() = synchronized(lock) { targetsVersion }
     val currentTablesVersion: Long get() = synchronized(lock) { tablesVersion }
 

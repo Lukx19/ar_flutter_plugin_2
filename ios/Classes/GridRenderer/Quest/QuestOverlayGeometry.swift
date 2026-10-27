@@ -138,23 +138,8 @@ final class QuestOverlayGeometry {
     let ax = f.donutAim[3 * i], ay = f.donutAim[3 * i + 1], az = f.donutAim[3 * i + 2]
     if !basis(ax - sx, ay - sy, az - sz) { return }
     let camDistance = distance(camX, camY, camZ, sx, sy, sz)
-    if camDistance <= 2 * f.donutPositionTolerance[i] {
-      // At the standpoint: the donut frames the aim point around the reticle.
-      let aimDistance = distance(camX, camY, camZ, ax, ay, az)
-      if aimDistance < 1e-3 { return }
-      let given = f.donutInnerCircleDegrees[i]
-      let degrees = given > 0 ? given : QuestOverlayGeometry.defaultInnerCircleDegrees
-      let reticle = aimDistance * Float(tan(Double(degrees) * Double.pi / 180))
-      let outer = clampRadius(
-        reticle * QuestOverlayGeometry.aimRingReticleRatio, distance: aimDistance, minPx: minRingPx(f),
-        maxPx: Float.greatestFiniteMagnitude)
-      ring(ax, ay, az, outer, QuestOverlayGeometry.ringSegments, colour)
-      let state = f.donutState[i]
-      if state != QuestOverlayLayout.stateCaptured && state != QuestOverlayLayout.stateTimedOut {
-        dashedCircle(ax, ay, az, reticle, colour)
-      }
-      return
-    }
+    // Keep the lens target fixed. The shared HUD owns the near-lens sight.
+    if camDistance < 0.25 { return }
     let given = f.donutRingRadius[i]
     let radius = given > 0 ? given : QuestOverlayGeometry.defaultRingRadiusMetres
     let outer = clampRadius(radius, distance: camDistance, minPx: minRingPx(f), maxPx: maxRingPx(f))

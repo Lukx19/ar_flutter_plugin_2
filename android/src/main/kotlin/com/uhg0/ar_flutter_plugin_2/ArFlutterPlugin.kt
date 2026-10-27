@@ -10,6 +10,7 @@ import io.flutter.embedding.engine.plugins.activity.ActivityAware
 import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
 import io.flutter.plugin.common.MethodChannel
 import com.uhg0.ar_flutter_plugin_2.capabilities.MethodChannelARCameraCapabilities
+import com.uhg0.ar_flutter_plugin_2.capture.GuidancePreviewLuma
 import com.uhg0.ar_flutter_plugin_2.capture.NativeCapturePreviewOwnerV2
 import com.uhg0.ar_flutter_plugin_2.capture.CapturePreviewWorkQueue
 import com.uhg0.ar_flutter_plugin_2.sceneview.SceneViewHostRetentionCensus
@@ -55,7 +56,7 @@ class ArFlutterPlugin: FlutterPlugin, ActivityAware {
                     result.success(null)
                     return@setMethodCallHandler
                 }
-                if (call.method !in setOf("materializeNativeCapturePreview", "beginNativeCapturePreviewDeletion",
+                if (call.method !in setOf("guidanceNativeCapturePreview", "materializeNativeCapturePreview", "beginNativeCapturePreviewDeletion",
                         "commitNativeCapturePreviewDeletion", "rollbackNativeCapturePreviewDeletion",
                         "reconcileNativeCapturePreviews", "deleteNativeCaptureSession", "reconcileNativeCaptureSessions")) {
                     result.notImplemented()
@@ -71,6 +72,10 @@ class ArFlutterPlugin: FlutterPlugin, ActivityAware {
                                 previewOwner.reconcile(requireNotNull(call.argument<List<String>>("references")))
                                 null
                             }
+                            "guidanceNativeCapturePreview" -> previewOwner.materialize(
+                                requireNotNull(call.argument<String>("manifestId")),
+                                requireNotNull(call.argument<String>("captureId")), cancelled, 512,
+                            )?.let { GuidancePreviewLuma.read(it, cancelled) }
                             "materializeNativeCapturePreview" -> previewOwner.materialize(
                                 requireNotNull(call.argument<String>("manifestId")),
                                 requireNotNull(call.argument<String>("captureId")),

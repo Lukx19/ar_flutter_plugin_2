@@ -18,6 +18,33 @@ import XCTest
 /// green, age white, source yellow, completion blue, so a probe tells which
 /// attribute drew.
 final class GridStyleRenderTests: XCTestCase {
+  private final class VolumeProbe: GridLineOverlay {
+    let messageMagic: UInt32 = 0x7ffffffe
+    let greyOutside = false
+    let volumetric = true
+    func onMessage(_ message: UnsafeRawBufferPointer) -> Bool { false }
+    func isInScope(_ x: Float,_ y: Float,_ z: Float) -> Bool { true }
+    func reset() {}
+    func buildLines(camX: Float,camY: Float,camZ: Float,sink: GridOverlayLineSink) -> Int {
+      sink.line(-0.4,0,-1,0.4,0,-1,rgba:0xff00ffff)
+      return 1
+    }
+  }
+
+  func testGuidanceVolumeDrawsFilledTrianglesRatherThanOnePixelLines() throws {
+    mode(GridDisplayCodes.baseNone)
+    try render()
+    XCTAssertEqual(drawnPixels(),0)
+    host.core.addLineOverlay(VolumeProbe())
+    try render()
+    // A 24 mm tube spans over five pixels at this depth, for a readable band.
+    XCTAssertGreaterThan(drawnPixels(),700)
+    let centre = probe(128,128)
+    XCTAssertGreaterThan(centre.r,200)
+    XCTAssertGreaterThan(centre.b,200)
+    XCTAssertEqual(centre.g,0)
+  }
+
   private static let size = 256
   private var device: MTLDevice!
   private var queue: MTLCommandQueue!
@@ -123,7 +150,7 @@ final class GridStyleRenderTests: XCTestCase {
   }
 
   private func sendTables() {
-    let colours: [UInt32] = [0xFF00_00FF, 0x00FF_00FF, 0xFFFF_FFFF, 0xFFFF_00FF, 0x0000_FFFF]
+    let colours: [UInt32] = [0xFF00_00FF, 0x00FF_00FF, 0xFFFF_FFFF, 0xFFFF_00FF, 0x0000_FFFF, 0xFF00_FFFF]
     for attribute in 0..<GridDisplayCodes.colourAttributes {
       writer.colourTable(attribute: attribute, rgba: colours[attribute])
       XCTAssertEqual(writer.withMessage { host.onDisplayMessage($0) }, .colourTable)
@@ -164,6 +191,96 @@ final class GridStyleRenderTests: XCTestCase {
   }
 
   private var centre: Int { GridStyleRenderTests.size / 2 }
+
+  /// Independent camera uniform selects the saved-photo bin while the
+  /// projection keeps the synthetic point at the same probe pixel.
+  private func directionalProbe(azimuth: Float, elevation: Float, creditedBin: Int,
+                                reverseNormal: Bool = false) throws -> RGBA {
+    let az = azimuth * .pi / 180
+    let el = elevation * .pi / 180
+    let direction = SIMD3<Float>(cos(el) * cos(az), sin(el), cos(el) * sin(az))
+    writer.begin(RendererDeltaLayout.kindReset, firstSlot: 0, records: 0, capacity: 64, brickKey: 0)
+    offer()
+    writer.begin(RendererDeltaLayout.kindSurfaceSlice, firstSlot: 0, records: 1, capacity: 64, brickKey: brickKey)
+    let n = direction * (reverseNormal ? Float(-1) : Float(1))
+    writer.surface(0, 0, 0, -2, n.x, n.y, n.z, size: 0.08, confidence: 255, binQuality: 0)
+    var surface = writer.message
+    let offset = RendererDeltaLayout.headerBytes + SurfaceInstanceLayout.bins + (creditedBin / 8) * 4
+    let word = UInt32(15) << UInt32((creditedBin % 8) * 4)
+    for i in 0..<4 { surface[offset + i] = UInt8(truncatingIfNeeded: word >> UInt32(i * 8)) }
+    XCTAssertEqual(surface.withUnsafeBytes { host.onRenderMessage($0) }, GridRendererStatus.ok)
+    writer.colourTable(attribute: GridDisplayCodes.colourDirectionalCoverage, rgba: 0)
+    var table = writer.message
+    for i in 0..<256 {
+      let o = ColourTableLayout.headerBytes + i * 4
+      table[o] = UInt8(i)
+      table[o + 1] = i == 255 ? 255 : 0
+      table[o + 2] = 0
+      table[o + 3] = 255
+    }
+    XCTAssertEqual(table.withUnsafeBytes { host.onDisplayMessage($0) }, .colourTable)
+    view.cameraPosition = SIMD3(direction.x, direction.y, -2 + direction.z)
+    mode(GridDisplayCodes.basePoints, colour: GridDisplayCodes.colourDirectionalCoverage)
+    try render()
+    return probe(centre, centre)
+  }
+
+  func testDirectionalLacquerUsesEverySavedPhotoBinAndKeepsCornerFacesSeparate() throws {
+    for bin in 0..<24 {
+      let elevation: Float = bin / 8 == 0 ? 41.8 : (bin / 8 == 1 ? 0 : -41.8)
+      let azimuth = Float(bin % 8) * 45 + 22.5
+      let credited = try directionalProbe(azimuth: azimuth, elevation: elevation, creditedBin: bin)
+      XCTAssertTrue(credited.r > 100 && credited.g == 0, "bin \(bin): \(credited)")
+      let uncredited = try directionalProbe(azimuth: azimuth, elevation: elevation, creditedBin: (bin + 4) % 24)
+      XCTAssertEqual(uncredited.r, 0, "zero saved-photo credit remains valid")
+      XCTAssertEqual(uncredited.g, 0)
+    }
+    let back = try directionalProbe(azimuth: 67.5, elevation: 0, creditedBin: 9, reverseNormal: true)
+    XCTAssertGreaterThan(back.g, 100, "opposite corner face must remain unknown")
+  }
+
+  func testDirectionalLacquerTransitionsContinuouslyAcrossAzimuthBoundary() throws {
+    let before = try directionalProbe(azimuth: 44.9, elevation: 0, creditedBin: 9).r
+    let after = try directionalProbe(azimuth: 45.1, elevation: 0, creditedBin: 9).r
+    XCTAssertLessThan(abs(after - before), 15)
+    XCTAssertEqual(try directionalProbe(azimuth: 41, elevation: 0, creditedBin: 9).r, 0)
+    XCTAssertGreaterThan(try directionalProbe(azimuth: 49, elevation: 0, creditedBin: 9).r, 100)
+  }
+
+  func testDirectionalLacquerIsStableAtElevationAndAzimuthWrapBoundaries() throws {
+    let below = try directionalProbe(azimuth: 22.5, elevation: 19.37, creditedBin: 0).r
+    let above = try directionalProbe(azimuth: 22.5, elevation: 19.57, creditedBin: 0).r
+    XCTAssertLessThan(abs(above - below), 15)
+    XCTAssertEqual(try directionalProbe(azimuth: 22.5, elevation: 15, creditedBin: 0).r, 0)
+    XCTAssertGreaterThan(try directionalProbe(azimuth: 22.5, elevation: 24, creditedBin: 0).r, 100)
+    let left = try directionalProbe(azimuth: 359.9, elevation: 0, creditedBin: 8).r
+    let right = try directionalProbe(azimuth: 0.1, elevation: 0, creditedBin: 8).r
+    XCTAssertLessThan(abs(right - left), 15)
+    view.cameraPosition = SIMD3(0, 0, -2)
+    try render()
+    XCTAssertGreaterThan(probe(centre, centre).g, 100, "coincident view is unknown")
+  }
+
+  func testFocusPaintIsTransientAndDoesNotChangeSavedPhotoCoverage() throws {
+    var focus = Data(repeating: 0, count: 24)
+    let words: [(Int, UInt32)] = [(0, contractMagic("C3FP")), (16, Float(-2).bitPattern), (20, Float(0.5).bitPattern)]
+    for (offset, word) in words {
+      for i in 0..<4 { focus[offset + i] = UInt8(truncatingIfNeeded: word >> UInt32(i * 8)) }
+    }
+    focus[4] = 1
+    focus[6] = 1
+    XCTAssertEqual(focus.withUnsafeBytes { host.onDisplayMessage($0) }, .overlay)
+    mode(GridDisplayCodes.baseSplats)
+    try render()
+    XCTAssertLessThan(probe(centre, centre).g, 40)
+    mode(GridDisplayCodes.baseSplats, overlays: GridDisplayCodes.overlayFocusPriority)
+    try render()
+    XCTAssertGreaterThan(probe(centre, centre).g, 100, "focus spectrum paints existing surfels")
+    focus[6] = 0
+    XCTAssertEqual(Data(focus.prefix(8)).withUnsafeBytes { host.onDisplayMessage($0) }, .overlay)
+    try render()
+    XCTAssertLessThan(probe(centre, centre).g, 40, "clear returns original saved-photo coverage")
+  }
 
   func testPointsDrawAtTheirProjectedPosition() throws {
     mode(GridDisplayCodes.basePoints)
@@ -223,6 +340,18 @@ final class GridStyleRenderTests: XCTestCase {
       }
     }
     XCTAssertEqual(probe(4, 4).a, 0)
+  }
+
+  func testSpatialHalfTransparencyPreservesHalfOfCameraPixelsUnderOverlap() throws {
+    mode(GridDisplayCodes.baseSplats, overlays: GridDisplayCodes.overlayHalfTransparency)
+    try render()
+    var visible = 0
+    for y in (centre - 8)..<(centre + 8) {
+      for x in (centre - 8)..<(centre + 8) {
+        if probe(x, y).a > 0 { visible += 1 }
+      }
+    }
+    XCTAssertEqual(visible, 128, "64 overlapping surfels must still leave half the pixels clear")
   }
 
   func testCompactVoxelsDrawAndPaddingCollapses() throws {

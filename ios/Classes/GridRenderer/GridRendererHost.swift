@@ -26,6 +26,7 @@ final class GridRendererHost {
   private var draws: GridStyleDrawSet?
   private var preparedFormats: (MTLPixelFormat, MTLPixelFormat)?
   private let lineBatch = GridLineBatch()
+  private let volumeBatch = GridLineBatch(capacitySegments: 2048, volumetric: true)
   private var frameValue: UInt64?
   private let stateLock = NSLock()
   private var failed = false
@@ -163,6 +164,10 @@ final class GridRendererHost {
     if core.buildOverlayLines(
       camX: cam.x, camY: cam.y, camZ: cam.z, batch: lineBatch, focalPx: view.focalPx, pxPerDp: view.pxPerDp) > 0 {
       draws.drawLines(encoder, batch: lineBatch, view: view, completion: completion, frameValue: frameValue)
+    }
+    if core.buildOverlayLines(
+      camX: cam.x, camY: cam.y, camZ: cam.z, batch: volumeBatch, focalPx: view.focalPx, pxPerDp: view.pxPerDp) > 0 {
+      draws.drawLines(encoder, batch: volumeBatch, view: view, completion: completion, frameValue: frameValue)
     }
     if core.mode.has(GridDisplayCodes.overlayRawFeaturePoints) {
       rawFeaturePoints.update(frameTimestamp: frameTimestamp, read: featurePoints)

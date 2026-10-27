@@ -39,7 +39,7 @@ class QuestLineOverlayTest {
         core.lineOverlays.add(overlay)
         val message = reference()
         assertEquals(DisplayIntake.OVERLAY, core.onDisplayMessage(message, 0, message.capacity()))
-        val batch = GridLineBatch()
+        val batch = GridLineBatch(capacitySegments = 2048, volumetric = true)
         val segments = core.buildOverlayLines(2f, 1.6f, 2f, batch)
         assertTrue(segments > 0)
         assertSame(overlay, core.scopeOverlay())
@@ -79,23 +79,18 @@ class QuestLineOverlayTest {
     }
 
     @Test
-    fun `quest lines draw on top after depth-tested overlays with the frame's screen scale`() {
+    fun `quest volumes are depth tested and diagnostic lines remain separate`() {
         val core = GridRendererCore(ByteArrayGpuTarget())
-        // Registered first, still collected after the depth-tested overlay.
         core.lineOverlays.add(QuestLineOverlay())
         core.lineOverlays.add(DepthTestedOverlay())
         val message = reference()
         core.onDisplayMessage(message, 0, message.capacity())
-        val batch = GridLineBatch()
-        // 10.5 m from the standpoint: the far ring's outer loop would be 11 px
-        // across at 1500 px focal length, so it is raised to 24 dp (24 px
-        // radius at density 2); the first loop is 0.8 of that.
-        assertTrue(core.buildOverlayLines(2f, 1.2f, 12f, batch, focalPx = 1500f, pxPerDp = 2f) > 1)
-        assertEquals(1, batch.depthTestedSegments)
-        assertEquals(0x00, batch.vertices.get(12).toInt())
-        assertEquals(0.8f * 24f * 10.5f / 1500f, standpointDistance(batch, 2), 1e-5f)
-        // Without a focal length the ring keeps its 8 cm world radius.
-        core.buildOverlayLines(2f, 1.2f, 12f, batch)
-        assertEquals(0.8f * 0.08f, standpointDistance(batch, 2), 1e-5f)
+        val lines = GridLineBatch()
+        assertEquals(1, core.buildOverlayLines(2f, 1.2f, 12f, lines))
+        val volume = GridLineBatch(capacitySegments = 2048, volumetric = true)
+        assertTrue(core.buildOverlayLines(2f, 1.2f, 12f, volume, focalPx = 1500f, pxPerDp = 2f) > 1)
+        assertEquals(volume.segments, volume.depthTestedSegments)
+        assertEquals(36, volume.verticesPerSegment)
+        assertTrue(kotlin.math.abs(standpointDistance(volume, 0) - 0.8f*24f*10.5f/1500f)<0.02f)
     }
 }

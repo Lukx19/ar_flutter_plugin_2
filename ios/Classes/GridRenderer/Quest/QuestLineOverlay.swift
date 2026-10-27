@@ -72,7 +72,8 @@ final class QuestLineOverlay: GridLineOverlay {
   }
 
   /// Guidance stays readable over the grid: drawn without the depth test.
-  var drawOnTop: Bool { true }
+  var drawOnTop: Bool { false }
+  var volumetric: Bool { true }
 
   func setView(focalPx: Float, pxPerDp: Float) {
     layer.setView(focalPx: focalPx, pxPerDp: pxPerDp)

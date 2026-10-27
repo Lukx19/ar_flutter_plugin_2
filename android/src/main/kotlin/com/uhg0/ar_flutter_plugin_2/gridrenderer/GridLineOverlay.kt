@@ -33,6 +33,9 @@ internal interface GridLineOverlay {
      */
     val drawOnTop: Boolean get() = false
 
+    /** World-volume guidance uses triangle tubes, separate from diagnostic lines. */
+    val volumetric: Boolean get() = false
+
     /** Render thread, before [buildLines]: projection focal length in pixels and display density. */
     fun setView(focalPx: Float, pxPerDp: Float) {}
 
@@ -57,9 +60,10 @@ internal interface GridLineOverlay {
  * Segments beyond the capacity are dropped and counted; nothing allocates
  * per frame.
  */
-internal class GridLineBatch(val capacitySegments: Int = DEFAULT_CAPACITY) : GridOverlayLineSink {
+internal class GridLineBatch(val capacitySegments: Int = DEFAULT_CAPACITY, val volumetric: Boolean = false) : GridOverlayLineSink {
     val vertices: ByteBuffer =
-        ByteBuffer.allocateDirect(capacitySegments * 2 * VERTEX_BYTES).order(ByteOrder.nativeOrder())
+        ByteBuffer.allocateDirect(capacitySegments * (if (volumetric) 36 else 2) * VERTEX_BYTES).order(ByteOrder.nativeOrder())
+    val verticesPerSegment: Int get() = if (volumetric) 36 else 2
     var segments = 0
         private set
     var dropped = 0L
@@ -84,9 +88,41 @@ internal class GridLineBatch(val capacitySegments: Int = DEFAULT_CAPACITY) : Gri
             dropped++
             return
         }
+        if (volumetric) {
+            tube(x0, y0, z0, x1, y1, z1, rgba)
+            return
+        }
         val o = segments * 2 * VERTEX_BYTES
         put(o, x0, y0, z0, rgba)
         put(o + VERTEX_BYTES, x1, y1, z1, rgba)
+        segments++
+    }
+
+    // A closed square prism, 24 mm thick. Fixed scratch arrays; no per-frame allocations.
+    private val corners = FloatArray(24)
+    private fun tube(x0: Float, y0: Float, z0: Float, x1: Float, y1: Float, z1: Float, rgba: Int) {
+        val dx = x1-x0; val dy = y1-y0; val dz = z1-z0
+        val length = kotlin.math.sqrt(dx*dx+dy*dy+dz*dz)
+        if (!length.isFinite() || length < 0.0001f) return
+        val nx=dx/length; val ny=dy/length; val nz=dz/length
+        var ux = if (kotlin.math.abs(ny)<0.9f) -nz else 0f
+        var uy = if (kotlin.math.abs(ny)<0.9f) 0f else nz
+        var uz = if (kotlin.math.abs(ny)<0.9f) nx else -ny
+        val ul=kotlin.math.sqrt(ux*ux+uy*uy+uz*uz)
+        ux/=ul; uy/=ul; uz/=ul
+        val vx=ny*uz-nz*uy; val vy=nz*ux-nx*uz; val vz=nx*uy-ny*ux
+        for (i in 0..7) {
+            val a=if (i%4==0 || i%4==3) -0.012f else 0.012f
+            val b=if (i%4<2) -0.012f else 0.012f
+            corners[i*3]=(if(i<4)x0 else x1)+ux*a+vx*b
+            corners[i*3+1]=(if(i<4)y0 else y1)+uy*a+vy*b
+            corners[i*3+2]=(if(i<4)z0 else z1)+uz*a+vz*b
+        }
+        var offset=segments*36*VERTEX_BYTES
+        for (j in TUBE_INDICES) {
+            put(offset,corners[j*3],corners[j*3+1],corners[j*3+2],rgba)
+            offset+=VERTEX_BYTES
+        }
         segments++
     }
 
@@ -101,6 +137,7 @@ internal class GridLineBatch(val capacitySegments: Int = DEFAULT_CAPACITY) : Gri
     }
 
     companion object {
+        private val TUBE_INDICES = intArrayOf(0,1,5,0,5,4,1,2,6,1,6,5,2,3,7,2,7,6,3,0,4,3,4,7,0,3,2,0,2,1,4,5,6,4,6,7)
         const val VERTEX_BYTES = 16
         const val DEFAULT_CAPACITY = 8192
     }

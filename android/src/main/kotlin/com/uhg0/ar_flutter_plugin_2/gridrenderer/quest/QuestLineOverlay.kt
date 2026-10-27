@@ -25,7 +25,8 @@ internal class QuestLineOverlay(
         layer.onMessage(buffer, length) == QuestOverlayStatus.OK
 
     /** Guidance stays readable over the grid: drawn without the depth test. */
-    override val drawOnTop: Boolean get() = true
+    override val drawOnTop: Boolean get() = false
+    override val volumetric: Boolean get() = true
 
     override fun setView(focalPx: Float, pxPerDp: Float) = layer.setView(focalPx, pxPerDp)
 

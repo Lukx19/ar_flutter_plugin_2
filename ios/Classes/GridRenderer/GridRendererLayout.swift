@@ -152,7 +152,10 @@ enum GridDisplayCodes {
   static let colourAge = 2
   static let colourSource = 3
   static let colourCompletion = 4
-  static let colourAttributes = 5
+  static let colourDirectionalCoverage = 5
+  static let colourAttributes = 6
+  static let overlayHalfTransparency = 64
+  static let overlayFocusPriority = 128
 
   static let sizeFixed = 0
   static let sizeByCoverage = 1

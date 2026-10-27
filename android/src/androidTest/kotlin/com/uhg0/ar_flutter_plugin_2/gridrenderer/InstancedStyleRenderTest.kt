@@ -9,6 +9,8 @@ import android.opengl.GLES30
 import android.opengl.Matrix
 import android.os.SystemClock
 import android.util.Log
+import com.uhg0.ar_flutter_plugin_2.visibilitycontract.ColourTableLayout
+import kotlin.math.*
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.uhg0.ar_flutter_plugin_2.visibilitycontract.RendererDeltaLayout
 import com.uhg0.ar_flutter_plugin_2.visibilitycontract.SurfaceInstanceLayout
@@ -132,7 +134,7 @@ class InstancedStyleRenderTest {
     }
 
     private fun sendTables() {
-        val colours = intArrayOf(0xFF0000FF.toInt(), 0x00FF00FF, 0xFFFFFFFF.toInt(), 0xFFFF00FF.toInt(), 0x0000FFFF)
+        val colours = intArrayOf(0xFF0000FF.toInt(), 0x00FF00FF, 0xFFFFFFFF.toInt(), 0xFFFF00FF.toInt(), 0x0000FFFF, 0xFF00FFFF.toInt())
         for (attribute in 0 until GridDisplayCodes.COLOUR_ATTRIBUTES) {
             writer.colourTable(attribute, colours[attribute])
             assertEquals(DisplayIntake.COLOUR_TABLE, core.onDisplayMessage(writer.buffer, 0, writer.length))
@@ -185,7 +187,105 @@ class InstancedStyleRenderTest {
 
     private fun red(rgba: Int) = rgba ushr 24
     private fun green(rgba: Int) = (rgba ushr 16) and 0xff
+    private fun blue(rgba: Int) = (rgba ushr 8) and 0xff
     private fun alpha(rgba: Int) = rgba and 0xff
+
+    // Projection stays fixed to probe the same pixel. The independent camera
+    // uniform supplies each synthetic world-space surface-to-view direction.
+    private fun directionalProbe(azimuth: Double, elevation: Double, creditedBin: Int, reverseNormal: Boolean = false): Int {
+        val az = Math.toRadians(azimuth)
+        val el = Math.toRadians(elevation)
+        val x = (cos(el) * cos(az)).toFloat()
+        val y = sin(el).toFloat()
+        val z = (cos(el) * sin(az)).toFloat()
+        writer.begin(RendererDeltaLayout.KIND_RESET, 0, 0, 64, 0)
+        offer()
+        writer.begin(RendererDeltaLayout.KIND_SURFACE_SLICE, 0, 1, 64, brickKey)
+        val sign = if (reverseNormal) -1 else 1
+        writer.surface(0, 0f, 0f, -2f, sign*x, sign*y, sign*z, size = 0.08f, confidence = 255, binQuality = 0)
+        writer.buffer.putInt(RendererDeltaLayout.HEADER_BYTES + SurfaceInstanceLayout.BINS + (creditedBin / 8) * 4,
+            15 shl ((creditedBin % 8) * 4))
+        offer()
+        writer.colourTable(GridDisplayCodes.COLOUR_DIRECTIONAL_COVERAGE, 0)
+        for (i in 0..255) {
+            val o = ColourTableLayout.HEADER_BYTES + i * 4
+            writer.buffer.put(o, i.toByte())
+            writer.buffer.put(o + 1, (if (i == 255) 255 else 0).toByte())
+            writer.buffer.put(o + 2, 0)
+            writer.buffer.put(o + 3, 255.toByte())
+        }
+        assertEquals(DisplayIntake.COLOUR_TABLE, core.onDisplayMessage(writer.buffer, 0, writer.length))
+        view.cameraPosition[0] = x
+        view.cameraPosition[1] = y
+        view.cameraPosition[2] = -2 + z
+        mode(GridDisplayCodes.BASE_POINTS, colour = GridDisplayCodes.COLOUR_DIRECTIONAL_COVERAGE)
+        render()
+        return probe(SIZE / 2, SIZE / 2)
+    }
+
+    @Test
+    fun directionalLacquerUsesEverySavedPhotoBinAndKeepsCornerFacesSeparate() {
+        for (bin in 0 until 24) {
+            val elevation = when (bin / 8) { 0 -> 41.8; 1 -> 0.0; else -> -41.8 }
+            val azimuth = bin % 8 * 45.0 + 22.5
+            val credited = directionalProbe(azimuth, elevation, bin)
+            assertTrue("bin $bin", red(credited) > 100 && green(credited) == 0)
+            val uncredited = directionalProbe(azimuth, elevation, (bin + 4) % 24)
+            assertEquals("zero saved-photo credit is valid, not unknown", 0, red(uncredited))
+            assertEquals(0, green(uncredited))
+        }
+        val backFace = directionalProbe(67.5, 0.0, 9, reverseNormal = true)
+        assertTrue("opposite corner face is unknown, never credited", green(backFace) > 100)
+    }
+
+    @Test
+    fun directionalLacquerTransitionsContinuouslyAcrossAzimuthBoundary() {
+        val before = red(directionalProbe(44.9, 0.0, 9))
+        val after = red(directionalProbe(45.1, 0.0, 9))
+        assertTrue("small movement must not jump between quality 0 and 15", abs(after - before) < 15)
+        assertEquals(0, red(directionalProbe(41.0, 0.0, 9)))
+        assertTrue(red(directionalProbe(49.0, 0.0, 9)) > 100)
+    }
+
+    @Test
+    fun directionalLacquerIsStableAtElevationAndAzimuthWrapBoundaries() {
+        val below = red(directionalProbe(22.5, 19.37, 0))
+        val above = red(directionalProbe(22.5, 19.57, 0))
+        assertTrue(abs(above - below) < 15)
+        assertEquals(0, red(directionalProbe(22.5, 15.0, 0)))
+        assertTrue(red(directionalProbe(22.5, 24.0, 0)) > 100)
+        val left = red(directionalProbe(359.9, 0.0, 8))
+        val right = red(directionalProbe(0.1, 0.0, 8))
+        assertTrue("azimuth wraps without a quality discontinuity", abs(right - left) < 15)
+        view.cameraPosition[0] = 0f
+        view.cameraPosition[1] = 0f
+        view.cameraPosition[2] = -2f
+        render()
+        assertTrue("coincident view is unknown", green(probe(SIZE / 2, SIZE / 2)) > 100)
+    }
+
+    @Test
+    fun focusPaintIsTransientAndDoesNotChangeSavedPhotoCoverage() {
+        val focus = ByteBuffer.allocate(24).order(ByteOrder.LITTLE_ENDIAN)
+        focus.putInt(0, com.uhg0.ar_flutter_plugin_2.visibilitycontract.contractMagic("C3FP"))
+        focus.putShort(4, 1.toShort())
+        focus.put(6, 1.toByte())
+        focus.putFloat(8, 0f)
+        focus.putFloat(12, 0f)
+        focus.putFloat(16, -2f)
+        focus.putFloat(20, 0.5f)
+        assertEquals(DisplayIntake.OVERLAY, core.onDisplayMessage(focus, 0, 24))
+        mode(GridDisplayCodes.BASE_SPLATS)
+        render()
+        assertTrue(green(probe(SIZE / 2, SIZE / 2)) < 40)
+        mode(GridDisplayCodes.BASE_SPLATS, overlays = GridDisplayCodes.OVERLAY_FOCUS_PRIORITY)
+        render()
+        assertTrue("focus spectrum must paint existing surfels", green(probe(SIZE / 2, SIZE / 2)) > 100)
+        focus.put(6, 0)
+        assertEquals(DisplayIntake.OVERLAY, core.onDisplayMessage(focus, 0, 8))
+        render()
+        assertTrue("clear returns to original saved coverage", green(probe(SIZE / 2, SIZE / 2)) < 40)
+    }
 
     @Test
     fun pointsDrawAtTheirProjectedPosition() {
@@ -209,6 +309,19 @@ class InstancedStyleRenderTest {
             assertTrue("($dx, $dy) $rgba", red(rgba) > 60 && alpha(rgba) > 0)
         }
 
+    }
+
+    @Test
+    fun spatialHalfTransparencyPreservesHalfOfCameraPixelsUnderOverlap() {
+        mode(GridDisplayCodes.BASE_SPLATS, overlays = GridDisplayCodes.OVERLAY_HALF_TRANSPARENCY)
+        render()
+        var visible = 0
+        for (y in SIZE / 2 - 8 until SIZE / 2 + 8) {
+            for (x in SIZE / 2 - 8 until SIZE / 2 + 8) {
+                if (alpha(probe(x, y)) > 0) visible++
+            }
+        }
+        assertEquals("overlap cannot fill the camera pixels", 128, visible)
     }
 
     @Test
@@ -267,6 +380,22 @@ class InstancedStyleRenderTest {
         assertTrue("centre $centre", green(centre) > 60 && red(centre) < 40)
         assertEquals(staged, target.stagedBytes)
         assertEquals(growths, target.growths)
+    }
+
+    @Test
+    fun guidanceVolumesDrawFilledBandsInsteadOfSinglePixelLines() {
+        mode(GridDisplayCodes.BASE_NONE)
+        render()
+        assertEquals(0, drawnPixels())
+        val batch = GridLineBatch(capacitySegments = 1, volumetric = true)
+        batch.line(-0.4f, 0f, -1f, 0.4f, 0f, -1f, 0xff00ffff.toInt())
+        batch.endDepthTested()
+        draws.drawLines(batch, view)
+        GLES30.glFinish()
+        assertEquals(GLES30.GL_NO_ERROR, GLES30.glGetError())
+        assertTrue("filled 24 mm band: ${drawnPixels()}", drawnPixels() > 700)
+        val centre = probe(SIZE/2, SIZE/2)
+        assertTrue(red(centre) > 200 && blue(centre) > 200 && green(centre) == 0)
     }
 
     @Test

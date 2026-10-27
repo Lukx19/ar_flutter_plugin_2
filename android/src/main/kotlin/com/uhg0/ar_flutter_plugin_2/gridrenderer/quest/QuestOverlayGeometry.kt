@@ -173,20 +173,8 @@ internal class QuestOverlayGeometry {
         val az = f.donutAim[3 * i + 2]
         if (!basis(ax - sx, ay - sy, az - sz)) return
         val camDistance = distance(camX, camY, camZ, sx, sy, sz)
-        if (camDistance <= 2f * f.donutPositionTolerance[i]) {
-            // At the standpoint: the donut frames the aim point around the reticle.
-            val aimDistance = distance(camX, camY, camZ, ax, ay, az)
-            if (aimDistance < 1e-3f) return
-            val degrees = f.donutInnerCircleDegrees[i].let { if (it > 0f) it else DEFAULT_INNER_CIRCLE_DEGREES }
-            val reticle = aimDistance * tan(Math.toRadians(degrees.toDouble())).toFloat()
-            val outer = clampRadius(reticle * AIM_RING_RETICLE_RATIO, aimDistance, minRingPx(f), Float.MAX_VALUE)
-            ring(ax, ay, az, outer, RING_SEGMENTS, colour, sink)
-            val state = f.donutState[i]
-            if (state != QuestOverlayLayout.STATE_CAPTURED && state != QuestOverlayLayout.STATE_TIMED_OUT) {
-                dashedCircle(ax, ay, az, reticle, colour, sink)
-            }
-            return
-        }
+        // Keep the lens target fixed. The shared HUD owns the near-lens sight.
+        if (camDistance < 0.25f) return
         val radius = f.donutRingRadius[i].let { if (it > 0f) it else DEFAULT_RING_RADIUS_METRES }
         val outer = clampRadius(radius, camDistance, minRingPx(f), maxRingPx(f))
         ring(sx, sy, sz, outer, if (camDistance > FAR_METRES) FAR_SEGMENTS else RING_SEGMENTS, colour, sink)
