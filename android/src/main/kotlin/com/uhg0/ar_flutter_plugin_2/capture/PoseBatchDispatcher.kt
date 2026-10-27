@@ -31,7 +31,8 @@ internal class PoseBatchDispatcher(
         require((scheduleFlush == null) == (cancelFlush == null))
     }
 
-    private val pending = ArrayDeque<ByteArray>(capacity)
+    private data class Sample(val bytes: ByteArray, val displayRotation: Double?)
+    private val pending = ArrayDeque<Sample>(capacity)
     private var inFlight = false
     private var droppedSinceLastBatch = 0L
     private var flushScheduled = false
@@ -41,14 +42,14 @@ internal class PoseBatchDispatcher(
         dispatchIfIdle(holdPartialBatch = false)
     }
 
-    fun offer(sample: ByteArray) {
+    fun offer(sample: ByteArray, displayRotation: Double? = null) {
         require(sample.size == PackedPoseWireV2.SAMPLE_BYTES)
         if (closed) return
         if (pending.size == capacity) {
             pending.removeFirst()
             droppedSinceLastBatch++
         }
-        pending.addLast(sample)
+        pending.addLast(Sample(sample, displayRotation?.takeIf { it.isFinite() }))
         dispatchIfIdle(holdPartialBatch = true)
     }
 
@@ -82,10 +83,12 @@ internal class PoseBatchDispatcher(
             cancelFlush!!(flushTask)
         }
         val count = pending.size
-        val batch = if (count == 1) pending.removeFirst() else {
-            ByteArray(count * PackedPoseWireV2.SAMPLE_BYTES).also { bytes ->
-                for (index in 0 until count) pending.removeFirst().copyInto(bytes, index * PackedPoseWireV2.SAMPLE_BYTES)
-            }
+        val rotations = ArrayList<Double?>(count)
+        val batch = ByteArray(count * PackedPoseWireV2.SAMPLE_BYTES)
+        for (index in 0 until count) {
+            val sample = pending.removeFirst()
+            sample.bytes.copyInto(batch, index * PackedPoseWireV2.SAMPLE_BYTES)
+            rotations.add(sample.displayRotation)
         }
         val dropped = droppedSinceLastBatch
         droppedSinceLastBatch = 0L
@@ -97,6 +100,7 @@ internal class PoseBatchDispatcher(
                 "sampleCount" to count,
                 "sampleBytes" to batch,
                 "droppedOldestCount" to dropped,
+                "displayRotationV1" to rotations,
             ),
             object : MethodChannel.Result {
                 override fun success(result: Any?) = complete()

@@ -385,26 +385,49 @@ final class GridLineOverlayTests: XCTestCase {
     XCTAssertTrue(layer.greyOutside)
   }
 
-  func testQuestLinesDrawOnTopAfterDepthTestedOverlaysWithTheFramesScreenScale() {
+  func testQuestVolumesAreDepthTestedAndDiagnosticLinesRemainSeparate() {
     let core = GridRendererCore(target: ByteArrayGpuTarget())
     let quest = QuestLineOverlay()
-    // Registered first, still collected after the depth-tested overlay.
     core.addLineOverlay(quest)
     core.addLineOverlay(DepthTestedOverlay())
     XCTAssertEqual(core.display(questReference), .overlay)
-    XCTAssertTrue(core.scopeOverlay() === quest)
-    let batch = GridLineBatch()
-    // 10.5 m from the standpoint: the far ring's outer loop is raised to 24
-    // dp (24 px radius at density 2); the first loop is 0.8 of that.
+    let lines = GridLineBatch()
+    XCTAssertEqual(core.buildOverlayLines(camX: 2, camY: 1.2, camZ: 12, batch: lines), 1)
+    let batch = GridLineBatch(capacitySegments: 2048, volumetric: true)
     XCTAssertGreaterThan(core.buildOverlayLines(camX: 2, camY: 1.2, camZ: 12, batch: batch, focalPx: 1500, pxPerDp: 2), 1)
-    XCTAssertEqual(batch.depthTestedSegments, 1)
-    XCTAssertEqual(simd_length(vertex(batch, 2) - SIMD3(2, 1.2, 1.5)), 0.8 * 24 * 10.5 / 1500, accuracy: 1e-5)
-    // Without a focal length the ring keeps its 8 cm world radius.
-    core.buildOverlayLines(camX: 2, camY: 1.2, camZ: 12, batch: batch)
-    XCTAssertEqual(simd_length(vertex(batch, 2) - SIMD3(2, 1.2, 1.5)), 0.8 * 0.08, accuracy: 1e-5)
-    // A truncated quest message is rejected and keeps the shown frame.
+    XCTAssertEqual(batch.depthTestedSegments, batch.segments)
+    XCTAssertEqual(batch.verticesPerSegment, 36)
+    XCTAssertEqual(simd_length(vertex(batch, 0) - SIMD3(2, 1.2, 1.5)), 0.8 * 24 * 10.5 / 1500, accuracy: 0.02)
     XCTAssertEqual(core.display(questReference.prefix(12)), .rejected)
     XCTAssertEqual(quest.layer.rejectedMessages, 1)
+  }
+
+  func testVolumeBufferBoundsWholeTubesAndRejectsInvalidSegments() {
+    let batch = GridLineBatch(capacitySegments: 1, volumetric: true)
+    batch.line(0,0,0,0,0,0,rgba: 0)
+    batch.line(0,0,0,.nan,1,0,rgba: 0)
+    XCTAssertEqual(batch.segments,0)
+    batch.line(0,0,0,0,1,0,rgba: 0x12345678)
+    XCTAssertEqual(batch.segments,1)
+    XCTAssertEqual(batch.byteCount,36*16)
+    for i in 0..<36 {
+      XCTAssertEqual(abs(vertex(batch,i).x),0.012,accuracy: 1e-6)
+      XCTAssertEqual(vertexByte(batch,i*16+12),0x12)
+    }
+    batch.line(0,0,0,1,0,0,rgba: 0)
+    XCTAssertEqual(batch.dropped,1)
+    batch.clear()
+    XCTAssertEqual(batch.segments,0)
+  }
+
+  func testNearLensTargetHidesRatherThanMovingToTheSurface() {
+    let layer = QuestOverlayLayer()
+    XCTAssertEqual(questReference.withUnsafeBytes { layer.onMessage($0) }, .ok)
+    let r = SegmentRecorder()
+    XCTAssertEqual(layer.buildLines(camX:2,camY:1.2,camZ:1.5,sink:r),10+20+4)
+    let away = SegmentRecorder()
+    _ = layer.buildLines(camX:2,camY:1.2,camZ:1.8,sink:away)
+    for i in 0..<96 { XCTAssertEqual(away.segments[i].a.z,1.5,accuracy:1e-6) }
   }
 
   private final class DepthTestedOverlay: GridLineOverlay {

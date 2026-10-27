@@ -20,6 +20,12 @@ abstract final class DisplayOverlay {
   /// platform renderer from its own frames. Set by the app while the grid
   /// samples tracking points only (no depth), never part of a preset.
   static const int rawFeaturePoints = 32;
+
+  /// Stable screen-door half transparency; applies only to surfels.
+  static const int halfTransparency = 64;
+
+  /// Transient focus-priority paint, separate from saved-photo coverage.
+  static const int focusPriority = 128;
 }
 
 /// Surface attribute mapped through a colour table.
@@ -29,7 +35,10 @@ abstract final class DisplayColourAttribute {
   static const int age = 2;
   static const int source = 3;
   static const int completion = 4;
-  static const int count = 5;
+
+  /// Saved-photo quality in the current surface-to-camera direction.
+  static const int directionalCoverage = 5;
+  static const int count = 6;
 }
 
 /// Point or splat size rule.

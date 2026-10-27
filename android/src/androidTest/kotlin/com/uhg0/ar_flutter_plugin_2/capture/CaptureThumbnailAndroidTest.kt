@@ -59,6 +59,20 @@ class CaptureThumbnailAndroidTest {
                 val before = MessageDigest.getInstance("SHA-256").digest(source.readBytes())
                 assertTrue(CaptureThumbnail.write(source, thumb, { false }, 512))
                 assertTrue(CaptureThumbnail.valid(thumb, 512))
+                val analysis = requireNotNull(GuidancePreviewLuma.read(thumb.absolutePath) { false })
+                assertEquals("guidance_luma_v1", analysis["wireVersion"])
+                assertEquals(4128, analysis["sourceWidth"])
+                assertEquals(3096, analysis["sourceHeight"])
+                assertEquals(orientation, analysis["exifOrientation"])
+                val analysisWidth = analysis["width"] as Int
+                val analysisHeight = analysis["height"] as Int
+                val luma = analysis["luma"] as ByteArray
+                assertTrue(analysisWidth <= 256 && analysisHeight <= 256)
+                assertEquals(analysisWidth * analysisHeight, luma.size)
+                val topLeft = corners[orientation - 1][0]
+                val expectedLuma = (Color.red(topLeft) * 77 + Color.green(topLeft) * 150 + Color.blue(topLeft) * 29) shr 8
+                assertTrue(kotlin.math.abs((luma[(analysisHeight / 4) * analysisWidth + analysisWidth / 4].toInt() and 255) - expectedLuma) <= 24)
+                assertNull(GuidancePreviewLuma.read(thumb.absolutePath) { true })
                 val image = requireNotNull(BitmapFactory.decodeFile(thumb.absolutePath))
                 try {
                     assertEquals(if (orientation < 5) 512 else 384, image.width)

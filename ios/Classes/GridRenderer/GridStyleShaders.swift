@@ -11,7 +11,7 @@ import Foundation
 /// at 0 per draw, as the Android attribute pointers do. Surface record
 /// words: meta0 = size f16 | source << 16 | flags << 24, meta1 = coverage |
 /// completion << 8 | confidence << 16 | age << 24, bins 3 x u32. Colour
-/// tables are one 256 x 5 RGBA8 texture, row = contract colour attribute
+/// tables are one 256 x 6 RGBA8 texture, row = contract colour attribute
 /// code. Metal clip depth is 0..1 (the ARKit projection targets it).
 ///
 /// Quality threshold: `minQuality` (display mode byte 20) discards surface
@@ -36,6 +36,7 @@ enum GridStyleShaders {
     float focalPx; float fixedPx; int colorAttr; int sizeRule;
     int selectedOnly; int grey; int minQuality; int sphere;
     float scale; int summaryKind; int residencyFilter; float alpha;
+    int focusCount;
   };
   struct VOut { float4 pos [[position]]; float4 color; float2 uv; float light; };
   struct POut { float4 pos [[position]]; float psize [[point_size]]; float4 color; };
@@ -66,7 +67,47 @@ enum GridStyleShaders {
   static float surfaceSize(Surface s) { return float(as_type<half2>(s.meta0).x); }
   static float coverage(Surface s) { return float(s.meta1 & 255u) / 255.0; }
   static float confidence(Surface s) { return float((s.meta1 >> 16) & 255u) / 255.0; }
-  static uint attributeByte(Surface s, int a) {
+
+
+  // Saved-photo bins, not depth/feature observation history. A narrow continuous
+  // transition avoids boundary flicker without per-surface temporal GPU storage.
+  constant float2 DIRECTION_AZIMUTHS[8] = {float2(0.923879533, 0.382683432), float2(0.382683432, 0.923879533), float2(-0.382683432, 0.923879533), float2(-0.923879533, 0.382683432), float2(-0.923879533, -0.382683432), float2(-0.382683432, -0.923879533), float2(0.382683432, -0.923879533), float2(0.923879533, -0.382683432) };
+  static float2 directionalSample(Surface s, int band, int sector, float weight, float3 normal) {
+  sector = (sector + 8) % 8;
+  float horizontal = band == 1 ? 1.0 : 0.745476000;
+  float vertical = band == 0 ? 0.666532470 : (band == 1 ? 0.0 : -0.666532470);
+  float2 az = DIRECTION_AZIMUTHS[sector];
+  float3 dir = float3(horizontal * az.x, vertical, horizontal * az.y);
+  if (dot(normal, dir) < 0.25) return float2(0.0);
+  int bin = band * 8 + sector;
+  float quality = float((s.bins[bin / 8] >> uint(4 * (bin % 8))) & 15u);
+  return float2(quality * weight, weight);
+  }
+  static uint directionalByte(Surface s, constant GridUniforms& u, float3 normal) {
+  float3 delta = u.camPos.xyz - float3(s.pos);
+  if (dot(delta, delta) < 0.000001) return 255u;
+  float3 view = normalize(delta);
+  if (dot(normal, view) < 0.1) return 255u;
+  float az = atan2(view.z, view.x) / 0.7853981634;
+  if (az < 0.0) az += 8.0;
+  int sector = int(floor(az));
+  float f = fract(az);
+  int neighbor = f < 0.5 ? sector - 1 : sector + 1;
+  // Three degrees either side of an azimuth boundary.
+  float edgeWeight = 0.5 * (1.0 - smoothstep(0.0, 0.0666667, min(f, 1.0 - f)));
+  int band = view.y > 0.3333333333 ? 0 : (view.y < -0.3333333333 ? 2 : 1);
+  int otherBand = view.y >= 0.0 ? (band == 0 ? 1 : 0) : (band == 2 ? 1 : 2);
+  float bandWeight = 0.5 * (1.0 - smoothstep(0.0, 0.03, abs(abs(view.y) - 0.3333333333)));
+  float2 q = directionalSample(s, band, sector, (1.0-edgeWeight)*(1.0-bandWeight), normal)
+    + directionalSample(s, band, neighbor, edgeWeight*(1.0-bandWeight), normal)
+    + directionalSample(s, otherBand, sector, (1.0-edgeWeight)*bandWeight, normal)
+    + directionalSample(s, otherBand, neighbor, edgeWeight*bandWeight, normal);
+  return q.y > 0.00001 ? uint(clamp(round(q.x / q.y * 16.0), 0.0, 240.0)) : 255u;
+  }
+
+  static uint attributeByte(Surface s, constant GridUniforms& u) {
+    int a = u.colorAttr;
+    if (a == 5) return directionalByte(s, u, surfaceNormal(s));
     if (a == 1) return (s.meta1 >> 16) & 255u;
     if (a == 2) return (s.meta1 >> 24) & 255u;
     if (a == 3) return (s.meta0 >> 16) & 255u;
@@ -84,6 +125,23 @@ enum GridStyleShaders {
     float4 c = t.read(uint2(min(value, 255u), uint(table)));
     return grey == 0 ? c : greyed(c);
   }
+  static float4 surfaceColor(Surface s, constant GridUniforms& u,
+                            constant float4* focus, texture2d<float, access::read> colors) {
+    float4 c = tableColor(colors, attributeByte(s, u), u.colorAttr, 0);
+    float priority = 0.0;
+    for (int i = 0; i < u.focusCount; i++) {
+      float3 delta = float3(s.pos) - focus[i].xyz;
+      if (dot(delta, delta) <= 0.25) priority = max(priority, focus[i].w);
+    }
+    if (priority > 0.0) {
+      float3 cool = float3(0.05, 0.30, 0.95);
+      float3 middle = float3(0.98, 0.82, 0.12);
+      float3 warm = float3(0.90, 0.15, 0.32);
+      c = float4(priority < 0.5 ? mix(cool, middle, priority * 2.0)
+        : mix(middle, warm, (priority - 0.5) * 2.0), 1.0);
+    }
+    return u.grey == 0 ? c : greyed(c);
+  }
   // The grid's 24 direction bins: three elevation bands of eight azimuths.
   static float3 binDirection(int bin) {
     int band = bin / 8;
@@ -94,7 +152,7 @@ enum GridStyleShaders {
 
   // Point sprites, size from the size rule; optional sphere shading.
   vertex POut grid_points_vs(uint vid [[vertex_id]], const device Surface* s [[buffer(0)]],
-                             constant GridUniforms& u [[buffer(1)]], texture2d<float, access::read> colors [[texture(0)]]) {
+                             constant GridUniforms& u [[buffer(1)]], constant float4* focus [[buffer(2)]], texture2d<float, access::read> colors [[texture(0)]]) {
     Surface r = s[vid];
     POut o;
     if (!surfaceValid(r, u)) { o.pos = OFFSCREEN; o.psize = 1; o.color = float4(0); return o; }
@@ -104,7 +162,7 @@ enum GridStyleShaders {
       px = clamp(surfaceSize(r) * sizeFactor(r, u.sizeRule) * u.focalPx / max(o.pos.w, 0.05), 1.0, 64.0);
     }
     o.psize = px;
-    o.color = tableColor(colors, attributeByte(r, u.colorAttr), u.colorAttr, u.grey);
+    o.color = surfaceColor(r, u, focus, colors);
     return o;
   }
 
@@ -120,7 +178,7 @@ enum GridStyleShaders {
 
   // Instanced quad oriented by the surface normal, soft edge.
   vertex VOut grid_splat_vs(uint vid [[vertex_id]], uint iid [[instance_id]], const device Surface* s [[buffer(0)]],
-                            constant GridUniforms& u [[buffer(1)]], texture2d<float, access::read> colors [[texture(0)]]) {
+                            constant GridUniforms& u [[buffer(1)]], constant float4* focus [[buffer(2)]], texture2d<float, access::read> colors [[texture(0)]]) {
     Surface r = s[iid];
     VOut o;
     if (!surfaceValid(r, u)) { o.pos = OFFSCREEN; o.color = float4(0); o.uv = float2(0); o.light = 0; return o; }
@@ -133,21 +191,26 @@ enum GridStyleShaders {
     float radius = surfaceSize(r) * 0.8 * (u.sizeRule == 0 ? 1.0 : sizeFactor(r, u.sizeRule));
     o.pos = u.viewProj * float4(a + (t * c.x + b * c.y) * radius, 1);
     o.uv = c;
-    o.color = tableColor(colors, attributeByte(r, u.colorAttr), u.colorAttr, u.grey);
+    o.color = surfaceColor(r, u, focus, colors);
     o.light = 0.4 + 0.6 * abs(dot(n, normalize(u.camPos.xyz - a)));
     return o;
   }
 
-  fragment float4 grid_splat_fs(VOut in [[stage_in]]) {
+  fragment float4 grid_splat_fs(VOut in [[stage_in]], constant GridUniforms& u [[buffer(1)]]) {
     float r2 = dot(in.uv, in.uv);
     if (r2 > 1.0) discard_fragment();
+    if (u.alpha < 0.75) {
+      // Same fixed screen-pixel mask in depth and colour; no opacity buildup.
+      if ((int(in.pos.x) + int(in.pos.y)) % 2 != 0) discard_fragment();
+      return float4(in.color.rgb * in.light, 1.0);
+    }
     return float4(in.color.rgb * in.light, 1.0 - smoothstep(0.55, 1.0, r2));
   }
 
   // Directional spikes: instance = surface x 24 + bin. Only bins facing the
   // normal are drawn; a low quality gives a long spike (needs photos).
   vertex VOut grid_spike_vs(uint vid [[vertex_id]], uint iid [[instance_id]], const device Surface* s [[buffer(0)]],
-                            constant GridUniforms& u [[buffer(1)]], texture2d<float, access::read> colors [[texture(0)]]) {
+                            constant GridUniforms& u [[buffer(1)]], constant float4* focus [[buffer(2)]], texture2d<float, access::read> colors [[texture(0)]]) {
     Surface r = s[iid / 24];
     VOut o; o.uv = float2(0); o.light = 1;
     int bin = int(iid % 24);
@@ -170,7 +233,7 @@ enum GridStyleShaders {
   // Occupancy voxels from the compact 8 B per voxel list; padding entries
   // (every byte 0xFF) collapse.
   vertex VOut grid_voxel_vs(uint vid [[vertex_id]], uint iid [[instance_id]], const device short4* v [[buffer(0)]],
-                            constant GridUniforms& u [[buffer(1)]], texture2d<float, access::read> colors [[texture(0)]]) {
+                            constant GridUniforms& u [[buffer(1)]], constant float4* focus [[buffer(2)]], texture2d<float, access::read> colors [[texture(0)]]) {
     short4 e = v[iid];
     VOut o; o.uv = float2(0); o.light = 1;
     if (all(e == short4(-1))) { o.pos = OFFSCREEN; o.color = float4(0); return o; }
@@ -199,7 +262,7 @@ enum GridStyleShaders {
 
   // Wire box per brick or region (line list, 24 vertices).
   vertex VOut grid_box_wire_vs(uint vid [[vertex_id]], uint iid [[instance_id]], const device Summary* b [[buffer(0)]],
-                               constant GridUniforms& u [[buffer(1)]], texture2d<float, access::read> colors [[texture(0)]]) {
+                               constant GridUniforms& u [[buffer(1)]], constant float4* focus [[buffer(2)]], texture2d<float, access::read> colors [[texture(0)]]) {
     Summary s = b[iid];
     VOut o; o.uv = float2(0); o.light = 1;
     if (boxHidden(s, u)) { o.pos = OFFSCREEN; o.color = float4(0); return o; }
@@ -212,7 +275,7 @@ enum GridStyleShaders {
 
   // Filled box per brick or region (14-vertex strip), drawn translucent.
   vertex VOut grid_box_fill_vs(uint vid [[vertex_id]], uint iid [[instance_id]], const device Summary* b [[buffer(0)]],
-                               constant GridUniforms& u [[buffer(1)]], texture2d<float, access::read> colors [[texture(0)]]) {
+                               constant GridUniforms& u [[buffer(1)]], constant float4* focus [[buffer(2)]], texture2d<float, access::read> colors [[texture(0)]]) {
     Summary s = b[iid];
     VOut o; o.uv = float2(0); o.light = 1;
     if (boxHidden(s, u)) { o.pos = OFFSCREEN; o.color = float4(0); return o; }

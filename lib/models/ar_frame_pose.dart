@@ -11,6 +11,31 @@ const String poseBatchWireVersion = 'pose_batch_v1';
 const String packedPoseBatchWireVersion = 'pose_batch_v2';
 const int packedPoseSampleBytes = 236;
 
+/// Optional sidecar aligned one-for-one with the packed samples. A malformed
+/// sidecar never invalidates tracking, but cannot qualify display-space cues.
+List<double?>? decodePoseDisplayRotations(Object? value, int sampleCount) {
+  if (sampleCount < 1 ||
+      sampleCount > 8 ||
+      value is! List ||
+      value.length != sampleCount) {
+    return null;
+  }
+  final result = <double?>[];
+  for (final rotation in value) {
+    if (rotation == null) {
+      result.add(null);
+      continue;
+    }
+    if (rotation is! num ||
+        !rotation.isFinite ||
+        rotation.abs() > 3.141592653589794) {
+      return null;
+    }
+    result.add(rotation.toDouble());
+  }
+  return result;
+}
+
 /// A camera-to-world transform with an explicit coordinate convention.
 final class ARPoseTransform {
   ARPoseTransform({
@@ -87,6 +112,13 @@ class ARFramePose {
   final String? wireVersion;
   final int? sequence;
 
+  /// Display right = cos(theta)*optical right + sin(theta)*optical up.
+  /// Native-qualified for this exact sample, absent on older producers.
+  final double? displayRotationRadians;
+
+  /// Per-sample native semantic plane facts. Shared application policy owns stability qualification.
+  final Map<String, Object>? semanticFloor;
+
   const ARFramePose({
     required this.position,
     required this.rotation,
@@ -103,6 +135,8 @@ class ARFramePose {
     this.poseSource,
     this.wireVersion,
     this.sequence,
+    this.displayRotationRadians,
+    this.semanticFloor,
   });
 
   factory ARFramePose.fromMap(Map<String, dynamic> map) {
@@ -132,6 +166,9 @@ class ARFramePose {
       poseSource: map['poseSource'] as String?,
       wireVersion: map['wireVersion'] as String?,
       sequence: (map['sequence'] as num?)?.toInt(),
+      displayRotationRadians:
+          decodePoseDisplayRotations([map['displayRotationV1']], 1)?.first,
+      semanticFloor: decodeSemanticFloor(map['semanticFloorV1']),
     );
   }
 
@@ -144,6 +181,8 @@ class ARFramePose {
     ByteData bytes,
     int offset, {
     String trackingConvention = arcoreGlCameraToWorldConvention,
+    double? displayRotationRadians,
+    Map<String, Object>? semanticFloor,
   }) {
     if (!isArCameraConvention(trackingConvention)) {
       throw ArgumentError.value(trackingConvention, 'trackingConvention');
@@ -199,8 +238,11 @@ class ARFramePose {
         'synthetic'
       ][state - 1],
       poseSource: source == 0 ? 'liveAnchor' : 'synthetic',
+      semanticFloor: decodeSemanticFloor(semanticFloor),
       wireVersion: packedPoseBatchWireVersion,
       sequence: integer(0),
+      displayRotationRadians:
+          decodePoseDisplayRotations([displayRotationRadians], 1)?.first,
     );
   }
 
@@ -230,6 +272,9 @@ class ARFramePose {
       if (poseSource != null) 'poseSource': poseSource,
       if (wireVersion != null) 'wireVersion': wireVersion,
       if (sequence != null) 'sequence': sequence,
+      if (displayRotationRadians != null)
+        'displayRotationV1': displayRotationRadians,
+      if (semanticFloor != null) 'semanticFloorV1': semanticFloor,
     };
   }
 
@@ -251,7 +296,9 @@ class ARFramePose {
         other.trackingState == trackingState &&
         other.poseSource == poseSource &&
         other.wireVersion == wireVersion &&
-        other.sequence == sequence;
+        other.sequence == sequence &&
+        other.displayRotationRadians == displayRotationRadians &&
+        _sameSemanticFloor(other.semanticFloor, semanticFloor);
   }
 
   @override
@@ -270,7 +317,14 @@ class ARFramePose {
       trackingState.hashCode ^
       poseSource.hashCode ^
       wireVersion.hashCode ^
-      sequence.hashCode;
+      sequence.hashCode ^
+      displayRotationRadians.hashCode ^
+      Object.hash(
+          semanticFloor?['classification'],
+          semanticFloor?['anchorId'],
+          semanticFloor?['worldY'],
+          semanticFloor?['normalY'],
+          semanticFloor?['areaSquareMetres']);
 
   @override
   String toString() =>
@@ -308,3 +362,35 @@ Map<String, double> _quaternionToMap(Quaternion value) => <String, double>{
       'z': value.z,
       'w': value.w,
     };
+
+/// Versioned optional sidecar, never inferred from ordinary horizontal planes.
+Map<String, Object>? decodeSemanticFloor(dynamic value) {
+  if (value is! Map || value['classification'] != 'floor') return null;
+  final id = value['anchorId'];
+  final y = value['worldY'];
+  final normal = value['normalY'];
+  final area = value['areaSquareMetres'];
+  if (id is! String ||
+      id.isEmpty ||
+      id.length > 128 ||
+      y is! num ||
+      !y.isFinite ||
+      normal is! num ||
+      !normal.isFinite ||
+      normal.abs() > 1.001 ||
+      area is! num ||
+      !area.isFinite ||
+      area <= 0) return null;
+  return Map.unmodifiable({
+    'classification': 'floor',
+    'anchorId': id,
+    'worldY': y.toDouble(),
+    'normalY': normal.toDouble(),
+    'areaSquareMetres': area.toDouble()
+  });
+}
+
+bool _sameSemanticFloor(Map<String, Object>? a, Map<String, Object>? b) {
+  if (a == null || b == null) return a == b;
+  return a.length == b.length && a.entries.every((e) => b[e.key] == e.value);
+}

@@ -41,6 +41,9 @@ final class DisplayModeHandler {
   private var tablesVersion = 0
   private var targets = [Float](
     repeating: 0, count: PlannerTargetMessageLayout.maxTargets * PlannerTargetMessageLayout.floatsPerTarget)
+  private var focus = [Float](repeating: 0, count: 64 * 4)
+  private var focusCount = 0
+  private var focusVersion = 0
   private var targetCount = 0
   private var targetsVersion = 0
   private var rejectedCount = 0
@@ -70,6 +73,9 @@ final class DisplayModeHandler {
       pending = GridDisplayState()
       pending.modeVersion = version
       modeAcceptedAtS = now()
+      focus = [Float](repeating: 0, count: 64 * 4)
+      focusCount = 0
+      focusVersion += 1
       targetCount = 0
       targetsVersion += 1
     }
@@ -119,6 +125,19 @@ final class DisplayModeHandler {
       tablesVersion += 1
       lock.unlock()
       return .colourTable
+    case contractMagic("C3FP"):
+      let count = b.le8(6)
+      guard version == 1, count <= 64, length == 8 + count * 16 else { return reject() }
+      for i in 0..<(count * 4) {
+        let value = b.leF32(8 + i * 4)
+        guard value.isFinite, i % 4 != 3 || (value >= 0 && value <= 1) else { return reject() }
+      }
+      lock.lock()
+      for i in focus.indices { focus[i] = i < count * 4 ? b.leF32(8 + i * 4) : 0 }
+      focusCount = count
+      focusVersion += 1
+      lock.unlock()
+      return .overlay
     case PlannerTargetMessageLayout.magic:
       guard version == PlannerTargetMessageLayout.version, length >= PlannerTargetMessageLayout.bytes else {
         return reject()
@@ -163,7 +182,7 @@ final class DisplayModeHandler {
     return modeAcceptedAtS
   }
 
-  /// Copies the colour tables (5 x 256 RGBA8) into [out] when newer than
+  /// Copies the colour tables (6 x 256 RGBA8) into [out] when newer than
   /// [knownVersion]; returns the version or -1.
   func snapshotTables(into out: UnsafeMutableRawPointer, knownVersion: Int) -> Int {
     lock.lock(); defer { lock.unlock() }
@@ -181,6 +200,23 @@ final class DisplayModeHandler {
     return targetCount
   }
 
+  func clearFocus() {
+    locked {
+      for i in focus.indices { focus[i] = 0 }
+      focusCount = 0
+      focusVersion += 1
+    }
+  }
+
+  func snapshotFocus(into out: inout [Float], knownVersion: Int) -> Int {
+    locked {
+      if focusVersion == knownVersion { return -1 }
+      for i in focus.indices { out[i] = focus[i] }
+      return focusCount
+    }
+  }
+
+  var currentFocusVersion: Int { locked { focusVersion } }
   var currentTargetsVersion: Int { locked { targetsVersion } }
   var currentTablesVersion: Int { locked { tablesVersion } }
 

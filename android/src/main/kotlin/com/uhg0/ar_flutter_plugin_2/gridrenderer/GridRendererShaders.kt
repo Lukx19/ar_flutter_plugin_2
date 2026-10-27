@@ -9,7 +9,7 @@ package com.uhg0.ar_flutter_plugin_2.gridrenderer
  * meta0 = size f16 | source << 16 | flags << 24, meta1 = coverage |
  * completion << 8 | confidence << 16 | age << 24, bins 3 x u32), 5-6 brick or
  * region summary, 11 compact voxel (i16 x, y, z, colour u16). Colour tables
- * are one 256 x 5 RGBA8 texture, row = contract colour attribute code.
+ * are one 256 x 6 RGBA8 texture, row = contract colour attribute code.
  *
  * Quality threshold: `u_minQuality` (0-255, display mode byte 20) discards
  * surface instances whose confidence byte is below it (points, splats, spike
@@ -37,6 +37,8 @@ uniform float u_fixedPx;
 uniform int u_selectedOnly;
 uniform int u_grey;
 uniform int u_minQuality;
+uniform int u_focusCount;
+uniform vec4 u_focus[64];
 uniform highp sampler2D u_colors;
 out vec4 v_color;
 const vec4 OFFSCREEN = vec4(2.0, 2.0, 2.0, 1.0);
@@ -57,7 +59,45 @@ bool surfaceValid() {
 float surfaceSize() { return unpackHalf2x16(a_meta0 & 0xffffu).x; }
 float coverage() { return float(a_meta1 & 255u) / 255.0; }
 float confidence() { return float((a_meta1 >> 16u) & 255u) / 255.0; }
+
+// Saved-photo bins, not depth/feature observation history. A narrow continuous
+// transition avoids boundary flicker without per-surface temporal GPU storage.
+const vec2 DIRECTION_AZIMUTHS[8] = vec2[8](vec2(0.923879533, 0.382683432), vec2(0.382683432, 0.923879533), vec2(-0.382683432, 0.923879533), vec2(-0.923879533, 0.382683432), vec2(-0.923879533, -0.382683432), vec2(-0.382683432, -0.923879533), vec2(0.382683432, -0.923879533), vec2(0.923879533, -0.382683432));
+vec2 directionalSample(int band, int sector, float weight, vec3 normal) {
+  sector = (sector + 8) % 8;
+  float horizontal = band == 1 ? 1.0 : 0.745476000;
+  float vertical = band == 0 ? 0.666532470 : (band == 1 ? 0.0 : -0.666532470);
+  vec2 az = DIRECTION_AZIMUTHS[sector];
+  vec3 dir = vec3(horizontal * az.x, vertical, horizontal * az.y);
+  if (dot(normal, dir) < 0.25) return vec2(0.0);
+  int bin = band * 8 + sector;
+  float quality = float((a_bins[bin / 8] >> uint(4 * (bin % 8))) & 15u);
+  return vec2(quality * weight, weight);
+}
+uint directionalByte(vec3 normal) {
+  vec3 delta = u_camPos - a_pos;
+  if (dot(delta, delta) < 0.000001) return 255u;
+  vec3 view = normalize(delta);
+  if (dot(normal, view) < 0.1) return 255u;
+  float az = atan(view.z, view.x) / 0.7853981634;
+  if (az < 0.0) az += 8.0;
+  int sector = int(floor(az));
+  float f = fract(az);
+  int neighbor = f < 0.5 ? sector - 1 : sector + 1;
+  // Three degrees either side of an azimuth boundary.
+  float edgeWeight = 0.5 * (1.0 - smoothstep(0.0, 0.0666667, min(f, 1.0 - f)));
+  int band = view.y > 0.3333333333 ? 0 : (view.y < -0.3333333333 ? 2 : 1);
+  int otherBand = view.y >= 0.0 ? (band == 0 ? 1 : 0) : (band == 2 ? 1 : 2);
+  float bandWeight = 0.5 * (1.0 - smoothstep(0.0, 0.03, abs(abs(view.y) - 0.3333333333)));
+  vec2 q = directionalSample(band, sector, (1.0-edgeWeight)*(1.0-bandWeight), normal)
+    + directionalSample(band, neighbor, edgeWeight*(1.0-bandWeight), normal)
+    + directionalSample(otherBand, sector, (1.0-edgeWeight)*bandWeight, normal)
+    + directionalSample(otherBand, neighbor, edgeWeight*bandWeight, normal);
+  return q.y > 0.00001 ? uint(clamp(round(q.x / q.y * 16.0), 0.0, 240.0)) : 255u;
+}
+
 uint attributeByte() {
+  if (u_colorAttr == 5) return directionalByte(octDecode(a_oct));
   if (u_colorAttr == 1) return (a_meta1 >> 16u) & 255u;
   if (u_colorAttr == 2) return (a_meta1 >> 24u) & 255u;
   if (u_colorAttr == 3) return (a_meta0 >> 16u) & 255u;
@@ -74,6 +114,24 @@ vec4 tableColor(uint value, int table) {
   vec4 c = texelFetch(u_colors, ivec2(int(value), table), 0);
   return u_grey == 0 ? c : vec4(vec3(dot(c.rgb, vec3(0.3, 0.59, 0.11)) * 0.5), c.a);
 }
+vec4 surfaceColor() {
+  vec4 c = texelFetch(u_colors, ivec2(int(attributeByte()), u_colorAttr), 0);
+  // Focus priority is transient user intent, never saved-photo credit.
+  float priority = 0.0;
+  for (int i = 0; i < u_focusCount; i++) {
+    vec3 delta = a_pos - u_focus[i].xyz;
+    if (dot(delta, delta) <= 0.25) priority = max(priority, u_focus[i].w);
+  }
+  if (priority > 0.0) {
+    vec3 cool = vec3(0.05, 0.30, 0.95);
+    vec3 middle = vec3(0.98, 0.82, 0.12);
+    vec3 warm = vec3(0.90, 0.15, 0.32);
+    c = vec4(priority < 0.5 ? mix(cool, middle, priority * 2.0)
+      : mix(middle, warm, (priority - 0.5) * 2.0), 1.0);
+  }
+  return u_grey == 0 ? c : vec4(vec3(dot(c.rgb, vec3(0.3, 0.59, 0.11)) * 0.5), c.a);
+}
+
 """
 
     private const val SUMMARY_HEADER = """#version 300 es
@@ -111,7 +169,7 @@ void main() {
     px = clamp(surfaceSize() * sizeFactor() * u_focalPx / max(gl_Position.w, 0.05), 1.0, 64.0);
   }
   gl_PointSize = px;
-  v_color = tableColor(attributeByte(), u_colorAttr);
+  v_color = surfaceColor();
 }
 """
 
@@ -146,13 +204,14 @@ void main() {
   vec3 p = a_pos + (t * c.x + b * c.y) * radius;
   gl_Position = u_viewProj * vec4(p, 1.0);
   v_uv = c;
-  v_color = tableColor(attributeByte(), u_colorAttr);
+  v_color = surfaceColor();
   v_light = 0.4 + 0.6 * abs(dot(n, normalize(u_camPos - a_pos)));
 }
 """
 
     const val SPLAT_FS = """#version 300 es
 precision mediump float;
+uniform float u_alpha;
 in vec2 v_uv;
 in vec4 v_color;
 in float v_light;
@@ -160,7 +219,14 @@ out vec4 o_color;
 void main() {
   float r2 = dot(v_uv, v_uv);
   if (r2 > 1.0) discard;
-  o_color = vec4(v_color.rgb * v_light, 1.0 - smoothstep(0.55, 1.0, r2));
+  if (u_alpha < 0.75) {
+    // Stable spatial half transparency: overlap never accumulates opacity.
+    // Same mask in depth and colour passes, no extra render target.
+    if ((int(gl_FragCoord.x) + int(gl_FragCoord.y)) % 2 != 0) discard;
+    o_color = vec4(v_color.rgb * v_light, 1.0);
+  } else {
+    o_color = vec4(v_color.rgb * v_light, 1.0 - smoothstep(0.55, 1.0, r2));
+  }
 }
 """
 
@@ -202,6 +268,8 @@ uniform mat4 u_viewProj;
 uniform int u_colorAttr;
 uniform int u_grey;
 uniform int u_minQuality;
+uniform int u_focusCount;
+uniform vec4 u_focus[64];
 uniform highp sampler2D u_colors;
 out vec4 v_color;
 const vec3 STRIP[14] = vec3[14](

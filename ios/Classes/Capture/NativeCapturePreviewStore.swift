@@ -1,4 +1,5 @@
 import Foundation
+import Flutter
 import ImageIO
 import UniformTypeIdentifiers
 
@@ -45,7 +46,15 @@ enum CapturePreviewThumbnail {
     ]
     guard let image = CGImageSourceCreateThumbnailAtIndex(imageSource, 0, options as CFDictionary), !cancelled(),
           let destination = CGImageDestinationCreateWithURL(target as CFURL, UTType.jpeg.identifier as CFString, 1, nil) else { return false }
-    CGImageDestinationAddImage(destination, image, [kCGImageDestinationLossyCompressionQuality: edge == 512 ? 0.78 : 0.85] as CFDictionary)
+    let properties = CGImageSourceCopyPropertiesAtIndex(imageSource, 0, nil) as? [CFString: Any]
+    let width = (properties?[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue ?? 0
+    let height = (properties?[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue ?? 0
+    let orientation = (properties?[kCGImagePropertyOrientation] as? NSNumber)?.intValue ?? 1
+    let description = "guidance_preview_v1:\(width):\(height):\(orientation)"
+    CGImageDestinationAddImage(destination, image, [
+      kCGImageDestinationLossyCompressionQuality: edge == 512 ? 0.78 : 0.85,
+      kCGImagePropertyTIFFDictionary: [kCGImagePropertyTIFFImageDescription: description],
+    ] as CFDictionary)
     guard CGImageDestinationFinalize(destination), !cancelled() else { return false }
     return valid(target, edge: edge)
   }
@@ -431,5 +440,56 @@ final class NativeCapturePreviewOwner {
     guard name.hasPrefix("deleting-") else { return false }
     let token = String(name.dropFirst(9))
     return UUID(uuidString: token)?.uuidString.lowercased() == token
+  }
+}
+
+
+/// Reads only the authorized, native-downsampled JPEG copy, never an original.
+/// The geometry descriptor records the actual source raster and EXIF transform.
+enum GuidancePreviewLuma {
+  struct SourceGeometry: Equatable {
+    let width: Int
+    let height: Int
+    let exifOrientation: Int
+  }
+
+  /// ImageIO can promote TIFF ImageDescription to IPTC Caption/Abstract when
+  /// encoding JPEG. Accept only these two native round-trip locations, with
+  /// the same bounded versioned descriptor; conflicting values are unknown.
+  static func sourceGeometry(_ properties: [CFString: Any]) -> SourceGeometry? {
+    let tiff = properties[kCGImagePropertyTIFFDictionary] as? [CFString: Any]
+    let iptc = properties[kCGImagePropertyIPTCDictionary] as? [CFString: Any]
+    let tiffDescription = tiff?[kCGImagePropertyTIFFImageDescription] as? String
+    let caption = iptc?[kCGImagePropertyIPTCCaptionAbstract] as? String
+    if let tiffDescription = tiffDescription, let caption = caption, tiffDescription != caption { return nil }
+    guard let description = tiffDescription ?? caption, description.count <= 80 else { return nil }
+    let parts = description.split(separator: ":", omittingEmptySubsequences: false)
+    guard parts.count == 4, parts[0] == "guidance_preview_v1",
+      parts.dropFirst().allSatisfy({ !$0.isEmpty && $0.allSatisfy({ $0 >= "0" && $0 <= "9" }) }),
+      let width = Int(parts[1]), let height = Int(parts[2]), let orientation = Int(parts[3]),
+      (1...65536).contains(width), (1...65536).contains(height), (1...8).contains(orientation) else { return nil }
+    return SourceGeometry(width: width, height: height, exifOrientation: orientation)
+  }
+
+  static func read(_ path: String, cancelled: () -> Bool) -> [String: Any]? {
+    let url = URL(fileURLWithPath: path)
+    guard CapturePreviewThumbnail.valid(url, edge: 512), !cancelled(),
+      let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+      let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+      let geometry = sourceGeometry(properties),
+      let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
+    let scale = min(1, 256 / Double(max(image.width, image.height)))
+    let width = max(1, Int(Double(image.width) * scale)), height = max(1, Int(Double(image.height) * scale))
+    var luma = Data(count: width * height)
+    let drawn = luma.withUnsafeMutableBytes { buffer -> Bool in
+      guard let context = CGContext(data: buffer.baseAddress, width: width, height: height,
+        bitsPerComponent: 8, bytesPerRow: width, space: CGColorSpaceCreateDeviceGray(), bitmapInfo: 0) else { return false }
+      context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+      return true
+    }
+    guard drawn, !cancelled() else { return nil }
+    return ["wireVersion": "guidance_luma_v1", "width": width, "height": height,
+      "sourceWidth": geometry.width, "sourceHeight": geometry.height, "exifOrientation": geometry.exifOrientation,
+      "luma": FlutterStandardTypedData(bytes: luma)]
   }
 }

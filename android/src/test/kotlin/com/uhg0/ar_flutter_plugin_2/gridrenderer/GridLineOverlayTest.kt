@@ -70,4 +70,22 @@ class GridLineOverlayTest {
         overlay.greyOutside = true
         assertSame(overlay, core.scopeOverlay())
     }
+    @Test
+    fun `volume buffers bound whole tubes and reject nonfinite degenerate segments`() {
+        val batch = GridLineBatch(capacitySegments = 1, volumetric = true)
+        batch.line(0f,0f,0f,0f,0f,0f,0)
+        batch.line(0f,0f,0f,Float.NaN,1f,0f,0)
+        assertEquals(0,batch.segments)
+        batch.line(0f,0f,0f,0f,1f,0f,0x12345678)
+        assertEquals(1,batch.segments)
+        assertEquals(36*16,batch.vertices.capacity())
+        for(i in 0 until 36) {
+            assertEquals(0.012f,kotlin.math.abs(batch.vertices.getFloat(i*16)),1e-6f)
+            assertEquals(0x12,batch.vertices.get(i*16+12).toInt())
+        }
+        batch.line(0f,0f,0f,1f,0f,0f,0)
+        assertEquals(1L,batch.dropped)
+        batch.clear()
+        assertEquals(0,batch.segments)
+    }
 }

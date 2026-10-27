@@ -9,6 +9,22 @@ import java.nio.ByteOrder
 
 class PoseBatchDispatcherTest {
     @Test
+    fun `display rotation remains paired with each sample across orientation changes and drops`() {
+        val sent = mutableListOf<Map<String, Any?>>()
+        val results = mutableListOf<MethodChannel.Result>()
+        val dispatcher = PoseBatchDispatcher({ _, arguments, result -> sent += arguments; results += result }, capacity = 2)
+        dispatcher.offer(sample(1), 0.0)
+        dispatcher.offer(sample(2), Math.PI / 2)
+        dispatcher.offer(sample(3), -Math.PI / 2)
+        dispatcher.offer(sample(4), null)
+        results[0].success(null)
+        assertEquals(listOf(0.0), sent[0]["displayRotationV1"])
+        assertEquals(listOf(-Math.PI / 2, null), sent[1]["displayRotationV1"])
+        assertEquals(3L, sequence(sent[1]["sampleBytes"] as ByteArray))
+        assertEquals(1L, sent[1]["droppedOldestCount"])
+    }
+
+    @Test
     fun `keeps one in flight batch and drops oldest beyond eight pending samples`() {
         val sent = mutableListOf<Map<String, Any?>>()
         val results = mutableListOf<MethodChannel.Result>()
