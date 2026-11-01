@@ -104,13 +104,16 @@ final class GridLineBatch: GridOverlayLineSink {
     segments += 1
   }
 
-  // A closed square prism, 24 mm thick, matching Android. Scratch is reused.
+  // A closed square prism, up to 24 mm thick, matching Android. Short segments
+  // scale down so screen-clamped ring edges cannot become overlapping spokes.
+  // Scratch is reused.
   private static let tubeIndices = [0,1,5,0,5,4,1,2,6,1,6,5,2,3,7,2,7,6,3,0,4,3,4,7,0,3,2,0,2,1,4,5,6,4,6,7]
   private var corners = [Float](repeating: 0, count: 24)
   private func tube(_ x0: Float, _ y0: Float, _ z0: Float, _ x1: Float, _ y1: Float, _ z1: Float, rgba: UInt32) {
     let dx=x1-x0, dy=y1-y0, dz=z1-z0
     let length=sqrt(dx*dx+dy*dy+dz*dz)
     if !length.isFinite || length < 0.0001 { return }
+    let halfWidth = min(Float(0.012), length * 0.25)
     let nx=dx/length, ny=dy/length, nz=dz/length
     var ux: Float = abs(ny)<0.9 ? -nz : 0
     var uy: Float = abs(ny)<0.9 ? 0 : nz
@@ -119,8 +122,8 @@ final class GridLineBatch: GridOverlayLineSink {
     ux/=ul; uy/=ul; uz/=ul
     let vx=ny*uz-nz*uy, vy=nz*ux-nx*uz, vz=nx*uy-ny*ux
     for i in 0...7 {
-      let a: Float = i%4==0 || i%4==3 ? -0.012 : 0.012
-      let b: Float = i%4<2 ? -0.012 : 0.012
+      let a: Float = i%4==0 || i%4==3 ? -halfWidth : halfWidth
+      let b: Float = i%4<2 ? -halfWidth : halfWidth
       corners[i*3]=(i<4 ? x0 : x1)+ux*a+vx*b
       corners[i*3+1]=(i<4 ? y0 : y1)+uy*a+vy*b
       corners[i*3+2]=(i<4 ? z0 : z1)+uz*a+vz*b

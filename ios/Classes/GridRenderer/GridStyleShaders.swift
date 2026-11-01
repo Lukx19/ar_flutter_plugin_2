@@ -128,17 +128,18 @@ enum GridStyleShaders {
   static float4 surfaceColor(Surface s, constant GridUniforms& u,
                             constant float4* focus, texture2d<float, access::read> colors) {
     float4 c = tableColor(colors, attributeByte(s, u), u.colorAttr, 0);
-    float priority = 0.0;
+    // A normal-focus region has valid zero priority; -1 means no region.
+    float priority = -1.0;
     for (int i = 0; i < u.focusCount; i++) {
       float3 delta = float3(s.pos) - focus[i].xyz;
       if (dot(delta, delta) <= 0.25) priority = max(priority, focus[i].w);
     }
-    if (priority > 0.0) {
-      float3 cool = float3(0.05, 0.30, 0.95);
-      float3 middle = float3(0.98, 0.82, 0.12);
-      float3 warm = float3(0.90, 0.15, 0.32);
-      c = float4(priority < 0.5 ? mix(cool, middle, priority * 2.0)
-        : mix(middle, warm, (priority - 0.5) * 2.0), 1.0);
+    if (priority >= 0.0) {
+      float3 low = float3(51.0, 204.0, 89.0) / 255.0;
+      float3 middle = float3(242.0, 178.0, 31.0) / 255.0;
+      float3 high = float3(230.0, 64.0, 46.0) / 255.0;
+      c = float4(priority < 0.5 ? mix(low, middle, priority * 2.0)
+        : mix(middle, high, (priority - 0.5) * 2.0), 1.0);
     }
     return u.grey == 0 ? c : greyed(c);
   }

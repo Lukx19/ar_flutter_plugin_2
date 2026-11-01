@@ -3,9 +3,9 @@ import 'camera_resolution.dart';
 import '../datatypes/image_format.dart';
 import '../datatypes/buffer_strategy.dart';
 
-/// The still a manual shutter takes on iOS (`initializeCapture`
-/// `stillCaptureMode`). Automatic captures always take [single]; Android
-/// ignores the setting. Every mode runs inside the running AR session: the
+/// The still a manual or automatic shutter takes on iOS (`initializeCapture`
+/// `stillCaptureMode`). Both lanes honor this profile; Android ignores the
+/// setting. Every mode runs inside the running AR session: the
 /// session is never paused for a still, and the other cameras (ultra-wide,
 /// telephoto) are not available while ARKit runs.
 enum ARStillCaptureMode {
@@ -17,8 +17,8 @@ enum ARStillCaptureMode {
   burst('burst'),
 
   /// One frame with ARKit multi-frame processing (balanced photo quality,
-  /// about 490 ms; iOS 26 and later, else a plain frame) and video HDR on
-  /// formats that support it: the in-AR HDR.
+  /// about 490 ms; iOS 26 and later, else a plain frame). Balanced processing
+  /// does not guarantee HDR; video HDR depends on the selected AR format.
   inArQuality('inArQuality');
 
   const ARStillCaptureMode(this.wireValue);
@@ -74,7 +74,7 @@ class ARCaptureConfig {
   /// Buffer management strategy
   final BufferStrategy bufferStrategy;
 
-  /// iOS still of a manual shutter; sent only when not
+  /// iOS still of a manual or automatic shutter; sent only when not
   /// [ARStillCaptureMode.single].
   final ARStillCaptureMode stillCaptureMode;
 

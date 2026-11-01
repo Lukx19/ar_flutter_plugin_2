@@ -5,12 +5,12 @@ import Foundation
 /// `QuestOverlayGeometry`:
 ///
 /// - A donut is a thin ring (three concentric loops) of the message's world
-///   radius at the standpoint, facing the aim point; its on-screen diameter
+///   radius at the standpoint, facing the aim point; its on-screen centre-line diameter
 ///   is clamped to the message's dp range using the focal length and
 ///   density from [setView].
-/// - Within twice the position tolerance the user is at the standpoint: the
-///   donut frames the aim point instead, around a dashed aim reticle whose
-///   radius is the inner circle as seen from the camera.
+/// - The ring stays at the fixed optical camera standpoint. Within 25 cm it
+///   is hidden for near clipping; the shared HUD owns the near-lens sight
+///   and remaining position/aim feedback, without moving the world target.
 /// - Shown donuts are amber, aimed green, the next trail start cyan;
 ///   captured donuts flash white three times, timed-out donuts fade out.
 /// - Trails are solid where captured and dashed elsewhere; footprints are

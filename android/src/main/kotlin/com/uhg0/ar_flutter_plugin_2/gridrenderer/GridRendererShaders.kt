@@ -117,17 +117,18 @@ vec4 tableColor(uint value, int table) {
 vec4 surfaceColor() {
   vec4 c = texelFetch(u_colors, ivec2(int(attributeByte()), u_colorAttr), 0);
   // Focus priority is transient user intent, never saved-photo credit.
-  float priority = 0.0;
+  // A normal-focus region has valid zero priority; -1 means no region.
+  float priority = -1.0;
   for (int i = 0; i < u_focusCount; i++) {
     vec3 delta = a_pos - u_focus[i].xyz;
     if (dot(delta, delta) <= 0.25) priority = max(priority, u_focus[i].w);
   }
-  if (priority > 0.0) {
-    vec3 cool = vec3(0.05, 0.30, 0.95);
-    vec3 middle = vec3(0.98, 0.82, 0.12);
-    vec3 warm = vec3(0.90, 0.15, 0.32);
-    c = vec4(priority < 0.5 ? mix(cool, middle, priority * 2.0)
-      : mix(middle, warm, (priority - 0.5) * 2.0), 1.0);
+  if (priority >= 0.0) {
+    vec3 low = vec3(51.0, 204.0, 89.0) / 255.0;
+    vec3 middle = vec3(242.0, 178.0, 31.0) / 255.0;
+    vec3 high = vec3(230.0, 64.0, 46.0) / 255.0;
+    c = vec4(priority < 0.5 ? mix(low, middle, priority * 2.0)
+      : mix(middle, high, (priority - 0.5) * 2.0), 1.0);
   }
   return u_grey == 0 ? c : vec4(vec3(dot(c.rgb, vec3(0.3, 0.59, 0.11)) * 0.5), c.a);
 }

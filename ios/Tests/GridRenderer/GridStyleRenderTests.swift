@@ -120,7 +120,7 @@ final class GridStyleRenderTests: XCTestCase {
     return uploaded
   }
 
-  private struct RGBA: CustomStringConvertible {
+  private struct RGBA: CustomStringConvertible, Equatable {
     let r: Int, g: Int, b: Int, a: Int
     var description: String { "(\(r), \(g), \(b), \(a))" }
   }
@@ -280,6 +280,55 @@ final class GridStyleRenderTests: XCTestCase {
     XCTAssertEqual(Data(focus.prefix(8)).withUnsafeBytes { host.onDisplayMessage($0) }, .overlay)
     try render()
     XCTAssertLessThan(probe(centre, centre).g, 40, "clear returns original saved-photo coverage")
+  }
+
+  func testFocusPriorityPaintUsesGreenAmberRedWithoutChangingUnfocusedCoverage() throws {
+    mode(GridDisplayCodes.baseSplats)
+    try render()
+    let original = probe(centre, centre)
+    var focus = Data(repeating: 0, count: 24)
+    func word(_ offset: Int, _ value: UInt32) {
+      for i in 0..<4 { focus[offset + i] = UInt8(truncatingIfNeeded: value >> UInt32(i * 8)) }
+    }
+    word(0, contractMagic("C3FP"))
+    focus[4] = 1
+    focus[6] = 1
+    word(16, Float(-2).bitPattern)
+    func publish(_ priority: Float, x: Float = 0) {
+      word(8, x.bitPattern)
+      word(20, priority.bitPattern)
+      XCTAssertEqual(focus.withUnsafeBytes { host.onDisplayMessage($0) }, .overlay)
+    }
+    publish(1)
+    try render()
+    XCTAssertEqual(
+      probe(centre, centre), original, "overlay off preserves coverage")
+    mode(GridDisplayCodes.baseSplats, overlays: GridDisplayCodes.overlayFocusPriority)
+    // A retained normal-focus region has valid zero priority; membership
+    // paints green without adding planner weight or earned photo credit.
+    let paints: [(Float, RGBA)] = [
+      (0, RGBA(r: 0x33, g: 0xCC, b: 0x59, a: original.a)),
+      (0.5, RGBA(r: 0xF2, g: 0xB2, b: 0x1F, a: original.a)),
+      (1, RGBA(r: 0xE6, g: 0x40, b: 0x2E, a: original.a)),
+    ]
+    for (priority, expected) in paints {
+      publish(priority)
+      try render()
+      let actual = probe(centre, centre)
+      XCTAssertLessThanOrEqual(abs(actual.r - expected.r), 3, "priority \(priority): \(actual)")
+      XCTAssertLessThanOrEqual(abs(actual.g - expected.g), 3, "priority \(priority): \(actual)")
+      XCTAssertLessThanOrEqual(abs(actual.b - expected.b), 3, "priority \(priority): \(actual)")
+      XCTAssertEqual(actual.a, original.a)
+    }
+    publish(1, x: 2)
+    try render()
+    XCTAssertEqual(
+      probe(centre, centre), original, "outside focus stays unchanged")
+    focus[6] = 0
+    XCTAssertEqual(Data(focus.prefix(8)).withUnsafeBytes { host.onDisplayMessage($0) }, .overlay)
+    try render()
+    XCTAssertEqual(
+      probe(centre, centre), original, "clear preserves earned coverage")
   }
 
   func testPointsDrawAtTheirProjectedPosition() throws {

@@ -38,6 +38,9 @@ protocol CameraControlDevice: AnyObject {
   var minExposureBias: Float { get }
   var maxExposureBias: Float { get }
   var exposureBias: Float { get }
+  /// Optional current format facts for bounded temporary still exposure.
+  var adaptiveStillCapabilities: AdaptiveStillExposureCapabilities? { get }
+  var isAdjustingExposure: Bool { get }
 
   var focusModes: Set<CameraFocusModeValue> { get }
   var focusMode: CameraFocusModeValue { get }
@@ -61,6 +64,7 @@ protocol CameraControlDevice: AnyObject {
   func configure(_ change: () throws -> Void) throws
   /// Manual exposure; nil keeps the current duration or ISO.
   func setCustomExposure(seconds: Double?, iso: Float?)
+  func setAdaptiveCustomExposure(seconds: Double, iso: Float, applied: @escaping () -> Void)
   func setExposureMode(_ mode: CameraExposureModeValue)
   func setExposureBias(_ bias: Float)
   func setFocusMode(_ mode: CameraFocusModeValue)
@@ -77,6 +81,12 @@ protocol CameraControlDevice: AnyObject {
 
 extension CameraControlDevice {
   var configurationIdentity: AnyHashable { AnyHashable(ObjectIdentifier(self)) }
+  var adaptiveStillCapabilities: AdaptiveStillExposureCapabilities? { nil }
+  var isAdjustingExposure: Bool { true }
+  func setAdaptiveCustomExposure(seconds: Double, iso: Float, applied: @escaping () -> Void) {
+    setCustomExposure(seconds: seconds, iso: iso)
+    applied()
+  }
 }
 
 /// A replacement view supersedes the previous device configuration owner.
@@ -84,25 +94,33 @@ extension CameraControlDevice {
 /// bridges. A lease removes only its own current token on destruction.
 private final class CameraControlOwnership {
   private static let lock = NSLock()
-  private static var current: [AnyHashable: UUID] = [:]
+  private static var current: [AnyHashable: (token: UUID, temporaryAuto: Bool)] = [:]
   private let identity: AnyHashable
   private let token = UUID()
+  let inheritedTemporaryAuto: Bool
 
   init(identity: AnyHashable) {
     self.identity = identity
     Self.lock.lock()
-    Self.current[identity] = token
+    inheritedTemporaryAuto = Self.current[identity]?.temporaryAuto ?? false
+    Self.current[identity] = (token, inheritedTemporaryAuto)
     Self.lock.unlock()
   }
 
   var isCurrent: Bool {
     Self.lock.lock(); defer { Self.lock.unlock() }
-    return Self.current[identity] == token
+    return Self.current[identity]?.token == token
+  }
+
+  func markTemporaryAuto(_ value: Bool) {
+    Self.lock.lock(); defer { Self.lock.unlock() }
+    guard Self.current[identity]?.token == token else { return }
+    Self.current[identity] = (token, value)
   }
 
   deinit {
     Self.lock.lock(); defer { Self.lock.unlock() }
-    if Self.current[identity] == token { Self.current.removeValue(forKey: identity) }
+    if Self.current[identity]?.token == token { Self.current.removeValue(forKey: identity) }
   }
 }
 
@@ -159,15 +177,113 @@ final class CameraControlBridge {
   private var whiteBalanceMode = "auto"
   private var manualTemperature: Int?
   private var focusRegion: (x: Double, y: Double)?
+  private var exposureRevision: UInt64 = 0
+  private var inheritedTemporaryAuto = false
+  private var adaptiveExposureIntent: (id: UUID, revision: UInt64)?
 
   init(device: CameraControlDevice) {
     self.device = device
     self.ownership = CameraControlOwnership(identity: device.configurationIdentity)
+    self.inheritedTemporaryAuto = ownership.inheritedTemporaryAuto
+  }
+
+  /// A replacement bridge inherits AUTO intent, never the previous bridge's
+  /// temporary custom mode. Recovery runs on its own camera queue and token.
+  private func restoreInheritedAdaptiveExposure() throws {
+    guard inheritedTemporaryAuto else { return }
+    try device.configure {
+      guard ownership.isCurrent else { return }
+      device.setExposureMode(.auto)
+      ownership.markTemporaryAuto(false)
+      inheritedTemporaryAuto = false
+    }
+  }
+
+  /// Best-effort still preparation on the existing camera-access queue. No
+  /// callback wait blocks that queue; late callbacks cannot acquire a second
+  /// exposure or restore over a later manual/replacement owner.
+  func prepareAdaptiveStillExposure(metering: AdaptiveStillExposureMetering?, ordinarySingle: Bool,
+                                    scheduler: AdaptiveStillExposureScheduler,
+                                    isCancelled: @escaping () -> Bool = { false },
+                                    ready: @escaping (AdaptiveStillExposureLease?) -> Void) {
+    do { try restoreInheritedAdaptiveExposure() } catch { return ready(nil) }
+    guard !isCancelled(), ownership.isCurrent, adaptiveExposureIntent == nil,
+      device.supportsCustomExposure,
+      let plan = AdaptiveStillExposurePolicy.plan(capabilities: device.adaptiveStillCapabilities,
+        metering: metering, now: scheduler.now, ordinarySingle: ordinarySingle,
+        automaticExposure: device.exposureMode == .auto, adjustingExposure: device.isAdjustingExposure)
+    else { return ready(nil) }
+    let state = AdaptiveStillExposurePreparation()
+    let id = UUID()
+    let revision = exposureRevision
+    func ownsTemporaryExposure() -> Bool {
+      ownership.isCurrent && exposureRevision == revision
+        && adaptiveExposureIntent?.id == id && adaptiveExposureIntent?.revision == revision
+    }
+    func end() {
+      guard !state.ended else { return }
+      guard ownsTemporaryExposure() else { state.ended = true; return }
+      do {
+        try device.configure {
+          guard ownsTemporaryExposure() else { return }
+          device.setExposureMode(.auto)
+          ownership.markTemporaryAuto(false)
+        }
+        state.ended = true
+        if adaptiveExposureIntent?.id == id { adaptiveExposureIntent = nil }
+      } catch {
+        // The independent 750ms expiry may retry a failed early restore.
+        // A replacement owner also inherits this AUTO intent explicitly.
+        NSLog("capture3d adaptive exposure restore unavailable: %@", String(describing: error))
+      }
+    }
+    func acknowledge() {
+      state.acknowledged = true
+      guard state.configurationFinished, !state.replied else { return }
+      state.replied = true
+      guard !state.ended, !isCancelled(), ownsTemporaryExposure() else {
+        end()
+        return ready(nil)
+      }
+      ready(AdaptiveStillExposureLease(plan: plan, end: { scheduler.perform { end() } }))
+    }
+    do {
+      try device.configure {
+        guard ownership.isCurrent, exposureRevision == revision,
+          device.supportsCustomExposure,
+          AdaptiveStillExposurePolicy.plan(capabilities: device.adaptiveStillCapabilities,
+            metering: metering, now: scheduler.now, ordinarySingle: ordinarySingle,
+            automaticExposure: device.exposureMode == .auto, adjustingExposure: device.isAdjustingExposure) == plan
+        else { throw CameraControlError.failed("The adaptive still control owner or metering changed") }
+        adaptiveExposureIntent = (id, revision)
+        ownership.markTemporaryAuto(true)
+        device.setAdaptiveCustomExposure(seconds: plan.exposureSeconds, iso: plan.iso) {
+          scheduler.perform { acknowledge() }
+        }
+      }
+      state.configurationFinished = true
+      scheduler.after(0.1) {
+        guard !state.replied else { return }
+        end()
+        state.replied = true
+        ready(nil)
+      }
+      // The physical still may never reply. Temporary control is bounded
+      // independently of the frame callback or durable attempt lifetime.
+      scheduler.after(0.75) { end() }
+      if state.acknowledged { acknowledge() }
+    } catch {
+      state.configurationFinished = true
+      end()
+      state.replied = true
+      ready(nil)
+    }
   }
 
   /// Handles one control method with the Android argument map; throws
   /// [CameraControlError] for a refusal or failure.
   func handle(_ method: String, _ arguments: [String: Any]) throws -> Any? {
+    try restoreInheritedAdaptiveExposure()
     func number(_ key: String) throws -> Double {
       guard let value = arguments[key] as? NSNumber, CFGetTypeID(value) != CFBooleanGetTypeID() else {
         throw CameraControlError(code: "CONFIG_INVALID", message: "\(key) is required")
@@ -253,29 +369,30 @@ final class CameraControlBridge {
   private func setISO(_ value: Int) throws -> Int {
     let range = try supportedISORange()
     let clamped = min(max(value, range[0]), range[1])
-    try apply("ISO \(clamped)") { device.setCustomExposure(seconds: nil, iso: Float(clamped)) }
+    try apply("ISO \(clamped)", exposureChange: true) { device.setCustomExposure(seconds: nil, iso: Float(clamped)) }
     return clamped
   }
 
   private func setExposureTime(micros: Int64) throws -> Int64 {
     let range = try supportedExposureRange()
     let clamped = min(max(micros, range["min"]!), range["max"]!)
-    try apply("exposure time \(clamped)us") { device.setCustomExposure(seconds: Double(clamped) / 1_000_000, iso: nil) }
+    try apply("exposure time \(clamped)us", exposureChange: true) { device.setCustomExposure(seconds: Double(clamped) / 1_000_000, iso: nil) }
     return clamped
   }
 
   private func setAutoExposureEnabled(_ enabled: Bool) throws -> Bool {
     if enabled {
-      try apply("auto exposure") { device.setExposureMode(.auto) }
+      try apply("auto exposure", exposureChange: true) { device.setExposureMode(.auto) }
     } else {
       guard device.supportsCustomExposure else { throw CameraControlError.unsupported("Manual exposure is not supported on this camera") }
-      try apply("manual exposure") { device.setCustomExposure(seconds: nil, iso: nil) }
+      try apply("manual exposure", exposureChange: true) { device.setCustomExposure(seconds: nil, iso: nil) }
     }
     return device.exposureMode != .custom
   }
 
   private func exposureState() -> [String: Any?] {
-    let auto = device.exposureMode != .custom
+    let auto = device.exposureMode != .custom || (ownership.isCurrent
+      && adaptiveExposureIntent?.revision == exposureRevision)
     return [
       "currentISO": Int(device.iso.rounded()),
       "currentExposureTime": Self.micros(device.exposureSeconds),
@@ -315,13 +432,13 @@ final class CameraControlBridge {
     let requested = Int((ev / step).rounded())
     let clamped = min(max(requested, steps.lowerBound), steps.upperBound)
     let bias = Double(clamped) * step
-    try apply("exposure compensation \(bias) EV") { device.setExposureBias(Float(bias)) }
+    try apply("exposure compensation \(bias) EV", exposureChange: true) { device.setExposureBias(Float(bias)) }
     return bias
   }
 
   private func setExposureLocked(_ locked: Bool) throws -> Bool {
     guard device.supportsLockedExposure else { throw CameraControlError.unsupported("Exposure lock is not supported on this camera") }
-    try apply(locked ? "exposure lock" : "exposure unlock") { device.setExposureMode(locked ? .locked : .auto) }
+    try apply(locked ? "exposure lock" : "exposure unlock", exposureChange: true) { device.setExposureMode(locked ? .locked : .auto) }
     return locked ? device.exposureMode == .locked : device.exposureMode != .locked
   }
 
@@ -520,6 +637,10 @@ final class CameraControlBridge {
       // either already owns the device, or applies its settings after this
       // lock is released. The retired view cannot overwrite either outcome.
       guard ownership.isCurrent else { return }
+      exposureRevision &+= 1
+      adaptiveExposureIntent = nil
+      inheritedTemporaryAuto = false
+      ownership.markTemporaryAuto(false)
       if device.hasTorch { try device.setTorch(false) }
       device.setExposureMode(.auto)
       device.setExposureBias(0)
@@ -533,11 +654,24 @@ final class CameraControlBridge {
 
   // MARK: Configuration
 
-  private func apply(_ what: String, _ change: () throws -> Void) throws {
+  private func apply(_ what: String, exposureChange: Bool = false, _ change: () throws -> Void) throws {
     do {
       try device.configure {
         guard ownership.isCurrent else {
           throw CameraControlError.failed("The camera control owner was replaced")
+        }
+        if inheritedTemporaryAuto {
+          device.setExposureMode(.auto)
+          inheritedTemporaryAuto = false
+          ownership.markTemporaryAuto(false)
+        }
+        if exposureChange {
+          ownership.markTemporaryAuto(false)
+          exposureRevision &+= 1
+          if adaptiveExposureIntent != nil {
+            adaptiveExposureIntent = nil
+            device.setExposureMode(.auto)
+          }
         }
         try change()
       }
@@ -739,6 +873,24 @@ final class StillCameraAccess: ARFrameObserver {
       guard !self.closed else { return }
       self.stopped = false
       self.drain()
+    }
+  }
+}
+
+extension StillCameraAccess: AdaptiveStillExposureScheduler {
+  var now: TimeInterval { ProcessInfo.processInfo.systemUptime }
+  func perform(_ action: @escaping () -> Void) { queue.async(execute: action) }
+  func after(_ delay: TimeInterval, _ action: @escaping () -> Void) {
+    queue.asyncAfter(deadline: .now() + delay, execute: action)
+  }
+
+  /// Acquired only by an active request on this queue. Preparation callbacks
+  /// check it before starting ARKit so a close/stop cannot launch a late still.
+  func currentCapturePermission() -> () -> Bool {
+    let token = active?.generation
+    return { [weak self] in
+      guard let self = self, let token = token else { return false }
+      return !self.closed && !self.stopped && self.active?.generation == token
     }
   }
 }

@@ -420,6 +420,62 @@ final class GridLineOverlayTests: XCTestCase {
     XCTAssertEqual(batch.segments,0)
   }
 
+  func testProjectedNearAndFarQuestVolumesRetainAHollowCameraAperture() {
+    let frame = QuestOverlayFrame()
+    frame.layers = QuestOverlayLayout.layerDonuts
+    frame.donutCount = 1
+    frame.donutAim[2] = -1
+    let geometry = QuestOverlayGeometry()
+    // Distance, physical focal pixels, display density. Close rings must
+    // preserve an aperture after the real volume builder expands their lines.
+    let views: [(Float, Float, Float)] = [
+      (0.3, 1500, 3), (0.3, 3000, 3), (1.5, 1500, 2), (10.5, 1500, 2),
+    ]
+    for (distance, focal, density) in views {
+      geometry.setView(focalPx: focal, pxPerDp: density)
+      let batch = GridLineBatch(capacitySegments: 128, volumetric: true)
+      _ = geometry.build(frame, camX: 0, camY: 0, camZ: distance, sink: batch)
+      let segments = distance > QuestOverlayGeometry.farMetres ? 16 : 32
+      XCTAssertEqual(batch.segments, 3 * segments)
+      XCTAssertEqual(batch.dropped, 0)
+      let expectedRadiusPx = min(max(0.08 * focal / distance, 12 * density), 48 * density)
+      var aperturePx = Float.infinity
+      var extentPx: Float = 0
+      for at in stride(from: 0, to: batch.segments * batch.verticesPerSegment, by: 3) {
+        let triangle = (0..<3).map { j -> SIMD2<Float> in
+          let point = vertex(batch, at + j)
+          let projected = SIMD2(point.x, point.y) * focal / (distance - point.z)
+          extentPx = max(extentPx, simd_length(projected))
+          return projected
+        }
+        aperturePx = min(aperturePx, originToTriangle(triangle))
+      }
+      XCTAssertGreaterThanOrEqual(
+        aperturePx, 0.55 * expectedRadiusPx, "camera ring must remain hollow at \(distance) m")
+      XCTAssertLessThanOrEqual(
+        extentPx, 1.15 * expectedRadiusPx,
+        "tube thickness must respect the screen-size clamp at \(distance) m")
+    }
+  }
+
+  /// Minimum distance to a projected filled triangle, including degenerate faces.
+  private func originToTriangle(_ p: [SIMD2<Float>]) -> Float {
+    func cross(_ a: SIMD2<Float>, _ b: SIMD2<Float>) -> Float { a.x * b.y - a.y * b.x }
+    let a = cross(p[0], p[1]), b = cross(p[1], p[2]), c = cross(p[2], p[0])
+    if abs(a + b + c) > 1e-6 && ((a >= 0 && b >= 0 && c >= 0) || (a <= 0 && b <= 0 && c <= 0)) {
+      return 0
+    }
+    var result = Float.infinity
+    for i in 0..<3 {
+      let start = p[i], delta = p[(i + 1) % 3] - start
+      let lengthSquared = simd_length_squared(delta)
+      let t: Float =
+        lengthSquared > 1e-12 ? min(max(-simd_dot(start, delta) / lengthSquared, 0), 1) : 0
+      result = min(result, simd_length(start + t * delta))
+    }
+    return result
+  }
+
   func testNearLensTargetHidesRatherThanMovingToTheSurface() {
     let layer = QuestOverlayLayer()
     XCTAssertEqual(questReference.withUnsafeBytes { layer.onMessage($0) }, .ok)

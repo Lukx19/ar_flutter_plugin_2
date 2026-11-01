@@ -288,6 +288,50 @@ class InstancedStyleRenderTest {
     }
 
     @Test
+    fun focusPriorityPaintUsesGreenAmberRedWithoutChangingUnfocusedCoverage() {
+        mode(GridDisplayCodes.BASE_SPLATS)
+        render()
+        val original = probe(SIZE / 2, SIZE / 2)
+        val focus = ByteBuffer.allocate(24).order(ByteOrder.LITTLE_ENDIAN)
+        focus.putInt(0, com.uhg0.ar_flutter_plugin_2.visibilitycontract.contractMagic("C3FP"))
+        focus.putShort(4, 1.toShort())
+        focus.put(6, 1.toByte())
+        focus.putFloat(16, -2f)
+        fun publish(priority: Float, x: Float = 0f) {
+            focus.putFloat(8, x)
+            focus.putFloat(20, priority)
+            assertEquals(DisplayIntake.OVERLAY, core.onDisplayMessage(focus, 0, 24))
+        }
+        publish(1f)
+        render()
+        assertEquals("overlay off preserves coverage", original, probe(SIZE / 2, SIZE / 2))
+        mode(GridDisplayCodes.BASE_SPLATS, overlays = GridDisplayCodes.OVERLAY_FOCUS_PRIORITY)
+        // A valid normal-focus region retains membership at zero priority;
+        // green paint does not add planner weight or earned photo credit.
+        val paints = arrayOf(
+            0f to intArrayOf(0x33, 0xCC, 0x59),
+            0.5f to intArrayOf(0xF2, 0xB2, 0x1F),
+            1f to intArrayOf(0xE6, 0x40, 0x2E),
+        )
+        for ((priority, expected) in paints) {
+            publish(priority)
+            render()
+            val actual = probe(SIZE / 2, SIZE / 2)
+            assertTrue("red at priority $priority", abs(red(actual) - expected[0]) <= 3)
+            assertTrue("green at priority $priority", abs(green(actual) - expected[1]) <= 3)
+            assertTrue("blue at priority $priority", abs(blue(actual) - expected[2]) <= 3)
+            assertEquals(alpha(original), alpha(actual))
+        }
+        publish(1f, x = 2f)
+        render()
+        assertEquals("outside focus stays unchanged", original, probe(SIZE / 2, SIZE / 2))
+        focus.put(6, 0)
+        assertEquals(DisplayIntake.OVERLAY, core.onDisplayMessage(focus, 0, 8))
+        render()
+        assertEquals("clear preserves earned coverage", original, probe(SIZE / 2, SIZE / 2))
+    }
+
+    @Test
     fun pointsDrawAtTheirProjectedPosition() {
         mode(GridDisplayCodes.BASE_POINTS)
         render()

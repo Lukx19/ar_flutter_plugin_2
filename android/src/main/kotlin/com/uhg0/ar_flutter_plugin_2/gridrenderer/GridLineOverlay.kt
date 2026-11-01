@@ -98,12 +98,15 @@ internal class GridLineBatch(val capacitySegments: Int = DEFAULT_CAPACITY, val v
         segments++
     }
 
-    // A closed square prism, 24 mm thick. Fixed scratch arrays; no per-frame allocations.
+    // A closed square prism, up to 24 mm thick. Short segments scale down so
+    // screen-clamped ring edges cannot expand into overlapping spokes.
+    // Fixed scratch arrays; no per-frame allocations.
     private val corners = FloatArray(24)
     private fun tube(x0: Float, y0: Float, z0: Float, x1: Float, y1: Float, z1: Float, rgba: Int) {
         val dx = x1-x0; val dy = y1-y0; val dz = z1-z0
         val length = kotlin.math.sqrt(dx*dx+dy*dy+dz*dz)
         if (!length.isFinite() || length < 0.0001f) return
+        val halfWidth = minOf(0.012f, length * 0.25f)
         val nx=dx/length; val ny=dy/length; val nz=dz/length
         var ux = if (kotlin.math.abs(ny)<0.9f) -nz else 0f
         var uy = if (kotlin.math.abs(ny)<0.9f) 0f else nz
@@ -112,8 +115,8 @@ internal class GridLineBatch(val capacitySegments: Int = DEFAULT_CAPACITY, val v
         ux/=ul; uy/=ul; uz/=ul
         val vx=ny*uz-nz*uy; val vy=nz*ux-nx*uz; val vz=nx*uy-ny*ux
         for (i in 0..7) {
-            val a=if (i%4==0 || i%4==3) -0.012f else 0.012f
-            val b=if (i%4<2) -0.012f else 0.012f
+            val a=if (i%4==0 || i%4==3) -halfWidth else halfWidth
+            val b=if (i%4<2) -halfWidth else halfWidth
             corners[i*3]=(if(i<4)x0 else x1)+ux*a+vx*b
             corners[i*3+1]=(if(i<4)y0 else y1)+uy*a+vy*b
             corners[i*3+2]=(if(i<4)z0 else z1)+uz*a+vz*b

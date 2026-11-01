@@ -5,6 +5,46 @@ import ImageIO
 import simd
 import UIKit
 
+/// Actual per-frame metadata, independent of mutable device getters. Missing
+/// EXIF deliberately leaves adaptive exposure unavailable (including replay).
+protocol StillExposureFrameMetadata {
+  var stillExifData: [String: Any] { get }
+  var stillExposureDurationSeconds: Double? { get }
+}
+
+extension ARKitCaptureFrame: StillExposureFrameMetadata {
+  var stillExifData: [String: Any] {
+    if #available(iOS 16.0, *) { return frame.exifData }
+    return [:]
+  }
+  var stillExposureDurationSeconds: Double? { frame.camera.exposureDuration }
+}
+
+struct StillFrameExposureFacts {
+  var exposureSeconds: Double?
+  var iso: Double?
+
+  init(_ frame: CaptureFrame) {
+    let metadata = frame as? StillExposureFrameMetadata
+    let raw = metadata?.stillExifData ?? [:]
+    let exif = raw[kCGImagePropertyExifDictionary as String] as? [String: Any] ?? raw
+    func positive(_ value: Any?) -> Double? {
+      guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+            number.doubleValue.isFinite, number.doubleValue > 0 else { return nil }
+      return number.doubleValue
+    }
+    exposureSeconds = positive(exif[kCGImagePropertyExifExposureTime as String])
+      ?? metadata?.stillExposureDurationSeconds.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
+    let values = exif[kCGImagePropertyExifISOSpeedRatings as String] as? [Any]
+    iso = positive(values?.first) ?? positive(exif[kCGImagePropertyExifISOSpeedRatings as String])
+  }
+
+  func metering(timestamp: TimeInterval) -> AdaptiveStillExposureMetering? {
+    guard let seconds = exposureSeconds, let iso = iso, iso <= Double(Float.greatestFiniteMagnitude) else { return nil }
+    return AdaptiveStillExposureMetering(timestamp: timestamp, exposureSeconds: seconds, iso: Float(iso))
+  }
+}
+
 /// Camera intrinsics of a still: ARKit reports them for the camera's image
 /// resolution; a still of another size scales each axis. Pixel centres are
 /// at integer coordinates (OpenCV; docs/02-architecture.md, Coordinate
@@ -33,12 +73,20 @@ enum StillIntrinsics {
 enum StillImageEncoder {
   private static let context = CIContext(options: [.cacheIntermediates: false])
 
-  static func encode(_ pixelBuffer: CVPixelBuffer, quality: Int, metadata: StillExposureMetadata, deviceModel: String, format: String = "jpeg") -> Data? {
+  static func encode(_ pixelBuffer: CVPixelBuffer, quality: Int, metadata: StillExposureMetadata, deviceModel: String, format: String = "jpeg",
+                     exposure: StillFrameExposureFacts? = nil) -> Data? {
     guard let space = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
     var comment = "capture3d still highResolution=\(metadata.highResolution) exposureTimestampNs=\(metadata.exposureTimestampNs)"
     if let k = metadata.intrinsics {
       comment += " fx=\(k.x) fy=\(k.y) cx=\(k.z) cy=\(k.w) width=\(metadata.width) height=\(metadata.height)"
     }
+    var exif: [String: Any] = [
+      kCGImagePropertyExifUserComment as String: comment,
+      kCGImagePropertyExifPixelXDimension as String: metadata.width,
+      kCGImagePropertyExifPixelYDimension as String: metadata.height,
+    ]
+    if let seconds = exposure?.exposureSeconds { exif[kCGImagePropertyExifExposureTime as String] = seconds }
+    if let iso = exposure?.iso { exif[kCGImagePropertyExifISOSpeedRatings as String] = [iso] }
     let properties: [String: Any] = [
       kCGImagePropertyOrientation as String: 1,
       kCGImagePropertyTIFFDictionary as String: [
@@ -46,11 +94,7 @@ enum StillImageEncoder {
         kCGImagePropertyTIFFModel as String: deviceModel,
         kCGImagePropertyTIFFOrientation as String: 1,
       ],
-      kCGImagePropertyExifDictionary as String: [
-        kCGImagePropertyExifUserComment as String: comment,
-        kCGImagePropertyExifPixelXDimension as String: metadata.width,
-        kCGImagePropertyExifPixelYDimension as String: metadata.height,
-      ],
+      kCGImagePropertyExifDictionary as String: exif,
     ]
     let image = CIImage(cvPixelBuffer: pixelBuffer, options: [.properties: properties])
     let options: [CIImageRepresentationOption: Any] = [
@@ -78,9 +122,9 @@ struct StillCaptureFailure: Error {
   var reason: String
 }
 
-/// The still a manual shutter takes on iOS (`initializeCapture`
-/// `stillCaptureMode`; default `single`). Automatic captures always take the
-/// fast in-AR still. Every mode runs in the running AR session; the session
+/// The selected still profile on iOS (`initializeCapture`
+/// `stillCaptureMode`; default `single`), honored by manual and automatic
+/// triggers alike. Every mode runs in the running AR session; the session
 /// is never paused for a still.
 enum StillCaptureMode: String, CaseIterable {
   /// `captureHighResolutionFrame`: one 12 MP frame, about 100 ms.
@@ -88,7 +132,7 @@ enum StillCaptureMode: String, CaseIterable {
   /// Several high-resolution frames in sequence ([BurstSettings]), each
   /// with its own frame's pose, intrinsics and timestamp.
   case burst
-  /// In-AR multi-frame processing (`.balanced`), the in-AR HDR: about 490 ms.
+  /// In-AR multi-frame processing (`.balanced`); this is not guaranteed HDR.
   case inArQuality
 
   static func parse(_ value: Any?) -> StillCaptureMode? {
@@ -135,6 +179,8 @@ final class HighResolutionStillExposure: StillExposurePort {
 
   private let frameSource: () -> ARFrameSource?
   private let cameraAccess: StillCameraAccess?
+  private let controlBridge: CameraControlBridge?
+  private let assessments: StillExposureAssessments?
   private let requireRequestedQuality: Bool
   /// Immutable geometry selected by the owning AR session, not a cache hint.
   let exactStillResolution: CGSize?
@@ -152,7 +198,18 @@ final class HighResolutionStillExposure: StillExposurePort {
   private final class Cancellation {
     private let lock = NSLock()
     private var cancelled = false
-    func cancel() { lock.lock(); cancelled = true; lock.unlock() }
+    private var lease: AdaptiveStillExposureLease?
+    func cancel() {
+      lock.lock(); cancelled = true; let previous = lease; lease = nil; lock.unlock()
+      previous?.finish()
+    }
+    func own(_ value: AdaptiveStillExposureLease?) {
+      lock.lock()
+      let rejected = cancelled
+      lease = rejected ? nil : value
+      lock.unlock()
+      if rejected { value?.finish() }
+    }
     var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return cancelled }
   }
   private var cancellations: [CaptureAttemptQualifier: Cancellation] = [:]
@@ -160,12 +217,15 @@ final class HighResolutionStillExposure: StillExposurePort {
 
   init(frameSource: @escaping () -> ARFrameSource?, jpegQuality: Int, requireRequestedQuality: Bool = false,
        exactStillResolution: CGSize? = nil, cameraAccess: StillCameraAccess? = nil,
+       controlBridge: CameraControlBridge? = nil, assessments: StillExposureAssessments? = nil,
        deviceModel: String = ARCameraCapabilities.hardwareModelIdentifier(),
        // The shared coordinator confirms quality-qualified retained images.
        // Tests may still observe physical exposure callbacks independently.
        shutterFeedback: @escaping () -> Void = {}) {
     self.frameSource = frameSource
     self.cameraAccess = cameraAccess
+    self.controlBridge = controlBridge
+    self.assessments = assessments
     self.requireRequestedQuality = requireRequestedQuality
     self.exactStillResolution = exactStillResolution
     self.shutterFeedback = shutterFeedback
@@ -179,7 +239,7 @@ final class HighResolutionStillExposure: StillExposurePort {
     set { lock.lock(); configuredBurst = newValue; lock.unlock() }
   }
 
-  /// Still of the next manual shutter.
+  /// Still profile of the next manual or automatic shutter.
   var mode: StillCaptureMode {
     get { lock.lock(); defer { lock.unlock() }; return configuredMode }
     set { lock.lock(); configuredMode = newValue; lock.unlock() }
@@ -208,11 +268,12 @@ final class HighResolutionStillExposure: StillExposurePort {
     requestExposure(qualifier, required: required, lane: .automatic, callback: callback)
   }
 
-  /// Manual shutters take the configured [mode]; Auto takes the fast still.
+  /// Both shutter lanes honor the configured profile; neither changes its
+  /// format, resolution, quality mode or burst image count.
   func requestExposure(_ qualifier: CaptureAttemptQualifier, required: Set<CaptureComponentKind>, lane: CaptureLane,
                        callback: @escaping (StillExposureOutcome) -> Void) -> Bool {
     guard required == (format == "heic" ? [.heic] : [.jpeg]) else { return false }
-    let mode = lane == .manual ? self.mode : .single
+    let mode = self.mode
     if mode == .burst || mode == .inArQuality {
       guard format == "jpeg", frameSource() != nil else { return false }
     }
@@ -228,7 +289,8 @@ final class HighResolutionStillExposure: StillExposurePort {
     }
     if mode == .burst || mode == .inArQuality {
       let settings = mode == .burst ? burst : BurstSettings(imageCount: 1, intervalMs: 0)
-      captureShot(mode: mode == .burst ? .burst : .quality, settings: settings, isCancelled: isCancelled) { result in
+      captureShot(mode: mode == .burst ? .burst : .quality, settings: settings, isCancelled: isCancelled,
+                  leasePrepared: cancellation.own, qualifier: qualifier, lane: lane) { result in
         switch result {
         case .success(let shot):
           finish(StillImageQualityGate.outcome(for: StillComponentSet(
@@ -239,7 +301,8 @@ final class HighResolutionStillExposure: StillExposurePort {
       }
       return true
     }
-    let requested = captureStill(quality: .fast, isCancelled: isCancelled) { result in
+    let requested = captureStill(quality: .fast, isCancelled: isCancelled, leasePrepared: cancellation.own,
+                                 qualifier: qualifier, lane: lane, captureMode: mode) { result in
       switch result {
       case .success(let still):
         finish(StillImageQualityGate.outcome(for: StillComponentSet(
@@ -267,10 +330,15 @@ final class HighResolutionStillExposure: StillExposurePort {
   /// One encoded still. Returns false when no frame source is available;
   /// otherwise [completion] runs exactly once on the encode queue.
   func captureStill(quality: StillFrameQuality = .fast, isCancelled: @escaping () -> Bool = { false },
-                    frameCaptured: (() -> Void)? = nil,
+                    frameCaptured: (() -> Void)? = nil, ordinarySingle: Bool = true,
+                    leasePrepared: ((AdaptiveStillExposureLease?) -> Void)? = nil,
+                    qualifier: CaptureAttemptQualifier? = nil, lane: CaptureLane = .automatic,
+                    captureMode: StillCaptureMode = .single,
                     completion: @escaping (Result<EncodedStill, StillCaptureFailure>) -> Void) -> Bool {
     guard let source = frameSource() else { return false }
     let requestedAt = DispatchTime.now().uptimeNanoseconds
+    // Written/read on the same physical camera queue before its frame callback.
+    var adaptiveTarget: AdaptiveStillExposurePlan?
     let receive: (CaptureFrame?, Error?) -> Void = { [weak self, weak source] frame, error in
       guard let self = self else { return completion(.failure(StillCaptureFailure(reason: "closed"))) }
       if isCancelled() { return completion(.failure(StillCaptureFailure(reason: "cancelled"))) }
@@ -287,7 +355,8 @@ final class HighResolutionStillExposure: StillExposurePort {
         if !isCancelled(), source?.replaysRecordedStills == false {
           (frameCaptured ?? self.shutterFeedback)()
         }
-        self.process(frame, highResolution: true, requestedAt: requestedAt, isCancelled: isCancelled, completion: completion)
+        self.process(frame, highResolution: true, requestedAt: requestedAt, isCancelled: isCancelled, target: adaptiveTarget,
+                     qualifier: qualifier, lane: lane, captureMode: captureMode, completion: completion)
       } else if !self.requireRequestedQuality, self.exactStillResolution == nil,
                 let current = source?.currentFrame,
                 ProcessInfo.processInfo.systemUptime - current.timestamp < Self.maximumFallbackFrameAge {
@@ -295,7 +364,8 @@ final class HighResolutionStillExposure: StillExposurePort {
         if !isCancelled(), source?.replaysRecordedStills == false {
           (frameCaptured ?? self.shutterFeedback)()
         }
-        self.process(current, highResolution: false, requestedAt: requestedAt, isCancelled: isCancelled, completion: completion)
+        self.process(current, highResolution: false, requestedAt: requestedAt, isCancelled: isCancelled, target: adaptiveTarget,
+                     qualifier: qualifier, lane: lane, captureMode: captureMode, completion: completion)
       } else {
         self.record { $0.failures += 1 }
         completion(.failure(StillCaptureFailure(reason: "high-resolution-frame-unavailable")))
@@ -303,11 +373,39 @@ final class HighResolutionStillExposure: StillExposurePort {
     }
     let request: (@escaping StillCameraAccess.FrameCompletion) -> Void = { completion in
       guard !isCancelled() else { return completion(nil, StillCaptureFailure(reason: "cancelled")) }
-      if self.requireRequestedQuality {
-        source.captureHighResolutionFrameForProfile(quality: quality, completion: completion)
-      } else {
-        source.captureHighResolutionFrame(quality: quality, completion: completion)
+      let permitted = self.cameraAccess?.currentCapturePermission() ?? { true }
+      // Recorded stills are file reads and remain available while replay is
+      // idle/paused; its source rejects disposal itself. Live physical capture
+      // requires a running session, including after an asynchronous apply ACK.
+      let sourceAvailable = {
+        source.replaysRecordedStills ? source.lifecycleState != .disposed : source.lifecycleState == .running
       }
+      guard sourceAvailable() else { return completion(nil, StillCaptureFailure(reason: "camera-stopped")) }
+      let begin: (AdaptiveStillExposureLease?) -> Void = { lease in
+        guard !isCancelled(), permitted(), sourceAvailable() else {
+          lease?.finish()
+          return completion(nil, StillCaptureFailure(reason: isCancelled() ? "cancelled" : "camera-stopped"))
+        }
+        adaptiveTarget = lease?.plan
+        leasePrepared?(lease)
+        let captured: StillCameraAccess.FrameCompletion = { frame, error in
+          // Restore on the owner queue before it releases this physical frame.
+          // Encoding uses the returned frame's EXIF, never restored getters.
+          lease?.finish()
+          leasePrepared?(nil)
+          completion(frame, error)
+        }
+        if self.requireRequestedQuality {
+          source.captureHighResolutionFrameForProfile(quality: quality, completion: captured)
+        } else {
+          source.captureHighResolutionFrame(quality: quality, completion: captured)
+        }
+      }
+      guard !source.replaysRecordedStills, let bridge = self.controlBridge,
+            let scheduler = self.cameraAccess else { return begin(nil) }
+      let sample = source.currentFrame.flatMap { StillFrameExposureFacts($0).metering(timestamp: $0.timestamp) }
+      bridge.prepareAdaptiveStillExposure(metering: sample, ordinarySingle: ordinarySingle, scheduler: scheduler,
+        isCancelled: { isCancelled() || !permitted() }, ready: begin)
     }
     if let cameraAccess = cameraAccess { cameraAccess.capture(request, completion: receive) }
     else { request(receive) }
@@ -315,8 +413,10 @@ final class HighResolutionStillExposure: StillExposurePort {
   }
 
   private func process(_ frame: CaptureFrame, highResolution: Bool, requestedAt: UInt64, isCancelled: @escaping () -> Bool,
-                       completion: @escaping (Result<EncodedStill, StillCaptureFailure>) -> Void) {
+                       target: AdaptiveStillExposurePlan?, qualifier: CaptureAttemptQualifier?, lane: CaptureLane,
+                       captureMode: StillCaptureMode, completion: @escaping (Result<EncodedStill, StillCaptureFailure>) -> Void) {
     let pixelBuffer = frame.capturedImage
+    let facts = StillFrameExposureFacts(frame)
     let timestamp = frame.timestamp
     let width = CVPixelBufferGetWidth(pixelBuffer)
     let height = CVPixelBufferGetHeight(pixelBuffer)
@@ -334,13 +434,23 @@ final class HighResolutionStillExposure: StillExposurePort {
       if isCancelled() { return completion(.failure(StillCaptureFailure(reason: "cancelled"))) }
       let started = DispatchTime.now().uptimeNanoseconds
       let format = self.format
-      guard let jpeg = StillImageEncoder.encode(pixelBuffer, quality: self.jpegQuality, metadata: metadata, deviceModel: self.deviceModel, format: format) else {
+      guard let jpeg = StillImageEncoder.encode(pixelBuffer, quality: self.jpegQuality, metadata: metadata, deviceModel: self.deviceModel, format: format, exposure: facts) else {
         self.record { $0.failures += 1 }
         return completion(.failure(StillCaptureFailure(reason: "image-encode-failed")))
       }
       let encodeMs = Double(DispatchTime.now().uptimeNanoseconds - started) / 1e6
       let sharpness = LaplacianSharpness.analyze(jpeg: jpeg)
       metadata.sharpness = sharpness?.score
+      // Quality assessment only: passing sharpness does not mean the attempt
+      // was admitted, durably retained or later credited as coverage.
+      self.assessments?.append(StillExposureAssessment(
+        attemptId: qualifier?.identity.attemptId, commitId: qualifier?.identity.commitId,
+        attemptOrdinal: qualifier?.identity.attemptOrdinal,
+        lane: lane == .manual ? "manual" : "automatic", mode: captureMode.rawValue, format: format,
+        exposureTimestampNs: metadata.exposureTimestampNs, exposureSeconds: facts.exposureSeconds, iso: facts.iso,
+        targetExposureSeconds: target?.exposureSeconds, targetISO: target?.iso, sharpness: sharpness?.score,
+        assessment: sharpness.map { $0.score >= LaplacianSharpness.productionThreshold ? "sharpness-passed" : "REJECTED_BLUR" }
+          ?? "QUALITY_ANALYSIS_FAILED"))
       self.record {
         if highResolution { $0.highResolution += 1 } else { $0.videoFallback += 1 }
         $0.lastEncodeMs = encodeMs
@@ -363,6 +473,8 @@ final class HighResolutionStillExposure: StillExposurePort {
   /// the burst with the images taken so far.
   func captureShot(mode: StillShotMode, settings: BurstSettings, isCancelled: @escaping () -> Bool = { false },
                    didEncode: ((Int) -> Void)? = nil,
+                   leasePrepared: ((AdaptiveStillExposureLease?) -> Void)? = nil,
+                   qualifier: CaptureAttemptQualifier? = nil, lane: CaptureLane = .automatic,
                    completion: @escaping (Result<CapturedShot, StillCaptureFailure>) -> Void) {
     let quality: StillFrameQuality = mode == .quality ? .balanced : .fast
     var images: [ShotImage] = []
@@ -380,7 +492,9 @@ final class HighResolutionStillExposure: StillExposurePort {
     func next() {
       if isCancelled() { return finish(.failure(StillCaptureFailure(reason: "cancelled"))) }
       let started = captureStill(quality: quality, isCancelled: isCancelled,
-                                 frameCaptured: mode == .burst ? {} : nil) { [weak self] result in
+                                 frameCaptured: mode == .burst ? {} : nil, ordinarySingle: mode == .quality,
+                                 leasePrepared: leasePrepared, qualifier: qualifier, lane: lane,
+                                 captureMode: mode == .burst ? .burst : .inArQuality) { [weak self] result in
         switch result {
         case .success(let still):
           didEncode?(still.encodingDurationUs)

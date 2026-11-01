@@ -287,8 +287,14 @@ final class NativeCaptureChannel: CaptureChannelExtension {
       existing.jpegQuality = parsed.jpegQuality
       exposure = existing
     } else {
+      // Bind adaptive exposure even when the controls panel was never opened.
+      // Replay and unsupported devices retain ordinary ARKit exposure.
+      if !frameSource.replaysRecordedStills, controls == nil, let device = controlDevice() {
+        controls = CameraControlBridge(device: device)
+      }
       exposure = HighResolutionStillExposure(frameSource: { [weak frameSource] in frameSource },
-        jpegQuality: parsed.jpegQuality, exactStillResolution: exact, cameraAccess: cameraAccess)
+        jpegQuality: parsed.jpegQuality, exactStillResolution: exact, cameraAccess: cameraAccess,
+        controlBridge: controls, assessments: .shared)
       stills = exposure
     }
     exposure.format = parsed.format
