@@ -64,13 +64,13 @@ internal class GridRendererCore(
     ): Int {
         batch.clear()
         for (overlay in lineOverlays) {
-            if (overlay.drawOnTop) continue
+            if (overlay.volumetric != batch.volumetric || overlay.drawOnTop) continue
             overlay.setView(focalPx, pxPerDp)
             overlay.buildLines(camX, camY, camZ, batch)
         }
         batch.endDepthTested()
         for (overlay in lineOverlays) {
-            if (!overlay.drawOnTop) continue
+            if (overlay.volumetric != batch.volumetric || !overlay.drawOnTop) continue
             overlay.setView(focalPx, pxPerDp)
             overlay.buildLines(camX, camY, camZ, batch)
         }

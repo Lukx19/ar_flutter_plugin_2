@@ -1,4 +1,6 @@
 import ARKit
+import ImageIO
+import UniformTypeIdentifiers
 import XCTest
 @testable import ar_flutter_plugin_2
 
@@ -6,8 +8,8 @@ import XCTest
 /// no ARKit camera: a frame source fake answers the still requests): every
 /// burst image comes from its own frame with its own pose, intrinsics and
 /// timestamp; an image taken while tracking is limited is kept and flagged;
-/// quality asks for balanced multi-frame processing; Auto stays the fast
-/// single still; a replay's repeated nearest still ends the burst; a
+/// quality asks for balanced multi-frame processing on either capture lane;
+/// a replay's repeated nearest still ends the burst; a
 /// recording without stills keeps shots single; video HDR is a creation
 /// option.
 final class BurstShotCaptureTests: XCTestCase {
@@ -24,7 +26,7 @@ final class BurstShotCaptureTests: XCTestCase {
   private func expose(_ exposure: HighResolutionStillExposure, lane: CaptureLane = .manual) throws -> StillComponentSet {
     let done = expectation(description: "exposure")
     var outcome: StillExposureOutcome?
-    XCTAssertTrue(exposure.requestExposure(qualifier(), required: [.jpeg], lane: lane) {
+    XCTAssertTrue(exposure.requestExposure(qualifier(), required: exposure.format == "heic" ? [.heic] : [.jpeg], lane: lane) {
       outcome = $0
       done.fulfill()
     })
@@ -183,12 +185,54 @@ final class BurstShotCaptureTests: XCTestCase {
     XCTAssertEqual(source.qualities, [.balanced])
   }
 
-  func testAutomaticCapturesTakeTheFastSingleStill() throws {
+  func testAutomaticCapturesHonorConfiguredQualityMode() throws {
     let source = source([ShotFixture.frame(timestamp: 30, pose: ShotFixture.pose(x: 3))])
-    let exposure = HighResolutionStillExposure(frameSource: { source }, jpegQuality: 90, deviceModel: "test")
+    source.replaysRecordedStills = true
+    let exposure = HighResolutionStillExposure(
+      frameSource: { source }, jpegQuality: 90, deviceModel: "test")
+    exposure.mode = .inArQuality
+    let set = try expose(exposure, lane: .automatic)
+    let shot = try XCTUnwrap(set.shot)
+    XCTAssertEqual(shot.mode, .quality)
+    XCTAssertEqual(shot.images.count, 1)
+    XCTAssertEqual(
+      source.qualities, [.balanced], "automatic capture must honor the selected quality profile")
+  }
+
+  func testAutomaticCapturesHonorConfiguredBurstMode() throws {
+    let source = source([
+      ShotFixture.frame(timestamp: 30, pose: ShotFixture.pose(x: 3)),
+      ShotFixture.frame(timestamp: 30.2, pose: ShotFixture.pose(x: 3.02)),
+    ])
+    source.replaysRecordedStills = true
+    let exposure = HighResolutionStillExposure(
+      frameSource: { source }, jpegQuality: 90, deviceModel: "test")
     exposure.mode = .burst
+    exposure.burst = BurstSettings(imageCount: 2, intervalMs: 0)
+    let set = try expose(exposure, lane: .automatic)
+    let shot = try XCTUnwrap(set.shot)
+    XCTAssertEqual(shot.mode, .burst)
+    XCTAssertEqual(shot.images.count, 2)
+    XCTAssertEqual(
+      source.qualities, [.fast, .fast], "automatic capture must retain every configured burst frame"
+    )
+  }
+
+  func testAutomaticSingleCaptureKeepsSelectedHeicAndExactResolution() throws {
+    let source = source([ShotFixture.frame(timestamp: 30, pose: ShotFixture.pose(x: 3))])
+    source.replaysRecordedStills = true
+    let exposure = HighResolutionStillExposure(
+      frameSource: { source }, jpegQuality: 95,
+      exactStillResolution: CGSize(width: 64, height: 48), deviceModel: "test")
+    exposure.format = "heic"
     let set = try expose(exposure, lane: .automatic)
     XCTAssertNil(set.shot)
+    XCTAssertEqual(set.components.map { $0.0 }, [.heic])
+    let bytes = try XCTUnwrap(set.components.first?.1)
+    let image = try XCTUnwrap(CGImageSourceCreateWithData(Data(bytes) as CFData, nil))
+    XCTAssertEqual(CGImageSourceGetType(image) as String?, UTType.heic.identifier)
+    XCTAssertEqual(set.metadata.width, 64)
+    XCTAssertEqual(set.metadata.height, 48)
     XCTAssertEqual(source.qualities, [.fast])
   }
 

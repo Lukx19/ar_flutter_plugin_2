@@ -42,6 +42,7 @@ struct GridStyleUniforms {
   var summaryKind: Int32 = 0
   var residencyFilter: Int32 = -1
   var alpha: Float = 1
+  var focusCount: Int32 = 0
 }
 
 /// The grid styles drawn from the persistent instance buffers with Metal
@@ -72,6 +73,9 @@ final class GridStyleDrawSet {
 
   let device: MTLDevice
   private let points: MTLRenderPipelineState
+  private var focusUniform = [Float](repeating: 0, count: 64 * 4)
+  private var focusCount = 0
+  private var focusVersion = -1
   private let splatDepth: MTLRenderPipelineState
   private let splatColour: MTLRenderPipelineState
   private let spike: MTLRenderPipelineState
@@ -85,7 +89,7 @@ final class GridStyleDrawSet {
   private let depthLessEqualRead: MTLDepthStencilState?
   private let depthLessRead: MTLDepthStencilState?
   private let depthAlways: MTLDepthStencilState?
-  /// Colour tables: 256 x 5 RGBA8, row = colour attribute code.
+  /// Colour tables: 256 x 6 RGBA8, row = colour attribute code.
   let colourTexture: MTLTexture
   private var tablesVersion = -1
   private var targetFloats = [Float](
@@ -96,6 +100,9 @@ final class GridStyleDrawSet {
   private var lineRing: [MTLBuffer]
   private var lineRingValue: [UInt64]
   private var lineSlot = 0
+  private var volumeRing: [MTLBuffer]
+  private var volumeRingValue: [UInt64]
+  private var volumeSlot = 0
   private var rawPointRing: [MTLBuffer]
   private var rawPointRingValue: [UInt64]
   private var rawPointSlot = 0
@@ -189,6 +196,16 @@ final class GridStyleDrawSet {
     }
     lineRing = ring
     lineRingValue = Array(repeating: 0, count: GridStyleDrawSet.lineRingSlots)
+    var volumes: [MTLBuffer] = []
+    for s in 0..<GridStyleDrawSet.lineRingSlots {
+      guard let b = device.makeBuffer(length: 2048 * 36 * GridLineBatch.vertexBytes, options: .storageModeShared) else {
+        throw GridRendererAllocationError(buffer: "overlay volumes", bytes: 2048 * 36 * GridLineBatch.vertexBytes)
+      }
+      b.label = "grid overlay volumes \(s)"
+      volumes.append(b)
+    }
+    volumeRing = volumes
+    volumeRingValue = Array(repeating: 0, count: GridStyleDrawSet.lineRingSlots)
     var pointRing: [MTLBuffer] = []
     let pointBytes = GridStyleDrawSet.maxRawFeaturePoints * GridStyleDrawSet.rawPointBytes
     for s in 0..<GridStyleDrawSet.lineRingSlots {
@@ -206,6 +223,11 @@ final class GridStyleDrawSet {
   /// targets when the display handler has newer ones. Render thread, while
   /// [target] has an open upload frame.
   func syncDisplayResources(_ display: DisplayModeHandler, target: MetalStagedBufferTarget) {
+    let focusKnown = display.currentFocusVersion
+    if focusKnown != focusVersion {
+      focusCount = max(0, display.snapshotFocus(into: &focusUniform, knownVersion: focusVersion))
+      focusVersion = focusKnown
+    }
     if display.currentTablesVersion != tablesVersion {
       var staged: (MTLBuffer, Int)?
       var version = -1
@@ -254,10 +276,15 @@ final class GridStyleDrawSet {
     var base = GridStyleUniforms()
     base.viewProj = view.viewProjection
     base.camPos = SIMD4(view.cameraPosition, 1)
+    base.focusCount = mode.has(GridDisplayCodes.overlayFocusPriority) ? Int32(focusCount) : 0
+    focusUniform.withUnsafeBytes { bytes in
+      encoder.setVertexBytes(bytes.baseAddress!, length: bytes.count, index: 2)
+    }
     base.focalPx = view.focalPx
     base.colorAttr = Int32(mode.colourAttribute)
     base.sizeRule = Int32(mode.sizeRule)
     base.minQuality = Int32(mode.minQuality)
+    base.alpha = mode.has(GridDisplayCodes.overlayHalfTransparency) ? 0.5 : 1
     switch mode.baseLayer {
     case GridDisplayCodes.basePoints:
       drawPoints(encoder, base, buffers, store, selectedOnly: false, fixedPx: mode.pointSizePx)
@@ -290,29 +317,42 @@ final class GridStyleDrawSet {
   func drawLines(_ encoder: MTLRenderCommandEncoder, batch: GridLineBatch, view: GridFrameView,
                  completion: GridFrameCompletion, frameValue: UInt64) {
     if batch.segments == 0 { return }
+    let buffer: MTLBuffer
+    if batch.volumetric {
+      volumeSlot = (volumeSlot + 1) % volumeRing.count
+      if completion.completedValue < volumeRingValue[volumeSlot] {
+        lineSlotBusyFrames += 1
+        return
+      }
+      buffer = volumeRing[volumeSlot]
+      volumeRingValue[volumeSlot] = frameValue
+    } else {
     lineSlot = (lineSlot + 1) % lineRing.count
     if completion.completedValue < lineRingValue[lineSlot] {
       lineSlotBusyFrames += 1
       return
     }
-    let buffer = lineRing[lineSlot]
+    buffer = lineRing[lineSlot]
+    lineRingValue[lineSlot] = frameValue
+    }
     let bytes = min(batch.byteCount, buffer.length)
     buffer.contents().copyMemory(from: batch.vertices, byteCount: bytes)
-    lineRingValue[lineSlot] = frameValue
     var u = GridStyleUniforms()
     u.viewProj = view.viewProjection
     encoder.setRenderPipelineState(lines)
     encoder.setVertexBuffer(buffer, offset: 0, index: 0)
     setUniforms(encoder, &u)
+    let primitive: MTLPrimitiveType = batch.volumetric ? .triangle : .line
+    let vertexCount = batch.verticesPerSegment
     let tested = batch.depthTestedSegments
     if tested > 0 {
       if let d = depthLessWrite { encoder.setDepthStencilState(d) }
-      encoder.drawPrimitives(type: .line, vertexStart: 0, vertexCount: tested * 2)
+      encoder.drawPrimitives(type: primitive, vertexStart: 0, vertexCount: tested * vertexCount)
       counters.drawCalls += 1
     }
     if batch.segments > tested {
       if let d = depthAlways { encoder.setDepthStencilState(d) }
-      encoder.drawPrimitives(type: .line, vertexStart: tested * 2, vertexCount: (batch.segments - tested) * 2)
+      encoder.drawPrimitives(type: primitive, vertexStart: tested * vertexCount, vertexCount: (batch.segments - tested) * vertexCount)
       counters.drawCalls += 1
     }
     counters.lineSegments = batch.segments
@@ -401,7 +441,11 @@ final class GridStyleDrawSet {
   /// Soft splats in two passes ("visibility splatting"), as on Android: pass
   /// 1 writes only depth, pushed back by a depth bias; pass 2 blends the
   /// colour of every splat in front of that depth without writing depth, so
-  /// coplanar splats accumulate while hidden surfaces stay hidden.
+  /// coplanar splats accumulate while hidden surfaces stay hidden. The
+  /// half-transparency flag uses an identical checkerboard discard in both
+  /// passes and opaque surviving fragments: overlap never fills the camera
+  /// pixels. This is spatial transparency, with no extra framebuffer; depth
+  /// comes from reconstructed surfels rather than live camera scene depth.
   private func drawSplats(_ encoder: MTLRenderCommandEncoder, _ base: GridStyleUniforms, _ buffers: MetalStagedBufferTarget) {
     guard let surfaces = buffers.metalBuffer(.surfaces) else { return }
     encoder.setRenderPipelineState(splatDepth)

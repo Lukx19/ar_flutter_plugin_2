@@ -385,26 +385,105 @@ final class GridLineOverlayTests: XCTestCase {
     XCTAssertTrue(layer.greyOutside)
   }
 
-  func testQuestLinesDrawOnTopAfterDepthTestedOverlaysWithTheFramesScreenScale() {
+  func testQuestVolumesAreDepthTestedAndDiagnosticLinesRemainSeparate() {
     let core = GridRendererCore(target: ByteArrayGpuTarget())
     let quest = QuestLineOverlay()
-    // Registered first, still collected after the depth-tested overlay.
     core.addLineOverlay(quest)
     core.addLineOverlay(DepthTestedOverlay())
     XCTAssertEqual(core.display(questReference), .overlay)
-    XCTAssertTrue(core.scopeOverlay() === quest)
-    let batch = GridLineBatch()
-    // 10.5 m from the standpoint: the far ring's outer loop is raised to 24
-    // dp (24 px radius at density 2); the first loop is 0.8 of that.
+    let lines = GridLineBatch()
+    XCTAssertEqual(core.buildOverlayLines(camX: 2, camY: 1.2, camZ: 12, batch: lines), 1)
+    let batch = GridLineBatch(capacitySegments: 2048, volumetric: true)
     XCTAssertGreaterThan(core.buildOverlayLines(camX: 2, camY: 1.2, camZ: 12, batch: batch, focalPx: 1500, pxPerDp: 2), 1)
-    XCTAssertEqual(batch.depthTestedSegments, 1)
-    XCTAssertEqual(simd_length(vertex(batch, 2) - SIMD3(2, 1.2, 1.5)), 0.8 * 24 * 10.5 / 1500, accuracy: 1e-5)
-    // Without a focal length the ring keeps its 8 cm world radius.
-    core.buildOverlayLines(camX: 2, camY: 1.2, camZ: 12, batch: batch)
-    XCTAssertEqual(simd_length(vertex(batch, 2) - SIMD3(2, 1.2, 1.5)), 0.8 * 0.08, accuracy: 1e-5)
-    // A truncated quest message is rejected and keeps the shown frame.
+    XCTAssertEqual(batch.depthTestedSegments, batch.segments)
+    XCTAssertEqual(batch.verticesPerSegment, 36)
+    XCTAssertEqual(simd_length(vertex(batch, 0) - SIMD3(2, 1.2, 1.5)), 0.8 * 24 * 10.5 / 1500, accuracy: 0.02)
     XCTAssertEqual(core.display(questReference.prefix(12)), .rejected)
     XCTAssertEqual(quest.layer.rejectedMessages, 1)
+  }
+
+  func testVolumeBufferBoundsWholeTubesAndRejectsInvalidSegments() {
+    let batch = GridLineBatch(capacitySegments: 1, volumetric: true)
+    batch.line(0,0,0,0,0,0,rgba: 0)
+    batch.line(0,0,0,.nan,1,0,rgba: 0)
+    XCTAssertEqual(batch.segments,0)
+    batch.line(0,0,0,0,1,0,rgba: 0x12345678)
+    XCTAssertEqual(batch.segments,1)
+    XCTAssertEqual(batch.byteCount,36*16)
+    for i in 0..<36 {
+      XCTAssertEqual(abs(vertex(batch,i).x),0.012,accuracy: 1e-6)
+      XCTAssertEqual(vertexByte(batch,i*16+12),0x12)
+    }
+    batch.line(0,0,0,1,0,0,rgba: 0)
+    XCTAssertEqual(batch.dropped,1)
+    batch.clear()
+    XCTAssertEqual(batch.segments,0)
+  }
+
+  func testProjectedNearAndFarQuestVolumesRetainAHollowCameraAperture() {
+    let frame = QuestOverlayFrame()
+    frame.layers = QuestOverlayLayout.layerDonuts
+    frame.donutCount = 1
+    frame.donutAim[2] = -1
+    let geometry = QuestOverlayGeometry()
+    // Distance, physical focal pixels, display density. Close rings must
+    // preserve an aperture after the real volume builder expands their lines.
+    let views: [(Float, Float, Float)] = [
+      (0.3, 1500, 3), (0.3, 3000, 3), (1.5, 1500, 2), (10.5, 1500, 2),
+    ]
+    for (distance, focal, density) in views {
+      geometry.setView(focalPx: focal, pxPerDp: density)
+      let batch = GridLineBatch(capacitySegments: 128, volumetric: true)
+      _ = geometry.build(frame, camX: 0, camY: 0, camZ: distance, sink: batch)
+      let segments = distance > QuestOverlayGeometry.farMetres ? 16 : 32
+      XCTAssertEqual(batch.segments, 3 * segments)
+      XCTAssertEqual(batch.dropped, 0)
+      let expectedRadiusPx = min(max(0.08 * focal / distance, 12 * density), 48 * density)
+      var aperturePx = Float.infinity
+      var extentPx: Float = 0
+      for at in stride(from: 0, to: batch.segments * batch.verticesPerSegment, by: 3) {
+        let triangle = (0..<3).map { j -> SIMD2<Float> in
+          let point = vertex(batch, at + j)
+          let projected = SIMD2(point.x, point.y) * focal / (distance - point.z)
+          extentPx = max(extentPx, simd_length(projected))
+          return projected
+        }
+        aperturePx = min(aperturePx, originToTriangle(triangle))
+      }
+      XCTAssertGreaterThanOrEqual(
+        aperturePx, 0.55 * expectedRadiusPx, "camera ring must remain hollow at \(distance) m")
+      XCTAssertLessThanOrEqual(
+        extentPx, 1.15 * expectedRadiusPx,
+        "tube thickness must respect the screen-size clamp at \(distance) m")
+    }
+  }
+
+  /// Minimum distance to a projected filled triangle, including degenerate faces.
+  private func originToTriangle(_ p: [SIMD2<Float>]) -> Float {
+    func cross(_ a: SIMD2<Float>, _ b: SIMD2<Float>) -> Float { a.x * b.y - a.y * b.x }
+    let a = cross(p[0], p[1]), b = cross(p[1], p[2]), c = cross(p[2], p[0])
+    if abs(a + b + c) > 1e-6 && ((a >= 0 && b >= 0 && c >= 0) || (a <= 0 && b <= 0 && c <= 0)) {
+      return 0
+    }
+    var result = Float.infinity
+    for i in 0..<3 {
+      let start = p[i], delta = p[(i + 1) % 3] - start
+      let lengthSquared = simd_length_squared(delta)
+      let t: Float =
+        lengthSquared > 1e-12 ? min(max(-simd_dot(start, delta) / lengthSquared, 0), 1) : 0
+      result = min(result, simd_length(start + t * delta))
+    }
+    return result
+  }
+
+  func testNearLensTargetHidesRatherThanMovingToTheSurface() {
+    let layer = QuestOverlayLayer()
+    XCTAssertEqual(questReference.withUnsafeBytes { layer.onMessage($0) }, .ok)
+    let r = SegmentRecorder()
+    XCTAssertEqual(layer.buildLines(camX:2,camY:1.2,camZ:1.5,sink:r),10+20+4)
+    let away = SegmentRecorder()
+    _ = layer.buildLines(camX:2,camY:1.2,camZ:1.8,sink:away)
+    for i in 0..<96 { XCTAssertEqual(away.segments[i].a.z,1.5,accuracy:1e-6) }
   }
 
   private final class DepthTestedOverlay: GridLineOverlay {

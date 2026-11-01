@@ -39,7 +39,7 @@ class QuestLineOverlayTest {
         core.lineOverlays.add(overlay)
         val message = reference()
         assertEquals(DisplayIntake.OVERLAY, core.onDisplayMessage(message, 0, message.capacity()))
-        val batch = GridLineBatch()
+        val batch = GridLineBatch(capacitySegments = 2048, volumetric = true)
         val segments = core.buildOverlayLines(2f, 1.6f, 2f, batch)
         assertTrue(segments > 0)
         assertSame(overlay, core.scopeOverlay())
@@ -79,23 +79,83 @@ class QuestLineOverlayTest {
     }
 
     @Test
-    fun `quest lines draw on top after depth-tested overlays with the frame's screen scale`() {
+    fun `quest volumes are depth tested and diagnostic lines remain separate`() {
         val core = GridRendererCore(ByteArrayGpuTarget())
-        // Registered first, still collected after the depth-tested overlay.
         core.lineOverlays.add(QuestLineOverlay())
         core.lineOverlays.add(DepthTestedOverlay())
         val message = reference()
         core.onDisplayMessage(message, 0, message.capacity())
-        val batch = GridLineBatch()
-        // 10.5 m from the standpoint: the far ring's outer loop would be 11 px
-        // across at 1500 px focal length, so it is raised to 24 dp (24 px
-        // radius at density 2); the first loop is 0.8 of that.
-        assertTrue(core.buildOverlayLines(2f, 1.2f, 12f, batch, focalPx = 1500f, pxPerDp = 2f) > 1)
-        assertEquals(1, batch.depthTestedSegments)
-        assertEquals(0x00, batch.vertices.get(12).toInt())
-        assertEquals(0.8f * 24f * 10.5f / 1500f, standpointDistance(batch, 2), 1e-5f)
-        // Without a focal length the ring keeps its 8 cm world radius.
-        core.buildOverlayLines(2f, 1.2f, 12f, batch)
-        assertEquals(0.8f * 0.08f, standpointDistance(batch, 2), 1e-5f)
+        val lines = GridLineBatch()
+        assertEquals(1, core.buildOverlayLines(2f, 1.2f, 12f, lines))
+        val volume = GridLineBatch(capacitySegments = 2048, volumetric = true)
+        assertTrue(core.buildOverlayLines(2f, 1.2f, 12f, volume, focalPx = 1500f, pxPerDp = 2f) > 1)
+        assertEquals(volume.segments, volume.depthTestedSegments)
+        assertEquals(36, volume.verticesPerSegment)
+        assertTrue(kotlin.math.abs(standpointDistance(volume, 0) - 0.8f*24f*10.5f/1500f)<0.02f)
+    }
+
+    @Test
+    fun `projected near and far quest volumes retain a hollow camera aperture`() {
+        val frame = QuestOverlayFrame().apply {
+            layers = QuestOverlayLayout.LAYER_DONUTS
+            donutCount = 1
+            donutAim[2] = -1f
+        }
+        val geometry = QuestOverlayGeometry()
+        // Distance, physical focal pixels, display density. The first two
+        // reproduce a screen-clamped camera ring close to the phone lens.
+        val views = arrayOf(
+            floatArrayOf(0.3f, 1500f, 3f),
+            floatArrayOf(0.3f, 3000f, 3f),
+            floatArrayOf(1.5f, 1500f, 2f),
+            floatArrayOf(10.5f, 1500f, 2f),
+        )
+        for ((distance, focal, density) in views) {
+            geometry.setView(focal, density)
+            val batch = GridLineBatch(capacitySegments = 128, volumetric = true)
+            geometry.build(frame, 0f, 0f, distance, OverlayLineSink(batch::line))
+            val segments = if (distance > QuestOverlayGeometry.FAR_METRES) 16 else 32
+            assertEquals(3 * segments, batch.segments)
+            assertEquals(0L, batch.dropped)
+            val expectedRadiusPx = (0.08f * focal / distance).coerceIn(12f * density, 48f * density)
+            var aperturePx = Float.POSITIVE_INFINITY
+            var extentPx = 0f
+            for (at in 0 until batch.segments * batch.verticesPerSegment step 3) {
+                val triangle = Array(3) { j ->
+                    val offset = (at + j) * GridLineBatch.VERTEX_BYTES
+                    val scale = focal / (distance - batch.vertices.getFloat(offset + 8))
+                    val x = batch.vertices.getFloat(offset) * scale
+                    val y = batch.vertices.getFloat(offset + 4) * scale
+                    extentPx = maxOf(extentPx, kotlin.math.sqrt(x * x + y * y))
+                    floatArrayOf(x, y)
+                }
+                aperturePx = minOf(aperturePx, originToTriangle(triangle))
+            }
+            assertTrue("camera ring must remain hollow at $distance m: $aperturePx px", aperturePx >= 0.55f * expectedRadiusPx)
+            assertTrue("tube thickness must respect the screen-size clamp at $distance m: $extentPx px", extentPx <= 1.15f * expectedRadiusPx)
+        }
+    }
+
+    /** Minimum distance to a projected filled triangle, including edges and degenerate faces. */
+    private fun originToTriangle(p: Array<FloatArray>): Float {
+        fun cross(a: FloatArray, b: FloatArray) = a[0] * b[1] - a[1] * b[0]
+        val a = cross(p[0], p[1])
+        val b = cross(p[1], p[2])
+        val c = cross(p[2], p[0])
+        if (kotlin.math.abs(a + b + c) > 1e-6f &&
+            ((a >= 0f && b >= 0f && c >= 0f) || (a <= 0f && b <= 0f && c <= 0f))) return 0f
+        var result = Float.POSITIVE_INFINITY
+        for (i in 0..2) {
+            val start = p[i]
+            val end = p[(i + 1) % 3]
+            val dx = end[0] - start[0]
+            val dy = end[1] - start[1]
+            val lengthSquared = dx * dx + dy * dy
+            val t = if (lengthSquared > 1e-12f) (-(start[0] * dx + start[1] * dy) / lengthSquared).coerceIn(0f, 1f) else 0f
+            val x = start[0] + t * dx
+            val y = start[1] + t * dy
+            result = minOf(result, kotlin.math.sqrt(x * x + y * y))
+        }
+        return result
     }
 }

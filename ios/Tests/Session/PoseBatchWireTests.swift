@@ -10,6 +10,70 @@ import XCTest
 /// encoder with float32 arithmetic emulated op by op (no JVM on the build
 /// host); the Dart decoder `ARFramePose.fromPacked` reads the same offsets.
 final class PoseBatchWireTests: XCTestCase {
+  func testSemanticFloorFactsStayPairedThroughDropAndPause() {
+    let sample = Data(repeating: 0, count: PoseBatchWire.sampleBytes)
+    let floor = SemanticFloorSample(anchorId: "floor", worldY: -1.5, normalY: 1, areaSquareMetres: 4)
+    var sent: [PoseBatch] = []
+    var completions: [() -> Void] = []
+    let dispatcher = PoseBatchDispatcher(capacity: 2) { batch, completion in
+      sent.append(batch)
+      completions.append(completion)
+    }
+    let sink = PoseBatchSink(dispatcher: dispatcher)
+    sink.open()
+    sink.offer(sample, semanticFloor: floor)
+    sink.offer(sample, semanticFloor: floor)
+    sink.offer(sample)
+    sink.offer(sample, semanticFloor: floor)
+    completions.removeFirst()()
+    XCTAssertEqual(sent[0].semanticFloorV1, [floor])
+    XCTAssertEqual(sent[1].semanticFloorV1, [nil, floor])
+    sink.pause()
+    completions.removeFirst()()
+    sink.resume()
+    sink.offer(sample)
+    XCTAssertEqual(sent.last?.semanticFloorV1, [])
+  }
+
+  func testDisplayRotationUsesTheActualViewBasisForBothPortraitsAndLandscapes() throws {
+    let camera = matrix_identity_float4x4
+    for angle in [Float(0), .pi / 2, -.pi / 2, .pi] {
+      let display = simd_float4x4(simd_quatf(angle: angle, axis: SIMD3<Float>(0, 0, 1)))
+      let actual = try XCTUnwrap(PoseStreamObserver.displayRotation(camera: camera, view: simd_inverse(display)))
+      XCTAssertEqual(sin(actual), Double(sin(angle)), accuracy: 1e-5)
+      XCTAssertEqual(cos(actual), Double(cos(angle)), accuracy: 1e-5)
+    }
+    var invalid = matrix_identity_float4x4
+    invalid.columns.0.x = .nan
+    XCTAssertNil(PoseStreamObserver.displayRotation(camera: invalid, view: matrix_identity_float4x4))
+  }
+
+  func testDisplayRotationStaysWithItsSampleAcrossQueueDropsAndPause() {
+    var sent: [PoseBatch] = []
+    var acknowledgements: [() -> Void] = []
+    let dispatcher = PoseBatchDispatcher(capacity: 2) { batch, acknowledge in
+      sent.append(batch); acknowledgements.append(acknowledge)
+    }
+    let sink = PoseBatchSink(dispatcher: dispatcher)
+    let sample = Self.bytes(Self.yaw180Golden)
+    sink.open()
+    sink.offer(sample, displayRotation: 0)
+    sink.offer(sample, displayRotation: .pi / 2)
+    sink.offer(sample, displayRotation: -.pi / 2)
+    sink.offer(sample)
+    acknowledgements[0]()
+    XCTAssertEqual(sent[0].displayRotationV1, [0])
+    XCTAssertEqual(sent[1].displayRotationV1, [-Double.pi / 2, nil])
+    XCTAssertEqual(sent[1].droppedOldestCount, 1)
+    sink.pause()
+    sink.offer(sample, displayRotation: .pi)
+    acknowledgements[1]()
+    XCTAssertEqual(sent.count, 2)
+    sink.resume()
+    sink.offer(sample, displayRotation: .pi)
+    XCTAssertEqual(sent[2].displayRotationV1, [Double.pi])
+  }
+
   /// 180 degrees about +Y, translation (1.5, -0.25, 2.0), tracking, sequence 7.
   static let yaw180Golden =
     "07000000000000007bc02cc8990100000100000000002000000000000000000000000000000000000000803f01010000"

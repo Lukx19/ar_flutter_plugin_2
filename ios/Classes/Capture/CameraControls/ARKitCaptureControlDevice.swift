@@ -41,6 +41,21 @@ final class ARKitCaptureControlDevice: CameraControlDevice {
   var minExposureBias: Float { device.minExposureTargetBias }
   var maxExposureBias: Float { device.maxExposureTargetBias }
   var exposureBias: Float { device.exposureTargetBias }
+  var isAdjustingExposure: Bool { device.isAdjustingExposure }
+
+  var adaptiveStillCapabilities: AdaptiveStillExposureCapabilities? {
+    // Older APIs do not positively distinguish detected flicker from unknown.
+    // Never guess a lighting frequency from region, frame rate or exposure.
+    guard #available(iOS 27.0, *), device.supportedExposureSignals.contains(.flicker) else { return nil }
+    let format = device.activeFormat
+    return AdaptiveStillExposureCapabilities(
+      minISO: format.minISO, maxISO: format.maxISO,
+      minExposureSeconds: format.minExposureDuration.seconds,
+      maxExposureSeconds: format.maxExposureDuration.seconds,
+      fixedAperture: format.minLensAperture == format.maxLensAperture,
+      videoHDREnabled: device.isVideoHDREnabled,
+      flickerDetected: device.activeExposureSignals.contains(.flicker))
+  }
 
   var focusModes: Set<CameraFocusModeValue> {
     var modes = Set<CameraFocusModeValue>()
@@ -91,6 +106,17 @@ final class ARKitCaptureControlDevice: CameraControlDevice {
     }
     let value = iso.map { min(max($0, format.minISO), format.maxISO) } ?? AVCaptureDevice.currentISO
     device.setExposureModeCustom(duration: duration, iso: value, completionHandler: nil)
+  }
+
+  func setAdaptiveCustomExposure(seconds: Double, iso: Float, applied: @escaping () -> Void) {
+    guard device.isExposureModeSupported(.custom) else { return }
+    let format = device.activeFormat
+    guard seconds.isFinite, iso.isFinite,
+      seconds >= format.minExposureDuration.seconds, seconds <= format.maxExposureDuration.seconds,
+      iso >= format.minISO, iso <= format.maxISO else { return }
+    // The completion time is in the capture-device clock, not ARFrame's
+    // clock. It is an apply acknowledgement only; frame EXIF verifies results.
+    device.setExposureModeCustom(duration: CMTime(seconds: seconds, preferredTimescale: 1_000_000_000), iso: iso) { _ in applied() }
   }
 
   // Every assignment below checks that the device supports the mode first:

@@ -180,7 +180,7 @@ class DeltaUploadSchedulerTest {
         val table = File(goldens, "colour_table.bin").readBytes()
         assertEquals(DisplayIntake.COLOUR_TABLE, handler.onMessage(table))
         assertEquals(0x0af540ff, handler.rgba(GridDisplayCodes.COLOUR_COVERAGE, 10))
-        val tables = ByteBuffer.allocateDirect(5 * ColourTableLayout.ENTRIES * 4)
+        val tables = ByteBuffer.allocateDirect(GridDisplayCodes.COLOUR_ATTRIBUTES * ColourTableLayout.ENTRIES * 4)
         assertTrue(handler.snapshotTables(tables, 0) > 0)
         mode[4] = 9
         assertEquals(DisplayIntake.REJECTED, handler.onMessage(mode))

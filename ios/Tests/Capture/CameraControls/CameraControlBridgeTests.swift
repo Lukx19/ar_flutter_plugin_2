@@ -19,6 +19,11 @@ final class FakeCameraControlDevice: CameraControlDevice {
   var minExposureBias: Float = -8
   var maxExposureBias: Float = 8
   var exposureBias: Float = 0
+  var adaptiveStillCapabilities: AdaptiveStillExposureCapabilities?
+  var isAdjustingExposure = false
+  var delayAdaptiveAcknowledgement = false
+  private(set) var adaptiveSetters = 0
+  var adaptiveAcknowledgements: [() -> Void] = []
   var focusModes: Set<CameraFocusModeValue> = [.auto, .continuous, .locked]
   var focusMode: CameraFocusModeValue = .continuous
   var lensPosition: Float = 0.5
@@ -63,6 +68,13 @@ final class FakeCameraControlDevice: CameraControlDevice {
     exposureMode = .custom
     if let seconds = seconds { exposureSeconds = seconds }
     if let iso = iso { self.iso = iso }
+  }
+
+  func setAdaptiveCustomExposure(seconds: Double, iso: Float, applied: @escaping () -> Void) {
+    adaptiveSetters += 1
+    setCustomExposure(seconds: seconds, iso: iso)
+    if delayAdaptiveAcknowledgement { adaptiveAcknowledgements.append(applied) }
+    else { applied() }
   }
 
   func setExposureMode(_ mode: CameraExposureModeValue) { requireLocked(); exposureMode = mode }

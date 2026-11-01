@@ -287,8 +287,14 @@ final class NativeCaptureChannel: CaptureChannelExtension {
       existing.jpegQuality = parsed.jpegQuality
       exposure = existing
     } else {
+      // Bind adaptive exposure even when the controls panel was never opened.
+      // Replay and unsupported devices retain ordinary ARKit exposure.
+      if !frameSource.replaysRecordedStills, controls == nil, let device = controlDevice() {
+        controls = CameraControlBridge(device: device)
+      }
       exposure = HighResolutionStillExposure(frameSource: { [weak frameSource] in frameSource },
-        jpegQuality: parsed.jpegQuality, exactStillResolution: exact, cameraAccess: cameraAccess)
+        jpegQuality: parsed.jpegQuality, exactStillResolution: exact, cameraAccess: cameraAccess,
+        controlBridge: controls, assessments: .shared)
       stills = exposure
     }
     exposure.format = parsed.format
@@ -783,7 +789,7 @@ enum NativeCapturePreviewChannel {
         }
         return result(nil)
       }
-      let known: Set<String> = ["materializeNativeCapturePreview", "beginNativeCapturePreviewDeletion",
+      let known: Set<String> = ["guidanceNativeCapturePreview", "materializeNativeCapturePreview", "beginNativeCapturePreviewDeletion",
                                 "commitNativeCapturePreviewDeletion", "rollbackNativeCapturePreviewDeletion",
                                 "reconcileNativeCapturePreviews", "deleteNativeCaptureSession", "reconcileNativeCaptureSessions"]
       guard known.contains(call.method) else { return result(FlutterMethodNotImplemented) }
@@ -799,6 +805,13 @@ enum NativeCapturePreviewChannel {
           case "reconcileNativeCapturePreviews":
             try owner.reconcile(liveReferences: arguments["references"] as? [String] ?? [])
             value = NSNull()
+          case "guidanceNativeCapturePreview":
+            guard let manifestId = arguments["manifestId"] as? String, let captureId = arguments["captureId"] as? String else {
+              throw DurableStoreStateError("manifestId and captureId are required")
+            }
+            if let path = try owner.materialize(manifestId: manifestId, captureId: captureId, edge: 512, cancelled: cancelled) {
+              value = GuidancePreviewLuma.read(path, cancelled: cancelled) ?? NSNull()
+            } else { value = NSNull() }
           case "materializeNativeCapturePreview":
             guard let manifestId = arguments["manifestId"] as? String, let captureId = arguments["captureId"] as? String else {
               throw DurableStoreStateError("manifestId and captureId are required")

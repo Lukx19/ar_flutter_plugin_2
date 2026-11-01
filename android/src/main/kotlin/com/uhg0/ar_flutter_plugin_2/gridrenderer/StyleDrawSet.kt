@@ -51,6 +51,9 @@ internal class StyleDrawSet(
 ) {
     private lateinit var points: Program
     private lateinit var splat: Program
+    private val focusUniform = FloatArray(64 * 4)
+    private var focusCount = 0
+    private var focusVersion = -1L
     private lateinit var spike: Program
     private lateinit var voxel: Program
     private lateinit var boxWire: Program
@@ -129,6 +132,11 @@ internal class StyleDrawSet(
 
     /** Uploads colour tables and planner targets when the display handler has newer ones. */
     fun syncDisplayResources(display: DisplayModeHandler) {
+        val focusKnown = display.currentFocusVersion
+        if (focusKnown != focusVersion) {
+            focusCount = display.snapshotFocus(focusUniform, focusVersion).coerceAtLeast(0)
+            focusVersion = focusKnown
+        }
         val version = display.snapshotTables(tableBytes, tablesVersion)
         if (version >= 0) {
             GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, texture[0])
@@ -207,6 +215,10 @@ internal class StyleDrawSet(
         GLES30.glUniform1i(p.selectedOnly, 0)
         GLES30.glUniform1i(p.grey, 0)
         GLES30.glUniform1i(p.minQuality, mode.minQuality)
+        val activeFocus = if (mode.has(GridDisplayCodes.OVERLAY_FOCUS_PRIORITY)) focusCount else 0
+        GLES30.glUniform1i(p.focusCount, activeFocus)
+        if (activeFocus > 0 && p.focus >= 0) GLES30.glUniform4fv(p.focus, activeFocus, focusUniform, 0)
+        GLES30.glUniform1f(p.alpha, if (mode.has(GridDisplayCodes.OVERLAY_HALF_TRANSPARENCY)) 0.5f else 1f)
     }
 
     /**
@@ -221,7 +233,7 @@ internal class StyleDrawSet(
         GLES30.glBlendFunc(GLES30.GL_SRC_ALPHA, GLES30.GL_ONE_MINUS_SRC_ALPHA)
         GLES30.glBindVertexArray(vao[VAO_LINES])
         GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, lineBuffer[0])
-        val bytes = batch.segments * 2 * GridLineBatch.VERTEX_BYTES
+        val bytes = batch.segments * batch.verticesPerSegment * GridLineBatch.VERTEX_BYTES
         batch.vertices.position(0)
         // Orphan and refill: a few kilobytes per frame, never read back.
         GLES30.glBufferData(GLES30.GL_ARRAY_BUFFER, bytes, batch.vertices, GLES30.GL_STREAM_DRAW)
@@ -231,14 +243,16 @@ internal class StyleDrawSet(
         GLES30.glVertexAttribDivisor(1, 0)
         GLES30.glVertexAttribPointer(0, 3, GLES30.GL_FLOAT, false, GridLineBatch.VERTEX_BYTES, 0)
         GLES30.glVertexAttribPointer(1, 4, GLES30.GL_UNSIGNED_BYTE, true, GridLineBatch.VERTEX_BYTES, 12)
+        val primitive = if (batch.volumetric) GLES30.GL_TRIANGLES else GLES30.GL_LINES
+        val vertexCount = batch.verticesPerSegment
         val tested = batch.depthTestedSegments
         if (tested > 0) {
-            GLES30.glDrawArrays(GLES30.GL_LINES, 0, tested * 2)
+            GLES30.glDrawArrays(primitive, 0, tested * vertexCount)
             counters.drawCalls++
         }
         if (batch.segments > tested) {
             GLES30.glDisable(GLES30.GL_DEPTH_TEST)
-            GLES30.glDrawArrays(GLES30.GL_LINES, tested * 2, (batch.segments - tested) * 2)
+            GLES30.glDrawArrays(primitive, tested * vertexCount, (batch.segments - tested) * vertexCount)
             GLES30.glEnable(GLES30.GL_DEPTH_TEST)
             counters.drawCalls++
         }
@@ -286,6 +300,11 @@ internal class StyleDrawSet(
      * writes only depth, pushed back by a polygon offset; pass 2 blends the
      * colour of every splat in front of that depth without writing depth,
      * so coplanar splats accumulate while hidden surfaces stay hidden.
+     * With HALF_TRANSPARENCY both passes discard the same checkerboard
+     * pixels; surviving colour is opaque, so arbitrarily many overlapping
+     * surfels still leave half the camera pixels visible. This is spatial
+     * transparency, not smooth alpha, and allocates no extra render target.
+     * Depth is reconstructed surfel depth, not the real camera scene depth.
      */
     private fun drawSplats(mode: GridDisplayState, view: GridFrameView) {
         val name = buffers.bufferName(GridBuffer.SURFACES)
@@ -528,6 +547,8 @@ internal class StyleDrawSet(
         val alpha: Int
         val grey: Int
         val minQuality: Int
+        val focusCount: Int
+        val focus: Int
 
         init {
             val v = compile(GLES30.GL_VERTEX_SHADER, vs)
@@ -557,6 +578,8 @@ internal class StyleDrawSet(
             alpha = loc("u_alpha")
             grey = loc("u_grey")
             minQuality = loc("u_minQuality")
+            focusCount = loc("u_focusCount")
+            focus = loc("u_focus[0]")
         }
 
         private fun compile(type: Int, source: String): Int {

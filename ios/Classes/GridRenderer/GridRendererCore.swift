@@ -94,12 +94,12 @@ final class GridRendererCore {
   ) -> Int {
     batch.clear()
     let current = lineOverlays
-    for overlay in current where !overlay.drawOnTop {
+    for overlay in current where overlay.volumetric == batch.volumetric && !overlay.drawOnTop {
       overlay.setView(focalPx: focalPx, pxPerDp: pxPerDp)
       _ = overlay.buildLines(camX: camX, camY: camY, camZ: camZ, sink: batch)
     }
     batch.endDepthTested()
-    for overlay in current where overlay.drawOnTop {
+    for overlay in current where overlay.volumetric == batch.volumetric && overlay.drawOnTop {
       overlay.setView(focalPx: focalPx, pxPerDp: pxPerDp)
       _ = overlay.buildLines(camX: camX, camY: camY, camZ: camZ, sink: batch)
     }

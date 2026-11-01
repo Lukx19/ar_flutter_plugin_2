@@ -66,6 +66,7 @@ internal class VisibilityGridRendererHost(
     val core = GridRendererCore(target, frameBudgetBytes = frameBudgetBytes)
     private val overlays = CopyOnWriteArrayList<GridOverlayLayer>()
     private val lineBatch = GridLineBatch()
+    private val volumeBatch = GridLineBatch(capacitySegments = 2048, volumetric = true)
     private val camera = CameraSnapshot()
 
     @Volatile private var anchor: View? = null
@@ -111,6 +112,7 @@ internal class VisibilityGridRendererHost(
     /** Removes the overlay view and releases every GL object. */
     fun detach() {
         GridRendererRegistry.unregister(this)
+        core.display.clearFocus()
         anchor = null
         mainHandler.post(::removeView)
     }
@@ -386,6 +388,9 @@ internal class VisibilityGridRendererHost(
                 val cam = overlayFrame.cameraPosition
                 if (core.buildOverlayLines(cam[0], cam[1], cam[2], lineBatch, frameView.focalPx, pxPerDp) > 0) {
                     draws.drawLines(lineBatch, frameView)
+                }
+                if (core.buildOverlayLines(cam[0], cam[1], cam[2], volumeBatch, frameView.focalPx, pxPerDp) > 0) {
+                    draws.drawLines(volumeBatch, frameView)
                 }
                 overlayFrame.widthPx = width
                 overlayFrame.heightPx = height

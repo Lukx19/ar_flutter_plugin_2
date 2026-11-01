@@ -1407,13 +1407,42 @@ internal class ArView(
         }
     }
 
+    // Explicit display basis from ARCore, never a platform-specific guessed
+    // portrait offset. Scratch storage stays on the session update thread.
+    private val displayRotationRawRight = FloatArray(3)
+    private val displayRotationRawUp = FloatArray(3)
+    private val displayRotationRight = FloatArray(3)
+    private val displayRotationRawForward = FloatArray(3)
+    private val displayRotationForward = FloatArray(3)
+
+    private fun cameraDisplayRotation(camera: com.google.ar.core.Camera): Double? {
+        val optical = camera.pose
+        val display = camera.displayOrientedPose
+        optical.getTransformedAxis(0, 1f, displayRotationRawRight, 0)
+        optical.getTransformedAxis(1, 1f, displayRotationRawUp, 0)
+        optical.getTransformedAxis(2, 1f, displayRotationRawForward, 0)
+        display.getTransformedAxis(0, 1f, displayRotationRight, 0)
+        display.getTransformedAxis(2, 1f, displayRotationForward, 0)
+        var cosine = 0.0; var sine = 0.0; var forwardAgreement = 0.0
+        for (i in 0..2) {
+            cosine += displayRotationRight[i] * displayRotationRawRight[i]
+            sine += displayRotationRight[i] * displayRotationRawUp[i]
+            forwardAgreement += displayRotationForward[i] * displayRotationRawForward[i]
+        }
+        if (!cosine.isFinite() || !sine.isFinite() || !forwardAgreement.isFinite() || forwardAgreement < .999 ||
+            kotlin.math.abs(cosine * cosine + sine * sine - 1.0) > .001) return null
+        return kotlin.math.atan2(sine, cosine)
+    }
+
     private fun onFrame(session: Session, frame: Frame) {
         val attribution = sceneHost.nativeFrameAttribution
         attribution.measureNativeFrame(NativeFrameSpan.OBSERVATION) {
             visibilityObservationSource.onFrame(frame)
         }
         attribution.measureNativeFrame(NativeFrameSpan.POSE) {
-            captureSession.buildPoseUpdate(frame)?.let(poseBatchDispatcher::offer)
+            captureSession.buildPoseUpdate(frame)?.let { sample ->
+                poseBatchDispatcher.offer(sample, cameraDisplayRotation(frame.camera))
+            }
         }
         if (playback != null) captureSession.onPlaybackFrame(frame)
         if (recorder.isRecording) recorder.onFrame(ArCoreRecordingPort(session)) { id, data -> frame.recordTrackBytes(id, data) }

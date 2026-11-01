@@ -142,10 +142,24 @@ struct PoseRateLimiter {
 }
 
 /// One `onPoseBatch` message: up to [capacity] concatenated samples.
+/// Raw semantic plane facts paired with one sensor sample. Qualification is shared Dart policy.
+struct SemanticFloorSample: Equatable {
+  let anchorId: String
+  let worldY: Double
+  let normalY: Double
+  let areaSquareMetres: Double
+  var arguments: [String: Any] {
+    ["classification": "floor", "anchorId": anchorId, "worldY": worldY,
+     "normalY": normalY, "areaSquareMetres": areaSquareMetres]
+  }
+}
+
 struct PoseBatch: Equatable {
   let sampleCount: Int
   let sampleBytes: Data
   let droppedOldestCount: Int
+  var displayRotationV1: [Double?] = []
+  var semanticFloorV1: [SemanticFloorSample?] = []
 }
 
 /// Bounded acknowledged transport: one batch in flight; while it is
@@ -157,7 +171,7 @@ final class PoseBatchDispatcher {
 
   private let send: Send
   private let capacity: Int
-  private var pending: [Data] = []
+  private var pending: [(bytes: Data, rotation: Double?, floor: SemanticFloorSample?)] = []
   private var inFlight = false
   private var droppedSinceLastBatch = 0
 
@@ -170,13 +184,13 @@ final class PoseBatchDispatcher {
   var pendingCount: Int { pending.count }
   var isInFlight: Bool { inFlight }
 
-  func offer(_ sample: Data) {
+  func offer(_ sample: Data, displayRotation: Double? = nil, semanticFloor: SemanticFloorSample? = nil) {
     precondition(sample.count == PoseBatchWire.sampleBytes)
     if pending.count == capacity {
       pending.removeFirst()
       droppedSinceLastBatch += 1
     }
-    pending.append(sample)
+    pending.append((sample, displayRotation?.isFinite == true ? displayRotation : nil, semanticFloor))
     dispatchIfIdle()
   }
 
@@ -191,12 +205,14 @@ final class PoseBatchDispatcher {
     guard !inFlight, !pending.isEmpty else { return }
     let count = pending.count
     var bytes = Data(capacity: count * PoseBatchWire.sampleBytes)
-    for sample in pending { bytes.append(sample) }
+    for sample in pending { bytes.append(sample.bytes) }
+    let rotations = pending.map { $0.rotation }
+    let floors = pending.map { $0.floor }
     pending.removeAll(keepingCapacity: true)
     let dropped = droppedSinceLastBatch
     droppedSinceLastBatch = 0
     inFlight = true
-    send(PoseBatch(sampleCount: count, sampleBytes: bytes, droppedOldestCount: dropped)) { [weak self] in
+    send(PoseBatch(sampleCount: count, sampleBytes: bytes, droppedOldestCount: dropped, displayRotationV1: rotations.contains(where: { $0 != nil }) ? rotations : [], semanticFloorV1: floors.contains(where: { $0 != nil }) ? floors : [])) { [weak self] in
       guard let self = self else { return }
       self.inFlight = false
       self.dispatchIfIdle()
@@ -237,8 +253,8 @@ final class PoseBatchSink {
 
   func resume() { isPaused = false }
 
-  func offer(_ sample: Data) {
+  func offer(_ sample: Data, displayRotation: Double? = nil, semanticFloor: SemanticFloorSample? = nil) {
     guard isOpen, !isPaused else { return }
-    dispatcher.offer(sample)
+    dispatcher.offer(sample, displayRotation: displayRotation, semanticFloor: semanticFloor)
   }
 }

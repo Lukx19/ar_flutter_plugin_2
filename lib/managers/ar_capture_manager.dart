@@ -2462,10 +2462,18 @@ class ARCaptureManager {
               throw const FormatException('Invalid packed pose batch.');
             }
             final bytes = ByteData.sublistView(payload);
+            final displayRotations =
+                decodePoseDisplayRotations(batch['displayRotationV1'], count);
+            final floorSidecar = batch['semanticFloorV1'];
+            final floors = floorSidecar is List && floorSidecar.length == count
+                ? floorSidecar
+                : null;
             for (var index = 0; index < count; index++) {
               _poseStreamController.add(ARFramePose.fromPacked(
                   bytes, index * packedPoseSampleBytes,
-                  trackingConvention: _packedTrackingConvention));
+                  trackingConvention: _packedTrackingConvention,
+                  displayRotationRadians: displayRotations?[index],
+                  semanticFloor: decodeSemanticFloor(floors?[index])));
             }
             break;
           }

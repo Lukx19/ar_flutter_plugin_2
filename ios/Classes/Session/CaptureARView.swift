@@ -83,12 +83,12 @@ final class CaptureARView: NSObject, FlutterPlatformView {
       }
     })
     let sink = poseSink
-    poseStream = PoseStreamObserver { [weak sink] sample in
-      DispatchQueue.main.async { sink?.offer(sample) }
-    }
+    poseStream = PoseStreamObserver(deliverDisplaySample: { [weak sink] sample, rotation, floor in
+      DispatchQueue.main.async { sink?.offer(sample, displayRotation: rotation, semanticFloor: floor) }
+    }, deliver: { _ in })
 
     let device = MTLCreateSystemDefaultDevice()
-    metalView = MTKView(frame: frame, device: device)
+    metalView = CaptureDisplayMetalView(frame: frame, device: device)
     metalView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
     metalView.backgroundColor = .black
     if let device = device {
@@ -98,6 +98,11 @@ final class CaptureARView: NSObject, FlutterPlatformView {
     }
     super.init()
 
+    if let displayView = metalView as? CaptureDisplayMetalView {
+      displayView.onDisplayOrientation = { [weak poseStream] orientation in
+        poseStream?.updateDisplayOrientation(orientation)
+      }
+    }
     renderLoop?.configure(metalView)
     source.addFrameObserver(poseStream)
     source.onSessionFailure = { [weak self] error in
@@ -166,6 +171,13 @@ final class CaptureARView: NSObject, FlutterPlatformView {
       "sampleCount": batch.sampleCount,
       "sampleBytes": FlutterStandardTypedData(bytes: batch.sampleBytes),
       "droppedOldestCount": batch.droppedOldestCount,
+      "semanticFloorV1": batch.semanticFloorV1.map { value -> Any in
+        value.map { $0.arguments as Any } ?? NSNull()
+      },
+      "displayRotationV1": batch.displayRotationV1.map { value -> Any in
+        if let value = value { return NSNumber(value: value) }
+        return NSNull()
+      },
     ]
   }
 
@@ -301,5 +313,20 @@ final class CaptureARViewFactory: NSObject, FlutterPlatformViewFactory {
 
   func createArgsCodec() -> FlutterMessageCodec & NSObjectProtocol {
     FlutterStandardMessageCodec.sharedInstance()
+  }
+}
+
+
+/// UIKit orientation is read on main during real window/layout changes. The
+/// session observer only reads the synchronized snapshot, never UIKit state.
+private final class CaptureDisplayMetalView: MTKView {
+  var onDisplayOrientation: ((UIInterfaceOrientation?) -> Void)?
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    onDisplayOrientation?(window?.windowScene?.interfaceOrientation)
+  }
+  override func didMoveToWindow() {
+    super.didMoveToWindow()
+    onDisplayOrientation?(window?.windowScene?.interfaceOrientation)
   }
 }
