@@ -109,6 +109,37 @@ final class NativeCapturePreviewReader {
     return false
   }
 
+  /// The committed original of [captureId] in the published root
+  /// [manifestId], in place: its blob path, stored format (`jpeg` or `heic`),
+  /// length and SHA-256 (Android `NativeCapturePreviewReaderV2.originalSource`).
+  /// Validates the root chain, the bound receipt and the blob length but not
+  /// the content digest: export packaging verifies [sha256] while it streams
+  /// the bytes. The blob is immutable and stays until its session is deleted.
+  /// Nil when the photo is not committed (including a store without
+  /// sessions); throws when the sessions folder or a session folder exists
+  /// but cannot be read, so the caller reports a retryable read failure, as
+  /// Android's directory stream does.
+  func originalSource(manifestId: String, captureId: String, cancelled: () -> Bool) throws
+    -> (path: String, format: String, length: Int64, sha256: String)? {
+    lock.lock(); defer { lock.unlock() }
+    guard DurableStoreEncoding.isHash(manifestId), DurableStoreEncoding.isHash(captureId) else { return nil }
+    let sessions = storeRoot.appendingPathComponent("sessions", isDirectory: true)
+    guard FileManager.default.fileExists(atPath: sessions.path) else { return nil }
+    let entries = try FileManager.default.contentsOfDirectory(atPath: sessions.path)
+    for name in entries.sorted() {
+      if cancelled() { return nil }
+      let session = sessions.appendingPathComponent(name, isDirectory: true)
+      if Self.isPlainDirectory(session), !FileManager.default.isReadableFile(atPath: session.path) {
+        throw DurableStoreStateError("Capture session folder is not readable")
+      }
+      guard Self.isPlainDirectory(session), !FileManager.default.fileExists(atPath: session.appendingPathComponent("tombstone").path),
+            let image = committedImage(session, manifestId, captureId, cancelled),
+            Self.isPlainFile(image.source), Self.fileSize(image.source) == image.length else { continue }
+      return (image.source.path, image.source.lastPathComponent.hasPrefix("heic.") ? "heic" : "jpeg", image.length, image.hash)
+    }
+    return nil
+  }
+
   /// The committed JPEG [captureId] of the published root [manifestId]: the
   /// attempt's JPEG when the root's bound committed receipt names
   /// [captureId], or image k of a burst shot root when [captureId] is
@@ -263,6 +294,53 @@ final class NativeCapturePreviewOwner {
     guard reader.materialize(manifestId: manifestId, captureId: captureId, target: target, edge: edge, cancelled: cancelled) else { return nil }
     if edge != 512 { trimDetailedCopies(viewed: target) }
     return target.path
+  }
+
+  /// The committed original blobs of `native-v2` photos, read in place by
+  /// export packaging (no copy), as one batch in reference order (Android
+  /// `NativeCapturePreviewOwnerV2.originals`). Each entry is `status: found`
+  /// with `captureId`, `fileName` (`<capture id>.jpg` or `.heic`), `path`,
+  /// `format`, `length` and `sha256`; `status: missing` for a malformed,
+  /// deletion-fenced or uncommitted photo; `status: error` with
+  /// `code: READ_FAILED` when that photo's store entry cannot be read. Throws
+  /// before the startup reconcile so the caller can retry; nil once
+  /// [cancelled]. Each lookup holds the owner lock alone, so deletions
+  /// interleave.
+  func originals(references: [String], cancelled: () -> Bool = { false }) throws -> [[String: Any]]? {
+    startup.lock.lock()
+    do {
+      defer { startup.lock.unlock() }
+      try checkRoot()
+      guard startup.reconciled else { throw DurableStoreStateError("Native capture previews are not reconciled yet") }
+    }
+    var entries: [[String: Any]] = []
+    entries.reserveCapacity(references.count)
+    for reference in references {
+      if cancelled() { return nil }
+      startup.lock.lock()
+      let entry = originalEntry(reference, cancelled)
+      startup.lock.unlock()
+      entries.append(entry)
+    }
+    return cancelled() ? nil : entries
+  }
+
+  private func originalEntry(_ reference: String, _ cancelled: () -> Bool) -> [String: Any] {
+    let missing: [String: Any] = ["status": "missing"]
+    let prefix = "native-v2://"
+    guard reference.hasPrefix(prefix) else { return missing }
+    let parts = reference.dropFirst(prefix.count).split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+    guard parts.count == 2, let key = try? Self.key(parts[0], parts[1]) else { return missing }
+    if FileManager.default.fileExists(atPath: root.appendingPathComponent("\(key).deleted").path) { return missing }
+    let found: (path: String, format: String, length: Int64, sha256: String)?
+    do {
+      found = try reader.originalSource(manifestId: parts[0], captureId: parts[1], cancelled: cancelled)
+    } catch {
+      return ["status": "error", "code": "READ_FAILED"]
+    }
+    guard let original = found else { return missing }
+    return ["status": "found", "captureId": parts[1], "fileName": "\(parts[1]).\(original.format == "heic" ? "heic" : "jpg")",
+            "path": original.path, "format": original.format, "length": Int(original.length), "sha256": original.sha256]
   }
 
   /// Resolves interrupted deletions against the persisted live references.

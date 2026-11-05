@@ -10,10 +10,11 @@ internal class NativeCapturePreviewOwnerV2(
     private val deleteDurableSession: (String) -> Long = { sessionId ->
         NativeCaptureSessionDeletionV2.deleteFromAppFiles(appFiles, sessionId)
     },
-    private val copyPreview: (String, String, File, () -> Boolean, Int) -> Boolean =
-        NativeCapturePreviewReaderV2(File(appFiles, "capture-v2-native/store"))::materializeJpegPreview,
+    reader: NativeCapturePreviewReaderV2 = NativeCapturePreviewReaderV2(File(appFiles, "capture-v2-native/store")),
+    private val locateOriginal: (String, String, () -> Boolean) -> NativeCaptureOriginal? = reader::originalSource,
+    private val copyPreview: (String, String, File, () -> Boolean, Int) -> Boolean = reader::materializeJpegPreview,
 ) {
-    private val sourceFormat = NativeCapturePreviewReaderV2(File(appFiles, "capture-v2-native/store"))::sourceFormat
+    private val sourceFormat = reader::sourceFormat
     private val root = File(appFiles.canonicalFile, "capture-v2-previews")
     private val startup = synchronized(startups) { startups.getOrPut(root.absolutePath) { Startup() } }
     private val lock = startup.lock
@@ -29,6 +30,50 @@ internal class NativeCapturePreviewOwnerV2(
         if (!copyPreview(manifestId, captureId, target, cancelled, edge)) return@synchronized null
         if (edge != 512) trimDetailedCopies(target)
         target.absolutePath
+    }
+
+    /**
+     * The committed original blobs of `native-v2` photos, read in place by export packaging
+     * (no copy), as one batch in reference order. Each entry is
+     * - `status=found` with `captureId`, `fileName` (`<capture id>.jpg` or `.heic`), `path`,
+     *   `format` (`jpeg` or `heic`), `length` and `sha256`, which the reader verifies while it
+     *   streams;
+     * - `status=missing` when the reference is malformed, fenced by a deletion or not committed;
+     * - `status=error` with a `code` when reading that photo's store entry failed.
+     * Throws before the startup reconcile, so the caller can retry. Returns null once
+     * [cancelled]. Each lookup holds the owner lock alone, so deletions interleave.
+     */
+    fun originals(references: List<String>, cancelled: () -> Boolean = { false }): List<Map<String, Any>>? {
+        synchronized(lock) {
+            checkRoot()
+            check(startup.reconciled) { "Native capture previews are not reconciled yet" }
+        }
+        val entries = ArrayList<Map<String, Any>>(references.size)
+        for (reference in references) {
+            if (cancelled()) return null
+            entries += synchronized(lock) { originalEntry(reference, cancelled) }
+        }
+        return if (cancelled()) null else entries
+    }
+
+    private fun originalEntry(reference: String, cancelled: () -> Boolean): Map<String, Any> {
+        val match = REFERENCE.matchEntire(reference) ?: return MISSING
+        val (manifestId, captureId) = match.destructured
+        if (File(root, "${key(manifestId, captureId)}.deleted").exists()) return MISSING
+        val original = try {
+            locateOriginal(manifestId, captureId, cancelled)
+        } catch (error: Exception) {
+            return mapOf("status" to "error", "code" to "READ_FAILED")
+        } ?: return MISSING
+        return mapOf(
+            "status" to "found",
+            "captureId" to captureId,
+            "fileName" to "$captureId.${if (original.format == "heic") "heic" else "jpg"}",
+            "path" to original.file.absolutePath,
+            "format" to original.format,
+            "length" to original.length,
+            "sha256" to original.sha256,
+        )
     }
 
     /**
@@ -178,6 +223,7 @@ internal class NativeCapturePreviewOwnerV2(
         val HASH = Regex("[0-9a-f]{64}")
         val KEY = Regex("[0-9a-f]{64}-[0-9a-f]{64}")
         val REFERENCE = Regex("native-v2://([0-9a-f]{64})/([0-9a-f]{64})")
+        val MISSING = mapOf<String, Any>("status" to "missing")
         val TRANSACTION = Regex("deleting-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
         val startups = mutableMapOf<String, Startup>()
     }

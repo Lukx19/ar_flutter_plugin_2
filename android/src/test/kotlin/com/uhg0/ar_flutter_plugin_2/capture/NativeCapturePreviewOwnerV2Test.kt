@@ -24,8 +24,10 @@ class NativeCapturePreviewOwnerV2Test {
     @Before fun initialize() { owner().reconcile(emptyList()) }
     @After fun cleanup() { root.deleteRecursively() }
 
-    @Test fun `HEIC immutable originals keep their extension and survive deletion rollback`() {
-        fun hash(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes).toCaptureHashHex()
+    private fun hash(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes).toCaptureHashHex()
+
+    /** One committed HEIC photo in the native store: its manifest id, blob and bytes. */
+    private fun committedHeic(): Triple<String, File, ByteArray> {
         val request = "d".repeat(64)
         val source = "immutable-heic-original".toByteArray()
         val sourceHash = hash(source)
@@ -39,6 +41,11 @@ class NativeCapturePreviewOwnerV2Test {
             parentFile!!.mkdirs()
             writeText("kind=COMMITTED_PICTURE\nrootHash=$manifestId\ncaptureId=$capture\nrequestHash=$request\nrevision=1\nheicSizeBytes=${source.size}\nreceiptHash=${hash("$request|$manifestId".toByteArray())}\n")
         }
+        return Triple(manifestId, original, source)
+    }
+
+    @Test fun `HEIC immutable originals keep their extension and survive deletion rollback`() {
+        val (manifestId, original, source) = committedHeic()
         val nativeReference = "native-v2://$manifestId/$capture"
         val owner = NativeCapturePreviewOwnerV2(root)
         owner.reconcile(listOf(nativeReference))
@@ -53,6 +60,65 @@ class NativeCapturePreviewOwnerV2Test {
         owner.commitDeletion(owner.beginDeletion(listOf(nativeReference)))
         assertNull(owner.materialize(manifestId, capture, edge = 0))
         assertArrayEquals(source, original.readBytes())
+    }
+
+    @Test fun `export originals resolve committed blobs in place in one ordered batch behind the deletion fence`() {
+        val (manifestId, original, source) = committedHeic()
+        val nativeReference = "native-v2://$manifestId/$capture"
+        val owner = NativeCapturePreviewOwnerV2(root)
+        owner.reconcile(listOf(nativeReference))
+        val unknown = "native-v2://$manifestId/$other"
+        val found = mapOf(
+            "status" to "found",
+            "captureId" to capture,
+            "fileName" to "$capture.heic",
+            "path" to original.absolutePath,
+            "format" to "heic",
+            "length" to source.size.toLong(),
+            "sha256" to hash(source),
+        )
+        val missing = mapOf("status" to "missing")
+        assertEquals(
+            listOf(missing, found, missing, found),
+            owner.originals(listOf(unknown, nativeReference, "native-v2://malformed", nativeReference)),
+        )
+        assertFalse("no preview copy is made", File(root.canonicalFile, "capture-v2-previews").listFiles().orEmpty().any { it.name.contains(capture) })
+        val token = owner.beginDeletion(listOf(nativeReference))
+        assertEquals("a pending deletion fences export", listOf(missing), owner.originals(listOf(nativeReference)))
+        owner.rollbackDeletion(token)
+        assertEquals(listOf(found), owner.originals(listOf(nativeReference)))
+        owner.commitDeletion(owner.beginDeletion(listOf(nativeReference)))
+        assertEquals(listOf(missing), owner.originals(listOf(nativeReference)))
+        assertArrayEquals(source, original.readBytes())
+    }
+
+    @Test fun `export originals wait for the reconcile, stop when cancelled and report a failed read per photo`() {
+        val files = Files.createTempDirectory("preview-owner-original").toFile()
+        try {
+            val located = mutableListOf<String>()
+            var cancelAfter = Int.MAX_VALUE
+            val owner = NativeCapturePreviewOwnerV2(files, locateOriginal = { _, captureId, _ ->
+                located += captureId
+                if (captureId == other) throw java.io.IOException("unreadable root")
+                null
+            })
+            val references = (1..40).map { "native-v2://$manifest/${it.toString(16).padStart(64, 'b')}" }
+            assertThrows("an unreconciled store is a retryable failure", IllegalStateException::class.java) {
+                owner.originals(references)
+            }
+            assertTrue(located.isEmpty())
+            owner.reconcile(emptyList())
+            assertEquals(
+                listOf(mapOf("status" to "missing"), mapOf("status" to "error", "code" to "READ_FAILED")),
+                owner.originals(listOf(reference, "native-v2://$manifest/$other")),
+            )
+            located.clear()
+            assertEquals("40 photos resolve in one call", 40, owner.originals(references)?.size)
+            located.clear()
+            cancelAfter = 3
+            assertNull(owner.originals(references) { located.size >= cancelAfter })
+            assertEquals("cancellation stops the batch between photos", 3, located.size)
+        } finally { files.deleteRecursively() }
     }
 
     @Test fun `original inspection copies share detail bound and deletion rollback fences all variants`() {

@@ -32,56 +32,70 @@ internal class NativeCapturePreviewReaderV2(
     ): Boolean {
         // Zero selects an immutable byte-for-byte original display copy.
         require(edge == 0 || edge == 512 || edge == 1024)
-        if (!HASH.matches(manifestId) || !HASH.matches(captureId)) return false
-        val sessions = File(storeRoot.canonicalFile, "sessions")
-        if (!sessions.isDirectory) return false
-        Files.newDirectoryStream(sessions.toPath()).use { entries ->
-        for (entry in entries) {
-            if (cancelled()) return false
-            val session = entry.toFile()
-            if (!session.isDirectory || session.canonicalFile != session.absoluteFile || File(session, "tombstone").exists()) continue
-            val descriptor = committedRoot(session, manifestId, captureId, cancelled)?.components
-                ?.firstOrNull { it.kind == "JPEG" || it.kind == "HEIC" }?.let { Descriptor(it.length, it.hash, it.kind.lowercase()) }
-                ?: continue
-            val source = File(
-                session,
-                "assets/$captureId/${descriptor.format}.${descriptor.hash}.blob",
-            )
-            if (!source.isFile || source.canonicalFile != source.absoluteFile || source.length() != descriptor.length) continue
-            val parent = target.parentFile ?: continue
-            parent.mkdirs()
+        val original = committedOriginal(manifestId, captureId, cancelled) ?: return false
+        val source = original.file
+        val parent = target.parentFile ?: return false
+        parent.mkdirs()
+        if (edge == 0) {
+            if (target.isFile && target.canonicalFile == target.absoluteFile && target.length() == original.length &&
+                sha256(target, cancelled).hex() == original.sha256) return !cancelled()
+        } else if (validPreview(target, edge)) return true
+        val partial = File(parent, "${target.name}.part")
+        try {
+            check(target.canonicalFile == target.absoluteFile && partial.canonicalFile == partial.absoluteFile)
+            if (cancelled() || sha256(source, cancelled).hex() != original.sha256) return false
             if (edge == 0) {
-                if (target.isFile && target.canonicalFile == target.absoluteFile && target.length() == descriptor.length &&
-                    sha256(target, cancelled).hex() == descriptor.hash) return !cancelled()
-            } else if (validPreview(target, edge)) return true
-            val partial = File(parent, "${target.name}.part")
-            try {
-                check(target.canonicalFile == target.absoluteFile && partial.canonicalFile == partial.absoluteFile)
-                if (cancelled() || sha256(source, cancelled).hex() != descriptor.hash) return false
-                if (edge == 0) {
-                    FileInputStream(source).use { input ->
-                        java.io.FileOutputStream(partial).use { output ->
-                            val receipt = copyWorkspace.copy(
-                                { bytes, offset, count -> if (cancelled()) throw java.io.IOException("Preview cancelled") else input.read(bytes, offset, count) },
-                                output::write,
-                            )
-                            if (receipt.length != descriptor.length || receipt.digest.hex() != descriptor.hash) return false
-                        }
+                FileInputStream(source).use { input ->
+                    java.io.FileOutputStream(partial).use { output ->
+                        val receipt = copyWorkspace.copy(
+                            { bytes, offset, count -> if (cancelled()) throw java.io.IOException("Preview cancelled") else input.read(bytes, offset, count) },
+                            output::write,
+                        )
+                        if (receipt.length != original.length || receipt.digest.hex() != original.sha256) return false
                     }
-                } else if (!writePreview(source, partial, cancelled, edge)) return false
-                if (cancelled()) return false
-                Files.move(
-                    partial.toPath(),
-                    target.toPath(),
-                    StandardCopyOption.ATOMIC_MOVE,
-                    StandardCopyOption.REPLACE_EXISTING,
-                )
-                return true
-            } catch (_: Throwable) { return false }
-            finally { partial.delete() }
+                }
+            } else if (!writePreview(source, partial, cancelled, edge)) return false
+            if (cancelled()) return false
+            Files.move(
+                partial.toPath(),
+                target.toPath(),
+                StandardCopyOption.ATOMIC_MOVE,
+                StandardCopyOption.REPLACE_EXISTING,
+            )
+            return true
+        } catch (_: Throwable) { return false }
+        finally { partial.delete() }
+    }
+
+    /**
+     * The committed original of [captureId] in the published root [manifestId], in place:
+     * its blob, stored format (`jpeg` or `heic`), length and SHA-256. Validates the root
+     * chain, the bound receipt and the blob length, but not the content digest; a reader
+     * of the returned file checks [NativeCaptureOriginal.sha256] while it streams the bytes.
+     * The blob is immutable and stays until its session is deleted.
+     */
+    @Synchronized
+    fun originalSource(manifestId: String, captureId: String, cancelled: () -> Boolean = { false }): NativeCaptureOriginal? =
+        committedOriginal(manifestId, captureId, cancelled)
+
+    private fun committedOriginal(manifestId: String, captureId: String, cancelled: () -> Boolean): NativeCaptureOriginal? {
+        if (!HASH.matches(manifestId) || !HASH.matches(captureId)) return null
+        val sessions = File(storeRoot.canonicalFile, "sessions")
+        if (!sessions.isDirectory) return null
+        Files.newDirectoryStream(sessions.toPath()).use { entries ->
+            for (entry in entries) {
+                if (cancelled()) return null
+                val session = entry.toFile()
+                if (!session.isDirectory || session.canonicalFile != session.absoluteFile || File(session, "tombstone").exists()) continue
+                val component = committedRoot(session, manifestId, captureId, cancelled)?.components
+                    ?.firstOrNull { it.kind == "JPEG" || it.kind == "HEIC" } ?: continue
+                val format = component.kind.lowercase()
+                val source = File(session, "assets/$captureId/$format.${component.hash}.blob")
+                if (!source.isFile || source.canonicalFile != source.absoluteFile || source.length() != component.length) continue
+                return NativeCaptureOriginal(source, format, component.length, component.hash)
+            }
         }
-        }
-        return false
+        return null
     }
 
     /** Root-qualified format of an immutable original; never inferred from its filename. */
@@ -220,7 +234,6 @@ internal class NativeCapturePreviewReaderV2(
 
     private fun ByteArray.hex() = toCaptureHashHex()
 
-    private data class Descriptor(val length: Long, val hash: String, val format: String)
     private data class RootPointer(val revision: Long, val hash: String)
 
     private companion object {
@@ -229,3 +242,6 @@ internal class NativeCapturePreviewReaderV2(
         val HASH = Regex("[0-9a-f]{64}")
     }
 }
+
+/** A committed original photo blob in the native store ([NativeCapturePreviewReaderV2.originalSource]). */
+internal data class NativeCaptureOriginal(val file: File, val format: String, val length: Long, val sha256: String)

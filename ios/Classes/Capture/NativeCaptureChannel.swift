@@ -759,7 +759,8 @@ final class SessionPauseObserver: ARFrameObserver {
 }
 
 /// `ar_flutter_plugin_2/native_capture_preview`: History and detail previews
-/// of committed durable photos without a live view, the two-phase preview
+/// of committed durable photos without a live view, their original blobs for
+/// export packaging (`resolveNativeCaptureOriginals`), the two-phase preview
 /// deletion used when the app deletes captures, and the durable photo
 /// deletion of a deleted session (`deleteNativeCaptureSession`, replies the
 /// reclaimed bytes).
@@ -783,7 +784,7 @@ enum NativeCapturePreviewChannel {
         }
         return result(nil)
       }
-      let known: Set<String> = ["materializeNativeCapturePreview", "beginNativeCapturePreviewDeletion",
+      let known: Set<String> = ["materializeNativeCapturePreview", "resolveNativeCaptureOriginals", "beginNativeCapturePreviewDeletion",
                                 "commitNativeCapturePreviewDeletion", "rollbackNativeCapturePreviewDeletion",
                                 "reconcileNativeCapturePreviews", "deleteNativeCaptureSession", "reconcileNativeCaptureSessions"]
       guard known.contains(call.method) else { return result(FlutterMethodNotImplemented) }
@@ -805,6 +806,11 @@ enum NativeCapturePreviewChannel {
             }
             value = try owner.materialize(manifestId: manifestId, captureId: captureId,
                                           edge: arguments["original"] as? Bool == true ? 0 : (arguments["detailed"] as? Bool == true ? 1024 : 512), cancelled: cancelled) ?? NSNull()
+          case "resolveNativeCaptureOriginals":
+            guard let references = arguments["references"] as? [String] else {
+              throw DurableStoreStateError("references are required")
+            }
+            value = try owner.originals(references: references, cancelled: cancelled) ?? NSNull()
           case "reconcileNativeCaptureSessions":
             guard let sessionIds = arguments["sessionIds"] as? [String] else {
               throw NativeCaptureWireError.invalid("sessionIds are required")

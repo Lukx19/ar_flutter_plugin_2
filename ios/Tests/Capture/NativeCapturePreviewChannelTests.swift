@@ -83,6 +83,56 @@ final class NativeCapturePreviewChannelTests: XCTestCase {
     XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: path)), bytes)
   }
 
+  /// Export packaging reads committed originals in place, in one ordered
+  /// batch: no preview copy, the stored format, length and digest, behind the
+  /// reconcile and deletion fences.
+  func testExportOriginalsResolveTheCommittedBlobsInPlace() throws {
+    let photo = try commitPhoto()
+    let unknown = "native-v2://\(photo.manifest)/\(String(repeating: "c", count: 64))"
+    func resolve(_ references: [String]) -> [[String: Any]]? {
+      invoke("resolveNativeCaptureOriginals", ["references": references, "requestId": UUID().uuidString]) as? [[String: Any]]
+    }
+    let done = expectation(description: "unreconciled")
+    messenger.invoke(NativeCapturePreviewChannel.name, "resolveNativeCaptureOriginals",
+                     ["references": [photo.reference], "requestId": UUID().uuidString]) { value in
+      XCTAssertTrue(value is FlutterError, "an unreconciled store is a retryable failure")
+      done.fulfill()
+    }
+    wait(for: [done], timeout: 60)
+    _ = invoke("reconcileNativeCapturePreviews", ["references": [photo.reference]])
+    let entries = try XCTUnwrap(resolve([unknown, photo.reference, "native-v2://malformed"]))
+    XCTAssertEqual(entries.map { $0["status"] as? String }, ["missing", "found", "missing"])
+    let found = entries[1]
+    let path = try XCTUnwrap(found["path"] as? String)
+    let bytes = try Data(contentsOf: URL(fileURLWithPath: path))
+    XCTAssertEqual(found["captureId"] as? String, photo.capture)
+    XCTAssertEqual(found["fileName"] as? String, "\(photo.capture).jpg")
+    XCTAssertEqual(found["format"] as? String, "jpeg")
+    XCTAssertEqual(found["length"] as? Int, bytes.count)
+    XCTAssertEqual(found["sha256"] as? String, DurableStoreEncoding.hex(DurableStoreEncoding.sha256([UInt8](bytes))))
+    XCTAssertTrue(path.hasPrefix(NativeCaptureStorePaths.store(appFiles).path), "the durable blob itself, not a preview copy")
+    let previews = (try? FileManager.default.contentsOfDirectory(atPath: NativeCaptureStorePaths.previews(appFiles).path)) ?? []
+    XCTAssertFalse(previews.contains { $0.contains(photo.capture) })
+    let token = try XCTUnwrap(invoke("beginNativeCapturePreviewDeletion", ["references": [photo.reference]]) as? String)
+    XCTAssertEqual(resolve([photo.reference])?.first?["status"] as? String, "missing", "a pending deletion fences export")
+    _ = invoke("rollbackNativeCapturePreviewDeletion", ["token": token])
+    XCTAssertEqual(resolve([photo.reference])?.first?["path"] as? String, path)
+  }
+
+  /// A store entry that exists but cannot be read is a retryable read
+  /// failure, not a missing photo (Android reports the same).
+  func testExportOriginalsReportAnUnreadableStoreAsAReadFailure() throws {
+    let photo = try commitPhoto()
+    _ = invoke("reconcileNativeCapturePreviews", ["references": [photo.reference]])
+    let sessions = NativeCaptureStorePaths.store(appFiles).appendingPathComponent("sessions", isDirectory: true)
+    try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: sessions.path)
+    defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: sessions.path) }
+    let entries = invoke("resolveNativeCaptureOriginals",
+                         ["references": [photo.reference], "requestId": UUID().uuidString]) as? [[String: Any]]
+    XCTAssertEqual(entries?.first?["status"] as? String, "error")
+    XCTAssertEqual(entries?.first?["code"] as? String, "READ_FAILED")
+  }
+
   func testCommittedPhotoPreviewResolvesOnlyAfterTheChannelReconciles() throws {
     let photo = try commitPhoto()
 

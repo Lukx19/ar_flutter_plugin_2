@@ -150,6 +150,29 @@ class NativeCapturePreviewReaderV2Test {
         } finally { root.deleteRecursively() }
     }
 
+    @Test fun `original source names the committed blob in place and refuses unbound or resized blobs`() {
+        val root = canonicalTempDirectory("original-source")
+        try {
+            val (manifestId, captureId, bytes) = committedChain(root)
+            val blob = File(root, "sessions/session/assets/$captureId/jpeg.${sha256(bytes)}.blob")
+            val reader = NativeCapturePreviewReaderV2(root, { _, _, _, _ -> error("no preview is written") }, { _, _ -> false })
+            assertEquals(
+                NativeCaptureOriginal(blob, "jpeg", bytes.size.toLong(), sha256(bytes)),
+                reader.originalSource(manifestId, captureId),
+            )
+            assertEquals(null, reader.originalSource(manifestId, "c".repeat(64)))
+            assertEquals(null, reader.originalSource(manifestId, captureId) { true })
+            // Same-length damage is left to the streaming reader's digest check.
+            blob.writeBytes(bytes.copyOf().also { it[0] = (it[0] + 1).toByte() })
+            assertEquals(blob, reader.originalSource(manifestId, captureId)?.file)
+            blob.writeBytes(bytes.copyOf(bytes.size - 1))
+            assertEquals(null, reader.originalSource(manifestId, captureId))
+            File(root, "sessions/session/tombstone").writeText("")
+            blob.writeBytes(bytes)
+            assertEquals(null, reader.originalSource(manifestId, captureId))
+        } finally { root.deleteRecursively() }
+    }
+
     @Test fun `tampered original cannot create thumbnail or change authoritative bytes`() {
         val root = canonicalTempDirectory("tampered-preview")
         try {
