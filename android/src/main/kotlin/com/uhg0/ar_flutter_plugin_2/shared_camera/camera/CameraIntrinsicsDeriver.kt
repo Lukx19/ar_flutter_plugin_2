@@ -123,12 +123,6 @@ internal object CameraIntrinsicsDeriver {
                 "width" to appliedCrop.width,
                 "height" to appliedCrop.height,
             ),
-            "effectiveCropRegion" to mapOf(
-                "left" to effectiveLeft,
-                "top" to effectiveTop,
-                "width" to effectiveWidth,
-                "height" to effectiveHeight,
-            ),
             "distortionCoefficients" to baseIntrinsics.distortionCoefficients,
             "fieldOfView" to mapOf(
                 "horizontal" to fovHorizontal,

@@ -73,9 +73,6 @@ class CameraIntrinsicsDeriverTest {
         assertEquals(3081.1 * scale, focalLength["fy"] as Double, 0.0001)
         assertEquals((2016.0 - 504 + 0.5) * scale - 0.5, principalPoint["cx"] as Double, 0.0001)
         assertEquals((1512.0 - 378 + 0.5) * scale - 0.5, principalPoint["cy"] as Double, 0.0001)
-        val effective = intrinsics["effectiveCropRegion"] as Map<*, *>
-        assertEquals(378.0, effective["top"] as Double, 0.0001)
-        assertEquals(2268.0, effective["height"] as Double, 0.0001)
         assertEquals(2016, resolution["width"])
         assertEquals(1512, resolution["height"])
         assertEquals(504, cropRegion["left"])
@@ -147,6 +144,43 @@ class CameraIntrinsicsDeriverTest {
         assertEquals(
             2.0 * kotlin.math.atan(2268.0 / (2.0 * 3062.0)),
             fieldOfView["vertical"] as Double,
+            1e-9,
+        )
+    }
+
+    @Test
+    fun `a crop region wider than the output is cropped at both sides`() {
+        // A 16:9 crop region (4032x2268 at top 378) shown as a 4:3 still: the
+        // effective crop is 3024x2268 at left 504, scaled by 2016 / 3024.
+        val intrinsics =
+            CameraIntrinsicsDeriver.derive(
+                baseIntrinsics =
+                    BaseCameraIntrinsics(
+                        fx = 3080.4,
+                        fy = 3081.1,
+                        cx = 2016.0,
+                        cy = 1512.0,
+                        activeArrayWidth = 4032,
+                        activeArrayHeight = 3024,
+                        distortionCoefficients = emptyList(),
+                    ),
+                outputWidth = 2016,
+                outputHeight = 1512,
+                cropRegion = CropRegionSpec(left = 0, top = 378, width = 4032, height = 2268),
+            )
+
+        val focalLength = intrinsics["focalLength"] as Map<*, *>
+        val principalPoint = intrinsics["principalPoint"] as Map<*, *>
+        val fieldOfView = intrinsics["fieldOfView"] as Map<*, *>
+        val scale = 2016.0 / 3024.0
+        assertEquals(3080.4 * scale, focalLength["fx"] as Double, 0.0001)
+        assertEquals(3081.1 * scale, focalLength["fy"] as Double, 0.0001)
+        assertEquals((2016.0 - 504 + 0.5) * scale - 0.5, principalPoint["cx"] as Double, 0.0001)
+        assertEquals((1512.0 - 378 + 0.5) * scale - 0.5, principalPoint["cy"] as Double, 0.0001)
+        // The horizontal field of view is the cropped band's, narrower than the sensor's.
+        assertEquals(
+            2.0 * kotlin.math.atan(3024.0 / (2.0 * 3080.4)),
+            fieldOfView["horizontal"] as Double,
             1e-9,
         )
     }
