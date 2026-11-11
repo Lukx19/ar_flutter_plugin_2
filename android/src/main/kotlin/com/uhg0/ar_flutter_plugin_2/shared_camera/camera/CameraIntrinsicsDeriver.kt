@@ -67,10 +67,25 @@ internal object CameraIntrinsicsDeriver {
                 height = baseIntrinsics.activeArrayHeight,
             )
 
+        // Camera2 never stretches: a stream whose aspect ratio differs from
+        // the crop region shows the largest centred part of the crop region
+        // with the stream's aspect ratio (SCALER_CROP_REGION). Both axes then
+        // scale by the same factor, so fx and fy keep the sensor's ratio.
         val cropWidth = appliedCrop.width.toDouble()
         val cropHeight = appliedCrop.height.toDouble()
-        val scaleX = outputWidth.toDouble() / cropWidth
-        val scaleY = outputHeight.toDouble() / cropHeight
+        val outputAspect = outputWidth.toDouble() / outputHeight.toDouble()
+        val effectiveWidth: Double
+        val effectiveHeight: Double
+        if (cropWidth / cropHeight > outputAspect) {
+            effectiveHeight = cropHeight
+            effectiveWidth = cropHeight * outputAspect
+        } else {
+            effectiveWidth = cropWidth
+            effectiveHeight = cropWidth / outputAspect
+        }
+        val effectiveLeft = appliedCrop.left + (cropWidth - effectiveWidth) / 2.0
+        val effectiveTop = appliedCrop.top + (cropHeight - effectiveHeight) / 2.0
+        val scale = outputWidth.toDouble() / effectiveWidth
         // Some Camera2 HALs advertise LENS_INTRINSIC_CALIBRATION but return a
         // zero principal point. Treat values on/outside the active-array edge
         // as invalid calibration rather than emitting unusable intrinsics.
@@ -80,12 +95,12 @@ internal object CameraIntrinsicsDeriver {
         val baseCy =
             baseIntrinsics.cy.takeIf { it > 0.0 && it < baseIntrinsics.activeArrayHeight.toDouble() }
                 ?: baseIntrinsics.activeArrayHeight / 2.0
-        val correctedFx = baseIntrinsics.fx * scaleX
-        val correctedFy = baseIntrinsics.fy * scaleY
+        val correctedFx = baseIntrinsics.fx * scale
+        val correctedFy = baseIntrinsics.fy * scale
         // Pixel centres at integer coordinates (OpenCV pinhole convention,
         // docs/02-architecture.md): the principal point scales as (c + 0.5) * s - 0.5.
-        val correctedCx = (baseCx - appliedCrop.left + 0.5) * scaleX - 0.5
-        val correctedCy = (baseCy - appliedCrop.top + 0.5) * scaleY - 0.5
+        val correctedCx = (baseCx - effectiveLeft + 0.5) * scale - 0.5
+        val correctedCy = (baseCy - effectiveTop + 0.5) * scale - 0.5
         val fovHorizontal = 2.0 * atan(outputWidth.toDouble() / (2.0 * correctedFx))
         val fovVertical = 2.0 * atan(outputHeight.toDouble() / (2.0 * correctedFy))
 
@@ -107,6 +122,12 @@ internal object CameraIntrinsicsDeriver {
                 "top" to appliedCrop.top,
                 "width" to appliedCrop.width,
                 "height" to appliedCrop.height,
+            ),
+            "effectiveCropRegion" to mapOf(
+                "left" to effectiveLeft,
+                "top" to effectiveTop,
+                "width" to effectiveWidth,
+                "height" to effectiveHeight,
             ),
             "distortionCoefficients" to baseIntrinsics.distortionCoefficients,
             "fieldOfView" to mapOf(
