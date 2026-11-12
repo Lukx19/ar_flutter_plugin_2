@@ -5,7 +5,9 @@ import org.junit.Test
 
 /**
  * Pixel centres are at integer coordinates (OpenCV pinhole convention,
- * docs/02-architecture.md): a principal point maps as (c - crop + 0.5) * s - 0.5.
+ * docs/02-architecture.md): a principal point maps as (c - left + 0.5) * s - 0.5,
+ * where left and s come from the effective crop, the largest centred part of
+ * the crop region with the output's aspect ratio (Camera2 never stretches).
  */
 class CameraIntrinsicsDeriverTest {
     @Test
@@ -41,7 +43,7 @@ class CameraIntrinsicsDeriverTest {
     }
 
     @Test
-    fun `derives crop corrected intrinsics from active array`() {
+    fun `a crop region of another aspect ratio is cropped to the output, not stretched`() {
         val intrinsics =
             CameraIntrinsicsDeriver.derive(
                 baseIntrinsics =
@@ -64,10 +66,13 @@ class CameraIntrinsicsDeriverTest {
         val resolution = intrinsics["resolution"] as Map<*, *>
         val cropRegion = intrinsics["cropRegion"] as Map<*, *>
 
-        assertEquals(2053.6, focalLength["fx"] as Double, 0.0001)
-        assertEquals(1848.66, focalLength["fy"] as Double, 0.01)
-        assertEquals(1512.5 * 2016.0 / 3024.0 - 0.5, principalPoint["cx"] as Double, 0.0001)
-        assertEquals(1260.5 * 1512.0 / 2520.0 - 0.5, principalPoint["cy"] as Double, 0.0001)
+        // 3024x2520 (6:5) shown as 2016x1512 (4:3): the effective crop is
+        // 3024x2268 at top 252 + 126 = 378, scaled by 2016 / 3024 on both axes.
+        val scale = 2016.0 / 3024.0
+        assertEquals(3080.4 * scale, focalLength["fx"] as Double, 0.0001)
+        assertEquals(3081.1 * scale, focalLength["fy"] as Double, 0.0001)
+        assertEquals((2016.0 - 504 + 0.5) * scale - 0.5, principalPoint["cx"] as Double, 0.0001)
+        assertEquals((1512.0 - 378 + 0.5) * scale - 0.5, principalPoint["cy"] as Double, 0.0001)
         assertEquals(2016, resolution["width"])
         assertEquals(1512, resolution["height"])
         assertEquals(504, cropRegion["left"])
@@ -106,5 +111,77 @@ class CameraIntrinsicsDeriverTest {
         assertEquals(0, cropRegion["top"])
         assertEquals(4032, cropRegion["width"])
         assertEquals(3024, cropRegion["height"])
+    }
+
+    @Test
+    fun `a 16 by 9 still from a 4 by 3 sensor keeps square pixels`() {
+        // Galaxy A40 class: 4:3 active array, 3840x2160 JPEG, no crop region.
+        val intrinsics =
+            CameraIntrinsicsDeriver.derive(
+                baseIntrinsics =
+                    BaseCameraIntrinsics(
+                        fx = 3062.0,
+                        fy = 3062.0,
+                        cx = 2016.0,
+                        cy = 1512.0,
+                        activeArrayWidth = 4032,
+                        activeArrayHeight = 3024,
+                        distortionCoefficients = emptyList(),
+                    ),
+                outputWidth = 3840,
+                outputHeight = 2160,
+            )
+
+        val focalLength = intrinsics["focalLength"] as Map<*, *>
+        val principalPoint = intrinsics["principalPoint"] as Map<*, *>
+        val fieldOfView = intrinsics["fieldOfView"] as Map<*, *>
+        val scale = 3840.0 / 4032.0
+        assertEquals(3062.0 * scale, focalLength["fx"] as Double, 0.0001)
+        assertEquals(focalLength["fx"] as Double, focalLength["fy"] as Double, 1e-9)
+        assertEquals((2016.0 + 0.5) * scale - 0.5, principalPoint["cx"] as Double, 0.0001)
+        assertEquals((1512.0 - 378 + 0.5) * scale - 0.5, principalPoint["cy"] as Double, 0.0001)
+        // The vertical field of view is the cropped band's, narrower than the sensor's.
+        assertEquals(
+            2.0 * kotlin.math.atan(2268.0 / (2.0 * 3062.0)),
+            fieldOfView["vertical"] as Double,
+            1e-9,
+        )
+    }
+
+    @Test
+    fun `a crop region wider than the output is cropped at both sides`() {
+        // A 16:9 crop region (4032x2268 at top 378) shown as a 4:3 still: the
+        // effective crop is 3024x2268 at left 504, scaled by 2016 / 3024.
+        val intrinsics =
+            CameraIntrinsicsDeriver.derive(
+                baseIntrinsics =
+                    BaseCameraIntrinsics(
+                        fx = 3080.4,
+                        fy = 3081.1,
+                        cx = 2016.0,
+                        cy = 1512.0,
+                        activeArrayWidth = 4032,
+                        activeArrayHeight = 3024,
+                        distortionCoefficients = emptyList(),
+                    ),
+                outputWidth = 2016,
+                outputHeight = 1512,
+                cropRegion = CropRegionSpec(left = 0, top = 378, width = 4032, height = 2268),
+            )
+
+        val focalLength = intrinsics["focalLength"] as Map<*, *>
+        val principalPoint = intrinsics["principalPoint"] as Map<*, *>
+        val fieldOfView = intrinsics["fieldOfView"] as Map<*, *>
+        val scale = 2016.0 / 3024.0
+        assertEquals(3080.4 * scale, focalLength["fx"] as Double, 0.0001)
+        assertEquals(3081.1 * scale, focalLength["fy"] as Double, 0.0001)
+        assertEquals((2016.0 - 504 + 0.5) * scale - 0.5, principalPoint["cx"] as Double, 0.0001)
+        assertEquals((1512.0 - 378 + 0.5) * scale - 0.5, principalPoint["cy"] as Double, 0.0001)
+        // The horizontal field of view is the cropped band's, narrower than the sensor's.
+        assertEquals(
+            2.0 * kotlin.math.atan(3024.0 / (2.0 * 3080.4)),
+            fieldOfView["horizontal"] as Double,
+            1e-9,
+        )
     }
 }
